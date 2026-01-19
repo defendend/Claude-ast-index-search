@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kotlin-index"
-version = "2.5.1"
+version = "2.5.2"
 description = "Fast code indexer for Android/Kotlin/Java projects with CLI and MCP server"
 readme = "README.md"
 license = "MIT"

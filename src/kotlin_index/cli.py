@@ -29,6 +29,8 @@ console = Console()
 
 def get_config():
     """Get configuration from environment or defaults."""
+    import hashlib
+
     # Try to auto-detect project root (look for settings.gradle or build.gradle)
     cwd = Path.cwd()
     project_root = os.environ.get("KOTLIN_INDEX_PROJECT_ROOT")
@@ -42,10 +44,14 @@ def get_config():
         else:
             project_root = str(cwd)
 
-    db_path = os.environ.get(
-        "KOTLIN_INDEX_DB_PATH",
-        str(Path.home() / ".cache" / "kotlin-index" / "index.db")
-    )
+    # Use project-specific database (hash of path for uniqueness)
+    db_path = os.environ.get("KOTLIN_INDEX_DB_PATH")
+    if not db_path:
+        # Create unique DB name: project_name-hash.db
+        project_name = Path(project_root).name
+        path_hash = hashlib.md5(project_root.encode()).hexdigest()[:8]
+        db_name = f"{project_name}-{path_hash}.db"
+        db_path = str(Path.home() / ".cache" / "kotlin-index" / db_name)
 
     # Ensure db directory exists
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)

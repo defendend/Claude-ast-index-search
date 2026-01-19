@@ -1,12 +1,12 @@
 # kotlin-index
 
-[![Version](https://img.shields.io/badge/version-2.5.1-blue.svg)](https://github.com/defendend/Claude-index-search-android-studio/releases)
+[![Version](https://img.shields.io/badge/version-2.5.2-blue.svg)](https://github.com/defendend/Claude-index-search-android-studio/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/downloads/)
 
 Fast code search for Android/Kotlin/Java projects using SQLite + FTS5.
 
-**v2.5.1** - Performance boost with ripgrep!
+**v2.5.2** - Project-specific databases!
 
 ## Features
 
@@ -309,6 +309,10 @@ Check file filter in `module_indexer.py`.
 Check tree-sitter node types in `symbol_indexer.py`.
 
 ## Changelog
+
+### v2.5.2
+- **Project-specific databases**: Each project now has its own index database (`project-hash.db`)
+- Fixed issue where multiple projects shared the same index, causing cross-project results
 
 ### v2.5.1
 - **Performance boost**: Use ripgrep (rg) instead of grep for 10-15x faster searches
