@@ -65,6 +65,9 @@ kotlin-index usages "UserRepository"
 | `kotlin-index class <name>` | Find class/interface by name |
 | `kotlin-index usages <name>` | Find symbol usages |
 | `kotlin-index implementations <name>` | Find interface implementations |
+| `kotlin-index hierarchy <class>` | Show class hierarchy (parents + children) |
+| `kotlin-index annotations <name>` | Find classes with annotation (@Module, @Inject) |
+| `kotlin-index changed` | Show symbols in changed files (git diff) |
 | `kotlin-index outline <file>` | Show file structure |
 
 ### Module Commands
@@ -251,6 +254,11 @@ Check file filter in `module_indexer.py`.
 Check tree-sitter node types in `symbol_indexer.py`.
 
 ## Changelog
+
+### v2.2.0
+- Add `hierarchy` command: show class hierarchy (parents and children)
+- Add `annotations` command: find classes with specific annotation (@Module, @Inject, etc.)
+- Add `changed` command: show symbols in changed files (git diff)
 
 ### v2.1.0
 - Fix `class` command: now supports contains search (e.g., `kotlin-index class Interactor`)

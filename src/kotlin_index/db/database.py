@@ -386,3 +386,62 @@ class Database:
             "references": refs_count,
             "last_indexed": last_indexed,
         }
+
+    # === Hierarchy ===
+
+    def get_class_hierarchy(self, class_name: str) -> dict:
+        """Получить полную иерархию класса (родители и дети)."""
+        # Найти класс
+        rows = self.execute("""
+            SELECT s.*, f.path as file_path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE s.name = ? AND s.type IN ('class', 'interface', 'object', 'enum')
+            LIMIT 1
+        """, (class_name,)).fetchall()
+
+        if not rows:
+            return None
+
+        symbol = dict(rows[0])
+
+        # Получить родителей
+        parents = self.execute("""
+            SELECT parent_name, inheritance_type
+            FROM inheritance
+            WHERE symbol_id = ?
+        """, (symbol["id"],)).fetchall()
+
+        # Получить детей (кто наследует этот класс)
+        children = self.execute("""
+            SELECT s.name, s.type, f.path as file_path, s.line, i.inheritance_type
+            FROM inheritance i
+            JOIN symbols s ON i.symbol_id = s.id
+            JOIN files f ON s.file_id = f.id
+            WHERE i.parent_name = ?
+            ORDER BY s.name
+        """, (class_name,)).fetchall()
+
+        return {
+            "symbol": symbol,
+            "parents": [dict(p) for p in parents],
+            "children": [dict(c) for c in children],
+        }
+
+    # === Symbols by file paths ===
+
+    def get_symbols_by_paths(self, paths: list[str]) -> list[dict]:
+        """Получить символы для списка путей файлов."""
+        if not paths:
+            return []
+
+        placeholders = ",".join("?" * len(paths))
+        rows = self.execute(f"""
+            SELECT s.*, f.path as file_path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE f.path IN ({placeholders})
+            AND s.type IN ('class', 'interface', 'object', 'enum', 'function')
+            ORDER BY f.path, s.line
+        """, paths).fetchall()
+        return [dict(row) for row in rows]

@@ -443,6 +443,163 @@ def find_implementations(
         console.print(f"    {impl['file_path']}:{impl['line']}")
 
 
+@app.command("hierarchy")
+def class_hierarchy(
+    class_name: str = typer.Argument(..., help="Class or interface name"),
+):
+    """Show class hierarchy (parents and children)."""
+    db = get_db()
+    hierarchy = db.get_class_hierarchy(class_name)
+    db.close()
+
+    if not hierarchy:
+        console.print(f"[yellow]Class/interface '{class_name}' not found[/yellow]")
+        return
+
+    symbol = hierarchy["symbol"]
+    parents = hierarchy["parents"]
+    children = hierarchy["children"]
+
+    # Show hierarchy tree
+    console.print(f"\n[bold]Hierarchy of \\[{symbol['type']}] {symbol['name']}[/bold]")
+    console.print(f"  {symbol['file_path']}:{symbol['line']}")
+
+    if parents:
+        console.print(f"\n[cyan]Parents ({len(parents)}):[/cyan]")
+        for p in parents:
+            rel = "extends" if p["inheritance_type"] == "extends" else "implements"
+            console.print(f"  {rel} {p['parent_name']}")
+
+    if children:
+        console.print(f"\n[cyan]Children ({len(children)}):[/cyan]")
+        for c in children:
+            rel = "extends" if c["inheritance_type"] == "extends" else "implements"
+            console.print(f"  [{c['type']}] {c['name']} ({rel})")
+            console.print(f"    {c['file_path']}:{c['line']}")
+
+    if not parents and not children:
+        console.print("\n[dim]No parents or children found[/dim]")
+
+
+@app.command("annotations")
+def find_annotations(
+    annotation: str = typer.Argument(..., help="Annotation name (e.g., @Module, @Inject)"),
+    limit: int = typer.Option(30, "--limit", "-l", help="Max results"),
+):
+    """Find classes with specific annotation."""
+    import subprocess
+
+    root, _ = get_config()
+
+    # Remove @ if present
+    annotation = annotation.lstrip("@")
+
+    # Use grep to find files with annotation
+    try:
+        result = subprocess.run(
+            ["grep", "-rl", f"@{annotation}", "--include=*.kt", "--include=*.java", root],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        files = result.stdout.strip().split("\n") if result.stdout.strip() else []
+    except Exception as e:
+        console.print(f"[red]Error searching: {e}[/red]")
+        return
+
+    if not files:
+        console.print(f"[yellow]No files with @{annotation} found[/yellow]")
+        return
+
+    # Get symbols from these files
+    db = get_db()
+    symbols = db.get_symbols_by_paths(files[:limit * 2])
+    db.close()
+
+    # Filter to classes only
+    classes = [s for s in symbols if s["type"] in ("class", "interface", "object")][:limit]
+
+    console.print(f"[bold]Classes with @{annotation} ({len(classes)}):[/bold]")
+    for s in classes:
+        console.print(f"  [{s['type']}] {s['name']}")
+        console.print(f"    {s['file_path']}:{s['line']}")
+
+
+@app.command("changed")
+def show_changed(
+    base: str = typer.Option("HEAD", "--base", "-b", help="Base commit/branch to compare"),
+):
+    """Show symbols in changed files (git diff)."""
+    import subprocess
+
+    root, _ = get_config()
+
+    # Get changed files from git
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", base],
+            capture_output=True,
+            text=True,
+            cwd=root,
+            timeout=10,
+        )
+        changed = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
+
+        # Also get untracked/staged files
+        result2 = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            cwd=root,
+            timeout=10,
+        )
+        for line in result2.stdout.strip().split("\n"):
+            if line and len(line) > 3:
+                changed.add(line[3:].strip())
+
+        changed = list(changed)
+
+    except Exception as e:
+        console.print(f"[red]Error running git: {e}[/red]")
+        return
+
+    # Filter to Kotlin/Java files
+    code_files = [f for f in changed if f.endswith((".kt", ".java"))]
+
+    if not code_files:
+        console.print("[yellow]No changed Kotlin/Java files[/yellow]")
+        return
+
+    # Convert to absolute paths
+    from pathlib import Path
+    abs_paths = [str(Path(root) / f) for f in code_files]
+
+    # Get symbols
+    db = get_db()
+    symbols = db.get_symbols_by_paths(abs_paths)
+    db.close()
+
+    console.print(f"[bold]Changed files ({len(code_files)}):[/bold]")
+    for f in code_files:
+        console.print(f"  {f}")
+
+    if symbols:
+        console.print(f"\n[bold]Symbols in changed files ({len(symbols)}):[/bold]")
+
+        by_file = {}
+        for s in symbols:
+            path = s["file_path"]
+            if path not in by_file:
+                by_file[path] = []
+            by_file[path].append(s)
+
+        for path, file_symbols in sorted(by_file.items()):
+            rel_path = path.replace(root + "/", "")
+            console.print(f"\n  [cyan]{rel_path}:[/cyan]")
+            for s in file_symbols:
+                console.print(f"    [{s['type']}] {s['name']} (line {s['line']})")
+
+
 @app.command("mcp")
 def run_mcp():
     """Start MCP server (requires kotlin-index[mcp])."""
