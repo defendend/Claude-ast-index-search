@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kotlin-index"
+version = "2.0.0"
+description = "Fast code indexer for Android/Kotlin/Java projects with CLI and MCP server"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "defendend", email = "defendend@example.com" }
+]
+keywords = ["kotlin", "android", "java", "index", "search", "mcp", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Text Processing :: Indexing",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "tree-sitter>=0.20.0",
+    "tree-sitter-kotlin>=0.0.1",
+    "tree-sitter-java>=0.0.1",
+]
+
+[project.optional-dependencies]
+mcp = [
+    "fastmcp>=0.1.0",
+    "pydantic>=2.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+kotlin-index = "kotlin_index.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/defendend/Claude-index-search-android-studio"
+Repository = "https://github.com/defendend/Claude-index-search-android-studio"
+Issues = "https://github.com/defendend/Claude-index-search-android-studio/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kotlin_index"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

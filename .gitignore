@@ -4,6 +4,9 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+*.egg-info/
+dist/
+build/
 
 # SQLite
 *.db
@@ -12,3 +15,6 @@ venv/
 .idea/
 .vscode/
 *.iml
+
+# Test
+test_venv/

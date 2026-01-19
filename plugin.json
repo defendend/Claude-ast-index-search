@@ -1,0 +1,40 @@
+{
+  "name": "kotlin-index",
+  "version": "2.0.0",
+  "description": "Fast code search for Android/Kotlin/Java projects",
+  "author": "defendend",
+  "repository": "https://github.com/defendend/Claude-index-search-android-studio",
+  "license": "MIT",
+  "install": {
+    "type": "pip",
+    "package": "kotlin-index",
+    "command": "pip install kotlin-index"
+  },
+  "skills": [
+    {
+      "name": "kotlin-index",
+      "file": "skills/kotlin-index.md",
+      "description": "Code search commands for Android/Kotlin/Java projects"
+    }
+  ],
+  "mcp": {
+    "optional": true,
+    "install": "pip install kotlin-index[mcp]",
+    "command": "kotlin-index mcp",
+    "description": "MCP server for IDE integration"
+  },
+  "commands": {
+    "init": "kotlin-index init",
+    "search": "kotlin-index search",
+    "rebuild": "kotlin-index rebuild",
+    "stats": "kotlin-index stats"
+  },
+  "keywords": [
+    "android",
+    "kotlin",
+    "java",
+    "code-search",
+    "indexer",
+    "mcp"
+  ]
+}

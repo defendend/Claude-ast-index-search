@@ -9,26 +9,46 @@ MCP сервер для индексации и поиска по Android про
 """
 
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-# Добавляем текущую директорию в путь для импортов
-SCRIPT_DIR = Path(__file__).parent
-sys.path.insert(0, str(SCRIPT_DIR))
-
 from fastmcp import FastMCP
-from db.database import Database
-from indexer.file_indexer import FileIndexer
-from indexer.module_indexer import ModuleIndexer
-from indexer.symbol_indexer import SymbolIndexer
+
+from kotlin_index.db.database import Database
+from kotlin_index.indexer.file_indexer import FileIndexer
+from kotlin_index.indexer.module_indexer import ModuleIndexer
+from kotlin_index.indexer.symbol_indexer import SymbolIndexer
+
+
+def get_config():
+    """Get configuration from environment or auto-detect."""
+    # Try to auto-detect project root (look for settings.gradle or build.gradle)
+    cwd = Path.cwd()
+    project_root = os.environ.get("KOTLIN_INDEX_PROJECT_ROOT")
+
+    if not project_root:
+        # Try to find project root by looking for gradle files
+        for parent in [cwd] + list(cwd.parents):
+            if (parent / "settings.gradle").exists() or (parent / "settings.gradle.kts").exists():
+                project_root = str(parent)
+                break
+        else:
+            project_root = str(cwd)
+
+    db_path = os.environ.get(
+        "KOTLIN_INDEX_DB_PATH",
+        str(Path.home() / ".cache" / "kotlin-index" / "index.db")
+    )
+
+    # Ensure db directory exists
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    return project_root, db_path
+
 
 # Конфигурация
-# По умолчанию: 2 уровня вверх от .claude/mcp-index
-DEFAULT_PROJECT_ROOT = str(SCRIPT_DIR.parent.parent)
-PROJECT_ROOT = os.environ.get("KOTLIN_INDEX_PROJECT_ROOT", DEFAULT_PROJECT_ROOT)
-DB_PATH = os.environ.get("KOTLIN_INDEX_DB_PATH", str(SCRIPT_DIR / "index.db"))
+PROJECT_ROOT, DB_PATH = get_config()
 
 # Инициализация
 mcp = FastMCP("kotlin-index")
@@ -470,5 +490,10 @@ def search(query: str, limit: int = 10) -> str:
     return "\n".join(output)
 
 
-if __name__ == "__main__":
+def run():
+    """Run the MCP server."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    run()

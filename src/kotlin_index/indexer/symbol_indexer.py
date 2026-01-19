@@ -1,13 +1,9 @@
 import re
-import sys
 import time
 from pathlib import Path
 from typing import Optional, Set
 
-# Добавляем родительскую директорию в путь
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from db.database import Database
+from kotlin_index.db.database import Database
 
 # Попробуем импортировать tree-sitter для Kotlin
 try:
