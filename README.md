@@ -18,19 +18,28 @@ Fast code search for Android/Kotlin/Java projects using SQLite + FTS5.
 
 ## Installation
 
-### Option 1: pip install (Recommended)
+### Option 1: Homebrew (macOS, recommended)
+
+```bash
+brew tap defendend/kotlin-index-
+brew install kotlin-index
+```
+
+This automatically installs ripgrep for maximum performance.
+
+### Option 2: pip install
 
 ```bash
 pip install kotlin-index
 ```
 
-### Option 2: pip install with MCP support
+### Option 3: pip install with MCP support
 
 ```bash
 pip install kotlin-index[mcp]
 ```
 
-### Option 3: From source
+### Option 4: From source
 
 ```bash
 git clone https://github.com/defendend/Claude-index-search-android-studio.git
