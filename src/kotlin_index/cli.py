@@ -146,6 +146,33 @@ def rebuild(
 
 
 @app.command()
+def update():
+    """Incremental index update (only changed files)."""
+    root, _ = get_config()
+    db = get_db()
+
+    symbol_indexer = SymbolIndexer(db, root)
+
+    console.print("[cyan]Updating index (incremental)...[/cyan]")
+    results = symbol_indexer.index_incremental()
+
+    db.set_meta("last_indexed", time.strftime("%Y-%m-%d %H:%M:%S"))
+    db.commit()
+    db.close()
+
+    if results["files"] == 0:
+        console.print(f"[yellow]No changed files (skipped: {results['skipped']})[/yellow]")
+        return
+
+    console.print(f"  Updated files: {results['files']}")
+    console.print(f"  Skipped: {results['skipped']}")
+    console.print(f"  Symbols: {results['symbols']}")
+    console.print(f"  Inheritance: {results['inheritance']}")
+    console.print(f"  References: {results['references']}")
+    console.print("\n[green]Done![/green]")
+
+
+@app.command()
 def stats():
     """Show index statistics."""
     db = get_db()

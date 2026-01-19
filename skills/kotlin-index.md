@@ -79,12 +79,17 @@ kotlin-index outline "/path/to/File.kt"
 
 ### Index Management
 
-**Rebuild index**:
+**Rebuild index** (full):
 ```bash
 kotlin-index rebuild
 kotlin-index rebuild --type files    # only files
 kotlin-index rebuild --type symbols  # only symbols
 kotlin-index rebuild --type modules  # only modules
+```
+
+**Update index** (incremental, only changed files):
+```bash
+kotlin-index update
 ```
 
 **Index statistics**:

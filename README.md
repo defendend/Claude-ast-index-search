@@ -81,6 +81,7 @@ kotlin-index usages "UserRepository"
 |---------|-------------|
 | `kotlin-index init` | Initialize index for current project |
 | `kotlin-index rebuild` | Rebuild entire index |
+| `kotlin-index update` | Incremental update (only changed files) |
 | `kotlin-index stats` | Show index statistics |
 
 ### Examples
