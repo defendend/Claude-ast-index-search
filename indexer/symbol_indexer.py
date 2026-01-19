@@ -465,23 +465,37 @@ class SymbolIndexer:
             if child.type == "superclass":
                 # extends
                 for subchild in child.children:
-                    if subchild.type == "type_identifier":
-                        parents.append((content[subchild.start_byte:subchild.end_byte], "extends"))
+                    type_name = self._extract_java_type_name(subchild, content)
+                    if type_name:
+                        parents.append((type_name, "extends"))
             elif child.type == "super_interfaces":
                 # implements
                 for subchild in child.children:
                     if subchild.type == "type_list":
                         for type_node in subchild.children:
-                            if type_node.type == "type_identifier":
-                                parents.append((content[type_node.start_byte:type_node.end_byte], "implements"))
+                            type_name = self._extract_java_type_name(type_node, content)
+                            if type_name:
+                                parents.append((type_name, "implements"))
             elif child.type == "extends_interfaces":
                 # interface extends interface
                 for subchild in child.children:
                     if subchild.type == "type_list":
                         for type_node in subchild.children:
-                            if type_node.type == "type_identifier":
-                                parents.append((content[type_node.start_byte:type_node.end_byte], "extends"))
+                            type_name = self._extract_java_type_name(type_node, content)
+                            if type_name:
+                                parents.append((type_name, "extends"))
         return parents
+
+    def _extract_java_type_name(self, node, content: str) -> Optional[str]:
+        """Извлечь имя типа из Java узла (поддержка generics)."""
+        if node.type == "type_identifier":
+            return content[node.start_byte:node.end_byte]
+        elif node.type == "generic_type":
+            # Для generic типов ищем type_identifier внутри
+            for child in node.children:
+                if child.type == "type_identifier":
+                    return content[child.start_byte:child.end_byte]
+        return None
 
     def _extract_type_name(self, node, content: str) -> Optional[str]:
         """Извлечь имя типа из узла."""

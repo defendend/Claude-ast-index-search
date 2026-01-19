@@ -4,15 +4,10 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Определяем корень проекта (на 2 уровня выше от .claude/mcp-index)
-# Поддерживаем оба worktree
-if [[ "$SCRIPT_DIR" == *"go-client-android-2"* ]]; then
-    PROJECT_ROOT="/Users/defendend/go-client-android-2"
-else
-    PROJECT_ROOT="/Users/defendend/go-client-android"
-fi
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Путь к БД (общий для обоих worktree, чтобы не индексировать дважды)
-DB_PATH="$HOME/.cache/go-index/index.db"
+# Путь к БД
+DB_PATH="$HOME/.cache/kotlin-index/index.db"
 
 # Создаём директорию для БД
 mkdir -p "$(dirname "$DB_PATH")"
@@ -23,8 +18,8 @@ if [ -d "$SCRIPT_DIR/.venv" ]; then
 fi
 
 # Экспортируем переменные
-export GO_INDEX_PROJECT_ROOT="$PROJECT_ROOT"
-export GO_INDEX_DB_PATH="$DB_PATH"
+export KOTLIN_INDEX_PROJECT_ROOT="$PROJECT_ROOT"
+export KOTLIN_INDEX_DB_PATH="$DB_PATH"
 
 # Запускаем сервер
 exec python3 "$SCRIPT_DIR/server.py"

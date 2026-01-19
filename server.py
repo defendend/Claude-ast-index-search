@@ -25,11 +25,13 @@ from indexer.module_indexer import ModuleIndexer
 from indexer.symbol_indexer import SymbolIndexer
 
 # Конфигурация
-PROJECT_ROOT = os.environ.get("GO_INDEX_PROJECT_ROOT", "/Users/defendend/go-client-android")
-DB_PATH = os.environ.get("GO_INDEX_DB_PATH", str(SCRIPT_DIR / "index.db"))
+# По умолчанию: 2 уровня вверх от .claude/mcp-index
+DEFAULT_PROJECT_ROOT = str(SCRIPT_DIR.parent.parent)
+PROJECT_ROOT = os.environ.get("KOTLIN_INDEX_PROJECT_ROOT", DEFAULT_PROJECT_ROOT)
+DB_PATH = os.environ.get("KOTLIN_INDEX_DB_PATH", str(SCRIPT_DIR / "index.db"))
 
 # Инициализация
-mcp = FastMCP("go-index")
+mcp = FastMCP("kotlin-index")
 db = Database(DB_PATH)
 db.connect()
 
@@ -426,7 +428,7 @@ def search(query: str, limit: int = 10) -> str:
     """
     output = [f"Результаты поиска '{query}':"]
 
-    # Поиск файлов
+    # Поиск файлов (LIKE для substring matching)
     files = db.search_files(query, limit)
     if files:
         output.append(f"\n--- Файлы ({len(files)}) ---")
@@ -435,8 +437,17 @@ def search(query: str, limit: int = 10) -> str:
         if len(files) > 5:
             output.append(f"  ... и ещё {len(files) - 5}")
 
-    # Поиск символов
-    symbols = db.search_symbols(query, limit=limit)
+    # Поиск символов (FTS для multi-word, LIKE для single-word)
+    # FTS5 не подходит для substring matching (UserRepo не найдёт по "Repo")
+    if " " in query:
+        try:
+            symbols = db.search_symbols_fts(query, limit=limit)
+        except Exception:
+            symbols = []
+        if not symbols:
+            symbols = db.search_symbols(query, limit=limit)
+    else:
+        symbols = db.search_symbols(query, limit=limit)
     if symbols:
         output.append(f"\n--- Символы ({len(symbols)}) ---")
         for s in symbols[:5]:

@@ -237,9 +237,36 @@ class Database:
         """Пересобрать FTS индекс символов."""
         self.execute("DELETE FROM symbols_fts")
         self.execute("""
-            INSERT INTO symbols_fts (name, signature)
-            SELECT name, COALESCE(signature, '') FROM symbols
+            INSERT INTO symbols_fts (rowid, name, signature)
+            SELECT id, name, COALESCE(signature, '') FROM symbols
         """)
+
+    def search_symbols_fts(self, query: str, symbol_type: str = None, limit: int = 20) -> list[dict]:
+        """Полнотекстовый поиск символов."""
+        # Подготовка запроса для FTS5 (добавляем * для prefix matching)
+        fts_query = f"{query}*"
+
+        if symbol_type:
+            rows = self.execute("""
+                SELECT s.*, f.path as file_path, f.module
+                FROM symbols s
+                JOIN files f ON s.file_id = f.id
+                JOIN symbols_fts fts ON s.id = fts.rowid
+                WHERE symbols_fts MATCH ? AND s.type = ?
+                ORDER BY rank
+                LIMIT ?
+            """, (fts_query, symbol_type, limit)).fetchall()
+        else:
+            rows = self.execute("""
+                SELECT s.*, f.path as file_path, f.module
+                FROM symbols s
+                JOIN files f ON s.file_id = f.id
+                JOIN symbols_fts fts ON s.id = fts.rowid
+                WHERE symbols_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            """, (fts_query, limit)).fetchall()
+        return [dict(row) for row in rows]
 
     # === Meta ===
 
