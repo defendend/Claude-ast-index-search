@@ -27,6 +27,8 @@ brew install kotlin-index
 
 This automatically installs ripgrep for maximum performance.
 
+See [homebrew-kotlin-index-](https://github.com/defendend/homebrew-kotlin-index-) for tap details.
+
 ### Option 2: pip install
 
 ```bash
