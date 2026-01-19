@@ -73,6 +73,12 @@ choco install ripgrep
 
 If ripgrep is not installed, commands will automatically fall back to grep.
 
+**Note:** Shell aliases (like `alias rg=...`) don't work - ripgrep must be a real binary in PATH. Verify with:
+```bash
+python3 -c "import shutil; print(shutil.which('rg'))"
+# Should print path like /opt/homebrew/bin/rg, not None
+```
+
 ## CLI Commands
 
 ### Search Commands
