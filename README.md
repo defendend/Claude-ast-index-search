@@ -2,7 +2,7 @@
 
 Fast code search for Android/Kotlin/Java projects using SQLite + FTS5.
 
-**v2.0.0** - Now available as pip package with CLI!
+**v2.5.0** - Compose & Coroutines support, 33 CLI commands!
 
 ## Features
 
