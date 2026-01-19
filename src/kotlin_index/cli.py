@@ -310,18 +310,29 @@ def find_class(
 
 @app.command("outline")
 def file_outline(
-    file_path: str = typer.Argument(..., help="Path to file"),
+    file_path: str = typer.Argument(..., help="Path to file (relative or absolute)"),
 ):
     """Show file structure (classes, functions, etc.)."""
+    from pathlib import Path
+
+    root, _ = get_config()
+
+    # Handle relative paths
+    if not file_path.startswith("/"):
+        file_path = str(Path(root) / file_path)
+
     db = get_db()
     symbols = db.get_file_symbols(file_path)
     db.close()
 
     if not symbols:
-        console.print(f"[yellow]No symbols found in '{file_path}'[/yellow]")
+        # Show relative path in error
+        rel_path = file_path.replace(root + "/", "")
+        console.print(f"[yellow]No symbols found in '{rel_path}'[/yellow]")
         return
 
-    console.print(f"[bold]Structure of {file_path}:[/bold]")
+    rel_path = file_path.replace(root + "/", "")
+    console.print(f"[bold]Structure of {rel_path}:[/bold]")
     for s in symbols:
         indent = "  " if s.get("parent_symbol_id") else ""
         sig = f" {s['signature']}" if s.get("signature") else ""
@@ -606,31 +617,54 @@ def find_callers(
     function_name: str = typer.Argument(..., help="Function name"),
     limit: int = typer.Option(50, "--limit", "-l", help="Max results"),
 ):
-    """Find where a function is called (uses references index)."""
-    db = get_db()
-    refs = db.get_references(function_name, limit)
-    db.close()
+    """Find where a function is called."""
+    import subprocess
 
-    if not refs:
+    root, _ = get_config()
+
+    # Search for function calls: name( or .name(
+    try:
+        result = subprocess.run(
+            ["grep", "-rn", "-E", f"[.>]{function_name}\\s*\\(|^\\s*{function_name}\\s*\\(",
+             "--include=*.kt", "--include=*.java", root],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
+    except Exception as e:
+        console.print(f"[red]Error searching: {e}[/red]")
+        return
+
+    # Filter out function definitions (fun name, def name, void name, etc.)
+    calls = []
+    for line in lines:
+        # Skip definitions
+        if re.search(rf'\b(fun|def|void|private|public|protected|override)\s+{function_name}\s*\(', line):
+            continue
+        calls.append(line)
+
+    if not calls:
         console.print(f"[yellow]No callers found for '{function_name}'[/yellow]")
         return
 
-    # Filter to call contexts
-    calls = [r for r in refs if r.get("context") in ("call", "reference", None)]
-
-    console.print(f"[bold]Callers of '{function_name}' ({len(calls)}):[/bold]")
-
+    # Group by file
     by_file = {}
-    for ref in calls:
-        path = ref["file_path"]
-        if path not in by_file:
-            by_file[path] = []
-        by_file[path].append(ref)
+    for line in calls[:limit]:
+        parts = line.split(":", 2)
+        if len(parts) >= 3:
+            file_path = parts[0].replace(root + "/", "")
+            line_num = parts[1]
+            content = parts[2].strip()[:70]
+            if file_path not in by_file:
+                by_file[file_path] = []
+            by_file[file_path].append((line_num, content))
 
-    for path, file_refs in sorted(by_file.items()):
-        console.print(f"\n  [cyan]{path}:[/cyan]")
-        for ref in file_refs:
-            console.print(f"    line {ref['line']}")
+    console.print(f"[bold]Callers of '{function_name}' ({len(calls[:limit])}):[/bold]")
+    for file_path, items in sorted(by_file.items()):
+        console.print(f"\n  [cyan]{file_path}:[/cyan]")
+        for line_num, content in items:
+            console.print(f"    :{line_num} {content}")
 
 
 @app.command("imports")
@@ -1016,16 +1050,19 @@ def find_extensions(
 
 @app.command("api")
 def show_api(
-    module_path: str = typer.Argument(..., help="Module path (e.g., features/payments/api)"),
+    module_name: str = typer.Argument(..., help="Module path or name (features/payments/api or features.payments.api)"),
 ):
     """Show public API of a module (public classes and functions)."""
     from pathlib import Path
 
     root, _ = get_config()
+
+    # Support both formats: features/payments/api and features.payments.api
+    module_path = module_name.replace(".", "/")
     module_dir = Path(root) / module_path
 
     if not module_dir.exists():
-        console.print(f"[red]Module not found: {module_path}[/red]")
+        console.print(f"[red]Module not found: {module_name}[/red]")
         return
 
     # Find all Kotlin/Java files in src/main

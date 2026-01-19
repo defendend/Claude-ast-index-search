@@ -265,6 +265,11 @@ Check tree-sitter node types in `symbol_indexer.py`.
 
 ## Changelog
 
+### v2.4.1
+- Fix `callers` command: now uses grep-based search instead of references index
+- Fix `outline` command: support relative paths
+- Fix `api` command: accept both path format (features/payments/api) and dot format (features.payments.api)
+
 ### v2.4.0
 - Add `todo` command: find TODO/FIXME/HACK comments with grouping
 - Add `deprecated` command: find @Deprecated classes and functions
