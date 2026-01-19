@@ -1,5 +1,9 @@
 # kotlin-index
 
+[![Version](https://img.shields.io/badge/version-2.5.1-blue.svg)](https://github.com/defendend/Claude-index-search-android-studio/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/downloads/)
+
 Fast code search for Android/Kotlin/Java projects using SQLite + FTS5.
 
 **v2.5.1** - Performance boost with ripgrep!
