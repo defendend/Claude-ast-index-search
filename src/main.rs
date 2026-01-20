@@ -635,7 +635,7 @@ fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 
     let mut count = 0;
 
-    search_files(root, &search_pattern, &["kt", "java"], |path, line_num, line| {
+    search_files(root, &search_pattern, &["kt", "java", "swift", "m", "h"], |path, line_num, line| {
         if count >= limit { return; }
 
         let rel_path = relative_path(root, path);
@@ -679,12 +679,13 @@ fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()> {
     let start = Instant::now();
     let pattern = format!(r"[.>]{function_name}\s*\(|^\s*{function_name}\s*\(");
-    let def_pattern = Regex::new(&format!(r"\b(fun|def|void|private|public|protected|override)\s+{function_name}\s*\("))?;
+    // Skip definitions in Kotlin/Java/Swift
+    let def_pattern = Regex::new(&format!(r"\b(fun|func|def|void|private|public|protected|override|internal|fileprivate|open)\s+{function_name}\s*[<(]"))?;
 
     let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut count = 0;
 
-    search_files(root, &pattern, &["kt", "java"], |path, line_num, line| {
+    search_files(root, &pattern, &["kt", "java", "swift", "m", "h"], |path, line_num, line| {
         if count >= limit { return; }
         if def_pattern.is_match(&line) { return; } // Skip definitions
 
@@ -863,11 +864,12 @@ fn cmd_composables(root: &Path, query: Option<&str>, limit: usize) -> Result<()>
 
 fn cmd_deprecated(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
     let start = Instant::now();
-    let pattern = r"@Deprecated";
+    // Kotlin/Java: @Deprecated, Swift: @available(*, deprecated)
+    let pattern = r"@Deprecated|@available\s*\([^)]*deprecated";
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
-    search_files(root, pattern, &["kt", "java"], |path, line_num, line| {
+    search_files(root, pattern, &["kt", "java", "swift", "m", "h"], |path, line_num, line| {
         if items.len() >= limit { return; }
 
         if let Some(q) = query {
@@ -970,7 +972,7 @@ fn cmd_annotations(root: &Path, annotation: &str, limit: usize) -> Result<()> {
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
-    search_files(root, &pattern, &["kt", "java"], |path, line_num, line| {
+    search_files(root, &pattern, &["kt", "java", "swift", "m", "h"], |path, line_num, line| {
         if items.len() >= limit { return; }
 
         let rel_path = relative_path(root, path);
@@ -991,12 +993,14 @@ fn cmd_annotations(root: &Path, annotation: &str, limit: usize) -> Result<()> {
 
 fn cmd_deeplinks(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
     let start = Instant::now();
-    // Search for deeplink patterns (common Android deeplink annotations and schemes)
-    let pattern = r#"://|deeplink|@DeepLink|DeepLinkHandler|@AppLink|NavDeepLink"#;
+    // Search for deeplink patterns
+    // Android: @DeepLink, DeepLinkHandler, @AppLink, NavDeepLink
+    // iOS: openURL, application(_:open:, handleOpen, CFBundleURLSchemes, UniversalLink
+    let pattern = r#"://|deeplink|@DeepLink|DeepLinkHandler|@AppLink|NavDeepLink|openURL|application\([^)]*open:|handleOpen|CFBundleURLSchemes|UniversalLink|NSUserActivity"#;
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
-    search_files(root, pattern, &["kt", "java", "xml"], |path, line_num, line| {
+    search_files(root, pattern, &["kt", "java", "xml", "swift", "m", "h", "plist"], |path, line_num, line| {
         if items.len() >= limit { return; }
 
         if let Some(q) = query {
@@ -1023,26 +1027,39 @@ fn cmd_deeplinks(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
 
 fn cmd_extensions(root: &Path, receiver_type: &str, limit: usize) -> Result<()> {
     let start = Instant::now();
-    // Pattern: fun ReceiverType.functionName
-    let pattern = format!(r"fun\s+{}\.(\w+)", regex::escape(receiver_type));
-    let func_regex = Regex::new(&format!(r"fun\s+{}\.(\w+)", regex::escape(receiver_type)))?;
+    // Kotlin: fun ReceiverType.functionName
+    // Swift: extension ReceiverType
+    let kotlin_pattern = format!(r"fun\s+{}\.(\w+)", regex::escape(receiver_type));
+    let swift_pattern = format!(r"extension\s+{}", regex::escape(receiver_type));
+    let pattern = format!(r"{}|{}", kotlin_pattern, swift_pattern);
 
-    let mut items: Vec<(String, String, usize)> = vec![];
+    let kotlin_regex = Regex::new(&kotlin_pattern)?;
+    let swift_regex = Regex::new(&swift_pattern)?;
 
-    search_files(root, &pattern, &["kt"], |path, line_num, line| {
+    let mut items: Vec<(String, String, usize, String)> = vec![]; // (name, path, line, lang)
+
+    search_files(root, &pattern, &["kt", "swift"], |path, line_num, line| {
         if items.len() >= limit { return; }
 
-        if let Some(caps) = func_regex.captures(&line) {
+        let rel_path = relative_path(root, path);
+
+        if let Some(caps) = kotlin_regex.captures(&line) {
             let func_name = caps.get(1).unwrap().as_str().to_string();
-            let rel_path = relative_path(root, path);
-            items.push((func_name, rel_path, line_num));
+            items.push((func_name, rel_path, line_num, "kt".to_string()));
+        } else if swift_regex.is_match(&line) {
+            let content: String = line.trim().chars().take(60).collect();
+            items.push((content, rel_path, line_num, "swift".to_string()));
         }
     })?;
 
-    println!("{}", format!("Extension functions for {} ({}):", receiver_type, items.len()).bold());
+    println!("{}", format!("Extensions for {} ({}):", receiver_type, items.len()).bold());
 
-    for (func_name, path, line_num) in &items {
-        println!("  {}.{}: {}:{}", receiver_type.cyan(), func_name, path, line_num);
+    for (name, path, line_num, lang) in &items {
+        if lang == "kt" {
+            println!("  {}.{}: {}:{}", receiver_type.cyan(), name, path, line_num);
+        } else {
+            println!("  {}:{} {}", path.cyan(), line_num, name);
+        }
     }
 
     eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
