@@ -9,6 +9,62 @@ use std::time::SystemTime;
 
 use crate::db::{self, SymbolKind};
 
+/// Project type detected by markers
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProjectType {
+    Android,  // Kotlin/Java - build.gradle.kts, settings.gradle.kts
+    IOS,      // Swift/ObjC - Package.swift, *.xcodeproj
+    Mixed,    // Both markers present
+    Unknown,
+}
+
+impl ProjectType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ProjectType::Android => "Android (Kotlin/Java)",
+            ProjectType::IOS => "iOS (Swift/ObjC)",
+            ProjectType::Mixed => "Mixed (Android + iOS)",
+            ProjectType::Unknown => "Unknown",
+        }
+    }
+}
+
+/// Detect project type by looking for marker files
+pub fn detect_project_type(root: &Path) -> ProjectType {
+    let has_gradle = root.join("settings.gradle.kts").exists()
+        || root.join("settings.gradle").exists()
+        || root.join("build.gradle.kts").exists()
+        || root.join("build.gradle").exists();
+
+    let has_swift = root.join("Package.swift").exists()
+        || fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.path().extension().map(|ext| ext == "xcodeproj").unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+    // Also check subdirectories for Package.swift (SPM structure)
+    let has_swift = has_swift || {
+        fs::read_dir(root)
+            .map(|entries| {
+                entries.filter_map(|e| e.ok()).any(|e| {
+                    let path = e.path();
+                    path.is_dir() && path.join("Package.swift").exists()
+                })
+            })
+            .unwrap_or(false)
+    };
+
+    match (has_gradle, has_swift) {
+        (true, true) => ProjectType::Mixed,
+        (true, false) => ProjectType::Android,
+        (false, true) => ProjectType::IOS,
+        (false, false) => ProjectType::Unknown,
+    }
+}
+
 /// Index a single Kotlin/Java file
 pub fn index_file(conn: &Connection, root: &Path, file_path: &Path) -> Result<()> {
     let metadata = fs::metadata(file_path)?;
@@ -328,7 +384,17 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         .to_string();
 
     let content = fs::read_to_string(file_path)?;
-    let (symbols, refs) = parse_symbols_and_refs(&content)?;
+
+    // Detect file type by extension
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_swift = ext == "swift";
+    let is_objc = ext == "m" || ext == "h";
+
+    let (symbols, refs) = if is_objc {
+        parse_symbols_and_refs(&content, false, true)?
+    } else {
+        parse_symbols_and_refs(&content, is_swift, false)?
+    };
 
     Ok(ParsedFile {
         rel_path,
@@ -465,9 +531,405 @@ fn parse_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     Ok(symbols)
 }
 
+/// Parse Swift symbols from file content
+fn parse_swift_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
+    let mut symbols = Vec::new();
+
+    // Swift class: public/private/internal/final class ClassName: Parent, Protocol
+    let class_re = Regex::new(
+        r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate|open|final)\s+)*class\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
+    )?;
+
+    // Swift struct
+    let struct_re = Regex::new(
+        r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate)\s+)*struct\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
+    )?;
+
+    // Swift enum
+    let enum_re = Regex::new(
+        r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate)\s+)*enum\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
+    )?;
+
+    // Swift protocol
+    let protocol_re = Regex::new(
+        r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate)\s+)*protocol\s+(\w+)(?:\s*:\s*([^{]+))?"
+    )?;
+
+    // Swift actor
+    let actor_re = Regex::new(
+        r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate|final)\s+)*actor\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
+    )?;
+
+    // Swift extension
+    let extension_re = Regex::new(
+        r"(?m)^[\s]*((?:public|private|internal|fileprivate)\s+)?extension\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
+    )?;
+
+    // Swift func (including async/throws)
+    let func_re = Regex::new(
+        r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate|open|final|override|static|class|mutating)\s+)*func\s+(\w+)\s*(?:<[^>]*>)?\s*\([^)]*\)"
+    )?;
+
+    // Swift init
+    let init_re = Regex::new(
+        r"(?m)^[\s]*((?:public|private|internal|fileprivate|override|convenience|required)\s+)*init\s*(?:\?|!)?\s*\("
+    )?;
+
+    // Swift var/let properties
+    let property_re = Regex::new(
+        r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate|static|class|lazy|weak|unowned)\s+)*(var|let)\s+(\w+)\s*:"
+    )?;
+
+    // Swift typealias
+    let typealias_re = Regex::new(
+        r"(?m)^[\s]*((?:public|private|internal|fileprivate)\s+)?typealias\s+(\w+)(?:\s*<[^>]*>)?\s*="
+    )?;
+
+    for (line_num, line) in content.lines().enumerate() {
+        let line_num = line_num + 1;
+
+        // Classes
+        if let Some(caps) = class_re.captures(line) {
+            let name = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+            let parents_str = caps.get(4).map(|m| m.as_str().trim());
+            let parents = parse_swift_parents(parents_str);
+
+            symbols.push(ParsedSymbol {
+                name,
+                kind: SymbolKind::Class,
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents,
+            });
+        }
+
+        // Structs
+        if let Some(caps) = struct_re.captures(line) {
+            let name = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+            let parents_str = caps.get(4).map(|m| m.as_str().trim());
+            let parents = parse_swift_parents(parents_str);
+
+            symbols.push(ParsedSymbol {
+                name,
+                kind: SymbolKind::Class, // Use Class for struct too (same semantics for search)
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents,
+            });
+        }
+
+        // Enums
+        if let Some(caps) = enum_re.captures(line) {
+            let name = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+            let parents_str = caps.get(4).map(|m| m.as_str().trim());
+            let parents = parse_swift_parents(parents_str);
+
+            symbols.push(ParsedSymbol {
+                name,
+                kind: SymbolKind::Enum,
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents,
+            });
+        }
+
+        // Protocols (like interfaces)
+        if let Some(caps) = protocol_re.captures(line) {
+            let name = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+            let parents_str = caps.get(4).map(|m| m.as_str().trim());
+            let parents = parse_swift_parents(parents_str);
+
+            symbols.push(ParsedSymbol {
+                name,
+                kind: SymbolKind::Interface, // Protocol ~ Interface
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents,
+            });
+        }
+
+        // Actors
+        if let Some(caps) = actor_re.captures(line) {
+            let name = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+            let parents_str = caps.get(4).map(|m| m.as_str().trim());
+            let parents = parse_swift_parents(parents_str);
+
+            symbols.push(ParsedSymbol {
+                name,
+                kind: SymbolKind::Class, // Actor ~ Class
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents,
+            });
+        }
+
+        // Extensions (track what type is being extended)
+        if let Some(caps) = extension_re.captures(line) {
+            let name = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+            let extended_name = format!("{}+Extension", name);
+
+            symbols.push(ParsedSymbol {
+                name: extended_name,
+                kind: SymbolKind::Object, // Use Object for extensions
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents: vec![(name, "extends".to_string())],
+            });
+        }
+
+        // Functions
+        if let Some(caps) = func_re.captures(line) {
+            let name = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+
+            symbols.push(ParsedSymbol {
+                name,
+                kind: SymbolKind::Function,
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents: vec![],
+            });
+        }
+
+        // Init (constructors)
+        if init_re.is_match(line) {
+            symbols.push(ParsedSymbol {
+                name: "init".to_string(),
+                kind: SymbolKind::Function,
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents: vec![],
+            });
+        }
+
+        // Properties
+        if let Some(caps) = property_re.captures(line) {
+            let name = caps.get(4).map(|m| m.as_str()).unwrap_or("").to_string();
+            if !name.is_empty() {
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: SymbolKind::Property,
+                    line: line_num,
+                    signature: line.trim().to_string(),
+                    parents: vec![],
+                });
+            }
+        }
+
+        // Type aliases
+        if let Some(caps) = typealias_re.captures(line) {
+            let name = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+
+            symbols.push(ParsedSymbol {
+                name,
+                kind: SymbolKind::TypeAlias,
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents: vec![],
+            });
+        }
+    }
+
+    Ok(symbols)
+}
+
+/// Parse Swift parent types (protocols, base class)
+fn parse_swift_parents(parents_str: Option<&str>) -> Vec<(String, String)> {
+    let mut parents = Vec::new();
+
+    if let Some(ps) = parents_str {
+        for parent in ps.split(',') {
+            let parent = parent.trim().split('<').next().unwrap_or("").trim();
+            let parent = parent.split("where").next().unwrap_or(parent).trim();
+            if !parent.is_empty() {
+                // In Swift, first parent could be class (extends), rest are protocols (implements)
+                let kind = if parents.is_empty() {
+                    "extends" // Could be class or protocol
+                } else {
+                    "implements"
+                };
+                parents.push((parent.to_string(), kind.to_string()));
+            }
+        }
+    }
+
+    parents
+}
+
+/// Parse Objective-C symbols from file content
+fn parse_objc_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
+    let mut symbols = Vec::new();
+
+    // ObjC @interface: @interface ClassName : SuperClass <Protocol1, Protocol2>
+    let interface_re = Regex::new(
+        r"(?m)^[\s]*@interface\s+(\w+)(?:\s*\([^)]*\))?(?:\s*:\s*(\w+))?(?:\s*<([^>]+)>)?"
+    )?;
+
+    // ObjC @protocol definition
+    let protocol_re = Regex::new(
+        r"(?m)^[\s]*@protocol\s+(\w+)(?:\s*<([^>]+)>)?"
+    )?;
+
+    // ObjC @implementation
+    let impl_re = Regex::new(
+        r"(?m)^[\s]*@implementation\s+(\w+)"
+    )?;
+
+    // ObjC method: - (returnType)methodName:(paramType)param
+    let method_re = Regex::new(
+        r"(?m)^[\s]*[-+]\s*\([^)]+\)\s*(\w+)"
+    )?;
+
+    // ObjC property: @property (attributes) Type name;
+    let property_re = Regex::new(
+        r"(?m)^[\s]*@property\s*(?:\([^)]*\))?\s*\w+[\s*]*(\w+)\s*;"
+    )?;
+
+    // C typedef (common in ObjC headers)
+    let typedef_re = Regex::new(
+        r"(?m)^[\s]*typedef\s+(?:struct|enum|NS_ENUM|NS_OPTIONS)?\s*(?:\([^)]*\))?\s*\{?[^}]*\}?\s*(\w+)\s*;"
+    )?;
+
+    for (line_num, line) in content.lines().enumerate() {
+        let line_num = line_num + 1;
+
+        // @interface
+        if let Some(caps) = interface_re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            let mut parents = Vec::new();
+
+            // Superclass
+            if let Some(superclass) = caps.get(2) {
+                parents.push((superclass.as_str().to_string(), "extends".to_string()));
+            }
+
+            // Protocols
+            if let Some(protocols) = caps.get(3) {
+                for proto in protocols.as_str().split(',') {
+                    let proto = proto.trim();
+                    if !proto.is_empty() {
+                        parents.push((proto.to_string(), "implements".to_string()));
+                    }
+                }
+            }
+
+            // Check if it's a category (has parentheses after name)
+            let is_category = line.contains(&format!("{}(", name)) ||
+                              line.contains(&format!("{} (", name));
+
+            if is_category {
+                // ObjC category - treat like extension
+                symbols.push(ParsedSymbol {
+                    name: format!("{}+Category", name),
+                    kind: SymbolKind::Object,
+                    line: line_num,
+                    signature: line.trim().to_string(),
+                    parents: vec![(name, "extends".to_string())],
+                });
+            } else {
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: SymbolKind::Class,
+                    line: line_num,
+                    signature: line.trim().to_string(),
+                    parents,
+                });
+            }
+        }
+
+        // @protocol
+        if let Some(caps) = protocol_re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            let mut parents = Vec::new();
+
+            // Protocol inheritance
+            if let Some(parent_protocols) = caps.get(2) {
+                for proto in parent_protocols.as_str().split(',') {
+                    let proto = proto.trim();
+                    if !proto.is_empty() {
+                        parents.push((proto.to_string(), "extends".to_string()));
+                    }
+                }
+            }
+
+            symbols.push(ParsedSymbol {
+                name,
+                kind: SymbolKind::Interface, // Protocol ~ Interface
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents,
+            });
+        }
+
+        // @implementation
+        if let Some(caps) = impl_re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+
+            // Skip if we already have @interface for this
+            // Implementation is just a reference back to the class
+            if !symbols.iter().any(|s| s.name == name && s.kind == SymbolKind::Class) {
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: SymbolKind::Class,
+                    line: line_num,
+                    signature: line.trim().to_string(),
+                    parents: vec![],
+                });
+            }
+        }
+
+        // Methods
+        if let Some(caps) = method_re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+
+            symbols.push(ParsedSymbol {
+                name,
+                kind: SymbolKind::Function,
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents: vec![],
+            });
+        }
+
+        // Properties
+        if let Some(caps) = property_re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+
+            symbols.push(ParsedSymbol {
+                name,
+                kind: SymbolKind::Property,
+                line: line_num,
+                signature: line.trim().to_string(),
+                parents: vec![],
+            });
+        }
+
+        // Typedefs
+        if let Some(caps) = typedef_re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            if !name.is_empty() && name != "NS_ENUM" && name != "NS_OPTIONS" {
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: SymbolKind::TypeAlias,
+                    line: line_num,
+                    signature: line.trim().to_string(),
+                    parents: vec![],
+                });
+            }
+        }
+    }
+
+    Ok(symbols)
+}
+
 /// Parse symbols AND references from file content (combined for efficiency)
-fn parse_symbols_and_refs(content: &str) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
-    let symbols = parse_symbols(content)?;
+fn parse_symbols_and_refs(content: &str, is_swift: bool, is_objc: bool) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
+    let symbols = if is_swift {
+        parse_swift_symbols(content)?
+    } else if is_objc {
+        parse_objc_symbols(content)?
+    } else {
+        parse_symbols(content)?
+    };
     let refs = extract_references(content, &symbols)?;
     Ok((symbols, refs))
 }
@@ -550,10 +1012,21 @@ fn extract_references(content: &str, defined_symbols: &[ParsedSymbol]) -> Result
     Ok(refs)
 }
 
-/// Index all Kotlin/Java files in a directory (parallel parsing, batched DB writes)
+/// Check if file extension is supported for indexing
+fn is_supported_extension(ext: &str) -> bool {
+    matches!(ext, "kt" | "java" | "swift" | "m" | "h")
+}
+
+/// Index all Kotlin/Java/Swift/ObjC files in a directory (parallel parsing, batched DB writes)
 pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
     use ignore::WalkBuilder;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Detect project type
+    let project_type = detect_project_type(root);
+    if progress {
+        eprintln!("Detected project type: {}", project_type.as_str());
+    }
 
     // Collect all file paths
     let walker = WalkBuilder::new(root)
@@ -566,7 +1039,8 @@ pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool) -> Re
         .filter(|e| {
             e.path()
                 .extension()
-                .map(|ext| ext == "kt" || ext == "java")
+                .and_then(|ext| ext.to_str())
+                .map(is_supported_extension)
                 .unwrap_or(false)
         })
         .map(|e| e.path().to_path_buf())
@@ -701,7 +1175,8 @@ pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress
         .filter(|e| {
             e.path()
                 .extension()
-                .map(|ext| ext == "kt" || ext == "java")
+                .and_then(|ext| ext.to_str())
+                .map(is_supported_extension)
                 .unwrap_or(false)
         })
         .map(|e| e.path().to_path_buf())
@@ -838,7 +1313,7 @@ pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress
     Ok((updated_count, files_to_parse.len(), deleted_paths.len()))
 }
 
-/// Index modules from build.gradle files
+/// Index modules from build.gradle files (Android) and Package.swift (iOS)
 pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
     use ignore::WalkBuilder;
 
@@ -849,12 +1324,17 @@ pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
 
     let mut count = 0;
 
+    // Regex to extract SPM targets from Package.swift
+    let spm_target_re = Regex::new(r#"\.(?:target|testTarget|binaryTarget)\s*\(\s*name:\s*["']([^"']+)["']"#)?;
+
     for entry in walker {
         let entry = entry?;
         let path = entry.path();
 
         if let Some(name) = path.file_name() {
             let name_str = name.to_string_lossy();
+
+            // Android/Gradle modules
             if name_str == "build.gradle" || name_str == "build.gradle.kts" {
                 if let Some(parent) = path.parent() {
                     let module_path = parent
@@ -872,6 +1352,42 @@ pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
                             rusqlite::params![module_name, module_path],
                         )?;
                         count += 1;
+                    }
+                }
+            }
+
+            // iOS/SPM modules (Package.swift)
+            if name_str == "Package.swift" {
+                if let Some(parent) = path.parent() {
+                    let package_path = parent
+                        .strip_prefix(root)
+                        .unwrap_or(parent)
+                        .to_string_lossy()
+                        .to_string();
+
+                    // Read Package.swift and extract targets
+                    if let Ok(content) = fs::read_to_string(path) {
+                        for caps in spm_target_re.captures_iter(&content) {
+                            let target_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                            if !target_name.is_empty() {
+                                let module_name = if package_path.is_empty() {
+                                    target_name.to_string()
+                                } else {
+                                    format!("{}.{}", package_path.replace('/', "."), target_name)
+                                };
+                                let module_path = if package_path.is_empty() {
+                                    target_name.to_string()
+                                } else {
+                                    format!("{}/{}", package_path, target_name)
+                                };
+
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
+                                    rusqlite::params![module_name, module_path],
+                                )?;
+                                count += 1;
+                            }
+                        }
                     }
                 }
             }
