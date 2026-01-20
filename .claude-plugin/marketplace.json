@@ -1,18 +1,18 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "kotlin-index-marketplace",
-  "description": "Plugins for Android/Kotlin/Java development",
+  "description": "Plugins for Android/Kotlin/Java and iOS/Swift/ObjC development",
   "owner": {
     "name": "defendend"
   },
   "plugins": [
     {
       "name": "kotlin-index",
-      "description": "Fast code search for Android/Kotlin/Java projects (36 CLI commands)",
+      "description": "Fast code search for Android/Kotlin/Java and iOS/Swift/ObjC projects (34 CLI commands)",
       "author": {
         "name": "defendend"
       },
-      "version": "3.2.0",
+      "version": "3.3.0",
       "category": "development",
       "homepage": "https://github.com/defendend/Claude-index-search-android-studio",
       "source": "./"

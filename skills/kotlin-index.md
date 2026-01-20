@@ -1,6 +1,6 @@
-# kotlin-index v3.2.0 - Code Search for Android/Kotlin/Java Projects
+# kotlin-index v3.3.0 - Code Search for Mobile Projects
 
-Fast native Rust CLI for code search in Android/Kotlin/Java projects using SQLite + FTS5.
+Fast native Rust CLI for code search in Android/Kotlin/Java and iOS/Swift/ObjC projects using SQLite + FTS5.
 
 ## Prerequisites
 
@@ -12,11 +12,21 @@ brew install kotlin-index
 
 Initialize index in project root:
 ```bash
-cd /path/to/android/project
+cd /path/to/project
 kotlin-index rebuild
 ```
 
-## Available Commands (36 total)
+## Supported Projects
+
+| Platform | Languages | Module System |
+|----------|-----------|---------------|
+| Android | Kotlin, Java | Gradle (build.gradle.kts) |
+| iOS | Swift, Objective-C | SPM (Package.swift) |
+| Mixed | All above | Both |
+
+Project type is auto-detected by marker files.
+
+## Available Commands (34 total)
 
 ### Search Commands
 
@@ -28,16 +38,19 @@ kotlin-index search "PaymentMethod"
 **Find files by name**:
 ```bash
 kotlin-index file "Fragment.kt"
+kotlin-index file "ViewController.swift"
 ```
 
 **Find symbols** (classes, interfaces, functions):
 ```bash
 kotlin-index symbol "PaymentInteractor"
+kotlin-index symbol "AppDelegate"
 ```
 
-**Find class/interface**:
+**Find class/interface/protocol**:
 ```bash
 kotlin-index class "BaseFragment"
+kotlin-index class "UIApplicationDelegate"  # Swift protocol
 ```
 
 **Find usages** of a symbol (~8ms indexed):
@@ -45,9 +58,10 @@ kotlin-index class "BaseFragment"
 kotlin-index usages "PaymentRepository"
 ```
 
-**Find implementations** (subclasses/implementors):
+**Find implementations** (subclasses/implementors/protocol conformance):
 ```bash
 kotlin-index implementations "BasePresenter"
+kotlin-index implementations "Codable"  # Swift protocol
 ```
 
 **Class hierarchy** (parents + children):
@@ -58,16 +72,18 @@ kotlin-index hierarchy "BaseFragment"
 **Find callers** of a function:
 ```bash
 kotlin-index callers "onClick"
+kotlin-index callers "viewDidLoad"
 ```
 
 **File imports**:
 ```bash
 kotlin-index imports "path/to/File.kt"
+kotlin-index imports "path/to/File.swift"
 ```
 
-### DI Commands (Dagger)
+### DI Commands (Dagger - Android only)
 
-**Find @Provides/@Binds** for a type (supports Java + Kotlin):
+**Find @Provides/@Binds** for a type:
 ```bash
 kotlin-index provides "UserRepository"
 ```
@@ -102,7 +118,7 @@ kotlin-index suppress
 kotlin-index suppress "UNCHECKED_CAST"
 ```
 
-**Find extension functions**:
+**Find extension functions** (Kotlin) / **extensions** (Swift):
 ```bash
 kotlin-index extensions "String"
 kotlin-index extensions "View"
@@ -125,7 +141,7 @@ kotlin-index changed
 kotlin-index changed --base "origin/main"
 ```
 
-### Compose Commands
+### Compose Commands (Android)
 
 **Find @Composable functions**:
 ```bash
@@ -138,7 +154,7 @@ kotlin-index composables "Button"
 kotlin-index previews
 ```
 
-### Coroutines Commands
+### Coroutines Commands (Kotlin)
 
 **Find suspend functions**:
 ```bash
@@ -154,9 +170,10 @@ kotlin-index flows "user"
 
 ### Module Commands
 
-**Find modules**:
+**Find modules** (Gradle or SPM):
 ```bash
 kotlin-index module "payments"
+kotlin-index module "NetworkKit"
 ```
 
 **Module dependencies**:
@@ -176,7 +193,7 @@ kotlin-index unused-deps "features.payments.impl" --verbose
 kotlin-index unused-deps "features.payments.impl" --strict  # only direct imports
 ```
 
-### XML & Resource Commands (new in v3.2)
+### XML & Resource Commands (Android only)
 
 **Find class usages in XML layouts**:
 ```bash
@@ -200,6 +217,7 @@ kotlin-index resource-usages --unused --module "features.payments.impl"
 **File outline** (classes, functions in file):
 ```bash
 kotlin-index outline "path/to/File.kt"
+kotlin-index outline "path/to/File.swift"
 ```
 
 ### Index Management
@@ -219,6 +237,27 @@ kotlin-index update
 ```bash
 kotlin-index stats
 ```
+
+## Swift/ObjC Support (v3.3.0)
+
+### Indexed Swift Constructs
+- `class`, `struct`, `enum`, `protocol`, `actor`
+- `extension` (indexed as `TypeName+Extension`)
+- `func`, `init`, `var`, `let`, `typealias`
+- Inheritance and protocol conformance
+
+### Indexed ObjC Constructs
+- `@interface` with superclass and protocols
+- `@protocol` definitions
+- `@implementation`
+- Methods (`-`/`+`), `@property`, `typedef`
+- Categories (indexed as `TypeName+Category`)
+
+### SPM Module Detection
+Parses `Package.swift` and extracts:
+- `.target(name: "...")`
+- `.testTarget(name: "...")`
+- `.binaryTarget(name: "...")`
 
 ## Performance
 
