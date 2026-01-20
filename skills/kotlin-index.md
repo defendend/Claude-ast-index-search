@@ -26,7 +26,7 @@ kotlin-index rebuild
 
 Project type is auto-detected by marker files.
 
-## Available Commands (42 total)
+## Available Commands (41 total)
 
 ### Search Commands
 
@@ -261,6 +261,11 @@ kotlin-index outline "path/to/File.swift"
 
 ### Index Management
 
+**Initialize index** (create empty database):
+```bash
+kotlin-index init
+```
+
 **Rebuild index** (includes module dependencies, XML, resources by default):
 ```bash
 kotlin-index rebuild
@@ -275,6 +280,11 @@ kotlin-index update
 **Index statistics**:
 ```bash
 kotlin-index stats
+```
+
+**Version info**:
+```bash
+kotlin-index version
 ```
 
 ## Swift/ObjC Support (v3.3.0+)

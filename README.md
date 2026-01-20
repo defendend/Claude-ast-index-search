@@ -45,7 +45,7 @@ kotlin-index implementations Presenter
 kotlin-index usages Repository
 ```
 
-## Commands (42)
+## Commands (41)
 
 ### Grep-based (no index required)
 
