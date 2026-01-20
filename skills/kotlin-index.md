@@ -1,4 +1,4 @@
-# kotlin-index v3.3.0 - Code Search for Mobile Projects
+# kotlin-index v3.4.0 - Code Search for Mobile Projects
 
 Fast native Rust CLI for code search in Android/Kotlin/Java and iOS/Swift/ObjC projects using SQLite + FTS5.
 
@@ -26,7 +26,7 @@ kotlin-index rebuild
 
 Project type is auto-detected by marker files.
 
-## Available Commands (34 total)
+## Available Commands (42 total)
 
 ### Search Commands
 
@@ -212,6 +212,45 @@ kotlin-index resource-usages "R.string.payment_title"
 kotlin-index resource-usages --unused --module "features.payments.impl"
 ```
 
+### iOS-Specific Commands (v3.4.0)
+
+**Find class usages in storyboards/xibs**:
+```bash
+kotlin-index storyboard-usages "MyViewController"
+kotlin-index storyboard-usages "TableViewCell" --module "Features"
+```
+
+**Find iOS asset usages** (xcassets):
+```bash
+kotlin-index asset-usages "AppIcon"
+kotlin-index asset-usages --unused --module "MainApp"  # find unused assets
+```
+
+**Find SwiftUI state properties**:
+```bash
+kotlin-index swiftui                    # all @State/@Binding/@Published
+kotlin-index swiftui "State"            # filter by type
+kotlin-index swiftui "userName"         # filter by name
+```
+
+**Find async functions** (Swift):
+```bash
+kotlin-index async-funcs
+kotlin-index async-funcs "fetch"
+```
+
+**Find Combine publishers**:
+```bash
+kotlin-index publishers                 # PassthroughSubject, CurrentValueSubject, AnyPublisher
+kotlin-index publishers "state"
+```
+
+**Find @MainActor usages**:
+```bash
+kotlin-index main-actor
+kotlin-index main-actor "ViewModel"
+```
+
 ### File Structure
 
 **File outline** (classes, functions in file):
@@ -238,7 +277,7 @@ kotlin-index update
 kotlin-index stats
 ```
 
-## Swift/ObjC Support (v3.3.0)
+## Swift/ObjC Support (v3.3.0+)
 
 ### Indexed Swift Constructs
 - `class`, `struct`, `enum`, `protocol`, `actor`
@@ -253,11 +292,18 @@ kotlin-index stats
 - Methods (`-`/`+`), `@property`, `typedef`
 - Categories (indexed as `TypeName+Category`)
 
-### SPM Module Detection
-Parses `Package.swift` and extracts:
-- `.target(name: "...")`
-- `.testTarget(name: "...")`
-- `.binaryTarget(name: "...")`
+### iOS UI & Assets (v3.4.0)
+- **Storyboards/XIBs**: customClass references, storyboard identifiers
+- **xcassets**: imageset, colorset, appiconset, dataset
+- **Asset usages**: UIImage(named:), Image(), Color()
+
+### Module Detection
+**SPM** - Parses `Package.swift`:
+- `.target(name: "...")`, `.testTarget(name: "...")`, `.binaryTarget(name: "...")`
+
+**CocoaPods** - Parses `Podfile` and `Podfile.lock`
+
+**Carthage** - Parses `Cartfile` and `Cartfile.resolved`
 
 ## Performance
 
@@ -271,6 +317,12 @@ Parses `Package.swift` and extracts:
 | unused-deps | ~12s |
 | xml-usages | ~1ms |
 | resource-usages | ~2ms |
+| storyboard-usages | ~1ms |
+| asset-usages | ~1ms |
+| swiftui | ~0.9s (grep) |
+| async-funcs | ~0.9s (grep) |
+| publishers | ~0.9s (grep) |
+| main-actor | ~0.9s (grep) |
 | todo | ~0.8s (grep) |
 
 ## Index Location

@@ -8,11 +8,11 @@
   "plugins": [
     {
       "name": "kotlin-index",
-      "description": "Fast code search for Android/Kotlin/Java and iOS/Swift/ObjC projects (34 CLI commands)",
+      "description": "Fast code search for Android/Kotlin/Java and iOS/Swift/ObjC projects (42 CLI commands)",
       "author": {
         "name": "defendend"
       },
-      "version": "3.3.0",
+      "version": "3.4.0",
       "category": "development",
       "homepage": "https://github.com/defendend/Claude-index-search-android-studio",
       "source": "./"
