@@ -1,4 +1,4 @@
-# kotlin-index v3.4.0
+# kotlin-index v3.4.1
 
 Fast code search CLI for Android/Kotlin/Java and iOS/Swift/ObjC projects. Native Rust implementation.
 
@@ -250,6 +250,15 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.4.1
+- **Fix grep-based commands for iOS** — 6 commands now work with Swift/ObjC:
+  - `todo` — search in .swift/.m/.h files
+  - `callers` — support Swift function call patterns
+  - `deprecated` — support `@available(*, deprecated)` syntax
+  - `annotations` — search in Swift/ObjC files (@objc, @IBAction, etc.)
+  - `deeplinks` — add iOS patterns (openURL, CFBundleURLSchemes, NSUserActivity)
+  - `extensions` — support Swift `extension Type` syntax
 
 ### 3.4.0
 - **iOS storyboard/xib analysis** — `storyboard-usages` command to find class usages in storyboards and xibs

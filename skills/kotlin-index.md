@@ -1,4 +1,4 @@
-# kotlin-index v3.4.0 - Code Search for Mobile Projects
+# kotlin-index v3.4.1 - Code Search for Mobile Projects
 
 Fast native Rust CLI for code search in Android/Kotlin/Java and iOS/Swift/ObjC projects using SQLite + FTS5.
 
