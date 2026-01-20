@@ -1,6 +1,6 @@
 {
   "name": "ast-index",
-  "version": "3.6.0",
+  "version": "3.6.2",
   "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, and Perl projects (46 CLI commands)",
   "author": {
     "name": "defendend"
