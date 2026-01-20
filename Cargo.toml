@@ -1,0 +1,36 @@
+[package]
+name = "kotlin-index"
+version = "3.0.0"
+edition = "2021"
+description = "Fast code search for Android/Kotlin/Java projects"
+license = "MIT"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Fast file search (ripgrep internals)
+ignore = "0.4"
+regex = "1"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+
+# SQLite + FTS5
+rusqlite = { version = "0.31", features = ["bundled-full"] }
+
+# Utilities
+walkdir = "2"
+anyhow = "1"
+colored = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+rayon = "1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
