@@ -26,294 +26,62 @@ ast-index rebuild
 
 Project type is auto-detected by marker files.
 
-## Available Commands (41 total)
+## Core Commands (Cross-Platform)
 
-### Search Commands
+### Search
 
-**Universal search** (files + symbols + modules):
 ```bash
-ast-index search "PaymentMethod"
+ast-index search "PaymentMethod"     # Universal search (files + symbols + modules)
+ast-index file "Fragment.kt"         # Find files by name
+ast-index symbol "PaymentInteractor" # Find symbols (classes, functions)
+ast-index class "BaseFragment"       # Find class/interface/protocol
+ast-index usages "Repository"        # Find usages (~8ms indexed)
+ast-index implementations "Base"     # Find subclasses/implementors
+ast-index hierarchy "BaseFragment"   # Class hierarchy tree
+ast-index callers "onClick"          # Find function callers
+ast-index imports "path/to/File.kt"  # File imports
 ```
 
-**Find files by name**:
+### Audit
+
 ```bash
-ast-index file "Fragment.kt"
-ast-index file "ViewController.swift"
+ast-index todo                       # Find TODO/FIXME/HACK
+ast-index deprecated                 # Find @Deprecated items
+ast-index suppress                   # Find @Suppress annotations
+ast-index extensions "String"        # Find extension functions
+ast-index deeplinks                  # Find deeplinks
+ast-index changed --base "main"      # Changed symbols (git diff)
+ast-index api "features/payments"    # Public API of module
 ```
 
-**Find symbols** (classes, interfaces, functions):
+### File & Index
+
 ```bash
-ast-index symbol "PaymentInteractor"
-ast-index symbol "AppDelegate"
+ast-index outline "path/to/File.kt"  # Symbols in file
+ast-index init                       # Initialize index
+ast-index rebuild                    # Full reindex
+ast-index update                     # Incremental update
+ast-index stats                      # Index statistics
+ast-index version                    # Version info
 ```
 
-**Find class/interface/protocol**:
-```bash
-ast-index class "BaseFragment"
-ast-index class "UIApplicationDelegate"  # Swift protocol
-```
+## Platform-Specific Commands
 
-**Find usages** of a symbol (~8ms indexed):
-```bash
-ast-index usages "PaymentRepository"
-```
+**For Android/Kotlin/Java projects**, see: `references/android-commands.md`
+- DI Commands (provides, inject, annotations)
+- Compose Commands (composables, previews)
+- Coroutines Commands (suspend, flows)
+- XML & Resource Commands (xml-usages, resource-usages)
 
-**Find implementations** (subclasses/implementors/protocol conformance):
-```bash
-ast-index implementations "BasePresenter"
-ast-index implementations "Codable"  # Swift protocol
-```
+**For iOS/Swift/ObjC projects**, see: `references/ios-commands.md`
+- Storyboard & XIB Commands (storyboard-usages)
+- Asset Commands (asset-usages)
+- SwiftUI Commands (swiftui)
+- Swift Concurrency (async-funcs, main-actor)
+- Combine Commands (publishers)
 
-**Class hierarchy** (parents + children):
-```bash
-ast-index hierarchy "BaseFragment"
-```
-
-**Find callers** of a function:
-```bash
-ast-index callers "onClick"
-ast-index callers "viewDidLoad"
-```
-
-**File imports**:
-```bash
-ast-index imports "path/to/File.kt"
-ast-index imports "path/to/File.swift"
-```
-
-### DI Commands (Dagger - Android only)
-
-**Find @Provides/@Binds** for a type:
-```bash
-ast-index provides "UserRepository"
-```
-
-**Find @Inject** points for a type:
-```bash
-ast-index inject "UserInteractor"
-```
-
-**Find classes with annotation**:
-```bash
-ast-index annotations "Module"
-ast-index annotations "Inject"
-```
-
-### Audit Commands
-
-**Find TODO/FIXME/HACK**:
-```bash
-ast-index todo
-ast-index todo "FIXME"
-```
-
-**Find @Deprecated** items:
-```bash
-ast-index deprecated
-```
-
-**Find @Suppress** annotations:
-```bash
-ast-index suppress
-ast-index suppress "UNCHECKED_CAST"
-```
-
-**Find extension functions** (Kotlin) / **extensions** (Swift):
-```bash
-ast-index extensions "String"
-ast-index extensions "View"
-```
-
-**Show public API** of a module:
-```bash
-ast-index api "features/payments/api"
-```
-
-**Find deeplinks**:
-```bash
-ast-index deeplinks
-ast-index deeplinks "payment"
-```
-
-**Show changed symbols** (git diff):
-```bash
-ast-index changed
-ast-index changed --base "origin/main"
-```
-
-### Compose Commands (Android)
-
-**Find @Composable functions**:
-```bash
-ast-index composables
-ast-index composables "Button"
-```
-
-**Find @Preview functions**:
-```bash
-ast-index previews
-```
-
-### Coroutines Commands (Kotlin)
-
-**Find suspend functions**:
-```bash
-ast-index suspend
-ast-index suspend "fetch"
-```
-
-**Find Flow/StateFlow/SharedFlow**:
-```bash
-ast-index flows
-ast-index flows "user"
-```
-
-### Module Commands
-
-**Find modules** (Gradle or SPM):
-```bash
-ast-index module "payments"
-ast-index module "NetworkKit"
-```
-
-**Module dependencies**:
-```bash
-ast-index deps "features.payments.impl"
-```
-
-**Modules depending on this module**:
-```bash
-ast-index dependents "features.payments.api"
-```
-
-**Find unused dependencies** (with transitive, XML, resource checks):
-```bash
-ast-index unused-deps "features.payments.impl"
-ast-index unused-deps "features.payments.impl" --verbose
-ast-index unused-deps "features.payments.impl" --strict  # only direct imports
-```
-
-### XML & Resource Commands (Android only)
-
-**Find class usages in XML layouts**:
-```bash
-ast-index xml-usages "PaymentIconView"
-ast-index xml-usages "ImageView" --module "features.payments.impl"
-```
-
-**Find resource usages**:
-```bash
-ast-index resource-usages "@drawable/ic_payment"
-ast-index resource-usages "R.string.payment_title"
-```
-
-**Find unused resources in module**:
-```bash
-ast-index resource-usages --unused --module "features.payments.impl"
-```
-
-### iOS-Specific Commands (v3.4.0)
-
-**Find class usages in storyboards/xibs**:
-```bash
-ast-index storyboard-usages "MyViewController"
-ast-index storyboard-usages "TableViewCell" --module "Features"
-```
-
-**Find iOS asset usages** (xcassets):
-```bash
-ast-index asset-usages "AppIcon"
-ast-index asset-usages --unused --module "MainApp"  # find unused assets
-```
-
-**Find SwiftUI state properties**:
-```bash
-ast-index swiftui                    # all @State/@Binding/@Published
-ast-index swiftui "State"            # filter by type
-ast-index swiftui "userName"         # filter by name
-```
-
-**Find async functions** (Swift):
-```bash
-ast-index async-funcs
-ast-index async-funcs "fetch"
-```
-
-**Find Combine publishers**:
-```bash
-ast-index publishers                 # PassthroughSubject, CurrentValueSubject, AnyPublisher
-ast-index publishers "state"
-```
-
-**Find @MainActor usages**:
-```bash
-ast-index main-actor
-ast-index main-actor "ViewModel"
-```
-
-### File Structure
-
-**File outline** (classes, functions in file):
-```bash
-ast-index outline "path/to/File.kt"
-ast-index outline "path/to/File.swift"
-```
-
-### Index Management
-
-**Initialize index** (create empty database):
-```bash
-ast-index init
-```
-
-**Rebuild index** (includes module dependencies, XML, resources by default):
-```bash
-ast-index rebuild
-ast-index rebuild --no-deps  # skip module dependencies
-```
-
-**Update index** (incremental):
-```bash
-ast-index update
-```
-
-**Index statistics**:
-```bash
-ast-index stats
-```
-
-**Version info**:
-```bash
-ast-index version
-```
-
-## Swift/ObjC Support (v3.3.0+)
-
-### Indexed Swift Constructs
-- `class`, `struct`, `enum`, `protocol`, `actor`
-- `extension` (indexed as `TypeName+Extension`)
-- `func`, `init`, `var`, `let`, `typealias`
-- Inheritance and protocol conformance
-
-### Indexed ObjC Constructs
-- `@interface` with superclass and protocols
-- `@protocol` definitions
-- `@implementation`
-- Methods (`-`/`+`), `@property`, `typedef`
-- Categories (indexed as `TypeName+Category`)
-
-### iOS UI & Assets (v3.4.0)
-- **Storyboards/XIBs**: customClass references, storyboard identifiers
-- **xcassets**: imageset, colorset, appiconset, dataset
-- **Asset usages**: UIImage(named:), Image(), Color()
-
-### Module Detection
-**SPM** - Parses `Package.swift`:
-- `.target(name: "...")`, `.testTarget(name: "...")`, `.binaryTarget(name: "...")`
-
-**CocoaPods** - Parses `Podfile` and `Podfile.lock`
-
-**Carthage** - Parses `Cartfile` and `Cartfile.resolved`
+**For module analysis**, see: `references/module-commands.md`
+- Module Commands (module, deps, dependents, unused-deps)
 
 ## Performance
 
@@ -324,16 +92,6 @@ ast-index version
 | usages | ~8ms (indexed) |
 | imports | ~0.3ms |
 | deps/dependents | ~2ms |
-| unused-deps | ~12s |
-| xml-usages | ~1ms |
-| resource-usages | ~2ms |
-| storyboard-usages | ~1ms |
-| asset-usages | ~1ms |
-| swiftui | ~0.9s (grep) |
-| async-funcs | ~0.9s (grep) |
-| publishers | ~0.9s (grep) |
-| main-actor | ~0.9s (grep) |
-| todo | ~0.8s (grep) |
 
 ## Index Location
 
