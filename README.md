@@ -1,6 +1,6 @@
-# ast-index v3.5.0
+# ast-index v3.6.0
 
-Fast code search CLI for Android/Kotlin/Java and iOS/Swift/ObjC projects. Native Rust implementation.
+Fast code search CLI for Android/Kotlin/Java, iOS/Swift/ObjC, and Perl projects. Native Rust implementation.
 
 ## Supported Projects
 
@@ -8,7 +8,8 @@ Fast code search CLI for Android/Kotlin/Java and iOS/Swift/ObjC projects. Native
 |----------|-----------|---------------|
 | Android | Kotlin, Java | Gradle |
 | iOS | Swift, Objective-C | SPM (Package.swift) |
-| Mixed | All above | Both |
+| Perl | Perl | Makefile.PL, Build.PL |
+| Mixed | All above | All |
 
 Project type is auto-detected.
 
@@ -56,7 +57,7 @@ ast-index implementations Presenter
 ast-index usages Repository
 ```
 
-## Commands (41)
+## Commands (46)
 
 ### Grep-based (no index required)
 
@@ -125,6 +126,16 @@ ast-index swiftui [QUERY]            # @State/@Binding/@Published props
 ast-index async-funcs [QUERY]        # Swift async functions
 ast-index publishers [QUERY]         # Combine publishers
 ast-index main-actor [QUERY]         # @MainActor usages
+```
+
+### Perl-specific commands (new in v3.6)
+
+```bash
+ast-index perl-exports [QUERY]       # Find @EXPORT/@EXPORT_OK
+ast-index perl-subs [QUERY]          # Find subroutines
+ast-index perl-pod [QUERY]           # Find POD documentation (=head1, =item, etc.)
+ast-index perl-tests [QUERY]         # Find Test::More assertions (ok, is, like, etc.)
+ast-index perl-imports [QUERY]       # Find use/require statements
 ```
 
 ### Index management
@@ -261,6 +272,17 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.6.0
+- **Perl support** — index and search Perl codebases
+  - Index: `package`, `sub`, `use constant`, `our` variables
+  - Inheritance: `use base`, `use parent`, `@ISA`
+  - File types: `.pm`, `.pl`, `.t`, `.pod`
+  - New commands: `perl-exports`, `perl-subs`, `perl-pod`, `perl-tests`, `perl-imports`
+  - Grep commands now search Perl files: `todo`, `callers`, `deprecated`, `annotations`
+  - `imports` command now parses Perl `use`/`require` statements
+  - Perl packages indexed as modules for `module` command
+  - Project detection: `Makefile.PL`, `Build.PL`, `cpanfile`
 
 ### 3.5.0
 - **Renamed to ast-index** — project renamed from `kotlin-index` to `ast-index`

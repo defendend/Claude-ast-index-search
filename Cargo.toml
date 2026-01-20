@@ -1,8 +1,8 @@
 [package]
 name = "ast-index"
-version = "3.5.0"
+version = "3.6.0"
 edition = "2021"
-description = "Fast code search for Android/Kotlin/Java and iOS/Swift/ObjC projects"
+description = "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, and Perl projects"
 license = "MIT"
 
 [dependencies]
