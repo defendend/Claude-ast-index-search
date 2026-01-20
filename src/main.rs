@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "kotlin-index")]
+#[command(name = "ast-index")]
 #[command(about = "Fast code search for Android/Kotlin/Java projects")]
 #[command(version)]
 struct Cli {
@@ -406,7 +406,7 @@ fn main() -> Result<()> {
         Commands::Publishers { query, limit } => cmd_publishers(&root, query.as_deref(), limit),
         Commands::MainActor { query, limit } => cmd_main_actor(&root, query.as_deref(), limit),
         Commands::Version => {
-            println!("kotlin-index-rs v{}", env!("CARGO_PKG_VERSION"));
+            println!("ast-index-rs v{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
@@ -1159,7 +1159,7 @@ fn cmd_init(root: &Path) -> Result<()> {
     db::init_db(&conn)?;
 
     println!("{}", "Initialized empty index.".green());
-    println!("Run 'kotlin-index rebuild' to build the index.");
+    println!("Run 'ast-index rebuild' to build the index.");
 
     eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     Ok(())
@@ -1298,7 +1298,7 @@ fn cmd_update(root: &Path) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index init' first.".red()
+            "Index not found. Run 'ast-index init' first.".red()
         );
         return Ok(());
     }
@@ -1331,7 +1331,7 @@ fn cmd_stats(root: &Path) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index init' first.".red()
+            "Index not found. Run 'ast-index init' first.".red()
         );
         return Ok(());
     }
@@ -1377,7 +1377,7 @@ fn cmd_search(root: &Path, query: &str, limit: usize) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }
@@ -1424,7 +1424,7 @@ fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize) -> Result<()>
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }
@@ -1454,7 +1454,7 @@ fn cmd_symbol(root: &Path, name: &str, kind: Option<&str>, limit: usize) -> Resu
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }
@@ -1490,7 +1490,7 @@ fn cmd_class(root: &Path, name: &str, limit: usize) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }
@@ -1520,7 +1520,7 @@ fn cmd_implementations(root: &Path, parent: &str, limit: usize) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }
@@ -1551,7 +1551,7 @@ fn cmd_hierarchy(root: &Path, name: &str) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }
@@ -1605,7 +1605,7 @@ fn cmd_module(root: &Path, pattern: &str, limit: usize) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }
@@ -1640,7 +1640,7 @@ fn cmd_deps(root: &Path, module: &str) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }
@@ -1653,7 +1653,7 @@ fn cmd_deps(root: &Path, module: &str) -> Result<()> {
     if dep_count == 0 {
         println!(
             "{}",
-            "Module dependencies not indexed. Run 'kotlin-index rebuild' to index them.".yellow()
+            "Module dependencies not indexed. Run 'ast-index rebuild' to index them.".yellow()
         );
         return Ok(());
     }
@@ -1705,7 +1705,7 @@ fn cmd_dependents(root: &Path, module: &str) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }
@@ -1718,7 +1718,7 @@ fn cmd_dependents(root: &Path, module: &str) -> Result<()> {
     if dep_count == 0 {
         println!(
             "{}",
-            "Module dependencies not indexed. Run 'kotlin-index rebuild' to index them.".yellow()
+            "Module dependencies not indexed. Run 'ast-index rebuild' to index them.".yellow()
         );
         return Ok(());
     }
@@ -1775,7 +1775,7 @@ fn cmd_unused_deps(
     let start = Instant::now();
 
     if !db::db_exists(root) {
-        println!("{}", "Index not found. Run 'kotlin-index rebuild' first.".red());
+        println!("{}", "Index not found. Run 'ast-index rebuild' first.".red());
         return Ok(());
     }
 
@@ -1784,7 +1784,7 @@ fn cmd_unused_deps(
     // Check if module deps are indexed
     let dep_count: i64 = conn.query_row("SELECT COUNT(*) FROM module_deps", [], |row| row.get(0))?;
     if dep_count == 0 {
-        println!("{}", "Module dependencies not indexed. Run 'kotlin-index rebuild' first.".yellow());
+        println!("{}", "Module dependencies not indexed. Run 'ast-index rebuild' first.".yellow());
         return Ok(());
     }
 
@@ -2502,7 +2502,7 @@ fn cmd_xml_usages(root: &Path, class_name: &str, module_filter: Option<&str>) ->
     let start = Instant::now();
 
     if !db::db_exists(root) {
-        println!("{}", "Index not found. Run 'kotlin-index rebuild' first.".red());
+        println!("{}", "Index not found. Run 'ast-index rebuild' first.".red());
         return Ok(());
     }
 
@@ -2511,7 +2511,7 @@ fn cmd_xml_usages(root: &Path, class_name: &str, module_filter: Option<&str>) ->
     // Check if XML usages are indexed
     let xml_count: i64 = conn.query_row("SELECT COUNT(*) FROM xml_usages", [], |row| row.get(0))?;
     if xml_count == 0 {
-        println!("{}", "XML usages not indexed. Run 'kotlin-index rebuild' first.".yellow());
+        println!("{}", "XML usages not indexed. Run 'ast-index rebuild' first.".yellow());
         return Ok(());
     }
 
@@ -2582,7 +2582,7 @@ fn cmd_resource_usages(
     let start = Instant::now();
 
     if !db::db_exists(root) {
-        println!("{}", "Index not found. Run 'kotlin-index rebuild' first.".red());
+        println!("{}", "Index not found. Run 'ast-index rebuild' first.".red());
         return Ok(());
     }
 
@@ -2591,7 +2591,7 @@ fn cmd_resource_usages(
     // Check if resources are indexed
     let res_count: i64 = conn.query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))?;
     if res_count == 0 {
-        println!("{}", "Resources not indexed. Run 'kotlin-index rebuild' first.".yellow());
+        println!("{}", "Resources not indexed. Run 'ast-index rebuild' first.".yellow());
         return Ok(());
     }
 
@@ -2761,7 +2761,7 @@ fn cmd_storyboard_usages(root: &Path, class_name: &str, module: Option<&str>) ->
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }
@@ -2824,7 +2824,7 @@ fn cmd_asset_usages(root: &Path, asset: &str, module: Option<&str>, asset_type: 
     if !db::db_exists(root) {
         println!(
             "{}",
-            "Index not found. Run 'kotlin-index rebuild' first.".red()
+            "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
     }

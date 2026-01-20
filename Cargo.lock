@@ -89,6 +89,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
+name = "ast-index"
+version = "3.5.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "colored",
+ "crossbeam-channel",
+ "dirs",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "parking_lot",
+ "rayon",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -600,28 +622,6 @@ checksum = "8c942ebf8e95485ca0d52d97da7c5a2c387d0e7f0ba4c35e93bfcaee045955b3"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "kotlin-index"
-version = "3.4.1"
-dependencies = [
- "anyhow",
- "clap",
- "colored",
- "crossbeam-channel",
- "dirs",
- "grep-matcher",
- "grep-regex",
- "grep-searcher",
- "ignore",
- "parking_lot",
- "rayon",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "walkdir",
 ]
 
 [[package]]

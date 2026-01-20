@@ -1,20 +1,20 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "kotlin-index-marketplace",
+  "name": "ast-index-marketplace",
   "description": "Plugins for Android/Kotlin/Java and iOS/Swift/ObjC development",
   "owner": {
     "name": "defendend"
   },
   "plugins": [
     {
-      "name": "kotlin-index",
+      "name": "ast-index",
       "description": "Fast code search for Android/Kotlin/Java and iOS/Swift/ObjC projects (41 CLI commands)",
       "author": {
         "name": "defendend"
       },
-      "version": "3.4.1",
+      "version": "3.5.0",
       "category": "development",
-      "homepage": "https://github.com/defendend/Claude-index-search-android-studio",
+      "homepage": "https://github.com/defendend/Claude-ast-index-search",
       "source": "./"
     }
   ]

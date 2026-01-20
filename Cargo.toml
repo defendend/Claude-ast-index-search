@@ -1,6 +1,6 @@
 [package]
-name = "kotlin-index"
-version = "3.4.1"
+name = "ast-index"
+version = "3.5.0"
 edition = "2021"
 description = "Fast code search for Android/Kotlin/Java and iOS/Swift/ObjC projects"
 license = "MIT"

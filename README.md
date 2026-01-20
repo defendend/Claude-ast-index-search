@@ -1,4 +1,4 @@
-# kotlin-index v3.4.1
+# ast-index v3.5.0
 
 Fast code search CLI for Android/Kotlin/Java and iOS/Swift/ObjC projects. Native Rust implementation.
 
@@ -17,17 +17,28 @@ Project type is auto-detected.
 ### Homebrew (macOS/Linux)
 
 ```bash
-brew tap defendend/kotlin-index
-brew install kotlin-index
+brew tap defendend/ast-index
+brew install ast-index
+```
+
+### Migration from kotlin-index
+
+If you have the old `kotlin-index` installed:
+
+```bash
+brew uninstall kotlin-index
+brew untap defendend/kotlin-index
+brew tap defendend/ast-index
+brew install ast-index
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/defendend/Claude-index-search-android-studio.git
-cd Claude-index-search-android-studio
+git clone https://github.com/defendend/Claude-ast-index-search.git
+cd Claude-ast-index-search
 cargo build --release
-# Binary: target/release/kotlin-index (~4.4 MB)
+# Binary: target/release/ast-index (~4.4 MB)
 ```
 
 ## Quick Start
@@ -36,13 +47,13 @@ cargo build --release
 cd /path/to/android/project
 
 # Build index
-kotlin-index rebuild
+ast-index rebuild
 
 # Search
-kotlin-index search ViewModel
-kotlin-index class BaseFragment
-kotlin-index implementations Presenter
-kotlin-index usages Repository
+ast-index search ViewModel
+ast-index class BaseFragment
+ast-index implementations Presenter
+ast-index usages Repository
 ```
 
 ## Commands (41)
@@ -50,80 +61,80 @@ kotlin-index usages Repository
 ### Grep-based (no index required)
 
 ```bash
-kotlin-index todo [PATTERN]           # TODO/FIXME/HACK comments
-kotlin-index callers <FUNCTION>       # Function call sites
-kotlin-index provides <TYPE>          # @Provides/@Binds for type
-kotlin-index suspend [QUERY]          # Suspend functions
-kotlin-index composables [QUERY]      # @Composable functions
-kotlin-index deprecated [QUERY]       # @Deprecated items
-kotlin-index suppress [QUERY]         # @Suppress annotations
-kotlin-index inject <TYPE>            # @Inject points
-kotlin-index annotations <ANN>        # Classes with annotation
-kotlin-index deeplinks [QUERY]        # Deeplinks
-kotlin-index extensions <TYPE>        # Extension functions
-kotlin-index flows [QUERY]            # Flow/StateFlow/SharedFlow
-kotlin-index previews [QUERY]         # @Preview functions
-kotlin-index usages <SYMBOL>          # Symbol usages (falls back to grep)
+ast-index todo [PATTERN]           # TODO/FIXME/HACK comments
+ast-index callers <FUNCTION>       # Function call sites
+ast-index provides <TYPE>          # @Provides/@Binds for type
+ast-index suspend [QUERY]          # Suspend functions
+ast-index composables [QUERY]      # @Composable functions
+ast-index deprecated [QUERY]       # @Deprecated items
+ast-index suppress [QUERY]         # @Suppress annotations
+ast-index inject <TYPE>            # @Inject points
+ast-index annotations <ANN>        # Classes with annotation
+ast-index deeplinks [QUERY]        # Deeplinks
+ast-index extensions <TYPE>        # Extension functions
+ast-index flows [QUERY]            # Flow/StateFlow/SharedFlow
+ast-index previews [QUERY]         # @Preview functions
+ast-index usages <SYMBOL>          # Symbol usages (falls back to grep)
 ```
 
 ### Index-based (requires rebuild)
 
 ```bash
-kotlin-index search <QUERY>           # Universal search
-kotlin-index file <PATTERN>           # Find files
-kotlin-index symbol <NAME>            # Find symbols
-kotlin-index class <NAME>             # Find classes/interfaces
-kotlin-index implementations <PARENT> # Find implementations
-kotlin-index hierarchy <CLASS>        # Class hierarchy tree
-kotlin-index usages <SYMBOL>          # Symbol usages (indexed, ~8ms)
+ast-index search <QUERY>           # Universal search
+ast-index file <PATTERN>           # Find files
+ast-index symbol <NAME>            # Find symbols
+ast-index class <NAME>             # Find classes/interfaces
+ast-index implementations <PARENT> # Find implementations
+ast-index hierarchy <CLASS>        # Class hierarchy tree
+ast-index usages <SYMBOL>          # Symbol usages (indexed, ~8ms)
 ```
 
 ### Module analysis
 
 ```bash
-kotlin-index module <PATTERN>         # Find modules
-kotlin-index deps <MODULE>            # Module dependencies
-kotlin-index dependents <MODULE>      # Dependent modules
-kotlin-index unused-deps <MODULE>     # Find unused dependencies (v3.2: +transitive, XML, resources)
-kotlin-index api <MODULE>             # Public API of module
+ast-index module <PATTERN>         # Find modules
+ast-index deps <MODULE>            # Module dependencies
+ast-index dependents <MODULE>      # Dependent modules
+ast-index unused-deps <MODULE>     # Find unused dependencies (v3.2: +transitive, XML, resources)
+ast-index api <MODULE>             # Public API of module
 ```
 
 ### XML & Resource analysis (new in v3.2)
 
 ```bash
-kotlin-index xml-usages <CLASS>       # Find class usages in XML layouts
-kotlin-index resource-usages <RES>    # Find resource usages (@drawable/ic_name, R.string.x)
-kotlin-index resource-usages --unused --module <MODULE>  # Find unused resources
+ast-index xml-usages <CLASS>       # Find class usages in XML layouts
+ast-index resource-usages <RES>    # Find resource usages (@drawable/ic_name, R.string.x)
+ast-index resource-usages --unused --module <MODULE>  # Find unused resources
 ```
 
 ### File analysis
 
 ```bash
-kotlin-index outline <FILE>           # Symbols in file
-kotlin-index imports <FILE>           # Imports in file
-kotlin-index changed [--base BRANCH]  # Changed symbols (git diff)
+ast-index outline <FILE>           # Symbols in file
+ast-index imports <FILE>           # Imports in file
+ast-index changed [--base BRANCH]  # Changed symbols (git diff)
 ```
 
 ### iOS-specific commands (new in v3.4)
 
 ```bash
-kotlin-index storyboard-usages <CLASS>  # Class usages in storyboards/xibs
-kotlin-index asset-usages [ASSET]       # iOS asset usages (xcassets)
-kotlin-index asset-usages --unused --module <MODULE>  # Find unused assets
-kotlin-index swiftui [QUERY]            # @State/@Binding/@Published props
-kotlin-index async-funcs [QUERY]        # Swift async functions
-kotlin-index publishers [QUERY]         # Combine publishers
-kotlin-index main-actor [QUERY]         # @MainActor usages
+ast-index storyboard-usages <CLASS>  # Class usages in storyboards/xibs
+ast-index asset-usages [ASSET]       # iOS asset usages (xcassets)
+ast-index asset-usages --unused --module <MODULE>  # Find unused assets
+ast-index swiftui [QUERY]            # @State/@Binding/@Published props
+ast-index async-funcs [QUERY]        # Swift async functions
+ast-index publishers [QUERY]         # Combine publishers
+ast-index main-actor [QUERY]         # @MainActor usages
 ```
 
 ### Index management
 
 ```bash
-kotlin-index init                     # Initialize DB
-kotlin-index rebuild [--type TYPE]    # Full reindex
-kotlin-index update                   # Incremental update
-kotlin-index stats                    # Index statistics
-kotlin-index version                  # Version info
+ast-index init                     # Initialize DB
+ast-index rebuild [--type TYPE]    # Full reindex
+ast-index update                   # Incremental update
+ast-index stats                    # Index statistics
+ast-index version                  # Version info
 ```
 
 ## Performance
@@ -251,6 +262,12 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 
 ## Changelog
 
+### 3.5.0
+- **Renamed to ast-index** — project renamed from `kotlin-index` to `ast-index`
+  - New CLI command: `ast-index` (was `kotlin-index`)
+  - New Homebrew tap: `defendend/ast-index` (was `defendend/kotlin-index`)
+  - New repo: `Claude-ast-index-search` (was `Claude-index-search-android-studio`)
+
 ### 3.4.1
 - **Fix grep-based commands for iOS** — 6 commands now work with Swift/ObjC:
   - `todo` — search in .swift/.m/.h files
@@ -348,23 +365,23 @@ Add to `.cursor/rules` or project's `CLAUDE.md`:
 ```markdown
 ## Code Search
 
-Use `kotlin-index` CLI for fast code search:
+Use `ast-index` CLI for fast code search:
 
 \`\`\`bash
 # Search class/interface/protocol
-kotlin-index class "ClassName"
+ast-index class "ClassName"
 
 # Find implementations
-kotlin-index implementations "BaseClass"
+ast-index implementations "BaseClass"
 
 # Find usages
-kotlin-index usages "SymbolName"
+ast-index usages "SymbolName"
 
 # Module dependencies
-kotlin-index deps "module.name"
+ast-index deps "module.name"
 \`\`\`
 
-Run `kotlin-index rebuild` in project root before first use.
+Run `ast-index rebuild` in project root before first use.
 ```
 
 ### Claude Code Plugin
@@ -374,18 +391,18 @@ Run `kotlin-index rebuild` in project root before first use.
 Add marketplace and install plugin:
 ```bash
 # In Claude Code
-/plugins add https://github.com/defendend/Claude-index-search-android-studio
-/plugins install kotlin-index
+/plugins add https://github.com/defendend/Claude-ast-index-search
+/plugins install ast-index
 ```
 
 Or manually:
 1. Add to `~/.claude/plugins/known_marketplaces.json`:
 ```json
 {
-  "kotlin-index-marketplace": {
+  "ast-index-marketplace": {
     "source": {
       "source": "github",
-      "repo": "defendend/Claude-index-search-android-studio"
+      "repo": "defendend/Claude-ast-index-search"
     }
   }
 }
@@ -397,28 +414,28 @@ Or manually:
 
 ```bash
 # Update CLI
-brew upgrade kotlin-index
+brew upgrade ast-index
 
 # Update plugin (in Claude Code)
-/plugins update kotlin-index
+/plugins update ast-index
 ```
 
 Or manually update:
 ```bash
 # Pull latest marketplace
-cd ~/.claude/plugins/marketplaces/kotlin-index-marketplace
+cd ~/.claude/plugins/marketplaces/ast-index-marketplace
 git pull origin main
 
 # Update cache
-rm -rf ~/.claude/plugins/cache/kotlin-index-marketplace/kotlin-index/*
-mkdir -p ~/.claude/plugins/cache/kotlin-index-marketplace/kotlin-index/3.2.0
-cp -r skills .claude-plugin ~/.claude/plugins/cache/kotlin-index-marketplace/kotlin-index/3.2.0/
+rm -rf ~/.claude/plugins/cache/ast-index-marketplace/ast-index/*
+mkdir -p ~/.claude/plugins/cache/ast-index-marketplace/ast-index/3.5.0
+cp -r skills .claude-plugin ~/.claude/plugins/cache/ast-index-marketplace/ast-index/3.5.0/
 ```
 
 ### Uninstall Plugin
 
 ```bash
-/plugins uninstall kotlin-index
+/plugins uninstall ast-index
 ```
 
 ## License

@@ -1,4 +1,4 @@
-# kotlin-index v3.4.1 - Code Search for Mobile Projects
+# ast-index v3.5.0 - Code Search for Mobile Projects
 
 Fast native Rust CLI for code search in Android/Kotlin/Java and iOS/Swift/ObjC projects using SQLite + FTS5.
 
@@ -6,14 +6,14 @@ Fast native Rust CLI for code search in Android/Kotlin/Java and iOS/Swift/ObjC p
 
 Install the CLI:
 ```bash
-brew tap defendend/kotlin-index
-brew install kotlin-index
+brew tap defendend/ast-index
+brew install ast-index
 ```
 
 Initialize index in project root:
 ```bash
 cd /path/to/project
-kotlin-index rebuild
+ast-index rebuild
 ```
 
 ## Supported Projects
@@ -32,259 +32,259 @@ Project type is auto-detected by marker files.
 
 **Universal search** (files + symbols + modules):
 ```bash
-kotlin-index search "PaymentMethod"
+ast-index search "PaymentMethod"
 ```
 
 **Find files by name**:
 ```bash
-kotlin-index file "Fragment.kt"
-kotlin-index file "ViewController.swift"
+ast-index file "Fragment.kt"
+ast-index file "ViewController.swift"
 ```
 
 **Find symbols** (classes, interfaces, functions):
 ```bash
-kotlin-index symbol "PaymentInteractor"
-kotlin-index symbol "AppDelegate"
+ast-index symbol "PaymentInteractor"
+ast-index symbol "AppDelegate"
 ```
 
 **Find class/interface/protocol**:
 ```bash
-kotlin-index class "BaseFragment"
-kotlin-index class "UIApplicationDelegate"  # Swift protocol
+ast-index class "BaseFragment"
+ast-index class "UIApplicationDelegate"  # Swift protocol
 ```
 
 **Find usages** of a symbol (~8ms indexed):
 ```bash
-kotlin-index usages "PaymentRepository"
+ast-index usages "PaymentRepository"
 ```
 
 **Find implementations** (subclasses/implementors/protocol conformance):
 ```bash
-kotlin-index implementations "BasePresenter"
-kotlin-index implementations "Codable"  # Swift protocol
+ast-index implementations "BasePresenter"
+ast-index implementations "Codable"  # Swift protocol
 ```
 
 **Class hierarchy** (parents + children):
 ```bash
-kotlin-index hierarchy "BaseFragment"
+ast-index hierarchy "BaseFragment"
 ```
 
 **Find callers** of a function:
 ```bash
-kotlin-index callers "onClick"
-kotlin-index callers "viewDidLoad"
+ast-index callers "onClick"
+ast-index callers "viewDidLoad"
 ```
 
 **File imports**:
 ```bash
-kotlin-index imports "path/to/File.kt"
-kotlin-index imports "path/to/File.swift"
+ast-index imports "path/to/File.kt"
+ast-index imports "path/to/File.swift"
 ```
 
 ### DI Commands (Dagger - Android only)
 
 **Find @Provides/@Binds** for a type:
 ```bash
-kotlin-index provides "UserRepository"
+ast-index provides "UserRepository"
 ```
 
 **Find @Inject** points for a type:
 ```bash
-kotlin-index inject "UserInteractor"
+ast-index inject "UserInteractor"
 ```
 
 **Find classes with annotation**:
 ```bash
-kotlin-index annotations "Module"
-kotlin-index annotations "Inject"
+ast-index annotations "Module"
+ast-index annotations "Inject"
 ```
 
 ### Audit Commands
 
 **Find TODO/FIXME/HACK**:
 ```bash
-kotlin-index todo
-kotlin-index todo "FIXME"
+ast-index todo
+ast-index todo "FIXME"
 ```
 
 **Find @Deprecated** items:
 ```bash
-kotlin-index deprecated
+ast-index deprecated
 ```
 
 **Find @Suppress** annotations:
 ```bash
-kotlin-index suppress
-kotlin-index suppress "UNCHECKED_CAST"
+ast-index suppress
+ast-index suppress "UNCHECKED_CAST"
 ```
 
 **Find extension functions** (Kotlin) / **extensions** (Swift):
 ```bash
-kotlin-index extensions "String"
-kotlin-index extensions "View"
+ast-index extensions "String"
+ast-index extensions "View"
 ```
 
 **Show public API** of a module:
 ```bash
-kotlin-index api "features/payments/api"
+ast-index api "features/payments/api"
 ```
 
 **Find deeplinks**:
 ```bash
-kotlin-index deeplinks
-kotlin-index deeplinks "payment"
+ast-index deeplinks
+ast-index deeplinks "payment"
 ```
 
 **Show changed symbols** (git diff):
 ```bash
-kotlin-index changed
-kotlin-index changed --base "origin/main"
+ast-index changed
+ast-index changed --base "origin/main"
 ```
 
 ### Compose Commands (Android)
 
 **Find @Composable functions**:
 ```bash
-kotlin-index composables
-kotlin-index composables "Button"
+ast-index composables
+ast-index composables "Button"
 ```
 
 **Find @Preview functions**:
 ```bash
-kotlin-index previews
+ast-index previews
 ```
 
 ### Coroutines Commands (Kotlin)
 
 **Find suspend functions**:
 ```bash
-kotlin-index suspend
-kotlin-index suspend "fetch"
+ast-index suspend
+ast-index suspend "fetch"
 ```
 
 **Find Flow/StateFlow/SharedFlow**:
 ```bash
-kotlin-index flows
-kotlin-index flows "user"
+ast-index flows
+ast-index flows "user"
 ```
 
 ### Module Commands
 
 **Find modules** (Gradle or SPM):
 ```bash
-kotlin-index module "payments"
-kotlin-index module "NetworkKit"
+ast-index module "payments"
+ast-index module "NetworkKit"
 ```
 
 **Module dependencies**:
 ```bash
-kotlin-index deps "features.payments.impl"
+ast-index deps "features.payments.impl"
 ```
 
 **Modules depending on this module**:
 ```bash
-kotlin-index dependents "features.payments.api"
+ast-index dependents "features.payments.api"
 ```
 
 **Find unused dependencies** (with transitive, XML, resource checks):
 ```bash
-kotlin-index unused-deps "features.payments.impl"
-kotlin-index unused-deps "features.payments.impl" --verbose
-kotlin-index unused-deps "features.payments.impl" --strict  # only direct imports
+ast-index unused-deps "features.payments.impl"
+ast-index unused-deps "features.payments.impl" --verbose
+ast-index unused-deps "features.payments.impl" --strict  # only direct imports
 ```
 
 ### XML & Resource Commands (Android only)
 
 **Find class usages in XML layouts**:
 ```bash
-kotlin-index xml-usages "PaymentIconView"
-kotlin-index xml-usages "ImageView" --module "features.payments.impl"
+ast-index xml-usages "PaymentIconView"
+ast-index xml-usages "ImageView" --module "features.payments.impl"
 ```
 
 **Find resource usages**:
 ```bash
-kotlin-index resource-usages "@drawable/ic_payment"
-kotlin-index resource-usages "R.string.payment_title"
+ast-index resource-usages "@drawable/ic_payment"
+ast-index resource-usages "R.string.payment_title"
 ```
 
 **Find unused resources in module**:
 ```bash
-kotlin-index resource-usages --unused --module "features.payments.impl"
+ast-index resource-usages --unused --module "features.payments.impl"
 ```
 
 ### iOS-Specific Commands (v3.4.0)
 
 **Find class usages in storyboards/xibs**:
 ```bash
-kotlin-index storyboard-usages "MyViewController"
-kotlin-index storyboard-usages "TableViewCell" --module "Features"
+ast-index storyboard-usages "MyViewController"
+ast-index storyboard-usages "TableViewCell" --module "Features"
 ```
 
 **Find iOS asset usages** (xcassets):
 ```bash
-kotlin-index asset-usages "AppIcon"
-kotlin-index asset-usages --unused --module "MainApp"  # find unused assets
+ast-index asset-usages "AppIcon"
+ast-index asset-usages --unused --module "MainApp"  # find unused assets
 ```
 
 **Find SwiftUI state properties**:
 ```bash
-kotlin-index swiftui                    # all @State/@Binding/@Published
-kotlin-index swiftui "State"            # filter by type
-kotlin-index swiftui "userName"         # filter by name
+ast-index swiftui                    # all @State/@Binding/@Published
+ast-index swiftui "State"            # filter by type
+ast-index swiftui "userName"         # filter by name
 ```
 
 **Find async functions** (Swift):
 ```bash
-kotlin-index async-funcs
-kotlin-index async-funcs "fetch"
+ast-index async-funcs
+ast-index async-funcs "fetch"
 ```
 
 **Find Combine publishers**:
 ```bash
-kotlin-index publishers                 # PassthroughSubject, CurrentValueSubject, AnyPublisher
-kotlin-index publishers "state"
+ast-index publishers                 # PassthroughSubject, CurrentValueSubject, AnyPublisher
+ast-index publishers "state"
 ```
 
 **Find @MainActor usages**:
 ```bash
-kotlin-index main-actor
-kotlin-index main-actor "ViewModel"
+ast-index main-actor
+ast-index main-actor "ViewModel"
 ```
 
 ### File Structure
 
 **File outline** (classes, functions in file):
 ```bash
-kotlin-index outline "path/to/File.kt"
-kotlin-index outline "path/to/File.swift"
+ast-index outline "path/to/File.kt"
+ast-index outline "path/to/File.swift"
 ```
 
 ### Index Management
 
 **Initialize index** (create empty database):
 ```bash
-kotlin-index init
+ast-index init
 ```
 
 **Rebuild index** (includes module dependencies, XML, resources by default):
 ```bash
-kotlin-index rebuild
-kotlin-index rebuild --no-deps  # skip module dependencies
+ast-index rebuild
+ast-index rebuild --no-deps  # skip module dependencies
 ```
 
 **Update index** (incremental):
 ```bash
-kotlin-index update
+ast-index update
 ```
 
 **Index statistics**:
 ```bash
-kotlin-index stats
+ast-index stats
 ```
 
 **Version info**:
 ```bash
-kotlin-index version
+ast-index version
 ```
 
 ## Swift/ObjC Support (v3.3.0+)
@@ -337,4 +337,4 @@ kotlin-index version
 
 ## Index Location
 
-Database stored at: `~/.cache/kotlin-index/<project-hash>/index.db`
+Database stored at: `~/.cache/ast-index/<project-hash>/index.db`
