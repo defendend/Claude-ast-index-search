@@ -32,9 +32,12 @@ The index is stored at `~/.cache/ast-index/<project-hash>/index.db` and needs re
 | Android | Kotlin, Java | Gradle (build.gradle.kts) |
 | iOS | Swift, Objective-C | SPM (Package.swift) |
 | Perl | Perl | Makefile.PL, Build.PL |
+| Proto | Protocol Buffers (proto2/proto3) | None (*.proto files) |
+| WSDL | WSDL, XSD | None (*.wsdl, *.xsd files) |
+| C/C++ | C, C++ (JNI focus) | None (*.cpp, *.h, *.hpp files) |
 | Mixed | All above | All |
 
-Project type is auto-detected by marker files (build.gradle.kts, Package.swift, Makefile.PL, etc.).
+Project type is auto-detected by marker files (build.gradle.kts, Package.swift, Makefile.PL, etc.). Proto, WSDL, and C++ files are indexed alongside main project type.
 
 ## Core Commands
 
@@ -132,7 +135,7 @@ ast-index callers "fetchUser"        # Find API call sites
 
 Returns: File path, line number, and context for each call site. Performance: ~1s (grep-based).
 
-### Call Tree (v3.6.2)
+### Call Tree (v3.7.0)
 
 **`call-tree`** - Show complete call hierarchy going UP (who calls the callers). Essential for understanding how a function is reached.
 
@@ -272,7 +275,7 @@ ast-index rebuild --no-deps          # Skip module dependency indexing
 ast-index rebuild --no-ignore        # Include gitignored files (build/ directories)
 ```
 
-The `--no-ignore` flag (v3.6.2) indexes files in gitignored directories like `build/`, useful for finding generated code like `BuildConfig.java`.
+The `--no-ignore` flag (v3.7.0) indexes files in gitignored directories like `build/`, useful for finding generated code like `BuildConfig.java`.
 
 **`update`** - Incremental index update. Faster than rebuild, only processes changed files.
 
@@ -359,4 +362,7 @@ For detailed platform-specific commands, consult:
 - **`references/android-commands.md`** - DI (Dagger), Compose, Coroutines, XML/Resource commands
 - **`references/ios-commands.md`** - Storyboard, SwiftUI, Swift Concurrency, Combine commands
 - **`references/perl-commands.md`** - Perl exports, subs, POD, tests, imports
+- **`references/proto-commands.md`** - Protocol Buffers (proto2/proto3) messages, services, RPCs
+- **`references/wsdl-commands.md`** - WSDL/XSD types, services, operations (Template Toolkit support)
+- **`references/cpp-commands.md`** - C/C++ classes, JNI functions, templates, namespaces
 - **`references/module-commands.md`** - Module search, dependencies, unused deps analysis
