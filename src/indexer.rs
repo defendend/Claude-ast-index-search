@@ -289,7 +289,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     })
 }
 
-pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
+pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ignore: bool) -> Result<usize> {
     use ignore::WalkBuilder;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -302,7 +302,8 @@ pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool) -> Re
     // Collect all file paths
     let walker = WalkBuilder::new(root)
         .hidden(true)
-        .git_ignore(true)
+        .git_ignore(!no_ignore)  // Respect .gitignore unless --no-ignore
+        .git_exclude(!no_ignore)
         .build();
 
     let files: Vec<PathBuf> = walker

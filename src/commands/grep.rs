@@ -115,6 +115,121 @@ pub fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()>
     Ok(())
 }
 
+/// Show call hierarchy (callers tree) for a function
+pub fn cmd_call_tree(root: &Path, function_name: &str, max_depth: usize, limit_per_level: usize) -> Result<()> {
+    let start = Instant::now();
+
+    println!("{}", format!("Call tree for '{}':", function_name).bold());
+    println!("  {}", function_name.cyan());
+
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(function_name.to_string());
+
+    build_call_tree(root, function_name, 1, max_depth, limit_per_level, &mut visited)?;
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+/// Recursively build call tree
+fn build_call_tree(
+    root: &Path,
+    function_name: &str,
+    current_depth: usize,
+    max_depth: usize,
+    limit: usize,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    if current_depth > max_depth {
+        return Ok(());
+    }
+
+    let indent = "  ".repeat(current_depth + 1);
+    let callers = find_caller_functions(root, function_name, limit)?;
+
+    if callers.is_empty() {
+        return Ok(());
+    }
+
+    for (caller_func, file_path, line_num) in callers {
+        let is_new = visited.insert(caller_func.clone());
+
+        if is_new {
+            println!("{}← {} ({}:{})", indent, caller_func.yellow(), file_path, line_num);
+            // Recursively find callers of this function
+            build_call_tree(root, &caller_func, current_depth + 1, max_depth, limit, visited)?;
+        } else {
+            println!("{}← {} (recursive)", indent, caller_func.dimmed());
+        }
+    }
+
+    Ok(())
+}
+
+/// Find functions that call the given function
+fn find_caller_functions(root: &Path, function_name: &str, limit: usize) -> Result<Vec<(String, String, usize)>> {
+    let pattern = format!(r"[.>]{function_name}\s*\(|^\s*{function_name}\s*\(|->{function_name}\s*\(|&{function_name}\s*\(");
+    let def_pattern = Regex::new(&format!(r"\b(fun|func|def|void|private|public|protected|override|internal|fileprivate|open|sub)\s+{function_name}\s*[<({{\[]"))?;
+
+    // Pattern to find function definitions
+    let func_def_re = Regex::new(r"(?:fun|func|def|void|private|public|protected|override|internal|open|sub)\s+(\w+)\s*[<(\[]")?;
+
+    let mut results: Vec<(String, String, usize)> = vec![];
+    let mut files_with_calls: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+
+    // First pass: find all files and line numbers with calls
+    search_files(root, &pattern, &["kt", "java", "swift", "m", "h", "pm", "pl", "t"], |path, line_num, line| {
+        if results.len() >= limit * 3 { return; } // Collect more to filter later
+        if def_pattern.is_match(line) { return; }
+
+        files_with_calls.entry(path.to_path_buf()).or_default().push(line_num);
+    })?;
+
+    // Second pass: for each call location, find the containing function
+    for (file_path, call_lines) in files_with_calls {
+        if results.len() >= limit { break; }
+
+        let content = match std::fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let lines: Vec<&str> = content.lines().collect();
+        let rel_path = relative_path(root, &file_path);
+
+        for call_line in call_lines {
+            if results.len() >= limit { break; }
+
+            // Search backwards to find the containing function
+            if let Some((func_name, func_line)) = find_containing_function(&lines, call_line, &func_def_re) {
+                // Avoid adding the same function twice for this target
+                if !results.iter().any(|(f, p, _)| f == &func_name && p == &rel_path) {
+                    results.push((func_name, rel_path.clone(), func_line));
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Find the function that contains a given line number
+fn find_containing_function(lines: &[&str], target_line: usize, func_def_re: &Regex) -> Option<(String, usize)> {
+    // Search backwards from the target line to find a function definition
+    let start_idx = (target_line.saturating_sub(1)).min(lines.len().saturating_sub(1));
+
+    for i in (0..=start_idx).rev() {
+        let line = lines[i];
+        if let Some(caps) = func_def_re.captures(line) {
+            if let Some(name) = caps.get(1) {
+                return Some((name.as_str().to_string(), i + 1));
+            }
+        }
+    }
+
+    None
+}
+
 /// Find Dagger @Provides/@Binds for a type
 pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
     let start = Instant::now();

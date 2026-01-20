@@ -35,6 +35,17 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: usize,
     },
+    /// Show call hierarchy (callers tree up) for a function
+    CallTree {
+        /// Function name
+        function_name: String,
+        /// Max depth of the tree
+        #[arg(short, long, default_value = "3")]
+        depth: usize,
+        /// Max callers per level
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
     /// Find @Provides/@Binds for a type
     Provides {
         /// Type name
@@ -134,6 +145,9 @@ enum Commands {
         /// Skip module dependencies indexing
         #[arg(long)]
         no_deps: bool,
+        /// Include gitignored files (e.g., build/ directories)
+        #[arg(long)]
+        no_ignore: bool,
     },
     /// Update index (incremental)
     Update,
@@ -392,6 +406,7 @@ fn main() -> Result<()> {
         // Grep commands
         Commands::Todo { pattern, limit } => commands::grep::cmd_todo(&root, &pattern, limit),
         Commands::Callers { function_name, limit } => commands::grep::cmd_callers(&root, &function_name, limit),
+        Commands::CallTree { function_name, depth, limit } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit),
         Commands::Provides { type_name, limit } => commands::grep::cmd_provides(&root, &type_name, limit),
         Commands::Suspend { query, limit } => commands::grep::cmd_suspend(&root, query.as_deref(), limit),
         Commands::Composables { query, limit } => commands::grep::cmd_composables(&root, query.as_deref(), limit),
@@ -405,7 +420,7 @@ fn main() -> Result<()> {
         Commands::Previews { query, limit } => commands::grep::cmd_previews(&root, query.as_deref(), limit),
         // Management commands
         Commands::Init => commands::management::cmd_init(&root),
-        Commands::Rebuild { r#type, no_deps } => commands::management::cmd_rebuild(&root, &r#type, !no_deps),
+        Commands::Rebuild { r#type, no_deps, no_ignore } => commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore),
         Commands::Update => commands::management::cmd_update(&root),
         Commands::Stats => commands::management::cmd_stats(&root),
         // Index commands

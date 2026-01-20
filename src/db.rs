@@ -212,6 +212,12 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             FOREIGN KEY (asset_id) REFERENCES ios_assets(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_ios_asset_usages_asset ON ios_asset_usages(asset_id);
+
+        -- Metadata for storing index settings
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         "#,
     )?;
     Ok(())

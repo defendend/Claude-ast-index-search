@@ -35,11 +35,20 @@ pub fn cmd_init(root: &Path) -> Result<()> {
 }
 
 /// Rebuild the index (full or partial)
-pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool) -> Result<()> {
+pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool) -> Result<()> {
     let start = Instant::now();
 
     let mut conn = db::open_db(root)?;
     db::init_db(&conn)?;
+
+    // Store no_ignore setting in database metadata
+    if no_ignore {
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('no_ignore', '1')",
+            [],
+        ).ok();
+        println!("{}", "Including gitignored files (build/, etc.)...".yellow());
+    }
 
     // Detect project type
     let project_type = indexer::detect_project_type(root);
@@ -50,7 +59,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool) -> Result<()
         "all" => {
             println!("{}", "Rebuilding full index...".cyan());
             db::clear_db(&conn)?;
-            let file_count = indexer::index_directory(&mut conn, root, true)?;
+            let file_count = indexer::index_directory(&mut conn, root, true, no_ignore)?;
             let module_count = indexer::index_modules(&conn, root)?;
 
             // Index CocoaPods/Carthage for iOS
@@ -128,7 +137,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool) -> Result<()
             println!("{}", "Rebuilding symbols index...".cyan());
             conn.execute("DELETE FROM symbols", [])?;
             conn.execute("DELETE FROM files", [])?;
-            let file_count = indexer::index_directory(&mut conn, root, true)?;
+            let file_count = indexer::index_directory(&mut conn, root, true, no_ignore)?;
             println!("{}", format!("Indexed {} files", file_count).green());
         }
         "modules" => {

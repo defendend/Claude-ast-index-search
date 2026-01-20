@@ -38,6 +38,11 @@ pub fn parse_kotlin_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let typealias_re = Regex::new(r"(?m)^[\s]*typealias\s+(\w+)(?:\s*<[^>]*>)?\s*=\s*(.+)")?;
     let enum_re = Regex::new(r"(?m)^[\s]*((?:public|private|protected|internal)[\s]+)*enum\s+class\s+(\w+)")?;
 
+    // Java static fields: public static final Type NAME = value;
+    let java_field_re = Regex::new(
+        r"(?m)^[\s]*((?:public|private|protected)[\s]+)?(?:static[\s]+)?(?:final[\s]+)?(\w+(?:<[^>]+>)?)\s+([A-Z][A-Z0-9_]*)\s*="
+    )?;
+
     let lines: Vec<&str> = content.lines().collect();
 
     for (line_num, line) in lines.iter().enumerate() {
@@ -134,6 +139,20 @@ pub fn parse_kotlin_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                 signature: line.trim().to_string(),
                 parents: vec![],
             });
+        }
+
+        // Java static fields (e.g., public static final String FOO = "bar";)
+        if let Some(caps) = java_field_re.captures(line) {
+            let name = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+            if !name.is_empty() {
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: SymbolKind::Property,
+                    line: line_num,
+                    signature: line.trim().to_string(),
+                    parents: vec![],
+                });
+            }
         }
     }
 

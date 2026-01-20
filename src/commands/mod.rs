@@ -31,6 +31,21 @@ use grep_searcher::{SearcherBuilder, sinks::UTF8};
 use grep_searcher::MmapChoice;
 use ignore::WalkBuilder;
 
+use crate::db;
+
+/// Check if no_ignore mode is enabled for this project
+pub fn is_no_ignore_enabled(root: &Path) -> bool {
+    if let Ok(conn) = db::open_db(root) {
+        let result: Result<String, _> = conn.query_row(
+            "SELECT value FROM metadata WHERE key = 'no_ignore'",
+            [],
+            |row| row.get(0),
+        );
+        return result.map(|v| v == "1").unwrap_or(false);
+    }
+    false
+}
+
 /// Get number of available CPU cores
 pub fn num_cpus() -> usize {
     std::thread::available_parallelism()
@@ -52,11 +67,12 @@ where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
+    let no_ignore = is_no_ignore_enabled(root);
 
     let walker = WalkBuilder::new(root)
         .hidden(true)
-        .git_ignore(true)
-        .git_exclude(true)
+        .git_ignore(!no_ignore)
+        .git_exclude(!no_ignore)
         .threads(num_cpus())
         .build_parallel();
 
@@ -125,11 +141,12 @@ where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
+    let no_ignore = is_no_ignore_enabled(root);
 
     let walker = WalkBuilder::new(root)
         .hidden(true)
-        .git_ignore(true)
-        .git_exclude(true)
+        .git_ignore(!no_ignore)
+        .git_exclude(!no_ignore)
         .threads(num_cpus())
         .build_parallel();
 
