@@ -1,0 +1,54 @@
+name: Sync Plugin Branch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.claude-plugin/**'
+      - 'commands/**'
+      - 'skills/**'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync to plugin branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch plugin branch
+          git fetch origin plugin:plugin || true
+
+          # Create temporary directory with plugin files
+          mkdir -p /tmp/plugin-files
+          cp -r .claude-plugin /tmp/plugin-files/
+          cp -r commands /tmp/plugin-files/
+          cp -r skills /tmp/plugin-files/
+
+          # Switch to plugin branch
+          git checkout plugin
+
+          # Remove old files and copy new ones
+          rm -rf .claude-plugin commands skills
+          cp -r /tmp/plugin-files/.claude-plugin .
+          cp -r /tmp/plugin-files/commands .
+          cp -r /tmp/plugin-files/skills .
+
+          # Commit and push if there are changes
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to sync"
+          else
+            git commit -m "Sync plugin from main ($(git rev-parse --short main))"
+            git push origin plugin
+            echo "Plugin branch synced successfully"
+          fi
