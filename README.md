@@ -388,54 +388,30 @@ Run `ast-index rebuild` in project root before first use.
 
 #### Install Plugin
 
-Add marketplace and install plugin:
 ```bash
-# In Claude Code
-/plugins add https://github.com/defendend/Claude-ast-index-search
-/plugins install ast-index
+# Add marketplace (once)
+claude plugin marketplace add defendend/Claude-ast-index-search
+
+# Install plugin
+claude plugin install ast-index
+
+# Restart Claude Code
 ```
 
-Or manually:
-1. Add to `~/.claude/plugins/known_marketplaces.json`:
-```json
-{
-  "ast-index-marketplace": {
-    "source": {
-      "source": "github",
-      "repo": "defendend/Claude-ast-index-search"
-    }
-  }
-}
-```
-
-2. Restart Claude Code and install plugin
-
-### Update Plugin
+#### Update Plugin
 
 ```bash
 # Update CLI
 brew upgrade ast-index
 
-# Update plugin (in Claude Code)
-/plugins update ast-index
+# Update plugin
+claude plugin update ast-index
 ```
 
-Or manually update:
-```bash
-# Pull latest marketplace
-cd ~/.claude/plugins/marketplaces/ast-index-marketplace
-git pull origin main
-
-# Update cache
-rm -rf ~/.claude/plugins/cache/ast-index-marketplace/ast-index/*
-mkdir -p ~/.claude/plugins/cache/ast-index-marketplace/ast-index/3.5.0
-cp -r skills .claude-plugin ~/.claude/plugins/cache/ast-index-marketplace/ast-index/3.5.0/
-```
-
-### Uninstall Plugin
+#### Uninstall Plugin
 
 ```bash
-/plugins uninstall ast-index
+claude plugin uninstall ast-index
 ```
 
 ## License
