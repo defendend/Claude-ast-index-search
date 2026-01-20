@@ -16,7 +16,8 @@ use crate::db::{self, SymbolKind};
 pub enum ProjectType {
     Android,  // Kotlin/Java - build.gradle.kts, settings.gradle.kts
     IOS,      // Swift/ObjC - Package.swift, *.xcodeproj
-    Mixed,    // Both markers present
+    Perl,     // Perl - .pm files, Makefile.PL, Build.PL
+    Mixed,    // Multiple platforms present
     Unknown,
 }
 
@@ -25,7 +26,8 @@ impl ProjectType {
         match self {
             ProjectType::Android => "Android (Kotlin/Java)",
             ProjectType::IOS => "iOS (Swift/ObjC)",
-            ProjectType::Mixed => "Mixed (Android + iOS)",
+            ProjectType::Perl => "Perl",
+            ProjectType::Mixed => "Mixed",
             ProjectType::Unknown => "Unknown",
         }
     }
@@ -59,11 +61,31 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
             .unwrap_or(false)
     };
 
-    match (has_gradle, has_swift) {
-        (true, true) => ProjectType::Mixed,
-        (true, false) => ProjectType::Android,
-        (false, true) => ProjectType::IOS,
-        (false, false) => ProjectType::Unknown,
+    // Perl project detection: Makefile.PL, Build.PL, or .pm files in root
+    let has_perl = root.join("Makefile.PL").exists()
+        || root.join("Build.PL").exists()
+        || root.join("cpanfile").exists()
+        || fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.path().extension().map(|ext| ext == "pm").unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+    // Count how many platforms are detected
+    let count = [has_gradle, has_swift, has_perl].iter().filter(|&&x| x).count();
+
+    if count > 1 {
+        ProjectType::Mixed
+    } else if has_gradle {
+        ProjectType::Android
+    } else if has_swift {
+        ProjectType::IOS
+    } else if has_perl {
+        ProjectType::Perl
+    } else {
+        ProjectType::Unknown
     }
 }
 
@@ -391,11 +413,14 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let is_swift = ext == "swift";
     let is_objc = ext == "m" || ext == "h";
+    let is_perl = ext == "pm" || ext == "pl" || ext == "t";
 
     let (symbols, refs) = if is_objc {
-        parse_symbols_and_refs(&content, false, true)?
+        parse_symbols_and_refs(&content, false, true, false)?
+    } else if is_perl {
+        parse_symbols_and_refs(&content, false, false, true)?
     } else {
-        parse_symbols_and_refs(&content, is_swift, false)?
+        parse_symbols_and_refs(&content, is_swift, false, false)?
     };
 
     Ok(ParsedFile {
@@ -923,12 +948,155 @@ fn parse_objc_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     Ok(symbols)
 }
 
+/// Parse Perl symbols from file content
+fn parse_perl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
+    let mut symbols = Vec::new();
+
+    // Regex patterns for Perl constructs
+    // Package declaration: package Name;
+    let package_re = Regex::new(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;")?;
+
+    // Subroutine definition: sub name { } or sub name($proto) { }
+    let sub_re = Regex::new(r"^\s*sub\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\{(]?")?;
+
+    // Constant definition: use constant NAME => value;
+    let constant_re = Regex::new(r"^\s*use\s+constant\s+([A-Z_][A-Z0-9_]*)\s*=>")?;
+
+    // Our variable declaration: our $VAR, our @ARRAY, our %HASH
+    let our_re = Regex::new(r"^\s*our\s+([\$@%][A-Za-z_][A-Za-z0-9_]*)")?;
+
+    // Inheritance patterns
+    // use base qw/Parent1 Parent2/; or use base 'Parent';
+    let use_base_re = Regex::new(r#"use\s+(?:base|parent)\s+(?:qw[/(]([^)/\\]+)[)/\\]|['"]([^'"]+)['"])"#)?;
+    // our @ISA = qw(Parent1 Parent2);
+    let isa_re = Regex::new(r#"our\s+@ISA\s*=\s*(?:qw[/(]([^)/\\]+)[)/\\]|\(([^)]+)\))"#)?;
+
+    // Track current package for context
+    let mut current_package: Option<(String, i64)> = None; // (name, symbol_id placeholder)
+    let mut pending_parents: Vec<(String, String)> = Vec::new();
+
+    for (line_num, line) in content.lines().enumerate() {
+        let line_num = line_num + 1;
+
+        // Package declaration
+        if let Some(caps) = package_re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            if !name.is_empty() {
+                // Apply any pending parents to this package
+                let parents = std::mem::take(&mut pending_parents);
+                symbols.push(ParsedSymbol {
+                    name: name.clone(),
+                    kind: SymbolKind::Package,
+                    line: line_num,
+                    signature: line.trim().to_string(),
+                    parents,
+                });
+                current_package = Some((name, symbols.len() as i64 - 1));
+            }
+            continue;
+        }
+
+        // Subroutine definition
+        if let Some(caps) = sub_re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            if !name.is_empty() {
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: SymbolKind::Function,
+                    line: line_num,
+                    signature: line.trim().to_string(),
+                    parents: vec![],
+                });
+            }
+            continue;
+        }
+
+        // Constant definition
+        if let Some(caps) = constant_re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            if !name.is_empty() {
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: SymbolKind::Constant,
+                    line: line_num,
+                    signature: line.trim().to_string(),
+                    parents: vec![],
+                });
+            }
+            continue;
+        }
+
+        // Our variable (but not @ISA which is handled separately)
+        if let Some(caps) = our_re.captures(line) {
+            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            // Skip @ISA as it's for inheritance, not a real variable to index
+            if !name.is_empty() && name != "@ISA" {
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: SymbolKind::Property,
+                    line: line_num,
+                    signature: line.trim().to_string(),
+                    parents: vec![],
+                });
+            }
+        }
+
+        // Inheritance: use base/parent
+        if let Some(caps) = use_base_re.captures(line) {
+            let parents_str = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
+            if let Some(ps) = parents_str {
+                for parent in ps.split_whitespace() {
+                    let parent_name = parent.trim();
+                    if !parent_name.is_empty() {
+                        let parent_entry = (parent_name.to_string(), "extends".to_string());
+                        // If we have a current package, add to its parents
+                        if let Some((_, idx)) = &current_package {
+                            let idx = *idx as usize;
+                            if idx < symbols.len() {
+                                symbols[idx].parents.push(parent_entry);
+                            }
+                        } else {
+                            // No package yet, save for later
+                            pending_parents.push(parent_entry);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Inheritance: @ISA
+        if let Some(caps) = isa_re.captures(line) {
+            let parents_str = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
+            if let Some(ps) = parents_str {
+                for parent in ps.split(|c: char| c.is_whitespace() || c == ',') {
+                    let parent_name = parent.trim().trim_matches(|c| c == '\'' || c == '"');
+                    if !parent_name.is_empty() {
+                        let parent_entry = (parent_name.to_string(), "extends".to_string());
+                        if let Some((_, idx)) = &current_package {
+                            let idx = *idx as usize;
+                            if idx < symbols.len() {
+                                symbols[idx].parents.push(parent_entry);
+                            }
+                        } else {
+                            pending_parents.push(parent_entry);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(symbols)
+}
+
 /// Parse symbols AND references from file content (combined for efficiency)
-fn parse_symbols_and_refs(content: &str, is_swift: bool, is_objc: bool) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
+fn parse_symbols_and_refs(content: &str, is_swift: bool, is_objc: bool, is_perl: bool) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
     let symbols = if is_swift {
         parse_swift_symbols(content)?
     } else if is_objc {
         parse_objc_symbols(content)?
+    } else if is_perl {
+        parse_perl_symbols(content)?
     } else {
         parse_symbols(content)?
     };
@@ -1014,7 +1182,7 @@ fn extract_references(content: &str, defined_symbols: &[ParsedSymbol]) -> Result
 
 /// Check if file extension is supported for indexing
 fn is_supported_extension(ext: &str) -> bool {
-    matches!(ext, "kt" | "java" | "swift" | "m" | "h")
+    matches!(ext, "kt" | "java" | "swift" | "m" | "h" | "pm" | "pl" | "t")
 }
 
 /// Index all Kotlin/Java/Swift/ObjC files in a directory (parallel parsing, batched DB writes)
@@ -1384,6 +1552,31 @@ pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
                                 conn.execute(
                                     "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
                                     rusqlite::params![module_name, module_path],
+                                )?;
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Perl modules (.pm files with package declarations)
+            if name_str.ends_with(".pm") {
+                if let Ok(content) = fs::read_to_string(path) {
+                    let package_re = Regex::new(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;").ok();
+                    if let Some(re) = package_re {
+                        for caps in re.captures_iter(&content) {
+                            let package_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                            if !package_name.is_empty() {
+                                let module_path = path
+                                    .strip_prefix(root)
+                                    .unwrap_or(path)
+                                    .to_string_lossy()
+                                    .to_string();
+
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
+                                    rusqlite::params![package_name, module_path],
                                 )?;
                                 count += 1;
                             }

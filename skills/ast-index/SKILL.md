@@ -1,11 +1,11 @@
 ---
 name: ast-index
-description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", or needs fast code search in Android/Kotlin/Java or iOS/Swift/ObjC projects. Also triggered by mentions of "ast-index" CLI tool.
+description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", "find Perl subs", "Perl exports", or needs fast code search in Android/Kotlin/Java, iOS/Swift/ObjC, or Perl projects. Also triggered by mentions of "ast-index" CLI tool.
 ---
 
-# ast-index - Code Search for Mobile Projects
+# ast-index - Code Search for Multi-Platform Projects
 
-Fast native Rust CLI for structural code search in Android/Kotlin/Java and iOS/Swift/ObjC projects using SQLite + FTS5 index.
+Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swift/ObjC, and Perl projects using SQLite + FTS5 index.
 
 ## Prerequisites
 
@@ -31,9 +31,10 @@ The index is stored at `~/.cache/ast-index/<project-hash>/index.db` and needs re
 |----------|-----------|---------------|
 | Android | Kotlin, Java | Gradle (build.gradle.kts) |
 | iOS | Swift, Objective-C | SPM (Package.swift) |
-| Mixed | All above | Both |
+| Perl | Perl | Makefile.PL, Build.PL |
+| Mixed | All above | All |
 
-Project type is auto-detected by marker files (build.gradle.kts, Package.swift, etc.).
+Project type is auto-detected by marker files (build.gradle.kts, Package.swift, Makefile.PL, etc.).
 
 ## Core Commands
 
@@ -272,6 +273,19 @@ For Storyboard, Assets, SwiftUI, and Concurrency commands, consult: `references/
 - **SwiftUI**: `swiftui` - Find @State, @Binding, @Published properties
 - **Swift Concurrency**: `async-funcs`, `main-actor` - Find async/await patterns
 - **Combine**: `publishers` - Find Combine publishers
+
+### Perl
+
+For Perl-specific commands, consult: `references/perl-commands.md`
+
+- **Exports**: `perl-exports` - Find @EXPORT and @EXPORT_OK definitions
+- **Subroutines**: `perl-subs` - Find all subroutine definitions
+- **POD**: `perl-pod` - Find POD documentation sections (=head1, =item, etc.)
+- **Tests**: `perl-tests` - Find Test::More assertions (ok, is, like, etc.)
+- **Imports**: `perl-imports` - Find use/require statements
+- **Indexed Symbols**: `package`, `sub`, `use constant`, `our` variables
+- **Inheritance**: `use base`, `use parent`, `@ISA` relationships
+- **Modules**: Perl packages indexed as modules for `module` command
 
 ### Module Analysis
 

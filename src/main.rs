@@ -347,6 +347,47 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: usize,
     },
+    // === Perl Commands ===
+    /// Find Perl exported functions (@EXPORT, @EXPORT_OK)
+    PerlExports {
+        /// Filter by module/function name
+        query: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Find Perl subroutines
+    PerlSubs {
+        /// Filter by name
+        query: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Find POD documentation sections
+    PerlPod {
+        /// Filter by heading text
+        query: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Find Perl test assertions (Test::More, Test::Simple)
+    PerlTests {
+        /// Filter by test name or pattern
+        query: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Find Perl use/require statements
+    PerlImports {
+        /// Filter by module name
+        query: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
     /// Show version
     Version,
 }
@@ -405,6 +446,11 @@ fn main() -> Result<()> {
         Commands::AsyncFuncs { query, limit } => cmd_async_funcs(&root, query.as_deref(), limit),
         Commands::Publishers { query, limit } => cmd_publishers(&root, query.as_deref(), limit),
         Commands::MainActor { query, limit } => cmd_main_actor(&root, query.as_deref(), limit),
+        Commands::PerlExports { query, limit } => cmd_perl_exports(&root, query.as_deref(), limit),
+        Commands::PerlSubs { query, limit } => cmd_perl_subs(&root, query.as_deref(), limit),
+        Commands::PerlPod { query, limit } => cmd_perl_pod(&root, query.as_deref(), limit),
+        Commands::PerlTests { query, limit } => cmd_perl_tests(&root, query.as_deref(), limit),
+        Commands::PerlImports { query, limit } => cmd_perl_imports(&root, query.as_deref(), limit),
         Commands::Version => {
             println!("ast-index-rs v{}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -635,7 +681,7 @@ fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 
     let mut count = 0;
 
-    search_files(root, &search_pattern, &["kt", "java", "swift", "m", "h"], |path, line_num, line| {
+    search_files(root, &search_pattern, &["kt", "java", "swift", "m", "h", "pm", "pl", "t"], |path, line_num, line| {
         if count >= limit { return; }
 
         let rel_path = relative_path(root, path);
@@ -678,14 +724,15 @@ fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 
 fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()> {
     let start = Instant::now();
-    let pattern = format!(r"[.>]{function_name}\s*\(|^\s*{function_name}\s*\(");
-    // Skip definitions in Kotlin/Java/Swift
-    let def_pattern = Regex::new(&format!(r"\b(fun|func|def|void|private|public|protected|override|internal|fileprivate|open)\s+{function_name}\s*[<(]"))?;
+    // Pattern for function calls: obj.func(), ->func(), func()
+    let pattern = format!(r"[.>]{function_name}\s*\(|^\s*{function_name}\s*\(|->{function_name}\s*\(|&{function_name}\s*\(");
+    // Skip definitions in Kotlin/Java/Swift/Perl
+    let def_pattern = Regex::new(&format!(r"\b(fun|func|def|void|private|public|protected|override|internal|fileprivate|open|sub)\s+{function_name}\s*[<({{\[]"))?;
 
     let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut count = 0;
 
-    search_files(root, &pattern, &["kt", "java", "swift", "m", "h"], |path, line_num, line| {
+    search_files(root, &pattern, &["kt", "java", "swift", "m", "h", "pm", "pl", "t"], |path, line_num, line| {
         if count >= limit { return; }
         if def_pattern.is_match(&line) { return; } // Skip definitions
 
@@ -865,11 +912,12 @@ fn cmd_composables(root: &Path, query: Option<&str>, limit: usize) -> Result<()>
 fn cmd_deprecated(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
     let start = Instant::now();
     // Kotlin/Java: @Deprecated, Swift: @available(*, deprecated)
-    let pattern = r"@Deprecated|@available\s*\([^)]*deprecated";
+    // Perl: DEPRECATED in comments or POD =head DEPRECATED
+    let pattern = r"@Deprecated|@available\s*\([^)]*deprecated|#.*DEPRECATED|=head.*DEPRECATED";
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
-    search_files(root, pattern, &["kt", "java", "swift", "m", "h"], |path, line_num, line| {
+    search_files(root, pattern, &["kt", "java", "swift", "m", "h", "pm", "pl", "t"], |path, line_num, line| {
         if items.len() >= limit { return; }
 
         if let Some(q) = query {
@@ -962,8 +1010,9 @@ fn cmd_inject(root: &Path, type_name: &str, limit: usize) -> Result<()> {
 
 fn cmd_annotations(root: &Path, annotation: &str, limit: usize) -> Result<()> {
     let start = Instant::now();
-    // Normalize annotation (add @ if missing)
-    let search_annotation = if annotation.starts_with('@') {
+    // Normalize annotation (add @ if missing for Java/Kotlin/Swift/ObjC)
+    // For Perl, attributes are like :lvalue, :method
+    let search_annotation = if annotation.starts_with('@') || annotation.starts_with(':') {
         annotation.to_string()
     } else {
         format!("@{}", annotation)
@@ -972,7 +1021,7 @@ fn cmd_annotations(root: &Path, annotation: &str, limit: usize) -> Result<()> {
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
-    search_files(root, &pattern, &["kt", "java", "swift", "m", "h"], |path, line_num, line| {
+    search_files(root, &pattern, &["kt", "java", "swift", "m", "h", "pm", "pl", "t"], |path, line_num, line| {
         if items.len() >= limit { return; }
 
         let rel_path = relative_path(root, path);
@@ -1558,11 +1607,13 @@ fn cmd_hierarchy(root: &Path, name: &str) -> Result<()> {
 
     let conn = db::open_db(root)?;
 
-    // Find the class
+    // Find the class/interface/package
     let classes = db::find_symbols_by_name(&conn, name, Some("class"), 1)?;
     let interfaces = db::find_symbols_by_name(&conn, name, Some("interface"), 1)?;
+    let packages = db::find_symbols_by_name(&conn, name, Some("package"), 1)?;
+    let protocols = db::find_symbols_by_name(&conn, name, Some("protocol"), 1)?;
 
-    let target = classes.first().or(interfaces.first());
+    let target = classes.first().or(interfaces.first()).or(packages.first()).or(protocols.first());
 
     if target.is_none() {
         println!("{}", format!("Class '{}' not found.", name).red());
@@ -2305,36 +2356,77 @@ fn cmd_outline(root: &Path, file: &str) -> Result<()> {
 
     let content = std::fs::read_to_string(&file_path)?;
 
-    // Parse symbols from file
-    let class_re = Regex::new(r"(?m)^\s*((?:public|private|protected|internal|abstract|open|final|sealed|data)?\s*)(class|interface|object|enum\s+class)\s+(\w+)")?;
-    let fun_re = Regex::new(r"(?m)^\s*((?:public|private|protected|internal|override|suspend)?\s*)fun\s+(?:<[^>]*>\s*)?(\w+)")?;
-    let prop_re = Regex::new(r"(?m)^\s*((?:public|private|protected|internal|override|const|lateinit)?\s*)(val|var)\s+(\w+)")?;
+    // Detect file type
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_perl = ext == "pm" || ext == "pl" || ext == "t";
 
     println!("{}", format!("Outline of {}:", file).bold());
 
     let mut found = false;
-    for (line_num, line) in content.lines().enumerate() {
-        let line_num = line_num + 1;
 
-        if let Some(caps) = class_re.captures(line) {
-            let kind = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            let name = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-            println!("  {} {} [{}]", format!(":{}", line_num).dimmed(), name.cyan(), kind);
-            found = true;
-        }
+    if is_perl {
+        // Perl patterns
+        let package_re = Regex::new(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;")?;
+        let sub_re = Regex::new(r"^\s*sub\s+([A-Za-z_][A-Za-z0-9_]*)")?;
+        let constant_re = Regex::new(r"^\s*use\s+constant\s+([A-Z_][A-Z0-9_]*)\s*=>")?;
+        let our_re = Regex::new(r"^\s*our\s+([\$@%][A-Za-z_][A-Za-z0-9_]*)")?;
 
-        if let Some(caps) = fun_re.captures(line) {
-            let name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            println!("  {} {} [function]", format!(":{}", line_num).dimmed(), name);
-            found = true;
-        }
+        for (line_num, line) in content.lines().enumerate() {
+            let line_num = line_num + 1;
 
-        if let Some(caps) = prop_re.captures(line) {
-            let kind = caps.get(2).map(|m| m.as_str()).unwrap_or("val");
-            let name = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-            if !name.is_empty() && name != "val" && name != "var" {
-                println!("  {} {} [{}]", format!(":{}", line_num).dimmed(), name, kind);
+            if let Some(caps) = package_re.captures(line) {
+                let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                println!("  {} {} [package]", format!(":{}", line_num).dimmed(), name.cyan());
                 found = true;
+            }
+
+            if let Some(caps) = sub_re.captures(line) {
+                let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                println!("  {} {} [sub]", format!(":{}", line_num).dimmed(), name);
+                found = true;
+            }
+
+            if let Some(caps) = constant_re.captures(line) {
+                let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                println!("  {} {} [constant]", format!(":{}", line_num).dimmed(), name);
+                found = true;
+            }
+
+            if let Some(caps) = our_re.captures(line) {
+                let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                println!("  {} {} [our]", format!(":{}", line_num).dimmed(), name);
+                found = true;
+            }
+        }
+    } else {
+        // Kotlin/Java patterns
+        let class_re = Regex::new(r"(?m)^\s*((?:public|private|protected|internal|abstract|open|final|sealed|data)?\s*)(class|interface|object|enum\s+class)\s+(\w+)")?;
+        let fun_re = Regex::new(r"(?m)^\s*((?:public|private|protected|internal|override|suspend)?\s*)fun\s+(?:<[^>]*>\s*)?(\w+)")?;
+        let prop_re = Regex::new(r"(?m)^\s*((?:public|private|protected|internal|override|const|lateinit)?\s*)(val|var)\s+(\w+)")?;
+
+        for (line_num, line) in content.lines().enumerate() {
+            let line_num = line_num + 1;
+
+            if let Some(caps) = class_re.captures(line) {
+                let kind = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                let name = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+                println!("  {} {} [{}]", format!(":{}", line_num).dimmed(), name.cyan(), kind);
+                found = true;
+            }
+
+            if let Some(caps) = fun_re.captures(line) {
+                let name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                println!("  {} {} [function]", format!(":{}", line_num).dimmed(), name);
+                found = true;
+            }
+
+            if let Some(caps) = prop_re.captures(line) {
+                let kind = caps.get(2).map(|m| m.as_str()).unwrap_or("val");
+                let name = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+                if !name.is_empty() && name != "val" && name != "var" {
+                    println!("  {} {} [{}]", format!(":{}", line_num).dimmed(), name, kind);
+                    found = true;
+                }
             }
         }
     }
@@ -2362,14 +2454,37 @@ fn cmd_imports(root: &Path, file: &str) -> Result<()> {
     }
 
     let content = std::fs::read_to_string(&file_path)?;
-    let import_re = Regex::new(r"(?m)^import\s+(.+)")?;
+
+    // Detect file type by extension
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_perl = ext == "pm" || ext == "pl" || ext == "t";
 
     println!("{}", format!("Imports in {}:", file).bold());
 
-    let mut imports: Vec<&str> = vec![];
-    for line in content.lines() {
-        if let Some(caps) = import_re.captures(line) {
-            imports.push(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
+    let mut imports: Vec<String> = vec![];
+
+    if is_perl {
+        // Perl: use Module; or require Module;
+        let use_re = Regex::new(r"^\s*(use|require)\s+([A-Za-z][A-Za-z0-9_:]*)")?;
+        for line in content.lines() {
+            if let Some(caps) = use_re.captures(line) {
+                let keyword = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                let module = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                // Skip pragmas
+                if module != "strict" && module != "warnings" && module != "utf8" &&
+                   module != "constant" && module != "base" && module != "parent" &&
+                   !module.starts_with("v5") && !module.starts_with("5.") {
+                    imports.push(format!("{} {}", keyword, module));
+                }
+            }
+        }
+    } else {
+        // Kotlin/Java/Swift: import statement
+        let import_re = Regex::new(r"(?m)^import\s+(.+)")?;
+        for line in content.lines() {
+            if let Some(caps) = import_re.captures(line) {
+                imports.push(caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string());
+            }
         }
     }
 
@@ -2444,11 +2559,15 @@ fn cmd_changed(root: &Path, base: &str) -> Result<()> {
 
     let changed_files: Vec<&str> = std::str::from_utf8(&output.stdout)?
         .lines()
-        .filter(|f| f.ends_with(".kt") || f.ends_with(".java"))
+        .filter(|f| {
+            f.ends_with(".kt") || f.ends_with(".java") ||
+            f.ends_with(".swift") || f.ends_with(".m") || f.ends_with(".h") ||
+            f.ends_with(".pm") || f.ends_with(".pl") || f.ends_with(".t")
+        })
         .collect();
 
     if changed_files.is_empty() {
-        println!("No Kotlin/Java files changed since {}", base);
+        println!("No supported files changed since {}", base);
         return Ok(());
     }
 
@@ -3108,6 +3227,214 @@ fn cmd_main_actor(root: &Path, query: Option<&str>, limit: usize) -> Result<()> 
     println!(
         "{}",
         format!("@MainActor usages ({}):", results.len()).bold()
+    );
+
+    for (path, line_num, content) in &results {
+        println!("  {}:{}", path.cyan(), line_num);
+        println!("    {}", content);
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+// === Perl Commands ===
+
+fn cmd_perl_exports(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    let start = Instant::now();
+
+    // Search for @EXPORT and @EXPORT_OK definitions
+    let pattern = r"our\s+@EXPORT|our\s+@EXPORT_OK|@EXPORT\s*=|@EXPORT_OK\s*=";
+
+    let mut results: Vec<(String, usize, String)> = vec![];
+
+    search_files(root, pattern, &["pm"], |path, line_num, line| {
+        if results.len() >= limit {
+            return;
+        }
+
+        if let Some(q) = query {
+            if !line.to_lowercase().contains(&q.to_lowercase()) {
+                return;
+            }
+        }
+
+        let rel_path = relative_path(root, path);
+        let content: String = line.trim().chars().take(100).collect();
+        results.push((rel_path, line_num, content));
+    })?;
+
+    println!(
+        "{}",
+        format!("Perl exports ({}):", results.len()).bold()
+    );
+
+    for (path, line_num, content) in &results {
+        println!("  {}:{}", path.cyan(), line_num);
+        println!("    {}", content);
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+fn cmd_perl_subs(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    let start = Instant::now();
+
+    // Search for sub definitions
+    let pattern = r"^\s*sub\s+\w+";
+
+    let mut results: Vec<(String, usize, String)> = vec![];
+
+    search_files(root, pattern, &["pm", "pl", "t"], |path, line_num, line| {
+        if results.len() >= limit {
+            return;
+        }
+
+        if let Some(q) = query {
+            if !line.to_lowercase().contains(&q.to_lowercase()) {
+                return;
+            }
+        }
+
+        let rel_path = relative_path(root, path);
+        let content: String = line.trim().chars().take(80).collect();
+        results.push((rel_path, line_num, content));
+    })?;
+
+    println!(
+        "{}",
+        format!("Perl subroutines ({}):", results.len()).bold()
+    );
+
+    for (path, line_num, content) in &results {
+        println!("  {}:{}", path.cyan(), line_num);
+        println!("    {}", content);
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+fn cmd_perl_pod(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    let start = Instant::now();
+
+    // Search for POD documentation sections
+    // =head1, =head2, =head3, =head4, =item, =over, =back, =pod, =cut, =begin, =end
+    let pattern = r"^=(head[1-4]|item|over|back|pod|cut|begin|end|for)\b";
+
+    let mut results: Vec<(String, usize, String)> = vec![];
+
+    search_files(root, pattern, &["pm", "pl", "pod"], |path, line_num, line| {
+        if results.len() >= limit {
+            return;
+        }
+
+        if let Some(q) = query {
+            if !line.to_lowercase().contains(&q.to_lowercase()) {
+                return;
+            }
+        }
+
+        let rel_path = relative_path(root, path);
+        let content: String = line.trim().chars().take(100).collect();
+        results.push((rel_path, line_num, content));
+    })?;
+
+    println!(
+        "{}",
+        format!("POD documentation ({}):", results.len()).bold()
+    );
+
+    for (path, line_num, content) in &results {
+        println!("  {}:{}", path.cyan(), line_num);
+        println!("    {}", content);
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+fn cmd_perl_tests(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    let start = Instant::now();
+
+    // Search for Test::More and Test::Simple assertions
+    // ok(), is(), isnt(), like(), unlike(), cmp_ok(), is_deeply(), diag(), pass(), fail()
+    // subtest, plan, done_testing, SKIP, TODO
+    let pattern = r"\b(ok|is|isnt|like|unlike|cmp_ok|is_deeply|diag|pass|fail|subtest|plan|done_testing|SKIP|TODO)\s*[\(\{]";
+
+    let mut results: Vec<(String, usize, String)> = vec![];
+
+    search_files(root, pattern, &["t", "pm", "pl"], |path, line_num, line| {
+        if results.len() >= limit {
+            return;
+        }
+
+        if let Some(q) = query {
+            if !line.to_lowercase().contains(&q.to_lowercase()) {
+                return;
+            }
+        }
+
+        let rel_path = relative_path(root, path);
+        let content: String = line.trim().chars().take(100).collect();
+        results.push((rel_path, line_num, content));
+    })?;
+
+    println!(
+        "{}",
+        format!("Perl tests ({}):", results.len()).bold()
+    );
+
+    for (path, line_num, content) in &results {
+        println!("  {}:{}", path.cyan(), line_num);
+        println!("    {}", content);
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+fn cmd_perl_imports(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    let start = Instant::now();
+
+    // Search for use/require statements
+    let pattern = r"^\s*(use|require)\s+[A-Za-z]";
+
+    let mut results: Vec<(String, usize, String)> = vec![];
+
+    search_files(root, pattern, &["pm", "pl", "t"], |path, line_num, line| {
+        if results.len() >= limit {
+            return;
+        }
+
+        // Skip 'use strict', 'use warnings', 'use constant', 'use base', 'use parent'
+        let trimmed = line.trim();
+        if trimmed.starts_with("use strict") ||
+           trimmed.starts_with("use warnings") ||
+           trimmed.starts_with("use constant") ||
+           trimmed.starts_with("use base") ||
+           trimmed.starts_with("use parent") ||
+           trimmed.starts_with("use utf8") ||
+           trimmed.starts_with("use v5") ||
+           trimmed.starts_with("use 5.") {
+            return;
+        }
+
+        if let Some(q) = query {
+            if !line.to_lowercase().contains(&q.to_lowercase()) {
+                return;
+            }
+        }
+
+        let rel_path = relative_path(root, path);
+        let content: String = line.trim().chars().take(100).collect();
+        results.push((rel_path, line_num, content));
+    })?;
+
+    println!(
+        "{}",
+        format!("Perl imports ({}):", results.len()).bold()
     );
 
     for (path, line_num, content) in &results {

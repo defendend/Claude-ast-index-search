@@ -264,6 +264,9 @@ pub enum SymbolKind {
     Function,
     Property,
     TypeAlias,
+    // Perl-specific
+    Package,
+    Constant,
 }
 
 impl SymbolKind {
@@ -276,6 +279,8 @@ impl SymbolKind {
             SymbolKind::Function => "function",
             SymbolKind::Property => "property",
             SymbolKind::TypeAlias => "typealias",
+            SymbolKind::Package => "package",
+            SymbolKind::Constant => "constant",
         }
     }
 }
@@ -506,7 +511,7 @@ pub fn find_class_like(
         SELECT s.name, s.kind, s.line, s.signature, f.path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE s.name = ?1 AND s.kind IN ('class', 'interface', 'object', 'enum')
+        WHERE s.name = ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
         LIMIT ?2
         "#,
     )?;
