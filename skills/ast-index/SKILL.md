@@ -349,3 +349,14 @@ To search effectively in a codebase:
 6. Use `ast-index changed --base main` before code review
 7. Run `ast-index update` periodically to keep index fresh
 8. Consult platform-specific references for specialized commands
+
+## Additional Resources
+
+### Reference Files
+
+For detailed platform-specific commands, consult:
+
+- **`references/android-commands.md`** - DI (Dagger), Compose, Coroutines, XML/Resource commands
+- **`references/ios-commands.md`** - Storyboard, SwiftUI, Swift Concurrency, Combine commands
+- **`references/perl-commands.md`** - Perl exports, subs, POD, tests, imports
+- **`references/module-commands.md`** - Module search, dependencies, unused deps analysis
