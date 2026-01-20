@@ -132,6 +132,30 @@ ast-index callers "fetchUser"        # Find API call sites
 
 Returns: File path, line number, and context for each call site. Performance: ~1s (grep-based).
 
+### Call Tree (v3.6.2)
+
+**`call-tree`** - Show complete call hierarchy going UP (who calls the callers). Essential for understanding how a function is reached.
+
+```bash
+ast-index call-tree "processPayment" --depth 3 --limit 10
+```
+
+Output:
+```
+Call tree for 'processPayment':
+  processPayment
+    ← handlePayment (PaymentPresenter.kt:45)
+      ← onPayButtonClick (CheckoutFragment.kt:112)
+        ← onClick (CheckoutFragment.kt:89)
+    ← retryPayment (PaymentRetryInteractor.kt:33)
+```
+
+Options:
+- `--depth N` - Maximum depth of the tree (default: 3)
+- `--limit N` - Maximum callers per level (default: 10)
+
+Works across Kotlin, Java, Swift, Objective-C, and Perl.
+
 ### Import Analysis
 
 **`imports`** - List all imports in a specific file. Useful for understanding file dependencies.
@@ -245,7 +269,10 @@ Returns: Public symbols organized by type.
 ```bash
 ast-index rebuild                    # Full rebuild with dependencies
 ast-index rebuild --no-deps          # Skip module dependency indexing
+ast-index rebuild --no-ignore        # Include gitignored files (build/ directories)
 ```
+
+The `--no-ignore` flag (v3.6.2) indexes files in gitignored directories like `build/`, useful for finding generated code like `BuildConfig.java`.
 
 **`update`** - Incremental index update. Faster than rebuild, only processes changed files.
 
@@ -305,6 +332,7 @@ For module dependency analysis, consult: `references/module-commands.md`
 | imports | ~0.3ms | File-based lookup |
 | deps/dependents | ~2ms | Module graph traversal |
 | callers | ~1s | Grep-based search |
+| call-tree | ~5-20s | Recursive grep + file read |
 | todo | ~0.8s | Grep-based search |
 | rebuild | ~25s | Full project indexing |
 | update | ~1s | Incremental update |
