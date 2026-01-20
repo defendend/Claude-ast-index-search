@@ -1,4 +1,4 @@
-# kotlin-index v3.1.0
+# kotlin-index v3.2.0
 
 Fast code search CLI for Android/Kotlin/Java projects. Native Rust implementation.
 
@@ -35,7 +35,7 @@ kotlin-index implementations Presenter
 kotlin-index usages Repository
 ```
 
-## Commands (34)
+## Commands (36)
 
 ### Grep-based (no index required)
 
@@ -74,8 +74,16 @@ kotlin-index usages <SYMBOL>          # Symbol usages (indexed, ~8ms)
 kotlin-index module <PATTERN>         # Find modules
 kotlin-index deps <MODULE>            # Module dependencies
 kotlin-index dependents <MODULE>      # Dependent modules
-kotlin-index unused-deps <MODULE>     # Find unused dependencies
+kotlin-index unused-deps <MODULE>     # Find unused dependencies (v3.2: +transitive, XML, resources)
 kotlin-index api <MODULE>             # Public API of module
+```
+
+### XML & Resource analysis (new in v3.2)
+
+```bash
+kotlin-index xml-usages <CLASS>       # Find class usages in XML layouts
+kotlin-index resource-usages <RES>    # Find resource usages (@drawable/ic_name, R.string.x)
+kotlin-index resource-usages --unused --module <MODULE>  # Find unused resources
 ```
 
 ### File analysis
@@ -206,9 +214,27 @@ inheritance (child_id, parent_name, kind)
 modules (id, name, path)
 module_deps (module_id, dep_module_id, dep_kind)
 refs (id, file_id, name, line, context)
+
+-- New in v3.2.0:
+xml_usages (id, module_id, file_path, line, class_name, usage_type, element_id)
+resources (id, module_id, type, name, file_path, line)
+resource_usages (id, resource_id, usage_file, usage_line, usage_type)
+transitive_deps (id, module_id, dependency_id, depth, path)
 ```
 
 ## Changelog
+
+### 3.2.0
+- Add `xml-usages` command — find class usages in XML layouts
+- Add `resource-usages` command — find resource usages (drawable, string, color, etc.)
+- Add `resource-usages --unused` — find unused resources in a module
+- Update `unused-deps` with transitive dependency checking (via api deps)
+- Update `unused-deps` with XML layout usage checking
+- Update `unused-deps` with resource usage checking
+- New flags: `--no-transitive`, `--no-xml`, `--no-resources`, `--strict`
+- Index XML layouts (5K+ usages in YandexGo project)
+- Index resources (63K+ resources, 15K+ usages)
+- Build transitive dependency cache (11K+ entries)
 
 ### 3.1.0
 - Add `unused-deps` command — find unused module dependencies
@@ -306,8 +332,8 @@ git pull origin main
 
 # Update cache
 rm -rf ~/.claude/plugins/cache/kotlin-index-marketplace/kotlin-index/*
-mkdir -p ~/.claude/plugins/cache/kotlin-index-marketplace/kotlin-index/3.0.0
-cp -r skills .claude-plugin ~/.claude/plugins/cache/kotlin-index-marketplace/kotlin-index/3.0.0/
+mkdir -p ~/.claude/plugins/cache/kotlin-index-marketplace/kotlin-index/3.2.0
+cp -r skills .claude-plugin ~/.claude/plugins/cache/kotlin-index-marketplace/kotlin-index/3.2.0/
 ```
 
 ### Uninstall Plugin

@@ -223,6 +223,41 @@ enum Commands {
         /// Show details for each dependency
         #[arg(long, short)]
         verbose: bool,
+        /// Skip transitive dependency checking
+        #[arg(long)]
+        no_transitive: bool,
+        /// Skip XML layout checking
+        #[arg(long)]
+        no_xml: bool,
+        /// Skip resource checking
+        #[arg(long)]
+        no_resources: bool,
+        /// Strict mode: only check direct imports (same as --no-transitive --no-xml --no-resources)
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Find class usages in XML layouts
+    XmlUsages {
+        /// Class name to search for
+        class_name: String,
+        /// Filter by module
+        #[arg(long)]
+        module: Option<String>,
+    },
+    /// Find resource usages
+    ResourceUsages {
+        /// Resource name (e.g., @drawable/ic_payment or R.string.app_name). Optional with --unused
+        #[arg(default_value = "")]
+        resource: String,
+        /// Filter by module (required for --unused)
+        #[arg(long)]
+        module: Option<String>,
+        /// Resource type filter (drawable, string, color, etc.)
+        #[arg(long, short = 't')]
+        r#type: Option<String>,
+        /// Show unused resources in a module (requires --module)
+        #[arg(long)]
+        unused: bool,
     },
     /// Find usages of a symbol
     Usages {
@@ -292,7 +327,16 @@ fn main() -> Result<()> {
         Commands::Module { pattern, limit } => cmd_module(&root, &pattern, limit),
         Commands::Deps { module } => cmd_deps(&root, &module),
         Commands::Dependents { module } => cmd_dependents(&root, &module),
-        Commands::UnusedDeps { module, verbose } => cmd_unused_deps(&root, &module, verbose),
+        Commands::UnusedDeps { module, verbose, no_transitive, no_xml, no_resources, strict } => {
+            let check_transitive = !no_transitive && !strict;
+            let check_xml = !no_xml && !strict;
+            let check_resources = !no_resources && !strict;
+            cmd_unused_deps(&root, &module, verbose, check_transitive, check_xml, check_resources)
+        }
+        Commands::XmlUsages { class_name, module } => cmd_xml_usages(&root, &class_name, module.as_deref()),
+        Commands::ResourceUsages { resource, module, r#type, unused } => {
+            cmd_resource_usages(&root, &resource, module.as_deref(), r#type.as_deref(), unused)
+        }
         Commands::Usages { symbol, limit } => cmd_usages(&root, &symbol, limit),
         Commands::Outline { file } => cmd_outline(&root, &file),
         Commands::Imports { file } => cmd_imports(&root, &file),
@@ -1044,19 +1088,27 @@ fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool) -> Result<()> {
             let file_count = indexer::index_directory(&mut conn, root, true)?;
             let module_count = indexer::index_modules(&conn, root)?;
 
+            let mut dep_count = 0;
+            let mut trans_count = 0;
             if index_deps {
                 println!("{}", "Indexing module dependencies...".cyan());
-                let dep_count = indexer::index_module_dependencies(&mut conn, root, true)?;
-                println!(
-                    "{}",
-                    format!("Indexed {} files, {} modules, {} dependencies", file_count, module_count, dep_count).green()
-                );
-            } else {
-                println!(
-                    "{}",
-                    format!("Indexed {} files, {} modules", file_count, module_count).green()
-                );
+                dep_count = indexer::index_module_dependencies(&mut conn, root, true)?;
+                trans_count = indexer::build_transitive_deps(&mut conn, true)?;
             }
+
+            println!("{}", "Indexing XML layouts...".cyan());
+            let xml_count = indexer::index_xml_usages(&mut conn, root, true)?;
+
+            println!("{}", "Indexing resources...".cyan());
+            let (res_count, res_usage_count) = indexer::index_resources(&mut conn, root, true)?;
+
+            println!(
+                "{}",
+                format!(
+                    "Indexed {} files, {} modules, {} deps, {} transitive, {} XML usages, {} resources ({} usages)",
+                    file_count, module_count, dep_count, trans_count, xml_count, res_count, res_usage_count
+                ).green()
+            );
         }
         "files" | "symbols" => {
             println!("{}", "Rebuilding symbols index...".cyan());
@@ -1148,12 +1200,14 @@ fn cmd_stats(root: &Path) -> Result<()> {
         .unwrap_or(0);
 
     println!("{}", "Index Statistics:".bold());
-    println!("  Files:   {}", stats.file_count);
-    println!("  Symbols: {}", stats.symbol_count);
-    println!("  Refs:    {}", stats.refs_count);
-    println!("  Modules: {}", stats.module_count);
-    println!("  DB size: {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
-    println!("  DB path: {}", db_path.display());
+    println!("  Files:      {}", stats.file_count);
+    println!("  Symbols:    {}", stats.symbol_count);
+    println!("  Refs:       {}", stats.refs_count);
+    println!("  Modules:    {}", stats.module_count);
+    println!("  XML usages: {}", stats.xml_usages_count);
+    println!("  Resources:  {}", stats.resources_count);
+    println!("  DB size:    {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
+    println!("  DB path:    {}", db_path.display());
 
     Ok(())
 }
@@ -1551,7 +1605,14 @@ fn cmd_dependents(root: &Path, module: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_unused_deps(root: &Path, module: &str, verbose: bool) -> Result<()> {
+fn cmd_unused_deps(
+    root: &Path,
+    module: &str,
+    verbose: bool,
+    check_transitive: bool,
+    check_xml: bool,
+    check_resources: bool,
+) -> Result<()> {
     let start = Instant::now();
 
     if !db::db_exists(root) {
@@ -1564,19 +1625,19 @@ fn cmd_unused_deps(root: &Path, module: &str, verbose: bool) -> Result<()> {
     // Check if module deps are indexed
     let dep_count: i64 = conn.query_row("SELECT COUNT(*) FROM module_deps", [], |row| row.get(0))?;
     if dep_count == 0 {
-        println!("{}", "Module dependencies not indexed. Run 'kotlin-index rebuild --deps' first.".yellow());
+        println!("{}", "Module dependencies not indexed. Run 'kotlin-index rebuild' first.".yellow());
         return Ok(());
     }
 
-    // Get module path
-    let module_path: Option<String> = conn.query_row(
-        "SELECT path FROM modules WHERE name = ?1",
+    // Get module id and path
+    let module_info: Option<(i64, String)> = conn.query_row(
+        "SELECT id, path FROM modules WHERE name = ?1",
         params![module],
-        |row| row.get(0)
+        |row| Ok((row.get(0)?, row.get(1)?))
     ).ok();
 
-    let module_path = match module_path {
-        Some(p) => p,
+    let (module_id, module_path) = match module_info {
+        Some((id, p)) => (id, p),
         None => {
             println!("{}", format!("Module '{}' not found in index.", module).red());
             return Ok(());
@@ -1591,83 +1652,282 @@ fn cmd_unused_deps(root: &Path, module: &str, verbose: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{}", format!("Analyzing {} dependencies of '{}'...\n", deps.len(), module).bold());
+    println!("{}", format!("Analyzing {} dependencies of '{}'...", deps.len(), module).bold());
+    if check_transitive || check_xml || check_resources {
+        let checks: Vec<&str> = [
+            if check_transitive { Some("transitive") } else { None },
+            if check_xml { Some("XML") } else { None },
+            if check_resources { Some("resources") } else { None },
+        ].into_iter().flatten().collect();
+        println!("  Checking: direct imports + {}\n", checks.join(", "));
+    } else {
+        println!("  Checking: direct imports only (strict mode)\n");
+    }
 
     let module_dir = root.join(&module_path);
 
+    // Results tracking
+    #[derive(Default)]
+    struct DepUsage {
+        direct_count: usize,
+        direct_symbols: Vec<String>,
+        transitive_count: usize,
+        transitive_via: Vec<(String, Vec<String>)>, // (intermediate_module, symbols)
+        xml_count: usize,
+        xml_usages: Vec<(String, i64)>, // (class_name, line)
+        resource_count: usize,
+        resource_usages: Vec<(String, String)>, // (resource_name, usage_type)
+    }
+
+    let mut dep_usages: HashMap<String, DepUsage> = HashMap::new();
     let mut unused: Vec<(String, String, String)> = vec![];
-    let mut used: Vec<(String, String, String, usize)> = vec![];
+    let mut used_direct: Vec<(String, String, String, usize)> = vec![];
+    let mut used_transitive: Vec<(String, String, String, usize)> = vec![];
+    let mut used_xml: Vec<(String, String, String, usize)> = vec![];
+    let mut used_resources: Vec<(String, String, String, usize)> = vec![];
 
     for (dep_name, dep_path, dep_kind) in &deps {
-        // Get public symbols from dependency
+        let mut usage = DepUsage::default();
+
+        // 1. Check direct usage
         let dep_symbols = get_module_public_symbols(&conn, root, dep_path)?;
 
-        if dep_symbols.is_empty() {
-            // Can't analyze - no symbols found
-            if verbose {
-                println!("  {} {} - no public symbols found", "?".yellow(), dep_name);
-            }
-            continue;
-        }
-
-        // Check how many symbols are used in the module
-        let mut usage_count = 0;
-        let mut used_symbols: Vec<String> = vec![];
-
         for symbol in &dep_symbols {
-            // Check if symbol is used in module files
             if is_symbol_used_in_module(root, &module_dir, symbol)? {
-                usage_count += 1;
-                if used_symbols.len() < 3 {
-                    used_symbols.push(symbol.clone());
+                usage.direct_count += 1;
+                if usage.direct_symbols.len() < 3 {
+                    usage.direct_symbols.push(symbol.clone());
                 }
             }
         }
 
-        if usage_count == 0 {
-            unused.push((dep_name.clone(), dep_path.clone(), dep_kind.clone()));
-        } else {
-            used.push((dep_name.clone(), dep_path.clone(), dep_kind.clone(), usage_count));
+        // 2. Check transitive usage (via api dependencies)
+        if check_transitive && usage.direct_count == 0 {
+            // Get transitive paths for this dependency
+            let mut stmt = conn.prepare(
+                "SELECT td.path FROM transitive_deps td
+                 JOIN modules m ON td.dependency_id = m.id
+                 WHERE td.module_id = ?1 AND m.name = ?2 AND td.depth > 1"
+            )?;
+
+            let paths: Vec<String> = stmt
+                .query_map(params![module_id, dep_name], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for path in paths {
+                // Parse the path (e.g., "A -> B -> C")
+                let parts: Vec<&str> = path.split(" -> ").collect();
+                if parts.len() >= 2 {
+                    let via_module = parts[1];
+                    // Check if any symbols from dep are re-exported via the intermediate module
+                    for symbol in &dep_symbols {
+                        if is_symbol_used_in_module(root, &module_dir, symbol)? {
+                            usage.transitive_count += 1;
+                            let entry = usage.transitive_via.iter_mut()
+                                .find(|(m, _)| m == via_module);
+                            if let Some((_, symbols)) = entry {
+                                if symbols.len() < 3 {
+                                    symbols.push(symbol.clone());
+                                }
+                            } else {
+                                usage.transitive_via.push((via_module.to_string(), vec![symbol.clone()]));
+                            }
+                            break; // Found transitive usage
+                        }
+                    }
+                }
+            }
         }
 
-        if verbose {
-            if usage_count == 0 {
-                println!("  {} {} - 0/{} symbols used", "✗".red(), dep_name, dep_symbols.len());
+        // 3. Check XML usages
+        if check_xml && usage.direct_count == 0 && usage.transitive_count == 0 {
+            // Get classes from the dependency module
+            let mut class_stmt = conn.prepare(
+                "SELECT DISTINCT s.name FROM symbols s
+                 JOIN files f ON s.file_id = f.id
+                 WHERE f.path LIKE ?1 AND s.kind IN ('class', 'object')
+                 LIMIT 50"
+            )?;
+            let dep_pattern = format!("{}%", dep_path);
+            let classes: Vec<String> = class_stmt
+                .query_map(params![dep_pattern], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // Check if any class is used in XML layouts of the target module
+            for class_name in &classes {
+                let mut xml_stmt = conn.prepare(
+                    "SELECT x.file_path, x.line FROM xml_usages x
+                     JOIN modules m ON x.module_id = m.id
+                     WHERE m.id = ?1 AND x.class_name LIKE ?2"
+                )?;
+                let class_pattern = format!("%{}", class_name);
+                let xml_results: Vec<(String, i64)> = xml_stmt
+                    .query_map(params![module_id, class_pattern], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                for (file_path, line) in xml_results {
+                    usage.xml_count += 1;
+                    if usage.xml_usages.len() < 3 {
+                        usage.xml_usages.push((class_name.clone(), line));
+                    }
+                }
+            }
+        }
+
+        // 4. Check resource usages
+        if check_resources && usage.direct_count == 0 && usage.transitive_count == 0 && usage.xml_count == 0 {
+            // Get resources defined in the dependency module
+            let mut res_stmt = conn.prepare(
+                "SELECT r.type, r.name FROM resources r
+                 JOIN modules m ON r.module_id = m.id
+                 WHERE m.name = ?1
+                 LIMIT 100"
+            )?;
+            let resources: Vec<(String, String)> = res_stmt
+                .query_map(params![dep_name], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // Check if these resources are used in the target module
+            for (res_type, res_name) in &resources {
+                let mut usage_stmt = conn.prepare(
+                    "SELECT ru.usage_type FROM resource_usages ru
+                     JOIN resources r ON ru.resource_id = r.id
+                     WHERE r.type = ?1 AND r.name = ?2
+                     AND ru.usage_file LIKE ?3"
+                )?;
+                let module_pattern = format!("{}%", module_path);
+                let usages: Vec<String> = usage_stmt
+                    .query_map(params![res_type, res_name, module_pattern], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                if !usages.is_empty() {
+                    usage.resource_count += usages.len();
+                    if usage.resource_usages.len() < 3 {
+                        usage.resource_usages.push((
+                            format!("@{}/{}", res_type, res_name),
+                            usages.first().cloned().unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Categorize the dependency
+        let total_usage = usage.direct_count + usage.transitive_count + usage.xml_count + usage.resource_count;
+
+        if total_usage == 0 {
+            unused.push((dep_name.clone(), dep_path.clone(), dep_kind.clone()));
+        } else if usage.direct_count > 0 {
+            used_direct.push((dep_name.clone(), dep_path.clone(), dep_kind.clone(), usage.direct_count));
+        } else if usage.transitive_count > 0 {
+            used_transitive.push((dep_name.clone(), dep_path.clone(), dep_kind.clone(), usage.transitive_count));
+        } else if usage.xml_count > 0 {
+            used_xml.push((dep_name.clone(), dep_path.clone(), dep_kind.clone(), usage.xml_count));
+        } else if usage.resource_count > 0 {
+            used_resources.push((dep_name.clone(), dep_path.clone(), dep_kind.clone(), usage.resource_count));
+        }
+
+        dep_usages.insert(dep_name.clone(), usage);
+    }
+
+    // Output results
+    if verbose {
+        println!("{}", "=== Direct Usage ===".cyan().bold());
+        for (name, _, _, count) in &used_direct {
+            let usage = dep_usages.get(name).unwrap();
+            let symbols_str = if usage.direct_symbols.is_empty() {
+                String::new()
             } else {
-                let symbols_str = if used_symbols.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", used_symbols.join(", "))
-                };
-                println!("  {} {} - {}/{} symbols used{}", "✓".green(), dep_name, usage_count, dep_symbols.len(), symbols_str);
+                format!(": {}", usage.direct_symbols.join(", "))
+            };
+            println!("  {} {} - {} symbols{}", "✓".green(), name, count, symbols_str);
+        }
+        if used_direct.is_empty() {
+            println!("  (none)");
+        }
+
+        if check_transitive {
+            println!("\n{}", "=== Transitive Usage ===".cyan().bold());
+            for (name, _, _, count) in &used_transitive {
+                let usage = dep_usages.get(name).unwrap();
+                println!("  {} {} - {} symbols", "✓".green(), name, count);
+                for (via, symbols) in &usage.transitive_via {
+                    println!("    └─ via {}: {}", via, symbols.join(", "));
+                }
+            }
+            if used_transitive.is_empty() {
+                println!("  (none)");
+            }
+        }
+
+        if check_xml {
+            println!("\n{}", "=== XML Usage ===".cyan().bold());
+            for (name, _, _, count) in &used_xml {
+                let usage = dep_usages.get(name).unwrap();
+                println!("  {} {} - {} usages", "✓".green(), name, count);
+                for (class, line) in &usage.xml_usages {
+                    println!("    └─ {}:{}", class, line);
+                }
+            }
+            if used_xml.is_empty() {
+                println!("  (none)");
+            }
+        }
+
+        if check_resources {
+            println!("\n{}", "=== Resource Usage ===".cyan().bold());
+            for (name, _, _, count) in &used_resources {
+                let usage = dep_usages.get(name).unwrap();
+                println!("  {} {} - {} usages", "✓".green(), name, count);
+                for (res, usage_type) in &usage.resource_usages {
+                    println!("    └─ {} ({})", res, usage_type);
+                }
+            }
+            if used_resources.is_empty() {
+                println!("  (none)");
             }
         }
     }
 
     // Summary
-    println!("\n{}", "=== Summary ===".bold());
-
+    println!("\n{}", "=== Unused ===".red().bold());
     if !unused.is_empty() {
-        println!("\n{} ({}):", "Potentially unused dependencies".red().bold(), unused.len());
         for (name, path, kind) in &unused {
-            println!("  {} {} ({})", "⚠".yellow(), name, kind);
-            println!("    path: {}", path);
+            println!("  {} {} ({})", "✗".red(), name, kind);
+            if verbose {
+                println!("    - No direct imports");
+                if check_transitive { println!("    - No transitive usage"); }
+                if check_xml { println!("    - No XML usage"); }
+                if check_resources { println!("    - No resource usage"); }
+            }
         }
+    } else {
+        println!("  (none - all dependencies are used)");
     }
 
-    if !used.is_empty() && verbose {
-        println!("\n{} ({}):", "Used dependencies".green(), used.len());
-        for (name, _path, kind, count) in &used {
-            println!("  {} {} ({}) - {} symbols", "✓".green(), name, kind, count);
-        }
-    }
-
-    println!("\n{}", format!(
+    println!("\n{}", "=== Summary ===".bold());
+    let total_used = used_direct.len() + used_transitive.len() + used_xml.len() + used_resources.len();
+    println!(
         "Total: {} unused, {} used of {} dependencies",
         unused.len(),
-        used.len(),
+        total_used,
         deps.len()
-    ).bold());
+    );
+    println!("  - Direct: {}", used_direct.len());
+    if check_transitive {
+        println!("  - Transitive: {}", used_transitive.len());
+    }
+    if check_xml {
+        println!("  - XML: {}", used_xml.len());
+    }
+    if check_resources {
+        println!("  - Resources: {}", used_resources.len());
+    }
 
     eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     Ok(())
@@ -2047,4 +2307,261 @@ fn cmd_changed(root: &Path, base: &str) -> Result<()> {
 
     eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     Ok(())
+}
+
+// === New v3.2.0 Commands ===
+
+fn cmd_xml_usages(root: &Path, class_name: &str, module_filter: Option<&str>) -> Result<()> {
+    let start = Instant::now();
+
+    if !db::db_exists(root) {
+        println!("{}", "Index not found. Run 'kotlin-index rebuild' first.".red());
+        return Ok(());
+    }
+
+    let conn = db::open_db(root)?;
+
+    // Check if XML usages are indexed
+    let xml_count: i64 = conn.query_row("SELECT COUNT(*) FROM xml_usages", [], |row| row.get(0))?;
+    if xml_count == 0 {
+        println!("{}", "XML usages not indexed. Run 'kotlin-index rebuild' first.".yellow());
+        return Ok(());
+    }
+
+    // Search for class in XML usages
+    let pattern = format!("%{}%", class_name);
+
+    let results: Vec<(String, String, i64, String, Option<String>)> = if let Some(module) = module_filter {
+        let mut stmt = conn.prepare(
+            "SELECT m.name, x.file_path, x.line, x.class_name, x.element_id
+             FROM xml_usages x
+             JOIN modules m ON x.module_id = m.id
+             WHERE x.class_name LIKE ?1 AND m.name = ?2
+             ORDER BY m.name, x.file_path, x.line"
+        )?;
+        let rows = stmt.query_map(params![pattern, module], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT m.name, x.file_path, x.line, x.class_name, x.element_id
+             FROM xml_usages x
+             JOIN modules m ON x.module_id = m.id
+             WHERE x.class_name LIKE ?1
+             ORDER BY m.name, x.file_path, x.line
+             LIMIT 100"
+        )?;
+        let rows = stmt.query_map(params![pattern], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    println!("{}", format!("XML usages of '{}' ({}):", class_name, results.len()).bold());
+
+    // Group by module
+    let mut by_module: HashMap<String, Vec<(String, i64, String, Option<String>)>> = HashMap::new();
+    for (module, file, line, class, element_id) in results {
+        by_module.entry(module).or_default().push((file, line, class, element_id));
+    }
+
+    for (module, usages) in &by_module {
+        println!("\n{}:", module.cyan());
+        for (file, line, class, element_id) in usages {
+            let id_str = element_id.as_ref()
+                .map(|id| format!(" ({})", id))
+                .unwrap_or_default();
+            println!("  {}:{}", file, line);
+            println!("    <{} ...{} />", class, id_str);
+        }
+    }
+
+    if by_module.is_empty() {
+        println!("  No XML usages found.");
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+fn cmd_resource_usages(
+    root: &Path,
+    resource: &str,
+    module_filter: Option<&str>,
+    type_filter: Option<&str>,
+    show_unused: bool,
+) -> Result<()> {
+    let start = Instant::now();
+
+    if !db::db_exists(root) {
+        println!("{}", "Index not found. Run 'kotlin-index rebuild' first.".red());
+        return Ok(());
+    }
+
+    let conn = db::open_db(root)?;
+
+    // Check if resources are indexed
+    let res_count: i64 = conn.query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))?;
+    if res_count == 0 {
+        println!("{}", "Resources not indexed. Run 'kotlin-index rebuild' first.".yellow());
+        return Ok(());
+    }
+
+    if show_unused {
+        // Show unused resources in the module
+        let module = module_filter.unwrap_or("");
+        if module.is_empty() {
+            println!("{}", "Please specify --module to find unused resources.".yellow());
+            return Ok(());
+        }
+    } else if resource.is_empty() {
+        println!("{}", "Please specify a resource name (e.g., @drawable/ic_payment or use --unused).".yellow());
+        return Ok(());
+    }
+
+    if show_unused {
+        let module = module_filter.unwrap_or("");
+        println!("{}", format!("Unused resources in '{}':", module).bold());
+
+        // Find resources defined in module that have no usages
+        let mut stmt = conn.prepare(
+            "SELECT r.type, r.name, r.file_path
+             FROM resources r
+             JOIN modules m ON r.module_id = m.id
+             LEFT JOIN resource_usages ru ON r.id = ru.resource_id
+             WHERE m.name = ?1 AND ru.id IS NULL
+             ORDER BY r.type, r.name"
+        )?;
+
+        let unused: Vec<(String, String, String)> = stmt
+            .query_map(params![module], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Group by type
+        let mut by_type: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (rtype, name, path) in unused {
+            if type_filter.map(|t| t == rtype).unwrap_or(true) {
+                by_type.entry(rtype).or_default().push((name, path));
+            }
+        }
+
+        let mut total = 0;
+        for (rtype, items) in &by_type {
+            println!("\n{} ({}):", rtype.cyan(), items.len());
+            for (name, path) in items.iter().take(10) {
+                println!("  {} @{}/{}", "⚠".yellow(), rtype, name);
+                println!("    defined in: {}", path);
+            }
+            if items.len() > 10 {
+                println!("  ... and {} more", items.len() - 10);
+            }
+            total += items.len();
+        }
+
+        println!("\n{}", format!("Total unused: {} resources", total).bold());
+
+    } else {
+        // Parse resource reference (e.g., @drawable/ic_payment or R.string.app_name)
+        let (res_type, res_name) = parse_resource_reference(resource);
+
+        let res_type = type_filter.unwrap_or(&res_type);
+
+        println!("{}", format!("Usages of '@{}/{}':", res_type, res_name).bold());
+
+        // Find resource usages
+        let results: Vec<(String, i64, String)> = if let Some(module) = module_filter {
+            let mut stmt = conn.prepare(
+                "SELECT ru.usage_file, ru.usage_line, ru.usage_type
+                 FROM resource_usages ru
+                 JOIN resources r ON ru.resource_id = r.id
+                 WHERE r.type = ?1 AND r.name = ?2 AND ru.usage_file LIKE ?3
+                 ORDER BY ru.usage_file, ru.usage_line
+                 LIMIT 100"
+            )?;
+            let module_pattern = format!("%{}%", module);
+            let rows = stmt.query_map(params![res_type, res_name, module_pattern], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT ru.usage_file, ru.usage_line, ru.usage_type
+                 FROM resource_usages ru
+                 JOIN resources r ON ru.resource_id = r.id
+                 WHERE r.type = ?1 AND r.name = ?2
+                 ORDER BY ru.usage_file, ru.usage_line
+                 LIMIT 100"
+            )?;
+            let rows = stmt.query_map(params![res_type, res_name], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        // Group by usage type
+        let code_usages: Vec<_> = results.iter().filter(|(_, _, t)| t == "code").collect();
+        let xml_usages: Vec<_> = results.iter().filter(|(_, _, t)| t == "xml").collect();
+
+        if !code_usages.is_empty() {
+            println!("\n{} ({}):", "Kotlin/Java".cyan(), code_usages.len());
+            for (file, line, _) in code_usages.iter().take(10) {
+                println!("  {}:{}", file, line);
+            }
+            if code_usages.len() > 10 {
+                println!("  ... and {} more", code_usages.len() - 10);
+            }
+        }
+
+        if !xml_usages.is_empty() {
+            println!("\n{} ({}):", "XML".cyan(), xml_usages.len());
+            for (file, line, _) in xml_usages.iter().take(10) {
+                println!("  {}:{}", file, line);
+            }
+            if xml_usages.len() > 10 {
+                println!("  ... and {} more", xml_usages.len() - 10);
+            }
+        }
+
+        if results.is_empty() {
+            println!("  No usages found.");
+        } else {
+            println!("\n{}", format!("Total: {} usages", results.len()).bold());
+        }
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+/// Parse resource reference like @drawable/ic_name or R.string.name
+fn parse_resource_reference(resource: &str) -> (String, String) {
+    // Format: @type/name
+    if resource.starts_with('@') {
+        let parts: Vec<&str> = resource[1..].splitn(2, '/').collect();
+        if parts.len() == 2 {
+            return (parts[0].to_string(), parts[1].to_string());
+        }
+    }
+
+    // Format: R.type.name
+    if resource.starts_with("R.") {
+        let parts: Vec<&str> = resource[2..].splitn(2, '.').collect();
+        if parts.len() == 2 {
+            return (parts[0].to_string(), parts[1].to_string());
+        }
+    }
+
+    // Assume it's just a name, try to guess type from prefix
+    let resource = resource.trim_start_matches('@');
+    if resource.starts_with("ic_") || resource.starts_with("img_") {
+        return ("drawable".to_string(), resource.to_string());
+    }
+    if resource.starts_with("color_") {
+        return ("color".to_string(), resource.to_string());
+    }
+
+    // Default: assume it's a string resource
+    ("string".to_string(), resource.to_string())
 }

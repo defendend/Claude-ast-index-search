@@ -121,6 +121,58 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name);
         CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);
+
+        -- XML usages (classes used in XML layouts)
+        CREATE TABLE IF NOT EXISTS xml_usages (
+            id INTEGER PRIMARY KEY,
+            module_id INTEGER,
+            file_path TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            class_name TEXT NOT NULL,
+            usage_type TEXT,
+            element_id TEXT,
+            FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_xml_usages_class ON xml_usages(class_name);
+        CREATE INDEX IF NOT EXISTS idx_xml_usages_module ON xml_usages(module_id);
+
+        -- Resources definitions
+        CREATE TABLE IF NOT EXISTS resources (
+            id INTEGER PRIMARY KEY,
+            module_id INTEGER,
+            type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            line INTEGER,
+            FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_resources_name ON resources(name);
+        CREATE INDEX IF NOT EXISTS idx_resources_type ON resources(type);
+        CREATE INDEX IF NOT EXISTS idx_resources_module ON resources(module_id);
+
+        -- Resource usages
+        CREATE TABLE IF NOT EXISTS resource_usages (
+            id INTEGER PRIMARY KEY,
+            resource_id INTEGER,
+            usage_file TEXT NOT NULL,
+            usage_line INTEGER NOT NULL,
+            usage_type TEXT,
+            FOREIGN KEY (resource_id) REFERENCES resources(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_resource_usages_resource ON resource_usages(resource_id);
+
+        -- Transitive dependencies cache
+        CREATE TABLE IF NOT EXISTS transitive_deps (
+            id INTEGER PRIMARY KEY,
+            module_id INTEGER NOT NULL,
+            dependency_id INTEGER NOT NULL,
+            depth INTEGER NOT NULL,
+            path TEXT,
+            FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE,
+            FOREIGN KEY (dependency_id) REFERENCES modules(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_transitive_deps_module ON transitive_deps(module_id);
+        CREATE INDEX IF NOT EXISTS idx_transitive_deps_dep ON transitive_deps(dependency_id);
         "#,
     )?;
     Ok(())
@@ -475,12 +527,16 @@ pub fn get_stats(conn: &Connection) -> Result<DbStats> {
     let symbol_count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
     let module_count: i64 = conn.query_row("SELECT COUNT(*) FROM modules", [], |row| row.get(0))?;
     let refs_count: i64 = conn.query_row("SELECT COUNT(*) FROM refs", [], |row| row.get(0)).unwrap_or(0);
+    let xml_usages_count: i64 = conn.query_row("SELECT COUNT(*) FROM xml_usages", [], |row| row.get(0)).unwrap_or(0);
+    let resources_count: i64 = conn.query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0)).unwrap_or(0);
 
     Ok(DbStats {
         file_count,
         symbol_count,
         module_count,
         refs_count,
+        xml_usages_count,
+        resources_count,
     })
 }
 
@@ -490,12 +546,18 @@ pub struct DbStats {
     pub symbol_count: i64,
     pub module_count: i64,
     pub refs_count: i64,
+    pub xml_usages_count: i64,
+    pub resources_count: i64,
 }
 
 /// Clear all data from the database
 pub fn clear_db(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+        DELETE FROM resource_usages;
+        DELETE FROM resources;
+        DELETE FROM xml_usages;
+        DELETE FROM transitive_deps;
         DELETE FROM refs;
         DELETE FROM inheritance;
         DELETE FROM module_deps;

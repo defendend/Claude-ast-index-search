@@ -1031,3 +1031,484 @@ pub fn get_module_dependents(conn: &Connection, module_name: &str) -> Result<Vec
 
     Ok(results)
 }
+
+/// Parsed XML usage
+#[derive(Debug)]
+pub struct XmlUsage {
+    pub file_path: String,
+    pub line: usize,
+    pub class_name: String,
+    pub usage_type: String,
+    pub element_id: Option<String>,
+}
+
+/// Index XML layouts for class usages
+pub fn index_xml_usages(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
+    use ignore::WalkBuilder;
+
+    // Get module IDs map
+    let module_ids: std::collections::HashMap<String, i64> = {
+        let mut stmt = conn.prepare("SELECT id, path FROM modules")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (path, id) = row?;
+            map.insert(path, id);
+        }
+        map
+    };
+
+    // Regex for class names in XML
+    // Full class name: <com.example.MyView ...>
+    let full_class_re = Regex::new(r"<([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.[A-Z][a-zA-Z0-9_]*)")?;
+    // view class="..." or fragment android:name="..."
+    let class_attr_re = Regex::new(r#"(?:class|android:name)\s*=\s*["']([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.[A-Z][a-zA-Z0-9_]*)["']"#)?;
+    // android:id="@+id/xxx"
+    let id_re = Regex::new(r#"android:id\s*=\s*["']@\+?id/([^"']+)["']"#)?;
+
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .build();
+
+    let xml_files: Vec<PathBuf> = walker
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let path = e.path();
+            path.extension().map(|ext| ext == "xml").unwrap_or(false)
+                && path.to_string_lossy().contains("/res/")
+                && (path.to_string_lossy().contains("/layout")
+                    || path.to_string_lossy().contains("/menu")
+                    || path.to_string_lossy().contains("/navigation"))
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    if progress {
+        eprintln!("Found {} XML layout files to index...", xml_files.len());
+    }
+
+    let tx = conn.transaction()?;
+
+    // Clear existing XML usages
+    tx.execute("DELETE FROM xml_usages", [])?;
+
+    let mut count = 0;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO xml_usages (module_id, file_path, line, class_name, usage_type, element_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        )?;
+
+        for xml_path in &xml_files {
+            let rel_path = xml_path
+                .strip_prefix(root)
+                .unwrap_or(xml_path)
+                .to_string_lossy()
+                .to_string();
+
+            // Find module for this file
+            let module_id = module_ids.iter()
+                .find(|(path, _)| rel_path.starts_with(*path))
+                .map(|(_, id)| *id);
+
+            if let Ok(content) = fs::read_to_string(xml_path) {
+                for (line_num, line) in content.lines().enumerate() {
+                    let line_num = line_num + 1;
+
+                    // Extract element_id if present on this line
+                    let element_id = id_re.captures(line).map(|c| c.get(1).unwrap().as_str().to_string());
+
+                    // Full class name tags
+                    for caps in full_class_re.captures_iter(line) {
+                        let class_name = caps.get(1).unwrap().as_str();
+                        stmt.execute(rusqlite::params![
+                            module_id,
+                            rel_path,
+                            line_num as i64,
+                            class_name,
+                            "view_tag",
+                            element_id
+                        ])?;
+                        count += 1;
+                    }
+
+                    // class="..." or android:name="..." attributes
+                    for caps in class_attr_re.captures_iter(line) {
+                        let class_name = caps.get(1).unwrap().as_str();
+                        let usage_type = if line.contains("<fragment") || line.contains("android:name") {
+                            "fragment"
+                        } else {
+                            "view_class_attr"
+                        };
+                        stmt.execute(rusqlite::params![
+                            module_id,
+                            rel_path,
+                            line_num as i64,
+                            class_name,
+                            usage_type,
+                            element_id
+                        ])?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    Ok(count)
+}
+
+/// Resource type
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResourceType {
+    Drawable,
+    String,
+    Color,
+    Dimen,
+    Style,
+    Layout,
+    Id,
+    Mipmap,
+    Other(String),
+}
+
+impl ResourceType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ResourceType::Drawable => "drawable",
+            ResourceType::String => "string",
+            ResourceType::Color => "color",
+            ResourceType::Dimen => "dimen",
+            ResourceType::Style => "style",
+            ResourceType::Layout => "layout",
+            ResourceType::Id => "id",
+            ResourceType::Mipmap => "mipmap",
+            ResourceType::Other(s) => s,
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "drawable" => ResourceType::Drawable,
+            "string" => ResourceType::String,
+            "color" => ResourceType::Color,
+            "dimen" => ResourceType::Dimen,
+            "style" => ResourceType::Style,
+            "layout" => ResourceType::Layout,
+            "id" => ResourceType::Id,
+            "mipmap" => ResourceType::Mipmap,
+            other => ResourceType::Other(other.to_string()),
+        }
+    }
+}
+
+/// Index Android resources (drawable, string, color, etc.)
+pub fn index_resources(conn: &mut Connection, root: &Path, progress: bool) -> Result<(usize, usize)> {
+    use ignore::WalkBuilder;
+
+    // Get module IDs map
+    let module_ids: std::collections::HashMap<String, i64> = {
+        let mut stmt = conn.prepare("SELECT id, path FROM modules")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (path, id) = row?;
+            map.insert(path, id);
+        }
+        map
+    };
+
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .build();
+
+    // Collect resource files
+    let res_files: Vec<PathBuf> = walker
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let path = e.path();
+            path.to_string_lossy().contains("/res/")
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    if progress {
+        eprintln!("Found {} resource files to analyze...", res_files.len());
+    }
+
+    let tx = conn.transaction()?;
+
+    // Clear existing resources
+    tx.execute("DELETE FROM resource_usages", [])?;
+    tx.execute("DELETE FROM resources", [])?;
+
+    let mut resource_count = 0;
+    let mut usage_count = 0;
+
+    // Regex for resource references
+    let r_ref_re = Regex::new(r"R\.(drawable|string|color|dimen|style|layout|id|mipmap)\.([a-zA-Z_][a-zA-Z0-9_]*)")?;
+    let xml_ref_re = Regex::new(r#"@(drawable|string|color|dimen|style|layout|id|mipmap)/([a-zA-Z_][a-zA-Z0-9_]*)"#)?;
+
+    // Resource definitions regex for values/*.xml
+    let string_def_re = Regex::new(r#"<string\s+name="([^"]+)""#)?;
+    let color_def_re = Regex::new(r#"<color\s+name="([^"]+)""#)?;
+    let dimen_def_re = Regex::new(r#"<dimen\s+name="([^"]+)""#)?;
+    let style_def_re = Regex::new(r#"<style\s+name="([^"]+)""#)?;
+
+    {
+        let mut res_stmt = tx.prepare_cached(
+            "INSERT INTO resources (module_id, type, name, file_path, line) VALUES (?1, ?2, ?3, ?4, ?5)"
+        )?;
+
+        // First pass: index resource definitions
+        for res_path in &res_files {
+            let rel_path = res_path
+                .strip_prefix(root)
+                .unwrap_or(res_path)
+                .to_string_lossy()
+                .to_string();
+
+            let module_id = module_ids.iter()
+                .find(|(path, _)| rel_path.starts_with(*path))
+                .map(|(_, id)| *id);
+
+            // Drawable files
+            if rel_path.contains("/drawable") || rel_path.contains("/mipmap") {
+                if let Some(name) = res_path.file_stem().and_then(|n| n.to_str()) {
+                    let res_type = if rel_path.contains("/mipmap") { "mipmap" } else { "drawable" };
+                    res_stmt.execute(rusqlite::params![module_id, res_type, name, rel_path, 1])?;
+                    resource_count += 1;
+                }
+            }
+
+            // Layout files
+            if rel_path.contains("/layout") && rel_path.ends_with(".xml") {
+                if let Some(name) = res_path.file_stem().and_then(|n| n.to_str()) {
+                    res_stmt.execute(rusqlite::params![module_id, "layout", name, rel_path, 1])?;
+                    resource_count += 1;
+                }
+            }
+
+            // Values files (strings, colors, dimens, styles)
+            if rel_path.contains("/values") && rel_path.ends_with(".xml") {
+                if let Ok(content) = fs::read_to_string(res_path) {
+                    for (line_num, line) in content.lines().enumerate() {
+                        let line_num = line_num + 1;
+
+                        if let Some(caps) = string_def_re.captures(line) {
+                            let name = caps.get(1).unwrap().as_str();
+                            res_stmt.execute(rusqlite::params![module_id, "string", name, rel_path, line_num as i64])?;
+                            resource_count += 1;
+                        }
+                        if let Some(caps) = color_def_re.captures(line) {
+                            let name = caps.get(1).unwrap().as_str();
+                            res_stmt.execute(rusqlite::params![module_id, "color", name, rel_path, line_num as i64])?;
+                            resource_count += 1;
+                        }
+                        if let Some(caps) = dimen_def_re.captures(line) {
+                            let name = caps.get(1).unwrap().as_str();
+                            res_stmt.execute(rusqlite::params![module_id, "dimen", name, rel_path, line_num as i64])?;
+                            resource_count += 1;
+                        }
+                        if let Some(caps) = style_def_re.captures(line) {
+                            let name = caps.get(1).unwrap().as_str();
+                            res_stmt.execute(rusqlite::params![module_id, "style", name, rel_path, line_num as i64])?;
+                            resource_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build resource ID map
+    let resource_ids: std::collections::HashMap<(String, String), i64> = {
+        let mut stmt = tx.prepare("SELECT id, type, name FROM resources")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (id, res_type, name) = row?;
+            map.insert((res_type, name), id);
+        }
+        map
+    };
+
+    // Second pass: index resource usages
+    {
+        let mut usage_stmt = tx.prepare_cached(
+            "INSERT INTO resource_usages (resource_id, usage_file, usage_line, usage_type) VALUES (?1, ?2, ?3, ?4)"
+        )?;
+
+        let walker = WalkBuilder::new(root)
+            .hidden(true)
+            .git_ignore(true)
+            .build();
+
+        let code_files: Vec<PathBuf> = walker
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let ext = e.path().extension().and_then(|s| s.to_str());
+                matches!(ext, Some("kt") | Some("java") | Some("xml"))
+            })
+            .map(|e| e.path().to_path_buf())
+            .collect();
+
+        for file_path in &code_files {
+            let rel_path = file_path
+                .strip_prefix(root)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
+
+            if let Ok(content) = fs::read_to_string(file_path) {
+                let is_xml = rel_path.ends_with(".xml");
+
+                for (line_num, line) in content.lines().enumerate() {
+                    let line_num = line_num + 1;
+
+                    // R.type.name references (Kotlin/Java)
+                    if !is_xml {
+                        for caps in r_ref_re.captures_iter(line) {
+                            let res_type = caps.get(1).unwrap().as_str();
+                            let res_name = caps.get(2).unwrap().as_str();
+
+                            if let Some(&resource_id) = resource_ids.get(&(res_type.to_string(), res_name.to_string())) {
+                                usage_stmt.execute(rusqlite::params![resource_id, rel_path, line_num as i64, "code"])?;
+                                usage_count += 1;
+                            }
+                        }
+                    }
+
+                    // @type/name references (XML)
+                    for caps in xml_ref_re.captures_iter(line) {
+                        let res_type = caps.get(1).unwrap().as_str();
+                        let res_name = caps.get(2).unwrap().as_str();
+
+                        if let Some(&resource_id) = resource_ids.get(&(res_type.to_string(), res_name.to_string())) {
+                            usage_stmt.execute(rusqlite::params![resource_id, rel_path, line_num as i64, "xml"])?;
+                            usage_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    Ok((resource_count, usage_count))
+}
+
+/// Build transitive dependencies cache
+pub fn build_transitive_deps(conn: &mut Connection, progress: bool) -> Result<usize> {
+    // Get all direct dependencies
+    let direct_deps: Vec<(i64, i64, String)> = {
+        let mut stmt = conn.prepare("SELECT module_id, dep_module_id, dep_kind FROM module_deps")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    // Get module names
+    let module_names: std::collections::HashMap<i64, String> = {
+        let mut stmt = conn.prepare("SELECT id, name FROM modules")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (id, name) = row?;
+            map.insert(id, name);
+        }
+        map
+    };
+
+    // Build adjacency list (only api dependencies create transitive access)
+    let mut api_deps: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+    for (module_id, dep_id, dep_kind) in &direct_deps {
+        if dep_kind == "api" {
+            api_deps.entry(*module_id).or_default().push(*dep_id);
+        }
+    }
+
+    let tx = conn.transaction()?;
+
+    // Clear existing
+    tx.execute("DELETE FROM transitive_deps", [])?;
+
+    let mut count = 0;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO transitive_deps (module_id, dependency_id, depth, path) VALUES (?1, ?2, ?3, ?4)"
+        )?;
+
+        // For each module, BFS to find all transitive dependencies
+        for (module_id, dep_id, _) in &direct_deps {
+            // Direct dependency
+            let path = format!("{} -> {}",
+                module_names.get(module_id).unwrap_or(&"?".to_string()),
+                module_names.get(dep_id).unwrap_or(&"?".to_string())
+            );
+            stmt.execute(rusqlite::params![module_id, dep_id, 1, path])?;
+            count += 1;
+
+            // BFS for transitive (only through api deps)
+            let mut visited: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            visited.insert(*dep_id);
+            let mut queue: std::collections::VecDeque<(i64, usize, String)> = std::collections::VecDeque::new();
+
+            // Add api dependencies of dep_id
+            if let Some(next_deps) = api_deps.get(dep_id) {
+                for &next_dep in next_deps {
+                    let next_path = format!("{} -> {} -> {}",
+                        module_names.get(module_id).unwrap_or(&"?".to_string()),
+                        module_names.get(dep_id).unwrap_or(&"?".to_string()),
+                        module_names.get(&next_dep).unwrap_or(&"?".to_string())
+                    );
+                    queue.push_back((next_dep, 2, next_path));
+                }
+            }
+
+            while let Some((trans_dep, depth, path)) = queue.pop_front() {
+                if visited.contains(&trans_dep) || depth > 5 {
+                    continue;
+                }
+                visited.insert(trans_dep);
+
+                stmt.execute(rusqlite::params![module_id, trans_dep, depth as i64, path])?;
+                count += 1;
+
+                // Continue BFS
+                if let Some(next_deps) = api_deps.get(&trans_dep) {
+                    for &next_dep in next_deps {
+                        if !visited.contains(&next_dep) {
+                            let next_path = format!("{} -> {}",
+                                path,
+                                module_names.get(&next_dep).unwrap_or(&"?".to_string())
+                            );
+                            queue.push_back((next_dep, depth + 1, next_path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    if progress {
+        eprintln!("Built {} transitive dependency entries", count);
+    }
+
+    Ok(count)
+}
