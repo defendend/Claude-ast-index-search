@@ -1,6 +1,16 @@
-# kotlin-index v3.2.0
+# kotlin-index v3.3.0
 
-Fast code search CLI for Android/Kotlin/Java projects. Native Rust implementation.
+Fast code search CLI for Android/Kotlin/Java and iOS/Swift/ObjC projects. Native Rust implementation.
+
+## Supported Projects
+
+| Platform | Languages | Module System |
+|----------|-----------|---------------|
+| Android | Kotlin, Java | Gradle |
+| iOS | Swift, Objective-C | SPM (Package.swift) |
+| Mixed | All above | Both |
+
+Project type is auto-detected.
 
 ## Installation
 
@@ -224,6 +234,13 @@ transitive_deps (id, module_id, dependency_id, depth, path)
 
 ## Changelog
 
+### 3.3.0
+- **iOS/Swift/ObjC support** — auto-detect project type and index Swift/ObjC files
+- Swift: class, struct, enum, protocol, actor, extension, func, init, var/let, typealias
+- ObjC: @interface, @protocol, @implementation, methods, @property, typedef, categories
+- SPM module detection from Package.swift (.target, .testTarget, .binaryTarget)
+- Inheritance and protocol conformance tracking for Swift/ObjC
+
 ### 3.2.0
 - Add `xml-usages` command — find class usages in XML layouts
 - Add `resource-usages` command — find resource usages (drawable, string, color, etc.)
@@ -288,9 +305,37 @@ transitive_deps (id, module_id, dependency_id, depth, path)
 #### 1.0.0
 - Initial release: File/symbol/module search, MCP server
 
-## Claude Code Plugin
+## IDE Integration
 
-### Install Plugin
+### Cursor
+
+Add to `.cursor/rules` or project's `CLAUDE.md`:
+
+```markdown
+## Code Search
+
+Use `kotlin-index` CLI for fast code search:
+
+\`\`\`bash
+# Search class/interface/protocol
+kotlin-index class "ClassName"
+
+# Find implementations
+kotlin-index implementations "BaseClass"
+
+# Find usages
+kotlin-index usages "SymbolName"
+
+# Module dependencies
+kotlin-index deps "module.name"
+\`\`\`
+
+Run `kotlin-index rebuild` in project root before first use.
+```
+
+### Claude Code Plugin
+
+#### Install Plugin
 
 Add marketplace and install plugin:
 ```bash
