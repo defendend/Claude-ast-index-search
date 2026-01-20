@@ -1681,6 +1681,7 @@ fn cmd_unused_deps(
 
     let mut dep_usages: HashMap<String, DepUsage> = HashMap::new();
     let mut unused: Vec<(String, String, String)> = vec![];
+    let mut exported: Vec<(String, String, String)> = vec![]; // api deps not directly used
     let mut used_direct: Vec<(String, String, String, usize)> = vec![];
     let mut used_transitive: Vec<(String, String, String, usize)> = vec![];
     let mut used_xml: Vec<(String, String, String, usize)> = vec![];
@@ -1821,7 +1822,12 @@ fn cmd_unused_deps(
         let total_usage = usage.direct_count + usage.transitive_count + usage.xml_count + usage.resource_count;
 
         if total_usage == 0 {
-            unused.push((dep_name.clone(), dep_path.clone(), dep_kind.clone()));
+            // Check if this is an api dependency (exported for consumers)
+            if dep_kind == "api" {
+                exported.push((dep_name.clone(), dep_path.clone(), dep_kind.clone()));
+            } else {
+                unused.push((dep_name.clone(), dep_path.clone(), dep_kind.clone()));
+            }
         } else if usage.direct_count > 0 {
             used_direct.push((dep_name.clone(), dep_path.clone(), dep_kind.clone(), usage.direct_count));
         } else if usage.transitive_count > 0 {
@@ -1894,10 +1900,35 @@ fn cmd_unused_deps(
         }
     }
 
-    // Summary
+    // Exported (api deps not directly used but intentionally re-exported)
+    if !exported.is_empty() {
+        println!("\n{}", "=== Exported (not directly used) ===".yellow().bold());
+        for (name, _path, _kind) in &exported {
+            println!("  {} {} (api)", "⚡".yellow(), name);
+            if verbose {
+                // Find consumers who use this exported dep
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT m.name FROM module_deps md
+                     JOIN modules m ON md.module_id = m.id
+                     JOIN modules dep ON md.dep_module_id = dep.id
+                     WHERE dep.name = ?1 AND m.name != ?2
+                     LIMIT 5"
+                )?;
+                let consumers: Vec<String> = stmt
+                    .query_map(params![name, module], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                if !consumers.is_empty() {
+                    println!("    └─ used by: {}", consumers.join(", "));
+                }
+            }
+        }
+    }
+
+    // Unused
     println!("\n{}", "=== Unused ===".red().bold());
     if !unused.is_empty() {
-        for (name, path, kind) in &unused {
+        for (name, _path, kind) in &unused {
             println!("  {} {} ({})", "✗".red(), name, kind);
             if verbose {
                 println!("    - No direct imports");
@@ -1913,8 +1944,9 @@ fn cmd_unused_deps(
     println!("\n{}", "=== Summary ===".bold());
     let total_used = used_direct.len() + used_transitive.len() + used_xml.len() + used_resources.len();
     println!(
-        "Total: {} unused, {} used of {} dependencies",
+        "Total: {} unused, {} exported, {} used of {} dependencies",
         unused.len(),
+        exported.len(),
         total_used,
         deps.len()
     );
@@ -1927,6 +1959,9 @@ fn cmd_unused_deps(
     }
     if check_resources {
         println!("  - Resources: {}", used_resources.len());
+    }
+    if !exported.is_empty() {
+        println!("  - Exported (api): {}", exported.len());
     }
 
     eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
