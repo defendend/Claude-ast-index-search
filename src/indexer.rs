@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::Result;
 use rayon::prelude::*;
 use regex::Regex;
@@ -946,10 +948,8 @@ fn extract_references(content: &str, defined_symbols: &[ParsedSymbol]) -> Result
     // Regex for identifiers that might be references:
     // - CamelCase identifiers (types, classes) like PaymentRepository, String
     // - Function calls like getCards(, process(
-    // - Property accesses like .repository, .data
     let identifier_re = Regex::new(r"\b([A-Z][a-zA-Z0-9]*)\b")?; // CamelCase types
     let func_call_re = Regex::new(r"\b([a-z][a-zA-Z0-9]*)\s*\(")?; // function calls
-    let property_re = Regex::new(r"\.([a-z][a-zA-Z0-9]*)\b")?; // .property access
 
     // Keywords to skip
     let keywords: HashSet<&str> = [
@@ -1407,11 +1407,6 @@ pub fn index_module_dependencies(conn: &mut Connection, root: &Path, progress: b
 
     // Standard Gradle style: implementation(project(":features:payments:api"))
     let gradle_project_re = Regex::new(r#"(?m)(api|implementation|compileOnly|testImplementation)\s*\(\s*project\s*\(\s*["']:([^"']+)["']\s*\)"#)?;
-
-    let walker = WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .build();
 
     // First, ensure all modules are indexed and get their IDs
     let module_ids: std::collections::HashMap<String, i64> = {

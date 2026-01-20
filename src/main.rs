@@ -431,6 +431,7 @@ where
 }
 
 /// Fast parallel file search with early termination support
+#[allow(dead_code)]
 fn search_files_limited<F>(
     root: &Path,
     pattern: &str,
@@ -634,10 +635,6 @@ fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()> {
 
 fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
     let start = Instant::now();
-
-    // Search for @Provides or @Binds, then look at the function signature
-    // Pattern: @Binds followed by function returning the type
-    let pattern = format!(r"@(Provides|Binds)[^\n]*\n[^\n]*:\s*{}\b", regex::escape(type_name));
 
     let mut results: Vec<(String, usize, String)> = vec![];
 
@@ -1507,9 +1504,9 @@ fn cmd_deps(root: &Path, module: &str) -> Result<()> {
     );
 
     // Group by kind
-    let mut api_deps: Vec<_> = deps.iter().filter(|(_, _, k)| k == "api").collect();
-    let mut impl_deps: Vec<_> = deps.iter().filter(|(_, _, k)| k == "implementation").collect();
-    let mut other_deps: Vec<_> = deps.iter().filter(|(_, _, k)| k != "api" && k != "implementation").collect();
+    let api_deps: Vec<_> = deps.iter().filter(|(_, _, k)| k == "api").collect();
+    let impl_deps: Vec<_> = deps.iter().filter(|(_, _, k)| k == "implementation").collect();
+    let other_deps: Vec<_> = deps.iter().filter(|(_, _, k)| k != "api" && k != "implementation").collect();
 
     if !api_deps.is_empty() {
         println!("  {}:", "api".cyan());
@@ -1769,7 +1766,7 @@ fn cmd_unused_deps(
                     .filter_map(|r| r.ok())
                     .collect();
 
-                for (file_path, line) in xml_results {
+                for (_file_path, line) in xml_results {
                     usage.xml_count += 1;
                     if usage.xml_usages.len() < 3 {
                         usage.xml_usages.push((class_name.clone(), line));
@@ -2022,17 +2019,10 @@ fn get_module_public_symbols(conn: &Connection, root: &Path, module_path: &str) 
 }
 
 /// Check if a symbol is used in the module directory
-fn is_symbol_used_in_module(root: &Path, module_dir: &Path, symbol: &str) -> Result<bool> {
+fn is_symbol_used_in_module(_root: &Path, module_dir: &Path, symbol: &str) -> Result<bool> {
     if !module_dir.exists() {
         return Ok(false);
     }
-
-    // Simple grep for the symbol name in module files
-    let pattern = format!(r"\b{}\b", regex::escape(symbol));
-    let matcher = match RegexMatcher::new(&pattern) {
-        Ok(m) => m,
-        Err(_) => return Ok(false),
-    };
 
     let mut found = false;
 
