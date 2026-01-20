@@ -2023,3 +2023,424 @@ pub fn build_transitive_deps(conn: &mut Connection, progress: bool) -> Result<us
 
     Ok(count)
 }
+
+/// Parsed iOS Storyboard/XIB usage
+#[derive(Debug)]
+pub struct StoryboardUsage {
+    pub file_path: String,
+    pub line: usize,
+    pub class_name: String,
+    pub usage_type: String, // "viewController", "view", "cell", "segue"
+    pub storyboard_id: Option<String>,
+}
+
+/// Index iOS storyboard and XIB files for class usages
+pub fn index_storyboard_usages(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
+    use ignore::WalkBuilder;
+
+    // Get module IDs map
+    let module_ids: std::collections::HashMap<String, i64> = {
+        let mut stmt = conn.prepare("SELECT id, path FROM modules")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (path, id) = row?;
+            map.insert(path, id);
+        }
+        map
+    };
+
+    // Regex for customClass in storyboards/xibs
+    // <viewController customClass="MyViewController" ...>
+    let custom_class_re = Regex::new(r#"customClass\s*=\s*["']([A-Z][a-zA-Z0-9_]+)["']"#)?;
+    // storyboardIdentifier="..."
+    let storyboard_id_re = Regex::new(r#"(?:storyboardIdentifier|identifier)\s*=\s*["']([^"']+)["']"#)?;
+
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .build();
+
+    let storyboard_files: Vec<PathBuf> = walker
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let path = e.path();
+            let ext = path.extension().and_then(|e| e.to_str());
+            matches!(ext, Some("storyboard") | Some("xib"))
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    if progress {
+        eprintln!("Found {} storyboard/xib files to index...", storyboard_files.len());
+    }
+
+    let tx = conn.transaction()?;
+
+    // Clear existing storyboard usages
+    tx.execute("DELETE FROM storyboard_usages", [])?;
+
+    let mut count = 0;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO storyboard_usages (module_id, file_path, line, class_name, usage_type, storyboard_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        )?;
+
+        for sb_path in &storyboard_files {
+            let rel_path = sb_path
+                .strip_prefix(root)
+                .unwrap_or(sb_path)
+                .to_string_lossy()
+                .to_string();
+
+            // Find module for this file
+            let module_id = module_ids.iter()
+                .find(|(path, _)| rel_path.starts_with(*path))
+                .map(|(_, id)| *id);
+
+            if let Ok(content) = fs::read_to_string(sb_path) {
+                for (line_num, line) in content.lines().enumerate() {
+                    let line_num = line_num + 1;
+
+                    // Extract storyboard identifier if present
+                    let sb_id = storyboard_id_re.captures(line).map(|c| c.get(1).unwrap().as_str().to_string());
+
+                    // Extract custom classes
+                    if let Some(caps) = custom_class_re.captures(line) {
+                        let class_name = caps.get(1).unwrap().as_str();
+
+                        // Determine usage type based on element
+                        let usage_type = if line.contains("<viewController") || line.contains("<tableViewController") || line.contains("<collectionViewController") || line.contains("<navigationController") || line.contains("<tabBarController") {
+                            "viewController"
+                        } else if line.contains("<tableViewCell") || line.contains("<collectionViewCell") {
+                            "cell"
+                        } else if line.contains("<view") || line.contains("<View") {
+                            "view"
+                        } else {
+                            "other"
+                        };
+
+                        stmt.execute(rusqlite::params![
+                            module_id,
+                            rel_path,
+                            line_num as i64,
+                            class_name,
+                            usage_type,
+                            sb_id
+                        ])?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    if progress {
+        eprintln!("Indexed {} storyboard/xib class usages", count);
+    }
+
+    Ok(count)
+}
+
+/// iOS Asset type
+#[derive(Debug, Clone, PartialEq)]
+pub enum IosAssetType {
+    ImageSet,
+    ColorSet,
+    AppIcon,
+    LaunchImage,
+    DataSet,
+    Other(String),
+}
+
+impl IosAssetType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            IosAssetType::ImageSet => "imageset",
+            IosAssetType::ColorSet => "colorset",
+            IosAssetType::AppIcon => "appiconset",
+            IosAssetType::LaunchImage => "launchimage",
+            IosAssetType::DataSet => "dataset",
+            IosAssetType::Other(s) => s,
+        }
+    }
+
+    pub fn from_extension(ext: &str) -> Self {
+        match ext {
+            "imageset" => IosAssetType::ImageSet,
+            "colorset" => IosAssetType::ColorSet,
+            "appiconset" => IosAssetType::AppIcon,
+            "launchimage" => IosAssetType::LaunchImage,
+            "dataset" => IosAssetType::DataSet,
+            other => IosAssetType::Other(other.to_string()),
+        }
+    }
+}
+
+/// Index iOS Assets.xcassets
+pub fn index_ios_assets(conn: &mut Connection, root: &Path, progress: bool) -> Result<(usize, usize)> {
+    use ignore::WalkBuilder;
+
+    // Get module IDs map
+    let module_ids: std::collections::HashMap<String, i64> = {
+        let mut stmt = conn.prepare("SELECT id, path FROM modules")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (path, id) = row?;
+            map.insert(path, id);
+        }
+        map
+    };
+
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .build();
+
+    // Find all .xcassets directories
+    let xcassets_dirs: Vec<PathBuf> = walker
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let path = e.path();
+            path.is_dir() && path.extension().map(|e| e == "xcassets").unwrap_or(false)
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    if progress {
+        eprintln!("Found {} .xcassets directories...", xcassets_dirs.len());
+    }
+
+    let tx = conn.transaction()?;
+
+    // Clear existing iOS assets
+    tx.execute("DELETE FROM ios_asset_usages", [])?;
+    tx.execute("DELETE FROM ios_assets", [])?;
+
+    let mut asset_count = 0;
+    let mut usage_count = 0;
+
+    {
+        let mut asset_stmt = tx.prepare_cached(
+            "INSERT INTO ios_assets (module_id, type, name, file_path) VALUES (?1, ?2, ?3, ?4)"
+        )?;
+
+        // Index assets from .xcassets directories
+        for xcassets_dir in &xcassets_dirs {
+            let rel_xcassets = xcassets_dir
+                .strip_prefix(root)
+                .unwrap_or(xcassets_dir)
+                .to_string_lossy()
+                .to_string();
+
+            let module_id = module_ids.iter()
+                .find(|(path, _)| rel_xcassets.starts_with(*path))
+                .map(|(_, id)| *id);
+
+            // Walk inside xcassets to find imagesets, colorsets, etc.
+            let inner_walker = WalkBuilder::new(xcassets_dir)
+                .hidden(false)
+                .build();
+
+            for entry in inner_walker {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                            if matches!(ext, "imageset" | "colorset" | "appiconset" | "launchimage" | "dataset") {
+                                if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
+                                    let rel_path = path
+                                        .strip_prefix(root)
+                                        .unwrap_or(path)
+                                        .to_string_lossy()
+                                        .to_string();
+
+                                    let asset_type = IosAssetType::from_extension(ext);
+                                    asset_stmt.execute(rusqlite::params![
+                                        module_id,
+                                        asset_type.as_str(),
+                                        name,
+                                        rel_path
+                                    ])?;
+                                    asset_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build asset ID map
+    let asset_ids: std::collections::HashMap<String, i64> = {
+        let mut stmt = tx.prepare("SELECT id, name FROM ios_assets")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (name, id) = row?;
+            map.insert(name, id);
+        }
+        map
+    };
+
+    // Index asset usages in Swift code
+    // UIImage(named: "assetName") or Image("assetName") or Color("colorName")
+    let swift_image_re = Regex::new(r#"(?:UIImage\s*\(\s*named:\s*["']|Image\s*\(\s*["']|\.image\s*\(\s*named:\s*["'])([^"']+)["']"#)?;
+    let swift_color_re = Regex::new(r#"(?:UIColor\s*\(\s*named:\s*["']|Color\s*\(\s*["'])([^"']+)["']"#)?;
+
+    {
+        let mut usage_stmt = tx.prepare_cached(
+            "INSERT INTO ios_asset_usages (asset_id, usage_file, usage_line, usage_type) VALUES (?1, ?2, ?3, ?4)"
+        )?;
+
+        let walker = WalkBuilder::new(root)
+            .hidden(true)
+            .git_ignore(true)
+            .build();
+
+        let swift_files: Vec<PathBuf> = walker
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path().extension().map(|ext| ext == "swift").unwrap_or(false)
+            })
+            .map(|e| e.path().to_path_buf())
+            .collect();
+
+        for file_path in &swift_files {
+            let rel_path = file_path
+                .strip_prefix(root)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
+
+            if let Ok(content) = fs::read_to_string(file_path) {
+                for (line_num, line) in content.lines().enumerate() {
+                    let line_num = line_num + 1;
+
+                    // Image references
+                    for caps in swift_image_re.captures_iter(line) {
+                        let asset_name = caps.get(1).unwrap().as_str();
+                        if let Some(&asset_id) = asset_ids.get(asset_name) {
+                            usage_stmt.execute(rusqlite::params![asset_id, rel_path, line_num as i64, "code"])?;
+                            usage_count += 1;
+                        }
+                    }
+
+                    // Color references
+                    for caps in swift_color_re.captures_iter(line) {
+                        let asset_name = caps.get(1).unwrap().as_str();
+                        if let Some(&asset_id) = asset_ids.get(asset_name) {
+                            usage_stmt.execute(rusqlite::params![asset_id, rel_path, line_num as i64, "code"])?;
+                            usage_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    if progress {
+        eprintln!("Indexed {} iOS assets, {} usages", asset_count, usage_count);
+    }
+
+    Ok((asset_count, usage_count))
+}
+
+/// Index CocoaPods and Carthage dependencies
+pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool) -> Result<usize> {
+    let mut count = 0;
+
+    // CocoaPods: Podfile
+    let podfile = root.join("Podfile");
+    if podfile.exists() {
+        if let Ok(content) = fs::read_to_string(&podfile) {
+            // pod 'PodName', '~> 1.0'
+            let pod_re = Regex::new(r#"pod\s+['"]([^'"]+)['"]"#)?;
+
+            for caps in pod_re.captures_iter(&content) {
+                let pod_name = caps.get(1).unwrap().as_str();
+                conn.execute(
+                    "INSERT OR IGNORE INTO modules (name, path, kind) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![format!("pod.{}", pod_name), "Pods", "cocoapods"],
+                )?;
+                count += 1;
+            }
+        }
+    }
+
+    // Podfile.lock for exact versions
+    let podfile_lock = root.join("Podfile.lock");
+    if podfile_lock.exists() {
+        if let Ok(content) = fs::read_to_string(&podfile_lock) {
+            // PODS:
+            //   - PodName (1.0.0)
+            let pod_lock_re = Regex::new(r#"^\s+-\s+([A-Za-z0-9_-]+)\s+\("#)?;
+
+            for line in content.lines() {
+                if let Some(caps) = pod_lock_re.captures(line) {
+                    let pod_name = caps.get(1).unwrap().as_str();
+                    conn.execute(
+                        "INSERT OR IGNORE INTO modules (name, path, kind) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![format!("pod.{}", pod_name), "Pods", "cocoapods"],
+                    )?;
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    // Carthage: Cartfile
+    let cartfile = root.join("Cartfile");
+    if cartfile.exists() {
+        if let Ok(content) = fs::read_to_string(&cartfile) {
+            // github "owner/repo" ~> 1.0
+            let carthage_re = Regex::new(r#"github\s+["']([^"']+)["']"#)?;
+
+            for caps in carthage_re.captures_iter(&content) {
+                let repo = caps.get(1).unwrap().as_str();
+                let name = repo.split('/').last().unwrap_or(repo);
+                conn.execute(
+                    "INSERT OR IGNORE INTO modules (name, path, kind) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![format!("carthage.{}", name), "Carthage/Build", "carthage"],
+                )?;
+                count += 1;
+            }
+        }
+    }
+
+    // Carthage.resolved for exact versions
+    let cartfile_resolved = root.join("Cartfile.resolved");
+    if cartfile_resolved.exists() {
+        if let Ok(content) = fs::read_to_string(&cartfile_resolved) {
+            let carthage_re = Regex::new(r#"github\s+["']([^"']+)["']"#)?;
+
+            for caps in carthage_re.captures_iter(&content) {
+                let repo = caps.get(1).unwrap().as_str();
+                let name = repo.split('/').last().unwrap_or(repo);
+                conn.execute(
+                    "INSERT OR IGNORE INTO modules (name, path, kind) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![format!("carthage.{}", name), "Carthage/Build", "carthage"],
+                )?;
+                count += 1;
+            }
+        }
+    }
+
+    if progress {
+        eprintln!("Indexed {} CocoaPods/Carthage dependencies", count);
+    }
+
+    Ok(count)
+}

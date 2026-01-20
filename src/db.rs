@@ -175,6 +175,43 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_transitive_deps_module ON transitive_deps(module_id);
         CREATE INDEX IF NOT EXISTS idx_transitive_deps_dep ON transitive_deps(dependency_id);
+
+        -- iOS storyboard/xib usages
+        CREATE TABLE IF NOT EXISTS storyboard_usages (
+            id INTEGER PRIMARY KEY,
+            module_id INTEGER,
+            file_path TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            class_name TEXT NOT NULL,
+            usage_type TEXT,
+            storyboard_id TEXT,
+            FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_storyboard_usages_class ON storyboard_usages(class_name);
+        CREATE INDEX IF NOT EXISTS idx_storyboard_usages_module ON storyboard_usages(module_id);
+
+        -- iOS assets (from .xcassets)
+        CREATE TABLE IF NOT EXISTS ios_assets (
+            id INTEGER PRIMARY KEY,
+            module_id INTEGER,
+            type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_ios_assets_name ON ios_assets(name);
+        CREATE INDEX IF NOT EXISTS idx_ios_assets_type ON ios_assets(type);
+
+        -- iOS asset usages
+        CREATE TABLE IF NOT EXISTS ios_asset_usages (
+            id INTEGER PRIMARY KEY,
+            asset_id INTEGER,
+            usage_file TEXT NOT NULL,
+            usage_line INTEGER NOT NULL,
+            usage_type TEXT,
+            FOREIGN KEY (asset_id) REFERENCES ios_assets(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_ios_asset_usages_asset ON ios_asset_usages(asset_id);
         "#,
     )?;
     Ok(())
@@ -531,6 +568,8 @@ pub fn get_stats(conn: &Connection) -> Result<DbStats> {
     let refs_count: i64 = conn.query_row("SELECT COUNT(*) FROM refs", [], |row| row.get(0)).unwrap_or(0);
     let xml_usages_count: i64 = conn.query_row("SELECT COUNT(*) FROM xml_usages", [], |row| row.get(0)).unwrap_or(0);
     let resources_count: i64 = conn.query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0)).unwrap_or(0);
+    let storyboard_usages_count: i64 = conn.query_row("SELECT COUNT(*) FROM storyboard_usages", [], |row| row.get(0)).unwrap_or(0);
+    let ios_assets_count: i64 = conn.query_row("SELECT COUNT(*) FROM ios_assets", [], |row| row.get(0)).unwrap_or(0);
 
     Ok(DbStats {
         file_count,
@@ -539,6 +578,8 @@ pub fn get_stats(conn: &Connection) -> Result<DbStats> {
         refs_count,
         xml_usages_count,
         resources_count,
+        storyboard_usages_count,
+        ios_assets_count,
     })
 }
 
@@ -550,12 +591,17 @@ pub struct DbStats {
     pub refs_count: i64,
     pub xml_usages_count: i64,
     pub resources_count: i64,
+    pub storyboard_usages_count: i64,
+    pub ios_assets_count: i64,
 }
 
 /// Clear all data from the database
 pub fn clear_db(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+        DELETE FROM ios_asset_usages;
+        DELETE FROM ios_assets;
+        DELETE FROM storyboard_usages;
         DELETE FROM resource_usages;
         DELETE FROM resources;
         DELETE FROM xml_usages;

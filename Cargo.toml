@@ -1,8 +1,8 @@
 [package]
 name = "kotlin-index"
-version = "3.3.0"
+version = "3.4.0"
 edition = "2021"
-description = "Fast code search for Android/Kotlin/Java projects"
+description = "Fast code search for Android/Kotlin/Java and iOS/Swift/ObjC projects"
 license = "MIT"
 
 [dependencies]

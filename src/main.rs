@@ -291,6 +291,62 @@ enum Commands {
         #[arg(long, default_value = "origin/trunk")]
         base: String,
     },
+    // === iOS Commands ===
+    /// Find class usages in storyboards/xibs (iOS)
+    StoryboardUsages {
+        /// Class name to search for
+        class_name: String,
+        /// Filter by module
+        #[arg(long)]
+        module: Option<String>,
+    },
+    /// Find iOS asset usages (images, colors from xcassets)
+    AssetUsages {
+        /// Asset name to search for. Optional with --unused
+        #[arg(default_value = "")]
+        asset: String,
+        /// Filter by module (required for --unused)
+        #[arg(long)]
+        module: Option<String>,
+        /// Asset type filter (imageset, colorset, etc.)
+        #[arg(long, short = 't')]
+        r#type: Option<String>,
+        /// Show unused assets in a module
+        #[arg(long)]
+        unused: bool,
+    },
+    /// Find SwiftUI views and state properties
+    Swiftui {
+        /// Filter by name or type (State, Binding, Published, ObservedObject)
+        query: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Find async functions (Swift)
+    AsyncFuncs {
+        /// Filter by name
+        query: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Find Combine publishers (Swift)
+    Publishers {
+        /// Filter by name
+        query: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Find @MainActor functions and classes (Swift)
+    MainActor {
+        /// Filter by name
+        query: Option<String>,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
     /// Show version
     Version,
 }
@@ -342,6 +398,13 @@ fn main() -> Result<()> {
         Commands::Imports { file } => cmd_imports(&root, &file),
         Commands::Api { module_path, limit } => cmd_api(&root, &module_path, limit),
         Commands::Changed { base } => cmd_changed(&root, &base),
+        // iOS commands
+        Commands::StoryboardUsages { class_name, module } => cmd_storyboard_usages(&root, &class_name, module.as_deref()),
+        Commands::AssetUsages { asset, module, r#type, unused } => cmd_asset_usages(&root, &asset, module.as_deref(), r#type.as_deref(), unused),
+        Commands::Swiftui { query, limit } => cmd_swiftui(&root, query.as_deref(), limit),
+        Commands::AsyncFuncs { query, limit } => cmd_async_funcs(&root, query.as_deref(), limit),
+        Commands::Publishers { query, limit } => cmd_publishers(&root, query.as_deref(), limit),
+        Commands::MainActor { query, limit } => cmd_main_actor(&root, query.as_deref(), limit),
         Commands::Version => {
             println!("kotlin-index-rs v{}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -352,10 +415,23 @@ fn main() -> Result<()> {
 fn find_project_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     for ancestor in cwd.ancestors() {
+        // Android/Gradle markers
         if ancestor.join("settings.gradle").exists()
             || ancestor.join("settings.gradle.kts").exists()
         {
             return Ok(ancestor.to_path_buf());
+        }
+        // iOS/Swift markers
+        if ancestor.join("Package.swift").exists() {
+            return Ok(ancestor.to_path_buf());
+        }
+        // Check for .xcodeproj
+        if let Ok(entries) = std::fs::read_dir(ancestor) {
+            for entry in entries.flatten() {
+                if entry.path().extension().map(|e| e == "xcodeproj").unwrap_or(false) {
+                    return Ok(ancestor.to_path_buf());
+                }
+            }
         }
     }
     Ok(cwd)
@@ -1078,6 +1154,11 @@ fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool) -> Result<()> {
     let mut conn = db::open_db(root)?;
     db::init_db(&conn)?;
 
+    // Detect project type
+    let project_type = indexer::detect_project_type(root);
+    let is_ios = matches!(project_type, indexer::ProjectType::IOS | indexer::ProjectType::Mixed);
+    let is_android = matches!(project_type, indexer::ProjectType::Android | indexer::ProjectType::Mixed);
+
     match index_type {
         "all" => {
             println!("{}", "Rebuilding full index...".cyan());
@@ -1085,27 +1166,76 @@ fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool) -> Result<()> {
             let file_count = indexer::index_directory(&mut conn, root, true)?;
             let module_count = indexer::index_modules(&conn, root)?;
 
+            // Index CocoaPods/Carthage for iOS
+            if is_ios {
+                let pkg_count = indexer::index_ios_package_managers(&conn, root, true)?;
+                if pkg_count > 0 {
+                    println!("{}", format!("Indexed {} CocoaPods/Carthage deps", pkg_count).dimmed());
+                }
+            }
+
             let mut dep_count = 0;
             let mut trans_count = 0;
-            if index_deps {
+            if index_deps && is_android {
                 println!("{}", "Indexing module dependencies...".cyan());
                 dep_count = indexer::index_module_dependencies(&mut conn, root, true)?;
                 trans_count = indexer::build_transitive_deps(&mut conn, true)?;
             }
 
-            println!("{}", "Indexing XML layouts...".cyan());
-            let xml_count = indexer::index_xml_usages(&mut conn, root, true)?;
+            // Android-specific: XML layouts and resources
+            let mut xml_count = 0;
+            let mut res_count = 0;
+            let mut res_usage_count = 0;
+            if is_android {
+                println!("{}", "Indexing XML layouts...".cyan());
+                xml_count = indexer::index_xml_usages(&mut conn, root, true)?;
 
-            println!("{}", "Indexing resources...".cyan());
-            let (res_count, res_usage_count) = indexer::index_resources(&mut conn, root, true)?;
+                println!("{}", "Indexing resources...".cyan());
+                let (rc, ruc) = indexer::index_resources(&mut conn, root, true)?;
+                res_count = rc;
+                res_usage_count = ruc;
+            }
 
-            println!(
-                "{}",
-                format!(
-                    "Indexed {} files, {} modules, {} deps, {} transitive, {} XML usages, {} resources ({} usages)",
-                    file_count, module_count, dep_count, trans_count, xml_count, res_count, res_usage_count
-                ).green()
-            );
+            // iOS-specific: storyboards and assets
+            let mut sb_count = 0;
+            let mut asset_count = 0;
+            let mut asset_usage_count = 0;
+            if is_ios {
+                println!("{}", "Indexing storyboards/xibs...".cyan());
+                sb_count = indexer::index_storyboard_usages(&mut conn, root, true)?;
+
+                println!("{}", "Indexing iOS assets...".cyan());
+                let (ac, auc) = indexer::index_ios_assets(&mut conn, root, true)?;
+                asset_count = ac;
+                asset_usage_count = auc;
+            }
+
+            // Print summary based on project type
+            if is_android && is_ios {
+                println!(
+                    "{}",
+                    format!(
+                        "Indexed {} files, {} modules, {} deps, {} XML usages, {} resources, {} storyboard usages, {} assets",
+                        file_count, module_count, dep_count, xml_count, res_count, sb_count, asset_count
+                    ).green()
+                );
+            } else if is_ios {
+                println!(
+                    "{}",
+                    format!(
+                        "Indexed {} files, {} modules, {} storyboard usages, {} assets ({} usages)",
+                        file_count, module_count, sb_count, asset_count, asset_usage_count
+                    ).green()
+                );
+            } else {
+                println!(
+                    "{}",
+                    format!(
+                        "Indexed {} files, {} modules, {} deps, {} transitive, {} XML usages, {} resources ({} usages)",
+                        file_count, module_count, dep_count, trans_count, xml_count, res_count, res_usage_count
+                    ).green()
+                );
+            }
         }
         "files" | "symbols" => {
             println!("{}", "Rebuilding symbols index...".cyan());
@@ -1196,13 +1326,28 @@ fn cmd_stats(root: &Path) -> Result<()> {
         .map(|m| m.len())
         .unwrap_or(0);
 
+    // Detect project type
+    let project_type = indexer::detect_project_type(root);
+
     println!("{}", "Index Statistics:".bold());
+    println!("  Project:    {}", project_type.as_str());
     println!("  Files:      {}", stats.file_count);
     println!("  Symbols:    {}", stats.symbol_count);
     println!("  Refs:       {}", stats.refs_count);
     println!("  Modules:    {}", stats.module_count);
-    println!("  XML usages: {}", stats.xml_usages_count);
-    println!("  Resources:  {}", stats.resources_count);
+
+    // Show Android-specific stats if relevant
+    if stats.xml_usages_count > 0 || stats.resources_count > 0 {
+        println!("  XML usages: {}", stats.xml_usages_count);
+        println!("  Resources:  {}", stats.resources_count);
+    }
+
+    // Show iOS-specific stats if relevant
+    if stats.storyboard_usages_count > 0 || stats.ios_assets_count > 0 {
+        println!("  Storyboard: {}", stats.storyboard_usages_count);
+        println!("  iOS assets: {}", stats.ios_assets_count);
+    }
+
     println!("  DB size:    {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
     println!("  DB path:    {}", db_path.display());
 
@@ -2589,4 +2734,370 @@ fn parse_resource_reference(resource: &str) -> (String, String) {
 
     // Default: assume it's a string resource
     ("string".to_string(), resource.to_string())
+}
+
+// === iOS Commands ===
+
+fn cmd_storyboard_usages(root: &Path, class_name: &str, module: Option<&str>) -> Result<()> {
+    let start = Instant::now();
+
+    if !db::db_exists(root) {
+        println!(
+            "{}",
+            "Index not found. Run 'kotlin-index rebuild' first.".red()
+        );
+        return Ok(());
+    }
+
+    let conn = db::open_db(root)?;
+
+    let query = if let Some(m) = module {
+        format!(
+            r#"
+            SELECT su.file_path, su.line, su.class_name, su.usage_type, su.storyboard_id
+            FROM storyboard_usages su
+            LEFT JOIN modules mod ON su.module_id = mod.id
+            WHERE su.class_name LIKE '%{}%'
+            AND (mod.name LIKE '%{}%' OR mod.path LIKE '%{}%')
+            ORDER BY su.file_path, su.line
+            "#,
+            class_name, m, m
+        )
+    } else {
+        format!(
+            r#"
+            SELECT file_path, line, class_name, usage_type, storyboard_id
+            FROM storyboard_usages
+            WHERE class_name LIKE '%{}%'
+            ORDER BY file_path, line
+            "#,
+            class_name
+        )
+    };
+
+    let mut stmt = conn.prepare(&query)?;
+    let results: Vec<(String, i64, String, Option<String>, Option<String>)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if results.is_empty() {
+        println!("{}", format!("No storyboard usages found for '{}'", class_name).yellow());
+    } else {
+        println!(
+            "{}",
+            format!("Storyboard usages for '{}' ({}):", class_name, results.len()).bold()
+        );
+        for (path, line, cls, usage_type, sb_id) in &results {
+            let type_str = usage_type.as_deref().unwrap_or("unknown");
+            let id_str = sb_id.as_deref().map(|s| format!(" (id: {})", s)).unwrap_or_default();
+            println!("  {}:{} {} [{}]{}", path.cyan(), line, cls, type_str, id_str);
+        }
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+fn cmd_asset_usages(root: &Path, asset: &str, module: Option<&str>, asset_type: Option<&str>, unused: bool) -> Result<()> {
+    let start = Instant::now();
+
+    if !db::db_exists(root) {
+        println!(
+            "{}",
+            "Index not found. Run 'kotlin-index rebuild' first.".red()
+        );
+        return Ok(());
+    }
+
+    let conn = db::open_db(root)?;
+
+    if unused {
+        // Find unused assets
+        if module.is_none() {
+            println!("{}", "Error: --unused requires --module".red());
+            return Ok(());
+        }
+
+        let m = module.unwrap();
+        let type_filter = asset_type.map(|t| format!("AND a.type = '{}'", t)).unwrap_or_default();
+
+        let query = format!(
+            r#"
+            SELECT a.name, a.type, a.file_path
+            FROM ios_assets a
+            LEFT JOIN modules mod ON a.module_id = mod.id
+            LEFT JOIN ios_asset_usages au ON a.id = au.asset_id
+            WHERE (mod.name LIKE '%{}%' OR mod.path LIKE '%{}%')
+            AND au.id IS NULL
+            {}
+            ORDER BY a.type, a.name
+            "#,
+            m, m, type_filter
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let results: Vec<(String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if results.is_empty() {
+            println!("{}", format!("No unused assets found in module '{}'", m).green());
+        } else {
+            println!(
+                "{}",
+                format!("Unused assets in '{}' ({}):", m, results.len()).bold()
+            );
+            for (name, atype, path) in &results {
+                println!("  {} [{}]: {}", name.cyan(), atype, path.dimmed());
+            }
+        }
+    } else if asset.is_empty() {
+        // List all assets
+        let type_filter = asset_type.map(|t| format!("WHERE type = '{}'", t)).unwrap_or_default();
+        let query = format!(
+            "SELECT name, type, file_path FROM ios_assets {} ORDER BY type, name LIMIT 100",
+            type_filter
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let results: Vec<(String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        println!("{}", format!("iOS assets ({}):", results.len()).bold());
+        for (name, atype, path) in &results {
+            println!("  {} [{}]: {}", name.cyan(), atype, path.dimmed());
+        }
+    } else {
+        // Find usages of specific asset
+        let query = format!(
+            r#"
+            SELECT a.name, a.type, au.usage_file, au.usage_line
+            FROM ios_assets a
+            JOIN ios_asset_usages au ON a.id = au.asset_id
+            WHERE a.name LIKE '%{}%'
+            ORDER BY au.usage_file, au.usage_line
+            "#,
+            asset
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let results: Vec<(String, String, String, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if results.is_empty() {
+            println!("{}", format!("No usages found for asset '{}'", asset).yellow());
+        } else {
+            println!(
+                "{}",
+                format!("Usages of '{}' ({}):", asset, results.len()).bold()
+            );
+            for (name, atype, file, line) in &results {
+                println!("  {} [{}]: {}:{}", name.cyan(), atype, file, line);
+            }
+        }
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+fn cmd_swiftui(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    let start = Instant::now();
+
+    // Search for SwiftUI state properties: @State, @Binding, @Published, @ObservedObject, @StateObject, @EnvironmentObject
+    let pattern = r"@(State|Binding|Published|ObservedObject|StateObject|EnvironmentObject)\s+(private\s+)?(var|let)\s+\w+";
+
+    let prop_regex = Regex::new(r"@(State|Binding|Published|ObservedObject|StateObject|EnvironmentObject)\s+(?:private\s+)?(?:var|let)\s+(\w+)")?;
+
+    let mut results: Vec<(String, String, String, usize)> = vec![];
+
+    search_files(root, pattern, &["swift"], |path, line_num, line| {
+        if results.len() >= limit {
+            return;
+        }
+
+        if let Some(caps) = prop_regex.captures(&line) {
+            let prop_type = caps.get(1).unwrap().as_str().to_string();
+            let prop_name = caps.get(2).unwrap().as_str().to_string();
+
+            if let Some(q) = query {
+                let q_lower = q.to_lowercase();
+                if !prop_name.to_lowercase().contains(&q_lower)
+                    && !prop_type.to_lowercase().contains(&q_lower)
+                {
+                    return;
+                }
+            }
+
+            let rel_path = relative_path(root, path);
+            results.push((prop_type, prop_name, rel_path, line_num));
+        }
+    })?;
+
+    println!(
+        "{}",
+        format!("SwiftUI state properties ({}):", results.len()).bold()
+    );
+
+    // Group by type
+    let mut by_type: HashMap<String, Vec<(String, String, usize)>> = HashMap::new();
+    for (prop_type, prop_name, path, line) in results {
+        by_type
+            .entry(prop_type)
+            .or_default()
+            .push((prop_name, path, line));
+    }
+
+    for (prop_type, props) in &by_type {
+        println!("\n  {} ({}):", format!("@{}", prop_type).cyan(), props.len());
+        for (name, path, line) in props.iter().take(10) {
+            println!("    {}: {}:{}", name, path, line);
+        }
+        if props.len() > 10 {
+            println!("    ... and {} more", props.len() - 10);
+        }
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+fn cmd_async_funcs(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    let start = Instant::now();
+
+    // Search for async functions in Swift
+    let pattern = r"func\s+\w+[^{]*\basync\b";
+
+    let func_regex = Regex::new(r"func\s+(\w+)\s*(?:<[^>]*>)?\s*\([^)]*\)[^{]*\basync\b")?;
+
+    let mut results: Vec<(String, String, usize)> = vec![];
+
+    search_files(root, pattern, &["swift"], |path, line_num, line| {
+        if results.len() >= limit {
+            return;
+        }
+
+        if let Some(caps) = func_regex.captures(&line) {
+            let func_name = caps.get(1).unwrap().as_str().to_string();
+
+            if let Some(q) = query {
+                if !func_name.to_lowercase().contains(&q.to_lowercase()) {
+                    return;
+                }
+            }
+
+            let rel_path = relative_path(root, path);
+            results.push((func_name, rel_path, line_num));
+        }
+    })?;
+
+    println!(
+        "{}",
+        format!("Async functions ({}):", results.len()).bold()
+    );
+
+    for (func_name, path, line_num) in &results {
+        println!("  {}: {}:{}", func_name.cyan(), path, line_num);
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+fn cmd_publishers(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    let start = Instant::now();
+
+    // Search for Combine publishers: PassthroughSubject, CurrentValueSubject, AnyPublisher, Published
+    let pattern = r"(PassthroughSubject|CurrentValueSubject|AnyPublisher|@Published)\s*[<(]";
+
+    let pub_regex = Regex::new(r"(PassthroughSubject|CurrentValueSubject|AnyPublisher)(?:\s*<[^>]+>)?\s*(?:\(\)|[,;=])|@Published\s+(?:private\s+)?var\s+(\w+)")?;
+
+    let mut results: Vec<(String, String, String, usize)> = vec![];
+
+    search_files(root, pattern, &["swift"], |path, line_num, line| {
+        if results.len() >= limit {
+            return;
+        }
+
+        if let Some(caps) = pub_regex.captures(&line) {
+            let pub_type = caps.get(1).map(|m| m.as_str()).unwrap_or("@Published");
+            let name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+            if let Some(q) = query {
+                let q_lower = q.to_lowercase();
+                if !pub_type.to_lowercase().contains(&q_lower)
+                    && !name.to_lowercase().contains(&q_lower)
+                    && !line.to_lowercase().contains(&q_lower)
+                {
+                    return;
+                }
+            }
+
+            let rel_path = relative_path(root, path);
+            let content: String = line.trim().chars().take(80).collect();
+            results.push((pub_type.to_string(), content, rel_path, line_num));
+        }
+    })?;
+
+    println!(
+        "{}",
+        format!("Combine publishers ({}):", results.len()).bold()
+    );
+
+    for (pub_type, content, path, line_num) in &results {
+        println!("  {} {}:{}", pub_type.cyan(), path, line_num);
+        println!("    {}", content.dimmed());
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+fn cmd_main_actor(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    let start = Instant::now();
+
+    // Search for @MainActor
+    let pattern = r"@MainActor";
+
+    let mut results: Vec<(String, usize, String)> = vec![];
+
+    search_files(root, pattern, &["swift"], |path, line_num, line| {
+        if results.len() >= limit {
+            return;
+        }
+
+        if let Some(q) = query {
+            if !line.to_lowercase().contains(&q.to_lowercase()) {
+                return;
+            }
+        }
+
+        let rel_path = relative_path(root, path);
+        let content: String = line.trim().chars().take(100).collect();
+        results.push((rel_path, line_num, content));
+    })?;
+
+    println!(
+        "{}",
+        format!("@MainActor usages ({}):", results.len()).bold()
+    );
+
+    for (path, line_num, content) in &results {
+        println!("  {}:{}", path.cyan(), line_num);
+        println!("    {}", content);
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
 }

@@ -1,4 +1,4 @@
-# kotlin-index v3.3.0
+# kotlin-index v3.4.0
 
 Fast code search CLI for Android/Kotlin/Java and iOS/Swift/ObjC projects. Native Rust implementation.
 
@@ -45,7 +45,7 @@ kotlin-index implementations Presenter
 kotlin-index usages Repository
 ```
 
-## Commands (36)
+## Commands (42)
 
 ### Grep-based (no index required)
 
@@ -102,6 +102,18 @@ kotlin-index resource-usages --unused --module <MODULE>  # Find unused resources
 kotlin-index outline <FILE>           # Symbols in file
 kotlin-index imports <FILE>           # Imports in file
 kotlin-index changed [--base BRANCH]  # Changed symbols (git diff)
+```
+
+### iOS-specific commands (new in v3.4)
+
+```bash
+kotlin-index storyboard-usages <CLASS>  # Class usages in storyboards/xibs
+kotlin-index asset-usages [ASSET]       # iOS asset usages (xcassets)
+kotlin-index asset-usages --unused --module <MODULE>  # Find unused assets
+kotlin-index swiftui [QUERY]            # @State/@Binding/@Published props
+kotlin-index async-funcs [QUERY]        # Swift async functions
+kotlin-index publishers [QUERY]         # Combine publishers
+kotlin-index main-actor [QUERY]         # @MainActor usages
 ```
 
 ### Index management
@@ -230,9 +242,22 @@ xml_usages (id, module_id, file_path, line, class_name, usage_type, element_id)
 resources (id, module_id, type, name, file_path, line)
 resource_usages (id, resource_id, usage_file, usage_line, usage_type)
 transitive_deps (id, module_id, dependency_id, depth, path)
+
+-- New in v3.4.0 (iOS):
+storyboard_usages (id, module_id, file_path, line, class_name, usage_type, storyboard_id)
+ios_assets (id, module_id, type, name, file_path)
+ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.4.0
+- **iOS storyboard/xib analysis** — `storyboard-usages` command to find class usages in storyboards and xibs
+- **iOS assets support** — index and search xcassets (images, colors), `asset-usages` command with `--unused` flag
+- **SwiftUI commands** — `swiftui` command to find @State, @Binding, @Published, @ObservedObject properties
+- **Swift concurrency** — `async-funcs` for async functions, `main-actor` for @MainActor usages
+- **Combine support** — `publishers` command to find PassthroughSubject, CurrentValueSubject, AnyPublisher
+- **CocoaPods/Carthage** — detect and index dependencies from Podfile and Cartfile
 
 ### 3.3.0
 - **iOS/Swift/ObjC support** — auto-detect project type and index Swift/ObjC files
