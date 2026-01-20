@@ -1,4 +1,4 @@
-# kotlin-index v3.1.0 - Code Search for Android/Kotlin/Java Projects
+# kotlin-index v3.2.0 - Code Search for Android/Kotlin/Java Projects
 
 Fast native Rust CLI for code search in Android/Kotlin/Java projects using SQLite + FTS5.
 
@@ -16,7 +16,7 @@ cd /path/to/android/project
 kotlin-index rebuild
 ```
 
-## Available Commands (34 total)
+## Available Commands (36 total)
 
 ### Search Commands
 
@@ -169,10 +169,30 @@ kotlin-index deps "features.payments.impl"
 kotlin-index dependents "features.payments.api"
 ```
 
-**Find unused dependencies** (~10s per module):
+**Find unused dependencies** (with transitive, XML, resource checks):
 ```bash
 kotlin-index unused-deps "features.payments.impl"
 kotlin-index unused-deps "features.payments.impl" --verbose
+kotlin-index unused-deps "features.payments.impl" --strict  # only direct imports
+```
+
+### XML & Resource Commands (new in v3.2)
+
+**Find class usages in XML layouts**:
+```bash
+kotlin-index xml-usages "PaymentIconView"
+kotlin-index xml-usages "ImageView" --module "features.payments.impl"
+```
+
+**Find resource usages**:
+```bash
+kotlin-index resource-usages "@drawable/ic_payment"
+kotlin-index resource-usages "R.string.payment_title"
+```
+
+**Find unused resources in module**:
+```bash
+kotlin-index resource-usages --unused --module "features.payments.impl"
 ```
 
 ### File Structure
@@ -184,7 +204,7 @@ kotlin-index outline "path/to/File.kt"
 
 ### Index Management
 
-**Rebuild index** (includes module dependencies by default):
+**Rebuild index** (includes module dependencies, XML, resources by default):
 ```bash
 kotlin-index rebuild
 kotlin-index rebuild --no-deps  # skip module dependencies
@@ -209,7 +229,9 @@ kotlin-index stats
 | usages | ~8ms (indexed) |
 | imports | ~0.3ms |
 | deps/dependents | ~2ms |
-| unused-deps | ~10s |
+| unused-deps | ~12s |
+| xml-usages | ~1ms |
+| resource-usages | ~2ms |
 | todo | ~0.8s (grep) |
 
 ## Index Location
