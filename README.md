@@ -1,6 +1,6 @@
-# ast-index v3.6.0
+# ast-index v3.8.0
 
-Fast code search CLI for Android/Kotlin/Java, iOS/Swift/ObjC, and Perl projects. Native Rust implementation.
+Fast code search CLI for Android/Kotlin/Java, iOS/Swift/ObjC, Python, Go, C++, and Perl projects. Native Rust implementation.
 
 ## Supported Projects
 
@@ -8,7 +8,9 @@ Fast code search CLI for Android/Kotlin/Java, iOS/Swift/ObjC, and Perl projects.
 |----------|-----------|---------------|
 | Android | Kotlin, Java | Gradle |
 | iOS | Swift, Objective-C | SPM (Package.swift) |
+| Backend | Python, Go, C++ | None (file-based) |
 | Perl | Perl | Makefile.PL, Build.PL |
+| Schema | Protocol Buffers, WSDL/XSD | None |
 | Mixed | All above | All |
 
 Project type is auto-detected.
@@ -136,6 +138,46 @@ ast-index perl-subs [QUERY]          # Find subroutines
 ast-index perl-pod [QUERY]           # Find POD documentation (=head1, =item, etc.)
 ast-index perl-tests [QUERY]         # Find Test::More assertions (ok, is, like, etc.)
 ast-index perl-imports [QUERY]       # Find use/require statements
+```
+
+### Python support (new in v3.8)
+
+```bash
+# Index Python files (.py)
+ast-index rebuild                    # Auto-detects Python files
+
+# Indexed symbols:
+# - class ClassName
+# - def function_name / async def function_name
+# - @decorator
+# - import module / from module import name
+
+# Commands work with Python:
+ast-index class "ClassName"          # Find Python classes
+ast-index symbol "function"          # Find functions
+ast-index outline "file.py"          # Show file structure
+ast-index imports "file.py"          # Show imports (including from X import Y)
+ast-index usages "ClassName"         # Find usages
+```
+
+### Go support (new in v3.8)
+
+```bash
+# Index Go files (.go)
+ast-index rebuild                    # Auto-detects Go files
+
+# Indexed symbols:
+# - package name
+# - type Name struct / type Name interface
+# - func Name() / func (r *T) Method()
+# - import "module"
+
+# Commands work with Go:
+ast-index class "StructName"         # Find structs/interfaces
+ast-index symbol "FuncName"          # Find functions
+ast-index outline "file.go"          # Show file structure
+ast-index imports "file.go"          # Show imports (including import blocks)
+ast-index usages "TypeName"          # Find usages
 ```
 
 ### Index management
@@ -272,6 +314,27 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.8.0
+- **Python support** — index and search Python codebases
+  - Index: `class`, `def`, `async def`, decorators
+  - Imports: `import module`, `from module import name`
+  - File types: `.py`
+  - `outline` and `imports` commands work with Python files
+- **Go support** — index and search Go codebases
+  - Index: `package`, `type struct`, `type interface`, `func`, methods with receivers
+  - Imports: single imports and import blocks
+  - File types: `.go`
+  - `outline` and `imports` commands work with Go files
+- **Performance** — `deeplinks` command 200x faster (optimized pattern)
+
+### 3.7.0
+- **call-tree command** — show complete call hierarchy going UP (who calls the callers)
+  - `ast-index call-tree "functionName" --depth 3 --limit 10`
+  - Works across Kotlin, Java, Swift, Objective-C, and Perl
+- **--no-ignore flag** — index gitignored directories like `build/`
+  - `ast-index rebuild --no-ignore`
+  - Useful for finding generated code like `BuildConfig.java`
 
 ### 3.6.0
 - **Perl support** — index and search Perl codebases
