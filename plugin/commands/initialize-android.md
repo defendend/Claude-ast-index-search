@@ -1,6 +1,6 @@
 ---
 name: initialize-android
-description: Initialize ast-index for Android/Kotlin/Java project - configures .claude/settings.json and CLAUDE.md
+description: Initialize ast-index for Android/Kotlin/Java project - configures .claude/settings.json, rules, and CLAUDE.md
 ---
 
 # Initialize ast-index for Android Project
@@ -39,48 +39,41 @@ Then create or merge into `.claude/settings.json`. If file doesn't exist, create
     "allow": [
       "Bash(ast-index *)"
     ]
-  },
-  "contextProtocol": {
-    "rules": [
-      "ALWAYS use `ast-index` FIRST for any code search. Only use grep/Search as fallback if ast-index returns no results or for patterns ast-index doesn't support (regex, string literals in code)",
-      "NEVER duplicate ast-index results with grep/Search - if ast-index found usages, that's the complete answer",
-      "For class/interface lookup: `ast-index class \"Name\"` (~1ms)",
-      "For finding usages: `ast-index usages \"Symbol\"` (~8ms) - returns ALL usages, no grep needed",
-      "For implementations: `ast-index implementations \"Interface\"`",
-      "For call hierarchy: `ast-index call-tree \"function\" --depth 3`",
-      "For inheritance: `ast-index hierarchy \"Class\"`",
-      "For Dagger: `ast-index provides/inject \"Type\"`",
-      "For Compose: `ast-index composables`",
-      "For modules: `ast-index deps/dependents \"module\"`",
-      "For universal search (files + symbols + content): `ast-index search \"query\"`",
-      "grep/Search ONLY for: regex patterns, string literals, comments, or when ast-index returns empty",
-      "Run `ast-index update` after git pull/merge to refresh index"
-    ]
   }
 }
 ```
 
-**Important**: If `.claude/settings.json` already exists, MERGE the `contextProtocol.rules` array (don't replace). Check for duplicates before adding.
+**Important**: If `.claude/settings.json` already exists, MERGE the permissions (don't replace).
 
-### 3. Update .claude/CLAUDE.md
+### 3. Create .claude/rules/ast-index.md (CRITICAL)
 
-If `.claude/CLAUDE.md` doesn't exist, create it:
+Create the rules directory and ast-index rules file:
 
 ```bash
-touch .claude/CLAUDE.md
+mkdir -p .claude/rules
 ```
 
-Then append this section at the end of the file:
+Create file `.claude/rules/ast-index.md` with this content:
 
 ```markdown
+# ast-index Rules
 
-## ast-index - Code Search Tool
+## Mandatory Search Rules
 
-**ALWAYS use ast-index FIRST for code search. Do NOT duplicate results with grep/Search.**
+1. **ALWAYS use ast-index FIRST** for any code search task
+2. **NEVER duplicate results** — if ast-index found usages/implementations, that IS the complete answer
+3. **DO NOT run grep "for completeness"** after ast-index returns results
+4. **Use grep/Search ONLY when:**
+   - ast-index returns empty results
+   - Searching for regex patterns (ast-index uses literal match)
+   - Searching for string literals inside code (`"some text"`)
+   - Searching in comments content
 
-Fast native CLI for structural code search in Android/Kotlin/Java projects.
+## Why ast-index
 
-### Quick Reference
+ast-index is 17-69x faster than grep (1-10ms vs 200ms-3s) and returns structured, accurate results.
+
+## Command Reference
 
 | Task | Command | Time |
 |------|---------|------|
@@ -94,7 +87,7 @@ Fast native CLI for structural code search in Android/Kotlin/Java projects.
 | Module deps | `ast-index deps "module-name"` | ~10ms |
 | File outline | `ast-index outline "File.kt"` | ~1ms |
 
-### Android-Specific Commands
+## Android-Specific Commands
 
 | Task | Command |
 |------|---------|
@@ -105,25 +98,16 @@ Fast native CLI for structural code search in Android/Kotlin/Java projects.
 | Flows | `ast-index flows` |
 | XML usages | `ast-index xml-usages "ViewClass"` |
 
-### When to use grep/Search instead
+## Index Management
 
-- Regex patterns (ast-index uses literal match)
-- String literals inside code (`"some text"`)
-- Comments content
-- When ast-index returns empty results
-
-### Index Management
-
-```bash
-ast-index rebuild    # Full reindex (run once after clone)
-ast-index update     # After git pull/merge
-ast-index stats      # Show index statistics
-```
+- `ast-index rebuild` — Full reindex (run once after clone)
+- `ast-index update` — After git pull/merge
+- `ast-index stats` — Show index statistics
 ```
 
 ### 4. Copy Skill Documentation to Project (CRITICAL)
 
-**MANDATORY STEP - DO NOT SKIP!** Copy the ast-index skill documentation from the plugin to the project's `.claude/` directory. Without this step, project-level Claude will NOT have access to ast-index documentation.
+**MANDATORY STEP - DO NOT SKIP!** Copy the ast-index skill documentation from the plugin to the project's `.claude/` directory.
 
 Execute these commands:
 
@@ -147,7 +131,6 @@ You MUST see SKILL.md and multiple .md files in references/. If not, the copy fa
 Run initial indexing:
 
 ```bash
-cd <project-root>
 ast-index rebuild
 ```
 
@@ -165,8 +148,8 @@ ast-index search "Activity"
 ## Output
 
 After completion, inform user:
-- settings.json has been configured with ast-index rules
-- CLAUDE.md has been updated with ast-index reference
+- settings.json has been configured with ast-index permissions
+- Rules file created at .claude/rules/ast-index.md
 - Skill documentation copied to .claude/skills/ast-index/
 - Index has been built with X files and Y symbols
 - Ready to use ast-index for code search
