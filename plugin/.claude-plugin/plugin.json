@@ -1,0 +1,10 @@
+{
+  "name": "ast-index",
+  "version": "3.8.1",
+  "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Python, Go, and Perl projects",
+  "author": {
+    "name": "defendend"
+  },
+  "commands": "./commands",
+  "skills": "./skills"
+}
