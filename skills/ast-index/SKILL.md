@@ -1,11 +1,11 @@
 ---
 name: ast-index
-description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", "find Perl subs", "Perl exports", or needs fast code search in Android/Kotlin/Java, iOS/Swift/ObjC, or Perl projects. Also triggered by mentions of "ast-index" CLI tool.
+description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", "find Perl subs", "Perl exports", "find Python class", "Go struct", "Go interface", or needs fast code search in Android/Kotlin/Java, iOS/Swift/ObjC, Perl, Python, Go, C++, or Protocol Buffers projects. Also triggered by mentions of "ast-index" CLI tool.
 ---
 
 # ast-index - Code Search for Multi-Platform Projects
 
-Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swift/ObjC, and Perl projects using SQLite + FTS5 index.
+Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swift/ObjC, Perl, Python, Go, C++, and Proto projects using SQLite + FTS5 index.
 
 ## Prerequisites
 
@@ -32,12 +32,14 @@ The index is stored at `~/.cache/ast-index/<project-hash>/index.db` and needs re
 | Android | Kotlin, Java | Gradle (build.gradle.kts) |
 | iOS | Swift, Objective-C | SPM (Package.swift) |
 | Perl | Perl | Makefile.PL, Build.PL |
+| Python | Python | None (*.py files) |
+| Go | Go | None (*.go files) |
 | Proto | Protocol Buffers (proto2/proto3) | None (*.proto files) |
 | WSDL | WSDL, XSD | None (*.wsdl, *.xsd files) |
-| C/C++ | C, C++ (JNI focus) | None (*.cpp, *.h, *.hpp files) |
+| C/C++ | C, C++ (JNI, uservices) | None (*.cpp, *.h, *.hpp files) |
 | Mixed | All above | All |
 
-Project type is auto-detected by marker files (build.gradle.kts, Package.swift, Makefile.PL, etc.). Proto, WSDL, and C++ files are indexed alongside main project type.
+Project type is auto-detected by marker files (build.gradle.kts, Package.swift, Makefile.PL, etc.). Python, Go, Proto, WSDL, and C++ files are indexed alongside main project type.
 
 ## Core Commands
 
@@ -362,7 +364,9 @@ For detailed platform-specific commands, consult:
 - **`references/android-commands.md`** - DI (Dagger), Compose, Coroutines, XML/Resource commands
 - **`references/ios-commands.md`** - Storyboard, SwiftUI, Swift Concurrency, Combine commands
 - **`references/perl-commands.md`** - Perl exports, subs, POD, tests, imports
+- **`references/python-commands.md`** - Python classes, functions, async handlers, imports
+- **`references/go-commands.md`** - Go structs, interfaces, methods, packages
 - **`references/proto-commands.md`** - Protocol Buffers (proto2/proto3) messages, services, RPCs
 - **`references/wsdl-commands.md`** - WSDL/XSD types, services, operations (Template Toolkit support)
-- **`references/cpp-commands.md`** - C/C++ classes, JNI functions, templates, namespaces
+- **`references/cpp-commands.md`** - C/C++ classes, JNI functions, uservices, namespaces
 - **`references/module-commands.md`** - Module search, dependencies, unused deps analysis
