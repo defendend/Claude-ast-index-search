@@ -5,6 +5,5 @@
   "author": {
     "name": "defendend"
   },
-  "commands": "./commands",
-  "skills": "./skills"
+  "commands": "./commands"
 }
