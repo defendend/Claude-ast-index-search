@@ -38,20 +38,27 @@ Then create or merge into `.claude/settings.json`. If file doesn't exist, create
   "permissions": {
     "allow": [
       "Bash(ast-index *)"
+    ],
+    "deny": [
+      "Bash(find:*)",
+      "Bash(find *)"
     ]
   },
   "rules": [
-    "When searching for classes, symbols, files, or code patterns - use `ast-index` CLI for fast indexed search instead of grep/find/Glob",
-    "For finding class/protocol definitions use `ast-index class \"ClassName\"`",
-    "For finding symbol usages use `ast-index usages \"SymbolName\"`",
-    "For finding protocol conformances use `ast-index implementations \"ProtocolName\"`",
-    "For understanding call hierarchy use `ast-index call-tree \"functionName\" --depth 3`",
-    "For exploring class inheritance use `ast-index hierarchy \"ClassName\"`",
-    "For finding SwiftUI views and property wrappers use `ast-index swiftui`",
-    "For finding async functions use `ast-index async-funcs`",
-    "For finding @MainActor usages use `ast-index main-actor`",
-    "For SPM module dependency analysis use `ast-index deps/dependents \"ModuleName\"`",
-    "Run `ast-index update` periodically to keep index fresh after code changes"
+    "ALWAYS use `ast-index` FIRST for any code search. Only use grep/Search as fallback if ast-index returns no results or for patterns ast-index doesn't support (regex, string literals in code)",
+    "NEVER duplicate ast-index results with grep/Search - if ast-index found usages, that's the complete answer",
+    "For class/protocol lookup: `ast-index class \"Name\"` (~1ms)",
+    "For finding usages: `ast-index usages \"Symbol\"` (~8ms) - returns ALL usages, no grep needed",
+    "For protocol conformances: `ast-index implementations \"Protocol\"`",
+    "For call hierarchy: `ast-index call-tree \"function\" --depth 3`",
+    "For inheritance: `ast-index hierarchy \"Class\"`",
+    "For SwiftUI: `ast-index swiftui`",
+    "For async functions: `ast-index async-funcs`",
+    "For @MainActor: `ast-index main-actor`",
+    "For modules: `ast-index deps/dependents \"module\"`",
+    "For universal search (files + symbols + content): `ast-index search \"query\"`",
+    "grep/Search ONLY for: regex patterns, string literals, comments, or when ast-index returns empty",
+    "Run `ast-index update` after git pull/merge to refresh index"
   ]
 }
 ```
@@ -72,42 +79,49 @@ Then append this section at the end of the file:
 
 ## ast-index - Code Search Tool
 
+**ALWAYS use ast-index FIRST for code search. Do NOT duplicate results with grep/Search.**
+
 Fast native CLI for structural code search in iOS/Swift/Objective-C projects.
 
 ### Quick Reference
 
-| Task | Command |
-|------|---------|
-| Universal search | `ast-index search "query"` |
-| Find class/protocol | `ast-index class "ClassName"` |
-| Find usages | `ast-index usages "SymbolName"` |
-| Find conformances | `ast-index implementations "Protocol"` |
-| Call hierarchy | `ast-index call-tree "function" --depth 3` |
-| Class hierarchy | `ast-index hierarchy "ClassName"` |
-| Find callers | `ast-index callers "functionName"` |
-| Module deps | `ast-index deps "ModuleName"` |
-| File outline | `ast-index outline "File.swift"` |
+| Task | Command | Time |
+|------|---------|------|
+| Universal search | `ast-index search "query"` | ~10ms |
+| Find class/protocol | `ast-index class "ClassName"` | ~1ms |
+| Find usages | `ast-index usages "SymbolName"` | ~8ms |
+| Find conformances | `ast-index implementations "Protocol"` | ~5ms |
+| Call hierarchy | `ast-index call-tree "function" --depth 3` | ~1s |
+| Class hierarchy | `ast-index hierarchy "ClassName"` | ~5ms |
+| Find callers | `ast-index callers "functionName"` | ~1s |
+| Module deps | `ast-index deps "ModuleName"` | ~10ms |
+| File outline | `ast-index outline "File.swift"` | ~1ms |
 
 ### iOS-Specific Commands
 
 | Task | Command |
 |------|---------|
-| SwiftUI views | `ast-index swiftui "query"` |
-| Async functions | `ast-index async-funcs "query"` |
+| SwiftUI views | `ast-index swiftui` |
+| Async functions | `ast-index async-funcs` |
 | @MainActor | `ast-index main-actor` |
-| Combine publishers | `ast-index publishers "query"` |
-| Storyboard usages | `ast-index storyboard-usages "ClassName"` |
-| Asset usages | `ast-index asset-usages "asset-name"` |
+| Combine publishers | `ast-index publishers` |
+| Storyboard usages | `ast-index storyboard-usages "Class"` |
+| Asset usages | `ast-index asset-usages "name"` |
+
+### When to use grep/Search instead
+
+- Regex patterns (ast-index uses literal match)
+- String literals inside code (`"some text"`)
+- Comments content
+- When ast-index returns empty results
 
 ### Index Management
 
 ```bash
 ast-index rebuild    # Full reindex (run once after clone)
-ast-index update     # Incremental update (run periodically)
+ast-index update     # After git pull/merge
 ast-index stats      # Show index statistics
 ```
-
-Performance: search ~10ms, usages ~8ms, class ~1ms (indexed queries).
 ```
 
 ### 4. Build the Index

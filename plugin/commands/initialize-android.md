@@ -38,19 +38,26 @@ Then create or merge into `.claude/settings.json`. If file doesn't exist, create
   "permissions": {
     "allow": [
       "Bash(ast-index *)"
+    ],
+    "deny": [
+      "Bash(find:*)",
+      "Bash(find *)"
     ]
   },
   "rules": [
-    "When searching for classes, symbols, files, or code patterns - use `ast-index` CLI for fast indexed search instead of grep/find/Glob",
-    "For finding class definitions use `ast-index class \"ClassName\"`",
-    "For finding symbol usages use `ast-index usages \"SymbolName\"`",
-    "For finding implementations of interface/class use `ast-index implementations \"InterfaceName\"`",
-    "For understanding call hierarchy use `ast-index call-tree \"functionName\" --depth 3`",
-    "For exploring class inheritance use `ast-index hierarchy \"ClassName\"`",
-    "For finding Dagger provides/inject points use `ast-index provides/inject \"ModuleName\"`",
-    "For finding Compose functions use `ast-index composables`",
-    "For module dependency analysis use `ast-index deps/dependents \"module-name\"`",
-    "Run `ast-index update` periodically to keep index fresh after code changes"
+    "ALWAYS use `ast-index` FIRST for any code search. Only use grep/Search as fallback if ast-index returns no results or for patterns ast-index doesn't support (regex, string literals in code)",
+    "NEVER duplicate ast-index results with grep/Search - if ast-index found usages, that's the complete answer",
+    "For class/interface lookup: `ast-index class \"Name\"` (~1ms)",
+    "For finding usages: `ast-index usages \"Symbol\"` (~8ms) - returns ALL usages, no grep needed",
+    "For implementations: `ast-index implementations \"Interface\"`",
+    "For call hierarchy: `ast-index call-tree \"function\" --depth 3`",
+    "For inheritance: `ast-index hierarchy \"Class\"`",
+    "For Dagger: `ast-index provides/inject \"Type\"`",
+    "For Compose: `ast-index composables`",
+    "For modules: `ast-index deps/dependents \"module\"`",
+    "For universal search (files + symbols + content): `ast-index search \"query\"`",
+    "grep/Search ONLY for: regex patterns, string literals, comments, or when ast-index returns empty",
+    "Run `ast-index update` after git pull/merge to refresh index"
   ]
 }
 ```
@@ -71,42 +78,49 @@ Then append this section at the end of the file:
 
 ## ast-index - Code Search Tool
 
+**ALWAYS use ast-index FIRST for code search. Do NOT duplicate results with grep/Search.**
+
 Fast native CLI for structural code search in Android/Kotlin/Java projects.
 
 ### Quick Reference
 
-| Task | Command |
-|------|---------|
-| Universal search | `ast-index search "query"` |
-| Find class | `ast-index class "ClassName"` |
-| Find usages | `ast-index usages "SymbolName"` |
-| Find implementations | `ast-index implementations "Interface"` |
-| Call hierarchy | `ast-index call-tree "function" --depth 3` |
-| Class hierarchy | `ast-index hierarchy "ClassName"` |
-| Find callers | `ast-index callers "functionName"` |
-| Module deps | `ast-index deps "module-name"` |
-| File outline | `ast-index outline "File.kt"` |
+| Task | Command | Time |
+|------|---------|------|
+| Universal search | `ast-index search "query"` | ~10ms |
+| Find class | `ast-index class "ClassName"` | ~1ms |
+| Find usages | `ast-index usages "SymbolName"` | ~8ms |
+| Find implementations | `ast-index implementations "Interface"` | ~5ms |
+| Call hierarchy | `ast-index call-tree "function" --depth 3` | ~1s |
+| Class hierarchy | `ast-index hierarchy "ClassName"` | ~5ms |
+| Find callers | `ast-index callers "functionName"` | ~1s |
+| Module deps | `ast-index deps "module-name"` | ~10ms |
+| File outline | `ast-index outline "File.kt"` | ~1ms |
 
 ### Android-Specific Commands
 
 | Task | Command |
 |------|---------|
-| Dagger provides | `ast-index provides "query"` |
-| Dagger inject | `ast-index inject "query"` |
-| Composables | `ast-index composables "query"` |
-| Suspend functions | `ast-index suspend "query"` |
-| Flows | `ast-index flows "query"` |
-| XML usages | `ast-index xml-usages "layout_name"` |
+| Dagger provides | `ast-index provides "Type"` |
+| Dagger inject | `ast-index inject "Type"` |
+| Composables | `ast-index composables` |
+| Suspend functions | `ast-index suspend` |
+| Flows | `ast-index flows` |
+| XML usages | `ast-index xml-usages "ViewClass"` |
+
+### When to use grep/Search instead
+
+- Regex patterns (ast-index uses literal match)
+- String literals inside code (`"some text"`)
+- Comments content
+- When ast-index returns empty results
 
 ### Index Management
 
 ```bash
 ast-index rebuild    # Full reindex (run once after clone)
-ast-index update     # Incremental update (run periodically)
+ast-index update     # After git pull/merge
 ast-index stats      # Show index statistics
 ```
-
-Performance: search ~10ms, usages ~8ms, class ~1ms (indexed queries).
 ```
 
 ### 4. Build the Index
