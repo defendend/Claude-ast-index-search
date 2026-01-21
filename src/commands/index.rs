@@ -19,9 +19,9 @@ use rusqlite::{params, Connection};
 use crate::db;
 use super::{search_files, relative_path};
 
-/// Full-text search across files and symbols
+/// Full-text search across files, symbols, and file contents
 pub fn cmd_search(root: &Path, query: &str, limit: usize) -> Result<()> {
-    let start = Instant::now();
+    let total_start = Instant::now();
 
     if !db::db_exists(root) {
         println!(
@@ -33,17 +33,34 @@ pub fn cmd_search(root: &Path, query: &str, limit: usize) -> Result<()> {
 
     let conn = db::open_db(root)?;
 
-    // Search in files
+    // 1. Search in file paths (index)
+    let files_start = Instant::now();
     let files = db::find_files(&conn, query, limit)?;
+    let files_time = files_start.elapsed();
 
-    // Search in symbols using FTS
+    // 2. Search in symbols using FTS (index)
+    let symbols_start = Instant::now();
     let fts_query = format!("{}*", query); // Prefix search
     let symbols = db::search_symbols(&conn, &fts_query, limit)?;
+    let symbols_time = symbols_start.elapsed();
 
+    // 3. Search in file contents (grep)
+    let content_start = Instant::now();
+    let pattern = regex::escape(query);
+    let mut content_matches: Vec<(String, usize, String)> = vec![];
+
+    super::search_files_limited(root, &pattern, &["kt", "java", "swift", "m", "h", "py", "go", "rs", "cpp", "c", "proto"], limit, |path, line_num, line| {
+        let rel_path = super::relative_path(root, path);
+        let content: String = line.trim().chars().take(100).collect();
+        content_matches.push((rel_path, line_num, content));
+    })?;
+    let content_time = content_start.elapsed();
+
+    // Output results
     println!("{}", format!("Search results for '{}':", query).bold());
 
     if !files.is_empty() {
-        println!("\n{}", "Files:".cyan());
+        println!("\n{}", "Files (by path):".cyan());
         for path in files.iter().take(limit) {
             println!("  {}", path);
         }
@@ -59,11 +76,26 @@ pub fn cmd_search(root: &Path, query: &str, limit: usize) -> Result<()> {
         }
     }
 
-    if files.is_empty() && symbols.is_empty() {
+    if !content_matches.is_empty() {
+        println!("\n{}", "Content matches:".cyan());
+        for (path, line_num, content) in content_matches.iter().take(limit) {
+            println!("  {}:{}", path.cyan(), line_num);
+            println!("    {}", content.dimmed());
+        }
+        if content_matches.len() > limit {
+            println!("  ... and {} more", content_matches.len() - limit);
+        }
+    }
+
+    if files.is_empty() && symbols.is_empty() && content_matches.is_empty() {
         println!("  No results found.");
     }
 
-    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    // Timing breakdown
+    eprintln!("\n{}", format!(
+        "Time: {:?} (files: {:?}, symbols: {:?}, content: {:?})",
+        total_start.elapsed(), files_time, symbols_time, content_time
+    ).dimmed());
     Ok(())
 }
 
