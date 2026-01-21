@@ -8,11 +8,11 @@
   "plugins": [
     {
       "name": "ast-index",
-      "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Python, Go, and Perl projects",
+      "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Python, Go, Perl, C++, Protocol Buffers, and WSDL/XSD projects",
       "author": {
         "name": "defendend"
       },
-      "version": "3.8.2",
+      "version": "3.8.3",
       "category": "development",
       "homepage": "https://github.com/defendend/Claude-ast-index-search",
       "source": "./plugin"
