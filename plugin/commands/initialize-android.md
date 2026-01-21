@@ -40,25 +40,27 @@ Then create or merge into `.claude/settings.json`. If file doesn't exist, create
       "Bash(ast-index *)"
     ]
   },
-  "rules": [
-    "ALWAYS use `ast-index` FIRST for any code search. Only use grep/Search as fallback if ast-index returns no results or for patterns ast-index doesn't support (regex, string literals in code)",
-    "NEVER duplicate ast-index results with grep/Search - if ast-index found usages, that's the complete answer",
-    "For class/interface lookup: `ast-index class \"Name\"` (~1ms)",
-    "For finding usages: `ast-index usages \"Symbol\"` (~8ms) - returns ALL usages, no grep needed",
-    "For implementations: `ast-index implementations \"Interface\"`",
-    "For call hierarchy: `ast-index call-tree \"function\" --depth 3`",
-    "For inheritance: `ast-index hierarchy \"Class\"`",
-    "For Dagger: `ast-index provides/inject \"Type\"`",
-    "For Compose: `ast-index composables`",
-    "For modules: `ast-index deps/dependents \"module\"`",
-    "For universal search (files + symbols + content): `ast-index search \"query\"`",
-    "grep/Search ONLY for: regex patterns, string literals, comments, or when ast-index returns empty",
-    "Run `ast-index update` after git pull/merge to refresh index"
-  ]
+  "contextProtocol": {
+    "rules": [
+      "ALWAYS use `ast-index` FIRST for any code search. Only use grep/Search as fallback if ast-index returns no results or for patterns ast-index doesn't support (regex, string literals in code)",
+      "NEVER duplicate ast-index results with grep/Search - if ast-index found usages, that's the complete answer",
+      "For class/interface lookup: `ast-index class \"Name\"` (~1ms)",
+      "For finding usages: `ast-index usages \"Symbol\"` (~8ms) - returns ALL usages, no grep needed",
+      "For implementations: `ast-index implementations \"Interface\"`",
+      "For call hierarchy: `ast-index call-tree \"function\" --depth 3`",
+      "For inheritance: `ast-index hierarchy \"Class\"`",
+      "For Dagger: `ast-index provides/inject \"Type\"`",
+      "For Compose: `ast-index composables`",
+      "For modules: `ast-index deps/dependents \"module\"`",
+      "For universal search (files + symbols + content): `ast-index search \"query\"`",
+      "grep/Search ONLY for: regex patterns, string literals, comments, or when ast-index returns empty",
+      "Run `ast-index update` after git pull/merge to refresh index"
+    ]
+  }
 }
 ```
 
-**Important**: If `.claude/settings.json` already exists, MERGE the rules array (don't replace). Check for duplicates before adding.
+**Important**: If `.claude/settings.json` already exists, MERGE the `contextProtocol.rules` array (don't replace). Check for duplicates before adding.
 
 ### 3. Update .claude/CLAUDE.md
 
@@ -119,9 +121,11 @@ ast-index stats      # Show index statistics
 ```
 ```
 
-### 4. Copy Skill Documentation to Project
+### 4. Copy Skill Documentation to Project (CRITICAL)
 
-Copy the ast-index skill documentation from the plugin to the project's `.claude/` directory so that project-level Claude has access to it:
+**MANDATORY STEP - DO NOT SKIP!** Copy the ast-index skill documentation from the plugin to the project's `.claude/` directory. Without this step, project-level Claude will NOT have access to ast-index documentation.
+
+Execute these commands:
 
 ```bash
 mkdir -p .claude/skills/ast-index/references
@@ -129,7 +133,14 @@ cp "${CLAUDE_PLUGIN_ROOT}/skills/ast-index/SKILL.md" .claude/skills/ast-index/
 cp "${CLAUDE_PLUGIN_ROOT}/skills/ast-index/references/"*.md .claude/skills/ast-index/references/
 ```
 
-This ensures the ast-index documentation is available in the project context.
+After executing, verify the files were copied:
+
+```bash
+ls -la .claude/skills/ast-index/
+ls -la .claude/skills/ast-index/references/
+```
+
+You MUST see SKILL.md and multiple .md files in references/. If not, the copy failed and must be retried.
 
 ### 5. Build the Index
 
