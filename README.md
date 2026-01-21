@@ -1,4 +1,4 @@
-# ast-index v3.8.0
+# ast-index v3.8.2
 
 Fast code search CLI for Android/Kotlin/Java, iOS/Swift/ObjC, Python, Go, C++, and Perl projects. Native Rust implementation.
 
@@ -314,6 +314,17 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.8.2
+- **Plugin improvements**
+  - Added C++, Protocol Buffers, and WSDL/XSD reference documentation
+  - Added "Critical Rules" section to SKILL.md for better Claude integration
+  - Initialize commands now copy skill documentation to project `.claude/` directory
+  - Updated plugin description to include all supported languages
+
+### 3.8.1
+- **search command fix** — `-l/--limit` parameter now correctly limits file results
+- **Content search** — `search` command now also searches file contents (not just filenames and symbols)
 
 ### 3.8.0
 - **Python support** — index and search Python codebases
