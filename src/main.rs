@@ -396,6 +396,8 @@ enum Commands {
     },
     /// Show version
     Version,
+    /// Install Claude Code plugin to ~/.claude/plugins/
+    InstallClaudePlugin,
 }
 
 fn main() -> Result<()> {
@@ -468,7 +470,56 @@ fn main() -> Result<()> {
             println!("ast-index v{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Commands::InstallClaudePlugin => cmd_install_claude_plugin(),
     }
+}
+
+fn cmd_install_claude_plugin() -> Result<()> {
+    use std::fs;
+    use std::io::Write;
+
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let plugin_dir = home.join(".claude").join("plugins").join("ast-index");
+
+    // Create plugin directory
+    fs::create_dir_all(&plugin_dir)?;
+    fs::create_dir_all(plugin_dir.join(".claude-plugin"))?;
+    fs::create_dir_all(plugin_dir.join("skills").join("ast-index").join("references"))?;
+    fs::create_dir_all(plugin_dir.join("commands"))?;
+
+    // Write plugin.json
+    let plugin_json = include_str!("../plugin/.claude-plugin/plugin.json");
+    fs::write(plugin_dir.join(".claude-plugin").join("plugin.json"), plugin_json)?;
+
+    // Write skill files
+    let skill_md = include_str!("../plugin/skills/ast-index/SKILL.md");
+    fs::write(plugin_dir.join("skills").join("ast-index").join("SKILL.md"), skill_md)?;
+
+    // Write reference files
+    let refs = [
+        ("android-commands.md", include_str!("../plugin/skills/ast-index/references/android-commands.md")),
+        ("go-commands.md", include_str!("../plugin/skills/ast-index/references/go-commands.md")),
+        ("ios-commands.md", include_str!("../plugin/skills/ast-index/references/ios-commands.md")),
+        ("module-commands.md", include_str!("../plugin/skills/ast-index/references/module-commands.md")),
+        ("perl-commands.md", include_str!("../plugin/skills/ast-index/references/perl-commands.md")),
+        ("python-commands.md", include_str!("../plugin/skills/ast-index/references/python-commands.md")),
+    ];
+    for (name, content) in refs {
+        fs::write(plugin_dir.join("skills").join("ast-index").join("references").join(name), content)?;
+    }
+
+    // Write command files
+    let commands = [
+        ("initialize-android.md", include_str!("../plugin/commands/initialize-android.md")),
+        ("initialize-ios.md", include_str!("../plugin/commands/initialize-ios.md")),
+    ];
+    for (name, content) in commands {
+        fs::write(plugin_dir.join("commands").join(name), content)?;
+    }
+
+    println!("Claude Code plugin installed to: {}", plugin_dir.display());
+    println!("\nRestart Claude Code to activate the plugin.");
+    Ok(())
 }
 
 fn find_project_root() -> Result<PathBuf> {
