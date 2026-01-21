@@ -44,11 +44,11 @@ pub fn cmd_search(root: &Path, query: &str, limit: usize) -> Result<()> {
 
     if !files.is_empty() {
         println!("\n{}", "Files:".cyan());
-        for path in files.iter().take(10) {
+        for path in files.iter().take(limit) {
             println!("  {}", path);
         }
-        if files.len() > 10 {
-            println!("  ... and {} more", files.len() - 10);
+        if files.len() > limit {
+            println!("  ... and {} more", files.len() - limit);
         }
     }
 
