@@ -1,17 +1,18 @@
-# ast-index v3.8.5
+# ast-index v3.9.0
 
-Fast code search CLI for Android/Kotlin/Java, iOS/Swift/ObjC, Python, Go, C++, and Perl projects. Native Rust implementation.
+Fast code search CLI for 14 programming languages. Native Rust implementation.
 
 ## Supported Projects
 
-| Platform | Languages | Module System |
-|----------|-----------|---------------|
-| Android | Kotlin, Java | Gradle |
-| iOS | Swift, Objective-C | SPM (Package.swift) |
-| Backend | Python, Go, C++ | None (file-based) |
-| Perl | Perl | Makefile.PL, Build.PL |
-| Schema | Protocol Buffers, WSDL/XSD | None |
-| Mixed | All above | All |
+| Platform | Languages | File Extensions |
+|----------|-----------|-----------------|
+| Android | Kotlin, Java | `.kt`, `.java` |
+| iOS | Swift, Objective-C | `.swift`, `.m`, `.h` |
+| Web/Frontend | TypeScript, JavaScript | `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.vue`, `.svelte` |
+| Systems | Rust | `.rs` |
+| Backend | C#, Python, Go, C++ | `.cs`, `.py`, `.go`, `.cpp`, `.cc`, `.c`, `.hpp` |
+| Scripting | Ruby, Perl | `.rb`, `.pm`, `.pl`, `.t` |
+| Schema | Protocol Buffers, WSDL/XSD | `.proto`, `.wsdl`, `.xsd` |
 
 Project type is auto-detected.
 
@@ -58,7 +59,7 @@ brew install ast-index
 ## Quick Start
 
 ```bash
-cd /path/to/android/project
+cd /path/to/project
 
 # Build index
 ast-index rebuild
@@ -70,7 +71,7 @@ ast-index implementations Presenter
 ast-index usages Repository
 ```
 
-## Commands (46)
+## Commands (46+)
 
 ### Grep-based (no index required)
 
@@ -98,6 +99,7 @@ ast-index search <QUERY>           # Universal search
 ast-index file <PATTERN>           # Find files
 ast-index symbol <NAME>            # Find symbols
 ast-index class <NAME>             # Find classes/interfaces
+ast-index symbol <NAME>            # Find any symbol by name
 ast-index implementations <PARENT> # Find implementations
 ast-index hierarchy <CLASS>        # Class hierarchy tree
 ast-index usages <SYMBOL>          # Symbol usages (indexed, ~8ms)
@@ -113,7 +115,7 @@ ast-index unused-deps <MODULE>     # Find unused dependencies (v3.2: +transitive
 ast-index api <MODULE>             # Public API of module
 ```
 
-### XML & Resource analysis (new in v3.2)
+### XML & Resource analysis
 
 ```bash
 ast-index xml-usages <CLASS>       # Find class usages in XML layouts
@@ -129,7 +131,7 @@ ast-index imports <FILE>           # Imports in file
 ast-index changed [--base BRANCH]  # Changed symbols (git diff)
 ```
 
-### iOS-specific commands (new in v3.4)
+### iOS-specific commands
 
 ```bash
 ast-index storyboard-usages <CLASS>  # Class usages in storyboards/xibs
@@ -141,7 +143,7 @@ ast-index publishers [QUERY]         # Combine publishers
 ast-index main-actor [QUERY]         # @MainActor usages
 ```
 
-### Perl-specific commands (new in v3.6)
+### Perl-specific commands
 
 ```bash
 ast-index perl-exports [QUERY]       # Find @EXPORT/@EXPORT_OK
@@ -149,46 +151,6 @@ ast-index perl-subs [QUERY]          # Find subroutines
 ast-index perl-pod [QUERY]           # Find POD documentation (=head1, =item, etc.)
 ast-index perl-tests [QUERY]         # Find Test::More assertions (ok, is, like, etc.)
 ast-index perl-imports [QUERY]       # Find use/require statements
-```
-
-### Python support (new in v3.8)
-
-```bash
-# Index Python files (.py)
-ast-index rebuild                    # Auto-detects Python files
-
-# Indexed symbols:
-# - class ClassName
-# - def function_name / async def function_name
-# - @decorator
-# - import module / from module import name
-
-# Commands work with Python:
-ast-index class "ClassName"          # Find Python classes
-ast-index symbol "function"          # Find functions
-ast-index outline "file.py"          # Show file structure
-ast-index imports "file.py"          # Show imports (including from X import Y)
-ast-index usages "ClassName"         # Find usages
-```
-
-### Go support (new in v3.8)
-
-```bash
-# Index Go files (.go)
-ast-index rebuild                    # Auto-detects Go files
-
-# Indexed symbols:
-# - package name
-# - type Name struct / type Name interface
-# - func Name() / func (r *T) Method()
-# - import "module"
-
-# Commands work with Go:
-ast-index class "StructName"         # Find structs/interfaces
-ast-index symbol "FuncName"          # Find functions
-ast-index outline "file.go"          # Show file structure
-ast-index imports "file.go"          # Show imports (including import blocks)
-ast-index usages "TypeName"          # Find usages
 ```
 
 ### Index management
@@ -201,89 +163,106 @@ ast-index stats                    # Index statistics
 ast-index version                  # Version info
 ```
 
+## Language-Specific Features
+
+### TypeScript/JavaScript (new in v3.9)
+
+Supported elements:
+- Classes, interfaces, type aliases, enums
+- Functions (regular, arrow, async)
+- React components and hooks (`useXxx`)
+- Vue SFC (`<script>` extraction)
+- Svelte components
+- Decorators (@Controller, @Injectable, etc.)
+- Namespaces, constants, imports/exports
+
+```bash
+ast-index class "Component"        # Find React/Vue components
+ast-index search "use"             # Find React hooks
+ast-index search "@Controller"     # Find NestJS controllers
+ast-index class "Props"            # Find prop interfaces
+```
+
+### Rust (new in v3.9)
+
+Supported elements:
+- Structs, enums, traits
+- Impl blocks (`impl Trait for Type`)
+- Functions, macros (`macro_rules!`)
+- Type aliases, constants, statics
+- Modules, use statements
+- Derive attributes
+
+```bash
+ast-index class "Service"          # Find structs
+ast-index class "Repository"       # Find traits
+ast-index search "impl"            # Find impl blocks
+ast-index search "macro_rules"     # Find macros
+```
+
+### Ruby (new in v3.9)
+
+Supported elements:
+- Classes, modules
+- Methods (def, def self.)
+- RSpec DSL (describe, it, let)
+- Rails patterns (has_many, validates, scope, callbacks)
+- Require statements, include/extend
+
+```bash
+ast-index class "Controller"       # Find controllers
+ast-index search "has_many"        # Find associations
+ast-index search "describe"        # Find RSpec tests
+ast-index search "scope"           # Find scopes
+```
+
+### C# (new in v3.9)
+
+Supported elements:
+- Classes, interfaces, structs, records
+- Enums, delegates, events
+- Methods, properties, fields
+- ASP.NET attributes (@ApiController, @HttpGet, etc.)
+- Unity attributes (@SerializeField)
+- Namespaces, using statements
+
+```bash
+ast-index class "Controller"       # Find ASP.NET controllers
+ast-index class "IRepository"      # Find interfaces
+ast-index search "[HttpGet]"       # Find API endpoints
+ast-index search "MonoBehaviour"   # Find Unity scripts
+```
+
+### Python
+
+```bash
+ast-index class "ClassName"        # Find Python classes
+ast-index symbol "function"        # Find functions
+ast-index outline "file.py"        # Show file structure
+ast-index imports "file.py"        # Show imports
+```
+
+### Go
+
+```bash
+ast-index class "StructName"       # Find structs/interfaces
+ast-index symbol "FuncName"        # Find functions
+ast-index outline "file.go"        # Show file structure
+ast-index imports "file.go"        # Show imports
+```
+
 ## Performance
 
 Benchmarks on large Android project (~29k files, ~300k symbols):
 
-### Speed Comparison (vs Python)
-
-| Category | Rust Wins | Python Wins | Equal |
-|----------|-----------|-------------|-------|
-| Grep-based (14) | 10 | 3 | 1 |
-| Index-based (6) | 5 | 1 | 0 |
-| Modules (4) | 4 | 0 | 0 |
-| Files (3) | 3 | 0 | 0 |
-| Management (6) | 4 | 1 | 1 |
-| **TOTAL** | **26** | **5** | **2** |
-
-### Top Speedups
-
-| Command | Rust | Python | Speedup |
-|---------|------|--------|---------|
+| Command | Rust | grep | Speedup |
+|---------|------|------|---------|
 | imports | 0.3ms | 90ms | **260x** |
 | dependents | 2ms | 100ms | **100x** |
 | deps | 3ms | 90ms | **90x** |
 | class | 1ms | 90ms | **90x** |
 | search | 11ms | 280ms | **14x** |
 | usages | 8ms | 90ms | **12x** |
-
-### Full Benchmark Results
-
-#### Grep-based commands
-
-| Command | Rust | Python | Winner |
-|---------|------|--------|--------|
-| todo | 0.79s | 1.43s | Rust 1.8x |
-| callers | 1.02s | 1.24s | Rust 1.2x |
-| provides | 1.76s | 1.61s | Python 1.1x |
-| suspend | 0.93s | 1.46s | Rust 1.6x |
-| composables | 1.35s | 1.28s | Python 1.1x |
-| deprecated | 1.20s | 1.06s | Python 1.1x |
-| suppress | 1.14s | 1.15s | Equal |
-| inject | 0.59s | 2.57s | Rust 4.4x |
-| annotations | 1.07s | 1.21s | Rust 1.1x |
-| deeplinks | 1.29s | 1.45s | Rust 1.1x |
-| extensions | 1.09s | 1.15s | Rust 1.1x |
-| flows | 1.13s | 1.11s | Equal |
-| previews | 1.11s | 1.18s | Rust 1.1x |
-| usages | 0.008s | 0.09s | Rust 12x |
-
-#### Index-based commands
-
-| Command | Rust | Python | Winner |
-|---------|------|--------|--------|
-| search | 0.02s | 0.28s | Rust 14x |
-| file | 0.03s | 0.09s | Rust 3x |
-| symbol | 0.36s | 0.10s | Python 3.6x |
-| class | 0.00s | 0.09s | Rust 90x |
-| implementations | 0.03s | 0.42s | Rust 14x |
-| hierarchy | 0.03s | 0.07s | Rust 2.3x |
-
-#### Module commands
-
-| Command | Rust | Python | Winner |
-|---------|------|--------|--------|
-| module | 0.01s | 0.15s | Rust 15x |
-| deps | 0.00s | 0.09s | Rust 90x |
-| dependents | 0.00s | 0.10s | Rust 100x |
-| api | 0.03s | 0.47s | Rust 16x |
-
-#### File analysis
-
-| Command | Rust | Python | Winner |
-|---------|------|--------|--------|
-| outline | 0.01s | 0.15s | Rust 15x |
-| imports | 0.00s | 0.09s | Rust 260x |
-| changed | 0.07s | 0.62s | Rust 9x |
-
-#### Index management
-
-| Command | Rust | Python | Winner |
-|---------|------|--------|--------|
-| rebuild | 24.7s | ~36s | Rust 1.5x |
-| rebuild --deps | 32.7s | N/A | Rust only |
-| update | 0.89s | 1.61s | Rust 1.8x |
-| stats | 0.41s | 0.20s | Python 2x |
 
 ### Size Comparison
 
@@ -311,20 +290,43 @@ inheritance (child_id, parent_name, kind)
 modules (id, name, path)
 module_deps (module_id, dep_module_id, dep_kind)
 refs (id, file_id, name, line, context)
-
--- New in v3.2.0:
 xml_usages (id, module_id, file_path, line, class_name, usage_type, element_id)
 resources (id, module_id, type, name, file_path, line)
 resource_usages (id, resource_id, usage_file, usage_line, usage_type)
 transitive_deps (id, module_id, dependency_id, depth, path)
-
--- New in v3.4.0 (iOS):
 storyboard_usages (id, module_id, file_path, line, class_name, usage_type, storyboard_id)
 ios_assets (id, module_id, type, name, file_path)
 ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.9.0
+- **TypeScript/JavaScript support** — index and search web projects
+  - React: components, hooks (useXxx), JSX/TSX
+  - Vue: SFC script extraction, defineComponent
+  - Svelte: component props extraction
+  - NestJS/Angular: decorators (@Controller, @Injectable, @Component)
+  - Node.js: ES modules, CommonJS
+  - File types: `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.vue`, `.svelte`
+- **Rust support** — index and search Rust codebases
+  - Structs, enums, traits, impl blocks
+  - Functions, macros, type aliases
+  - Derive attributes tracking
+  - File types: `.rs`
+- **Ruby support** — index and search Ruby/Rails codebases
+  - Classes, modules, methods
+  - RSpec DSL (describe, it, let, context)
+  - Rails: associations, validations, scopes, callbacks
+  - File types: `.rb`
+- **C# support** — index and search .NET projects
+  - Classes, interfaces, structs, records
+  - ASP.NET: controllers, HTTP attributes
+  - Unity: MonoBehaviour, SerializeField
+  - File types: `.cs`
+- **Explore agent** — deep code investigation with confirmations
+- **Review agent** — change analysis with impact assessment
+- **63 tests** — comprehensive test coverage for all parsers
 
 ### 3.8.5
 - **Documentation** — added troubleshooting section for brew install merge conflict errors
@@ -373,7 +375,7 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
   - Project detection: `Makefile.PL`, `Build.PL`, `cpanfile`
 
 ### 3.5.0
-- **Renamed to ast-index** — project renamed from `kotlin-index` to `ast-index`
+- **Renamed to ast-index** — project renamed from `kotlin-index`
   - New CLI command: `ast-index` (was `kotlin-index`)
   - New Homebrew tap: `defendend/ast-index` (was `defendend/kotlin-index`)
   - New repo: `Claude-ast-index-search` (was `Claude-index-search-android-studio`)
@@ -410,7 +412,7 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 - Update `unused-deps` with XML layout usage checking
 - Update `unused-deps` with resource usage checking
 - New flags: `--no-transitive`, `--no-xml`, `--no-resources`, `--strict`
-- Index XML layouts (5K+ usages in YandexGo project)
+- Index XML layouts (5K+ usages in large Android projects)
 - Index resources (63K+ resources, 15K+ usages)
 - Build transitive dependency cache (11K+ entries)
 

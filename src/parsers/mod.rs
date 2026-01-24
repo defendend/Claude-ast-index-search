@@ -4,21 +4,29 @@
 //! - Kotlin/Java (Android)
 //! - Swift (iOS)
 //! - Objective-C (iOS)
+//! - TypeScript/JavaScript (React, Vue, Svelte, Node.js)
 //! - Perl
 //! - Protocol Buffers (proto2/proto3)
 //! - WSDL/XSD (Web Services)
 //! - C/C++ (JNI bindings, uservices)
 //! - Python (backend services)
 //! - Go (backend services)
+//! - Rust (systems programming)
+//! - Ruby (Rails, RSpec)
+//! - C# (.NET, Unity, ASP.NET)
 
 pub mod cpp;
+pub mod csharp;
 pub mod go;
 pub mod kotlin;
 pub mod objc;
 pub mod perl;
 pub mod proto;
 pub mod python;
+pub mod ruby;
+pub mod rust;
 pub mod swift;
+pub mod typescript;
 pub mod wsdl;
 
 use crate::db::SymbolKind;
@@ -47,18 +55,47 @@ use regex::Regex;
 
 // Re-export parser functions
 pub use cpp::parse_cpp_symbols;
+pub use csharp::parse_csharp_symbols;
 pub use go::parse_go_symbols;
 pub use kotlin::{parse_kotlin_symbols, parse_parents};
 pub use objc::parse_objc_symbols;
 pub use perl::parse_perl_symbols;
 pub use proto::parse_proto_symbols;
 pub use python::parse_python_symbols;
+pub use ruby::parse_ruby_symbols;
+pub use rust::parse_rust_symbols;
 pub use swift::parse_swift_symbols;
+pub use typescript::{parse_typescript_symbols, extract_vue_script, extract_svelte_script};
 pub use wsdl::parse_wsdl_symbols;
 
 /// Check if file extension is supported for indexing
 pub fn is_supported_extension(ext: &str) -> bool {
-    matches!(ext, "kt" | "java" | "swift" | "m" | "h" | "pm" | "pl" | "t" | "proto" | "wsdl" | "xsd" | "cpp" | "cc" | "c" | "hpp" | "py" | "go")
+    matches!(ext,
+        // Kotlin/Java
+        "kt" | "java" |
+        // Swift/ObjC
+        "swift" | "m" | "h" |
+        // TypeScript/JavaScript
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "vue" | "svelte" |
+        // Perl
+        "pm" | "pl" | "t" |
+        // Protocol Buffers
+        "proto" |
+        // WSDL/XSD
+        "wsdl" | "xsd" |
+        // C/C++
+        "cpp" | "cc" | "c" | "hpp" |
+        // Python
+        "py" |
+        // Go
+        "go" |
+        // Rust
+        "rs" |
+        // Ruby
+        "rb" |
+        // C#
+        "cs"
+    )
 }
 
 /// Parse symbols and references from file content
@@ -72,6 +109,12 @@ pub fn parse_symbols_and_refs(
     is_cpp: bool,
     is_python: bool,
     is_go: bool,
+    is_rust: bool,
+    is_ruby: bool,
+    is_csharp: bool,
+    is_typescript: bool,
+    is_vue: bool,
+    is_svelte: bool,
 ) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
     let symbols = if is_swift {
         parse_swift_symbols(content)?
@@ -89,6 +132,22 @@ pub fn parse_symbols_and_refs(
         parse_python_symbols(content)?
     } else if is_go {
         parse_go_symbols(content)?
+    } else if is_rust {
+        parse_rust_symbols(content)?
+    } else if is_ruby {
+        parse_ruby_symbols(content)?
+    } else if is_csharp {
+        parse_csharp_symbols(content)?
+    } else if is_typescript {
+        parse_typescript_symbols(content)?
+    } else if is_vue {
+        // Extract script from Vue SFC and parse as TypeScript
+        let script = extract_vue_script(content);
+        parse_typescript_symbols(&script)?
+    } else if is_svelte {
+        // Extract script from Svelte and parse as TypeScript
+        let script = extract_svelte_script(content);
+        parse_typescript_symbols(&script)?
     } else {
         parse_kotlin_symbols(content)?
     };

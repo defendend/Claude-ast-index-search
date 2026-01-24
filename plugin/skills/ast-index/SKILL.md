@@ -1,11 +1,11 @@
 ---
 name: ast-index
-description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", "find Perl subs", "Perl exports", "find Python class", "Go struct", "Go interface", or needs fast code search in Android/Kotlin/Java, iOS/Swift/ObjC, Perl, Python, Go, C++, or Protocol Buffers projects. Also triggered by mentions of "ast-index" CLI tool.
+description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", "find Perl subs", "Perl exports", "find Python class", "Go struct", "Go interface", "find React component", "find TypeScript interface", "find Rust struct", "find Ruby class", "find C# controller", or needs fast code search in Android/Kotlin/Java, iOS/Swift/ObjC, TypeScript/JavaScript, Rust, Ruby, C#, Perl, Python, Go, C++, or Protocol Buffers projects. Also triggered by mentions of "ast-index" CLI tool.
 ---
 
 # ast-index - Code Search for Multi-Platform Projects
 
-Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swift/ObjC, Perl, Python, Go, C++, and Proto projects using SQLite + FTS5 index.
+Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swift/ObjC, TypeScript/JavaScript, Rust, Ruby, C#, Perl, Python, Go, C++, and Proto projects using SQLite + FTS5 index.
 
 ## Critical Rules
 
@@ -46,6 +46,10 @@ The index is stored at `~/.cache/ast-index/<project-hash>/index.db` and needs re
 |----------|-----------|---------------|
 | Android | Kotlin, Java | Gradle (build.gradle.kts) |
 | iOS | Swift, Objective-C | SPM (Package.swift) |
+| Web | TypeScript, JavaScript, React, Vue, Svelte | package.json |
+| Rust | Rust | Cargo.toml |
+| Ruby | Ruby, Rails, RSpec | Gemfile |
+| .NET | C#, ASP.NET, Unity | *.csproj |
 | Perl | Perl | Makefile.PL, Build.PL |
 | Python | Python | None (*.py files) |
 | Go | Go | None (*.go files) |
@@ -153,7 +157,43 @@ ast-index imports "path/to/File.kt"  # Show Kotlin file imports
 ast-index outline "PaymentFragment.kt"    # Show fragment structure
 ```
 
+### Code Quality
+
+**`todo`** - Find TODO/FIXME/HACK comments in code.
+
+```bash
+ast-index todo                           # Find all TODO comments
+ast-index todo --limit 10                # Limit results
+```
+
+**`deprecated`** - Find @Deprecated annotations.
+
+```bash
+ast-index deprecated                     # Find deprecated items
+```
+
+### Git Integration
+
+**`changed`** - Show symbols changed in git diff.
+
+```bash
+ast-index changed                        # Changes vs HEAD
+ast-index changed --base main            # Changes vs main branch
+```
+
+### Public API
+
+**`api`** - Show public API of a module.
+
+```bash
+ast-index api "core"                     # Public classes/functions in module
+```
+
 ## Index Management
+
+```bash
+ast-index init                           # Initialize index for current project
+```
 
 ```bash
 ast-index rebuild                    # Full rebuild with dependencies
@@ -161,6 +201,15 @@ ast-index rebuild --no-deps          # Skip module dependency indexing
 ast-index rebuild --no-ignore        # Include gitignored files
 ast-index update                     # Incremental update
 ast-index stats                      # Show index statistics
+```
+
+## Utility Commands
+
+```bash
+ast-index version                    # Show CLI version
+ast-index help                       # Show help message
+ast-index help <command>             # Show help for specific command
+ast-index install-claude-plugin      # Install Claude Code plugin to ~/.claude/plugins/
 ```
 
 ## Performance Reference
@@ -184,6 +233,9 @@ Consult: `references/android-commands.md`
 - **Compose Commands**: `composables`, `previews`
 - **Coroutines Commands**: `suspend`, `flows`
 - **XML Commands**: `xml-usages`, `resource-usages`
+- **Code Quality**: `deprecated`, `suppress`, `todo`
+- **Extensions**: `extensions`
+- **Navigation**: `deeplinks`
 
 ### iOS/Swift/ObjC
 
@@ -193,6 +245,39 @@ Consult: `references/ios-commands.md`
 - **Assets**: `asset-usages`
 - **SwiftUI**: `swiftui`
 - **Swift Concurrency**: `async-funcs`, `main-actor`
+- **Combine**: `publishers`
+
+### TypeScript/JavaScript
+
+Consult: `references/typescript-commands.md`
+
+- Index: `class`, `interface`, `type`, `function`, `const`, decorators
+- Supports: React (hooks, components), Vue SFC, Svelte, NestJS, Angular
+- `outline` and `imports` work with TS/JS files
+
+### Rust
+
+Consult: `references/rust-commands.md`
+
+- Index: `struct`, `enum`, `trait`, `impl`, `fn`, `macro_rules!`, `mod`
+- Supports: Derives, attributes (`#[test]`, `#[derive]`)
+- `outline` and `imports` work with Rust files
+
+### Ruby
+
+Consult: `references/ruby-commands.md`
+
+- Index: `class`, `module`, `def`, Rails DSL
+- Supports: RSpec (`describe`, `it`, `let`), Rails (associations, validations)
+- `outline` and `imports` work with Ruby files
+
+### C#/.NET
+
+Consult: `references/csharp-commands.md`
+
+- Index: `class`, `interface`, `struct`, `record`, `enum`, methods, properties
+- Supports: ASP.NET attributes, Unity (`MonoBehaviour`, `SerializeField`)
+- `outline` and `imports` work with C# files
 
 ### Python
 
@@ -215,6 +300,8 @@ Consult: `references/perl-commands.md`
 - **Exports**: `perl-exports`
 - **Subroutines**: `perl-subs`
 - **POD**: `perl-pod`
+- **Imports**: `perl-imports`
+- **Tests**: `perl-tests`
 
 ### Module Analysis
 
@@ -223,6 +310,7 @@ Consult: `references/module-commands.md`
 - **Module Search**: `module`
 - **Dependencies**: `deps`, `dependents`
 - **Unused Dependencies**: `unused-deps`
+- **Public API**: `api`
 
 ## Workflow Recommendations
 
@@ -240,6 +328,10 @@ For detailed platform-specific commands, consult:
 
 - **`references/android-commands.md`** - DI, Compose, Coroutines, XML
 - **`references/ios-commands.md`** - Storyboard, SwiftUI, Combine
+- **`references/typescript-commands.md`** - React, Vue, Svelte, NestJS, Angular
+- **`references/rust-commands.md`** - Structs, traits, impl blocks, macros
+- **`references/ruby-commands.md`** - Rails, RSpec, classes, modules
+- **`references/csharp-commands.md`** - ASP.NET, Unity, controllers, interfaces
 - **`references/perl-commands.md`** - Perl exports, subs, POD
 - **`references/python-commands.md`** - Python classes, functions
 - **`references/go-commands.md`** - Go structs, interfaces
