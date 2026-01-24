@@ -1,18 +1,18 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "ast-index-marketplace",
-  "description": "Plugins for Android/Kotlin/Java, iOS/Swift/ObjC, Python, Go, Perl, Proto, WSDL, and C++ development",
+  "description": "Plugins for Android/Kotlin/Java, iOS/Swift/ObjC, TypeScript/JavaScript, Rust, Ruby, C#, Python, Go, Perl, Proto, WSDL, and C++ development",
   "owner": {
     "name": "defendend"
   },
   "plugins": [
     {
       "name": "ast-index",
-      "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Python, Go, Perl, C++, Protocol Buffers, and WSDL/XSD projects",
+      "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, TypeScript/JavaScript, Rust, Ruby, C#, Python, Go, Perl, C++, Protocol Buffers, and WSDL/XSD projects",
       "author": {
         "name": "defendend"
       },
-      "version": "3.8.5",
+      "version": "3.9.0",
       "category": "development",
       "homepage": "https://github.com/defendend/Claude-ast-index-search",
       "source": "./plugin"

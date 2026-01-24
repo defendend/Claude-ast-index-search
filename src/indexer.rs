@@ -276,23 +276,41 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     let is_cpp = ext == "cpp" || ext == "cc" || ext == "c" || ext == "hpp" || ext == "h";
     let is_python = ext == "py";
     let is_go = ext == "go";
+    let is_rust = ext == "rs";
+    let is_ruby = ext == "rb";
+    let is_csharp = ext == "cs";
+    let is_typescript = ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" || ext == "mjs" || ext == "cjs";
+    let is_vue = ext == "vue";
+    let is_svelte = ext == "svelte";
 
     let (symbols, refs) = if is_objc {
-        parsers::parse_symbols_and_refs(&content, false, true, false, false, false, false, false, false)?
+        parsers::parse_symbols_and_refs(&content, false, true, false, false, false, false, false, false, false, false, false, false, false, false)?
     } else if is_perl {
-        parsers::parse_symbols_and_refs(&content, false, false, true, false, false, false, false, false)?
+        parsers::parse_symbols_and_refs(&content, false, false, true, false, false, false, false, false, false, false, false, false, false, false)?
     } else if is_proto {
-        parsers::parse_symbols_and_refs(&content, false, false, false, true, false, false, false, false)?
+        parsers::parse_symbols_and_refs(&content, false, false, false, true, false, false, false, false, false, false, false, false, false, false)?
     } else if is_wsdl {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, true, false, false, false)?
+        parsers::parse_symbols_and_refs(&content, false, false, false, false, true, false, false, false, false, false, false, false, false, false)?
     } else if is_cpp {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, true, false, false)?
+        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, true, false, false, false, false, false, false, false, false)?
     } else if is_python {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, true, false)?
+        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, true, false, false, false, false, false, false, false)?
     } else if is_go {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, true)?
+        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, true, false, false, false, false, false, false)?
+    } else if is_rust {
+        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, true, false, false, false, false, false)?
+    } else if is_ruby {
+        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, true, false, false, false, false)?
+    } else if is_csharp {
+        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, false, true, false, false, false)?
+    } else if is_typescript {
+        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, false, false, true, false, false)?
+    } else if is_vue {
+        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, false, false, false, true, false)?
+    } else if is_svelte {
+        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, false, false, false, false, true)?
     } else {
-        parsers::parse_symbols_and_refs(&content, is_swift, false, false, false, false, false, false, false)?
+        parsers::parse_symbols_and_refs(&content, is_swift, false, false, false, false, false, false, false, false, false, false, false, false, false)?
     };
 
     Ok(ParsedFile {

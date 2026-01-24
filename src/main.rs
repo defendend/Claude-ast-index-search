@@ -476,7 +476,6 @@ fn main() -> Result<()> {
 
 fn cmd_install_claude_plugin() -> Result<()> {
     use std::fs;
-    use std::io::Write;
 
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
     let plugin_dir = home.join(".claude").join("plugins").join("ast-index");

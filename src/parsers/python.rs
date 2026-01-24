@@ -18,7 +18,8 @@ pub fn parse_python_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let async_func_re = Regex::new(r"(?m)^[ \t]*async\s+def\s+([a-z_][a-z0-9_]*)\s*\([^)]*\)\s*(?:->\s*[^:]+)?:")?;
 
     // Import: import module or from module import X
-    let import_re = Regex::new(r"(?m)^(?:from\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s+)?import\s+([a-zA-Z_][a-zA-Z0-9_\.,\s]*)")?;
+    // Note: use [ \t] instead of \s to avoid capturing newlines in the import list
+    let import_re = Regex::new(r"(?m)^(?:from\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s+)?import\s+([a-zA-Z_][a-zA-Z0-9_\.,\ \t]*)")?;
 
     // Decorator: @decorator_name
     let decorator_re = Regex::new(r"(?m)^[ \t]*@([a-zA-Z_][a-zA-Z0-9_\.]*)")?;
@@ -70,7 +71,7 @@ pub fn parse_python_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
         let indent = &content[line_start..start];
 
         // Module-level functions have no indentation, methods have 4+ spaces
-        let indent_level = indent.chars().filter(|c| *c == ' ').count()
+        let _indent_level = indent.chars().filter(|c| *c == ' ').count()
             + indent.chars().filter(|c| *c == '\t').count() * 4;
 
         // Skip private methods/functions starting with _ (except __init__, __call__)
@@ -235,8 +236,7 @@ async def async_handler(request):
 
     #[test]
     fn test_parse_imports() {
-        let content = r#"
-import logging
+        let content = r#"import logging
 from driver_referrals.common import db
 from typing import Optional, List
 "#;

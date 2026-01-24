@@ -311,7 +311,7 @@ fn is_reserved_word(name: &str) -> bool {
 
 /// Check if name looks like a constructor (same as some class name)
 fn is_constructor_like(name: &str, _lines: &[&str]) -> bool {
-    // Simple heuristic: starts with uppercase T (Yandex style) and no return type
+    // Simple heuristic: starts with uppercase T (common C++ naming convention) and no return type
     name.starts_with('T') && name.len() > 1 && name.chars().nth(1).map(|c| c.is_uppercase()).unwrap_or(false)
 }
 
@@ -378,11 +378,11 @@ public:
     #[test]
     fn test_parse_jni_function() {
         let content = r#"
-JNIEXPORT jobject JNICALL Java_ru_yandex_direct_textprocessing_TextProcessing_analyze2
+JNIEXPORT jobject JNICALL Java_com_example_textprocessing_TextProcessor_analyze
   (JNIEnv *, jclass, jstring, jint, jboolean);
 "#;
         let symbols = parse_cpp_symbols(content).unwrap();
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "analyze2"));
+        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "analyze"));
     }
 
     #[test]

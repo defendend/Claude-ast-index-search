@@ -126,7 +126,7 @@ import (
     "context"
     "fmt"
 
-    "a.yandex-team.ru/taxi/backend-go/services/eats-files-uploads/internal/entities"
+    "github.com/example/backend-go/services/files-uploads/internal/entities"
 )
 ```
 

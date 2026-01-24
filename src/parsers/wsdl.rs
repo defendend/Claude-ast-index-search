@@ -8,8 +8,8 @@
 //! - Operations (as Function)
 //! - Services (as Class)
 //!
-//! Note: WSDL files in some projects (like Yandex Direct) may contain
-//! Template Toolkit directives ([% ... %]) which are stripped before parsing.
+//! Note: WSDL files in some projects may contain Template Toolkit directives
+//! ([% ... %]) which are stripped before parsing.
 
 use anyhow::Result;
 use regex::Regex;
