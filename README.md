@@ -1,4 +1,4 @@
-# ast-index v3.9.1
+# ast-index v3.9.2
 
 Fast code search CLI for 14 programming languages. Native Rust implementation.
 
@@ -300,6 +300,18 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.9.2
+- **Fix OOM crashes on large projects** (70K+ files)
+  - Batched indexing: parse and write to DB in chunks of 500 files instead of loading everything into memory
+  - Limited rayon thread pool to max 8 threads to cap peak memory
+  - Skip files > 1 MB (minified/generated code)
+  - Skip lines > 2000 chars in ref parser
+  - Truncate ref context to 500 chars (was unbounded — minified JS lines caused 12 GB+ databases)
+  - Reduced SQLite cache from 64 MB to 8 MB
+- **Hardcoded directory exclusions** — always skip `node_modules`, `__pycache__`, `build`, `dist`, `target`, `vendor`, `.gradle`, `Pods`, `DerivedData`, `.next`, `.nuxt`, `.venv`, `.cache` etc. regardless of `.gitignore`
+- **New project type detection** — Frontend (`package.json`), Python (`pyproject.toml`), Go (`go.mod`), Rust (`Cargo.toml`)
+- **LazyLock regex** — all 146 regex compilations cached via `std::sync::LazyLock` (was recompiling per file)
 
 ### 3.9.1
 - **Performance fix** — grep-based commands now use early termination
