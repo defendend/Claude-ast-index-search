@@ -73,6 +73,7 @@ where
         .hidden(true)
         .git_ignore(!no_ignore)
         .git_exclude(!no_ignore)
+        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
         .threads(num_cpus())
         .build_parallel();
 
@@ -146,6 +147,7 @@ where
         .hidden(true)
         .git_ignore(!no_ignore)
         .git_exclude(!no_ignore)
+        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
         .threads(num_cpus())
         .build_parallel();
 

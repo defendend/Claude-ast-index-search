@@ -1,5 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -9,26 +10,40 @@ pub fn parse_python_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let mut symbols = Vec::new();
 
     // Class definition: class ClassName(Base1, Base2):
-    let class_re = Regex::new(r"(?m)^[ \t]*class\s+([A-Z][A-Za-z0-9_]*)\s*(?:\(([^)]*)\))?:")?;
+    static CLASS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^[ \t]*class\s+([A-Z][A-Za-z0-9_]*)\s*(?:\(([^)]*)\))?:").unwrap());
+
+    let class_re = &*CLASS_RE;
 
     // Function definition: def function_name(...):
-    let func_re = Regex::new(r"(?m)^[ \t]*def\s+([a-z_][a-z0-9_]*)\s*\([^)]*\)\s*(?:->\s*[^:]+)?:")?;
+    static FUNC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^[ \t]*def\s+([a-z_][a-z0-9_]*)\s*\([^)]*\)\s*(?:->\s*[^:]+)?:").unwrap());
+
+    let func_re = &*FUNC_RE;
 
     // Async function: async def function_name(...):
-    let async_func_re = Regex::new(r"(?m)^[ \t]*async\s+def\s+([a-z_][a-z0-9_]*)\s*\([^)]*\)\s*(?:->\s*[^:]+)?:")?;
+    static ASYNC_FUNC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^[ \t]*async\s+def\s+([a-z_][a-z0-9_]*)\s*\([^)]*\)\s*(?:->\s*[^:]+)?:").unwrap());
+
+    let async_func_re = &*ASYNC_FUNC_RE;
 
     // Import: import module or from module import X
     // Note: use [ \t] instead of \s to avoid capturing newlines in the import list
-    let import_re = Regex::new(r"(?m)^(?:from\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s+)?import\s+([a-zA-Z_][a-zA-Z0-9_\.,\ \t]*)")?;
+    static IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(?:from\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s+)?import\s+([a-zA-Z_][a-zA-Z0-9_\.,\ \t]*)").unwrap());
+
+    let import_re = &*IMPORT_RE;
 
     // Decorator: @decorator_name
-    let decorator_re = Regex::new(r"(?m)^[ \t]*@([a-zA-Z_][a-zA-Z0-9_\.]*)")?;
+    static DECORATOR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^[ \t]*@([a-zA-Z_][a-zA-Z0-9_\.]*)").unwrap());
+
+    let decorator_re = &*DECORATOR_RE;
 
     // Constant assignment: CONSTANT_NAME = value (all caps at module level)
-    let constant_re = Regex::new(r"(?m)^([A-Z][A-Z0-9_]*)\s*=\s*")?;
+    static CONSTANT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^([A-Z][A-Z0-9_]*)\s*=\s*").unwrap());
+
+    let constant_re = &*CONSTANT_RE;
 
     // Type alias: TypeName = SomeType (PascalCase at module level, using TypeAlias or just =)
-    let type_alias_re = Regex::new(r"(?m)^([A-Z][a-zA-Z0-9_]*)\s*(?::\s*TypeAlias\s*)?=\s*(?:Union|Optional|List|Dict|Tuple|Callable|Type)")?;
+    static TYPE_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^([A-Z][a-zA-Z0-9_]*)\s*(?::\s*TypeAlias\s*)?=\s*(?:Union|Optional|List|Dict|Tuple|Callable|Type)").unwrap());
+
+    let type_alias_re = &*TYPE_ALIAS_RE;
 
     let lines: Vec<&str> = content.lines().collect();
 

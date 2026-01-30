@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -19,34 +20,52 @@ pub fn parse_objc_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let mut symbols = Vec::new();
 
     // ObjC @interface: @interface ClassName : SuperClass <Protocol1, Protocol2>
-    let interface_re = Regex::new(
+    static INTERFACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*@interface\s+(\w+)(?:\s*\([^)]*\))?(?:\s*:\s*(\w+))?(?:\s*<([^>]+)>)?"
-    )?;
+
+    ).unwrap());
+
+    let interface_re = &*INTERFACE_RE;
 
     // ObjC @protocol definition
-    let protocol_re = Regex::new(
+    static PROTOCOL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*@protocol\s+(\w+)(?:\s*<([^>]+)>)?"
-    )?;
+
+    ).unwrap());
+
+    let protocol_re = &*PROTOCOL_RE;
 
     // ObjC @implementation
-    let impl_re = Regex::new(
+    static IMPL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*@implementation\s+(\w+)"
-    )?;
+
+    ).unwrap());
+
+    let impl_re = &*IMPL_RE;
 
     // ObjC method: - (returnType)methodName:(paramType)param
-    let method_re = Regex::new(
+    static METHOD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*[-+]\s*\([^)]+\)\s*(\w+)"
-    )?;
+
+    ).unwrap());
+
+    let method_re = &*METHOD_RE;
 
     // ObjC property: @property (attributes) Type name;
-    let property_re = Regex::new(
+    static PROPERTY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*@property\s*(?:\([^)]*\))?\s*\w+[\s*]*(\w+)\s*;"
-    )?;
+
+    ).unwrap());
+
+    let property_re = &*PROPERTY_RE;
 
     // C typedef (common in ObjC headers)
-    let typedef_re = Regex::new(
+    static TYPEDEF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*typedef\s+(?:struct|enum|NS_ENUM|NS_OPTIONS)?\s*(?:\([^)]*\))?\s*\{?[^}]*\}?\s*(\w+)\s*;"
-    )?;
+
+    ).unwrap());
+
+    let typedef_re = &*TYPEDEF_RE;
 
     for (line_num, line) in content.lines().enumerate() {
         let line_num = line_num + 1;

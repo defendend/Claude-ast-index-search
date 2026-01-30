@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -22,27 +23,39 @@ pub fn parse_proto_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let _is_proto3 = content.contains("syntax = \"proto3\"") || content.contains("syntax = 'proto3'");
 
     // Package declaration
-    let package_re = Regex::new(r"(?m)^package\s+([\w.]+)\s*;")?;
+    static PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^package\s+([\w.]+)\s*;").unwrap());
+    let package_re = &*PACKAGE_RE;
 
     // Import statements - used in parse_proto_imports, not in symbol extraction
-    let _import_re = Regex::new(r#"(?m)^import\s+(?:public\s+|weak\s+)?"([^"]+)"\s*;"#)?;
+    static IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?m)^import\s+(?:public\s+|weak\s+)?"([^"]+)"\s*;"#).unwrap());
+    let _import_re = &*IMPORT_RE;
 
     // Message declaration (including nested)
-    let message_re = Regex::new(r"(?m)^(\s*)message\s+(\w+)\s*\{")?;
+    static MESSAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(\s*)message\s+(\w+)\s*\{").unwrap());
+
+    let message_re = &*MESSAGE_RE;
 
     // Service declaration
-    let service_re = Regex::new(r"(?m)^service\s+(\w+)\s*\{")?;
+    static SERVICE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^service\s+(\w+)\s*\{").unwrap());
+
+    let service_re = &*SERVICE_RE;
 
     // RPC declaration
-    let rpc_re = Regex::new(
+    static RPC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^\s*rpc\s+(\w+)\s*\(\s*(?:stream\s+)?(\w+)\s*\)\s*returns\s*\(\s*(?:stream\s+)?(\w+)\s*\)"
-    )?;
+
+    ).unwrap());
+
+    let rpc_re = &*RPC_RE;
 
     // Enum declaration
-    let enum_re = Regex::new(r"(?m)^(\s*)enum\s+(\w+)\s*\{")?;
+    static ENUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(\s*)enum\s+(\w+)\s*\{").unwrap());
+
+    let enum_re = &*ENUM_RE;
 
     // Option java_package (for cross-reference with Java)
-    let java_package_re = Regex::new(r#"(?m)^option\s+java_package\s*=\s*"([^"]+)"\s*;"#)?;
+    static JAVA_PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?m)^option\s+java_package\s*=\s*"([^"]+)"\s*;"#).unwrap());
+    let java_package_re = &*JAVA_PACKAGE_RE;
 
     let lines: Vec<&str> = content.lines().collect();
 
@@ -204,7 +217,8 @@ pub fn parse_proto_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
 #[allow(dead_code)]
 pub fn parse_proto_imports(content: &str) -> Result<Vec<(String, usize)>> {
     let mut imports = Vec::new();
-    let import_re = Regex::new(r#"(?m)^import\s+(?:public\s+|weak\s+)?"([^"]+)"\s*;"#)?;
+    static PROTO_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?m)^import\s+(?:public\s+|weak\s+)?"([^"]+)"\s*;"#).unwrap());
+    let import_re = &*PROTO_IMPORT_RE;
 
     for (line_num, line) in content.lines().enumerate() {
         if let Some(caps) = import_re.captures(line) {

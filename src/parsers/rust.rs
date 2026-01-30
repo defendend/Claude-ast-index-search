@@ -1,5 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -9,74 +10,116 @@ pub fn parse_rust_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let mut symbols = Vec::new();
 
     // Struct definition: struct Name { ... } or struct Name(...)
-    let struct_re = Regex::new(
+    static STRUCT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+([A-Z][A-Za-z0-9_]*)\s*(?:<[^>]*>)?"
-    )?;
+
+    ).unwrap());
+
+    let struct_re = &*STRUCT_RE;
 
     // Enum definition: enum Name { ... }
-    let enum_re = Regex::new(
+    static ENUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?enum\s+([A-Z][A-Za-z0-9_]*)\s*(?:<[^>]*>)?"
-    )?;
+
+    ).unwrap());
+
+    let enum_re = &*ENUM_RE;
 
     // Trait definition: trait Name { ... }
-    let trait_re = Regex::new(
+    static TRAIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?trait\s+([A-Z][A-Za-z0-9_]*)\s*(?:<[^>]*>)?(?:\s*:\s*[A-Za-z0-9_+\s<>,]+)?"
-    )?;
+
+    ).unwrap());
+
+    let trait_re = &*TRAIT_RE;
 
     // Impl block: impl Trait for Type or impl Type
-    let impl_re = Regex::new(
+    static IMPL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:unsafe\s+)?impl\s*(?:<[^>]*>\s*)?([A-Z][A-Za-z0-9_<>,\s]*?)\s+for\s+([A-Z][A-Za-z0-9_<>,\s]*)"
-    )?;
+
+    ).unwrap());
+
+    let impl_re = &*IMPL_RE;
 
     // Self impl block: impl Type { ... }
-    let impl_self_re = Regex::new(
+    static IMPL_SELF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*impl\s*(?:<[^>]*>\s*)?([A-Z][A-Za-z0-9_<>,\s]*)\s*\{"
-    )?;
+
+    ).unwrap());
+
+    let impl_self_re = &*IMPL_SELF_RE;
 
     // Function: fn name(...) or pub fn name(...)
-    let func_re = Regex::new(
+    static FUNC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([a-z_][a-z0-9_]*)\s*(?:<[^>]*>)?\s*\("
-    )?;
+
+    ).unwrap());
+
+    let func_re = &*FUNC_RE;
 
     // Macro definition: macro_rules! name { ... }
-    let macro_re = Regex::new(
+    static MACRO_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:#\[macro_export\]\s*)?macro_rules!\s+([a-z_][a-z0-9_]*)"
-    )?;
+
+    ).unwrap());
+
+    let macro_re = &*MACRO_RE;
 
     // Type alias: type Name = ...
-    let type_alias_re = Regex::new(
+    static TYPE_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?type\s+([A-Z][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*="
-    )?;
+
+    ).unwrap());
+
+    let type_alias_re = &*TYPE_ALIAS_RE;
 
     // Constant: const NAME: Type = ...
-    let const_re = Regex::new(
+    static CONST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?const\s+([A-Z][A-Z0-9_]+)\s*:"
-    )?;
+
+    ).unwrap());
+
+    let const_re = &*CONST_RE;
 
     // Static: static NAME: Type = ...
-    let static_re = Regex::new(
+    static STATIC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?static\s+(?:mut\s+)?([A-Z][A-Z0-9_]+)\s*:"
-    )?;
+
+    ).unwrap());
+
+    let static_re = &*STATIC_RE;
 
     // Module: mod name;
-    let mod_re = Regex::new(
+    static MOD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z_][a-z0-9_]*)"
-    )?;
+
+    ).unwrap());
+
+    let mod_re = &*MOD_RE;
 
     // Use statement: use path::to::item;
-    let use_re = Regex::new(
+    static USE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?use\s+([a-zA-Z_][a-zA-Z0-9_:]*)"
-    )?;
+
+    ).unwrap());
+
+    let use_re = &*USE_RE;
 
     // Derive attribute: #[derive(Trait1, Trait2)]
-    let derive_re = Regex::new(
+    static DERIVE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*#\[derive\(([^)]+)\)\]"
-    )?;
+
+    ).unwrap());
+
+    let derive_re = &*DERIVE_RE;
 
     // Other attributes: #[attribute]
-    let attr_re = Regex::new(
+    static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*#\[([a-z_][a-z0-9_]*)"
-    )?;
+
+    ).unwrap());
+
+    let attr_re = &*ATTR_RE;
 
     let lines: Vec<&str> = content.lines().collect();
 

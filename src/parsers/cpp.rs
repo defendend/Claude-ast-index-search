@@ -14,6 +14,7 @@
 
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -23,60 +24,70 @@ pub fn parse_cpp_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let mut symbols = Vec::new();
 
     // Class declaration: class ClassName or class ClassName : public Base
-    let class_re = Regex::new(
+    static CLASS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^(?:\s*)(?:template\s*<[^>]*>\s*)?(?:class|struct)\s+(\w+)(?:\s*:\s*(?:public|private|protected)\s+(\w+))?"
-    )?;
+    ).unwrap());
+    let class_re = &*CLASS_RE;
 
     // Standalone function definition (not inside class)
-    // Pattern: ReturnType FunctionName(params) { or ReturnType FunctionName(params);
-    let func_re = Regex::new(
+    static FUNC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^(?:\s*)(?:inline\s+)?(?:static\s+)?(?:virtual\s+)?(?:explicit\s+)?(?:constexpr\s+)?(?:const\s+)?(?:[\w:]+(?:<[^>]*>)?\s*[*&]?\s+)+(\w+)\s*\([^)]*\)\s*(?:const)?\s*(?:noexcept)?\s*(?:override)?\s*[{;]"
-    )?;
+    ).unwrap());
+    let func_re = &*FUNC_RE;
 
     // JNI export function: JNIEXPORT type JNICALL Java_package_Class_method
-    let jni_func_re = Regex::new(
+    static JNI_FUNC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^JNIEXPORT\s+\w+\s+JNICALL\s+(Java_[\w_]+)"
-    )?;
+    ).unwrap());
+    let jni_func_re = &*JNI_FUNC_RE;
 
     // Template function
-    let template_func_re = Regex::new(
+    static TEMPLATE_FUNC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^(?:\s*)template\s*<[^>]*>\s*(?:inline\s+)?(?:auto|[\w:]+(?:<[^>]*>)?\s*[*&]?\s+)+(\w+)\s*\([^)]*\)"
-    )?;
+    ).unwrap());
+    let template_func_re = &*TEMPLATE_FUNC_RE;
 
     // Namespace - including C++17 nested namespaces (namespace a::b::c {)
-    let namespace_re = Regex::new(
+    static NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^namespace\s+([\w:]+)\s*\{"
-    )?;
+    ).unwrap());
+    let namespace_re = &*NAMESPACE_RE;
 
     // Method definition in .cpp: ReturnType ClassName::MethodName(...)
-    let method_def_re = Regex::new(
+    static METHOD_DEF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^(?:[\w:]+(?:<[^>]*>)?\s*[*&]?\s+)?([\w]+)::([\w]+)\s*\([^)]*\)\s*(?:const)?\s*(?:noexcept)?\s*\{"
-    )?;
+    ).unwrap());
+    let method_def_re = &*METHOD_DEF_RE;
 
     // Include - used in parse_cpp_includes, not in symbol extraction
-    let _include_re = Regex::new(
+    static INCLUDE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"(?m)^#include\s+[<"]([^>"]+)[>"]"#
-    )?;
+    ).unwrap());
+    let _include_re = &*INCLUDE_RE;
 
     // Macro define (function-like)
-    let macro_re = Regex::new(
+    static MACRO_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^#define\s+(\w+)\s*\([^)]*\)"
-    )?;
+    ).unwrap());
+    let macro_re = &*MACRO_RE;
 
     // Typedef
-    let typedef_re = Regex::new(
+    static TYPEDEF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^typedef\s+.+\s+(\w+)\s*;"
-    )?;
+    ).unwrap());
+    let typedef_re = &*TYPEDEF_RE;
 
     // Using alias: using TypeName = SomeType;
-    let using_alias_re = Regex::new(
+    static USING_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^using\s+(\w+)\s*="
-    )?;
+    ).unwrap());
+    let using_alias_re = &*USING_ALIAS_RE;
 
     // Enum declaration
-    let enum_re = Regex::new(
+    static ENUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^(?:\s*)enum\s+(?:class\s+)?(\w+)"
-    )?;
+    ).unwrap());
+    let enum_re = &*ENUM_RE;
 
     let lines: Vec<&str> = content.lines().collect();
     let mut in_class = false;
@@ -184,8 +195,6 @@ pub fn parse_cpp_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
         if let Some(caps) = namespace_re.captures(line) {
             let full_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             if !full_name.is_empty() {
-                // For nested namespaces, create a symbol for each part
-                // e.g., "views::feeds" creates symbols for "views" and "feeds"
                 for part in full_name.split("::") {
                     if !part.is_empty() {
                         symbols.push(ParsedSymbol {
@@ -197,7 +206,6 @@ pub fn parse_cpp_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                         });
                     }
                 }
-                // Also add the full namespace path as a symbol
                 if full_name.contains("::") {
                     symbols.push(ParsedSymbol {
                         name: full_name.to_string(),
@@ -311,7 +319,6 @@ fn is_reserved_word(name: &str) -> bool {
 
 /// Check if name looks like a constructor (same as some class name)
 fn is_constructor_like(name: &str, _lines: &[&str]) -> bool {
-    // Simple heuristic: starts with uppercase T (common C++ naming convention) and no return type
     name.starts_with('T') && name.len() > 1 && name.chars().nth(1).map(|c| c.is_uppercase()).unwrap_or(false)
 }
 
@@ -319,7 +326,8 @@ fn is_constructor_like(name: &str, _lines: &[&str]) -> bool {
 #[allow(dead_code)]
 pub fn parse_cpp_includes(content: &str) -> Result<Vec<(String, usize)>> {
     let mut includes = Vec::new();
-    let include_re = Regex::new(r#"(?m)^#include\s+[<"]([^>"]+)[>"]"#)?;
+    static INCLUDE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?m)^#include\s+[<"]([^>"]+)[>"]"#).unwrap());
+    let include_re = &*INCLUDE_RE;
 
     for (line_num, line) in content.lines().enumerate() {
         if let Some(caps) = include_re.captures(line) {

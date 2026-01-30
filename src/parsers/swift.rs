@@ -11,6 +11,7 @@
 
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -20,54 +21,84 @@ pub fn parse_swift_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let mut symbols = Vec::new();
 
     // Swift class: public/private/internal/final class ClassName: Parent, Protocol
-    let class_re = Regex::new(
+    static CLASS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate|open|final)\s+)*class\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
-    )?;
+
+    ).unwrap());
+
+    let class_re = &*CLASS_RE;
 
     // Swift struct
-    let struct_re = Regex::new(
+    static STRUCT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate)\s+)*struct\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
-    )?;
+
+    ).unwrap());
+
+    let struct_re = &*STRUCT_RE;
 
     // Swift enum
-    let enum_re = Regex::new(
+    static ENUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate)\s+)*enum\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
-    )?;
+
+    ).unwrap());
+
+    let enum_re = &*ENUM_RE;
 
     // Swift protocol
-    let protocol_re = Regex::new(
+    static PROTOCOL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate)\s+)*protocol\s+(\w+)(?:\s*:\s*([^{]+))?"
-    )?;
+
+    ).unwrap());
+
+    let protocol_re = &*PROTOCOL_RE;
 
     // Swift actor
-    let actor_re = Regex::new(
+    static ACTOR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate|final)\s+)*actor\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
-    )?;
+
+    ).unwrap());
+
+    let actor_re = &*ACTOR_RE;
 
     // Swift extension
-    let extension_re = Regex::new(
+    static EXTENSION_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*((?:public|private|internal|fileprivate)\s+)?extension\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
-    )?;
+
+    ).unwrap());
+
+    let extension_re = &*EXTENSION_RE;
 
     // Swift func (including async/throws)
-    let func_re = Regex::new(
+    static FUNC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate|open|final|override|static|class|mutating)\s+)*func\s+(\w+)\s*(?:<[^>]*>)?\s*\([^)]*\)"
-    )?;
+
+    ).unwrap());
+
+    let func_re = &*FUNC_RE;
 
     // Swift init
-    let init_re = Regex::new(
+    static INIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*((?:public|private|internal|fileprivate|override|convenience|required)\s+)*init\s*(?:\?|!)?\s*\("
-    )?;
+
+    ).unwrap());
+
+    let init_re = &*INIT_RE;
 
     // Swift var/let properties
-    let property_re = Regex::new(
+    static PROPERTY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*(@\w+\s+)*((?:public|private|internal|fileprivate|static|class|lazy|weak|unowned)\s+)*(var|let)\s+(\w+)\s*:"
-    )?;
+
+    ).unwrap());
+
+    let property_re = &*PROPERTY_RE;
 
     // Swift typealias
-    let typealias_re = Regex::new(
+    static TYPEALIAS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*((?:public|private|internal|fileprivate)\s+)?typealias\s+(\w+)(?:\s*<[^>]*>)?\s*="
-    )?;
+
+    ).unwrap());
+
+    let typealias_re = &*TYPEALIAS_RE;
 
     for (line_num, line) in content.lines().enumerate() {
         let line_num = line_num + 1;

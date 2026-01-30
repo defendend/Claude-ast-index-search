@@ -233,7 +233,7 @@ pub fn open_db(project_root: &Path) -> Result<Connection> {
     // journal_mode returns result, use query_row
     let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "cache_size", "-64000")?;
+    conn.pragma_update(None, "cache_size", "-8000")?; // 8 MB cache to limit memory
 
     Ok(conn)
 }

@@ -49,9 +49,26 @@ pub struct ParsedRef {
     pub context: String,
 }
 
+/// Max length for context strings stored in DB (characters)
+const MAX_CONTEXT_LEN: usize = 500;
+
+/// Truncate context to avoid storing huge minified lines
+fn truncate_context(s: &str) -> String {
+    if s.len() <= MAX_CONTEXT_LEN {
+        s.to_string()
+    } else {
+        let mut end = MAX_CONTEXT_LEN;
+        while end < s.len() && !s.is_char_boundary(end) {
+            end += 1;
+        }
+        format!("{}...", &s[..end.min(s.len())])
+    }
+}
+
 use std::collections::HashSet;
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 // Re-export parser functions
 pub use cpp::parse_cpp_symbols;
@@ -165,8 +182,12 @@ pub fn extract_references(content: &str, defined_symbols: &[ParsedSymbol]) -> Re
     // Regex for identifiers that might be references:
     // - CamelCase identifiers (types, classes) like PaymentRepository, String
     // - Function calls like getCards(, process(
-    let identifier_re = Regex::new(r"\b([A-Z][a-zA-Z0-9]*)\b")?; // CamelCase types
-    let func_call_re = Regex::new(r"\b([a-z][a-zA-Z0-9]*)\s*\(")?; // function calls
+    static IDENTIFIER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b([A-Z][a-zA-Z0-9]*)\b").unwrap());
+
+    let identifier_re = &*IDENTIFIER_RE; // CamelCase types
+    static FUNC_CALL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b([a-z][a-zA-Z0-9]*)\s*\(").unwrap());
+
+    let func_call_re = &*FUNC_CALL_RE; // function calls
 
     // Keywords to skip
     let keywords: HashSet<&str> = [
@@ -188,6 +209,11 @@ pub fn extract_references(content: &str, defined_symbols: &[ParsedSymbol]) -> Re
         let line_num = line_num + 1;
         let trimmed = line.trim();
 
+        // Skip very long lines (minified code, generated files)
+        if trimmed.len() > 2000 {
+            continue;
+        }
+
         // Skip import/package declarations
         if trimmed.starts_with("import ") || trimmed.starts_with("package ") {
             continue;
@@ -205,7 +231,7 @@ pub fn extract_references(content: &str, defined_symbols: &[ParsedSymbol]) -> Re
                 refs.push(ParsedRef {
                     name: name.to_string(),
                     line: line_num,
-                    context: trimmed.to_string(),
+                    context: truncate_context(trimmed),
                 });
             }
         }
@@ -219,7 +245,7 @@ pub fn extract_references(content: &str, defined_symbols: &[ParsedSymbol]) -> Re
                     refs.push(ParsedRef {
                         name: name.to_string(),
                         line: line_num,
-                        context: trimmed.to_string(),
+                        context: truncate_context(trimmed),
                     });
                 }
             }
