@@ -13,6 +13,7 @@
 
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -21,23 +22,33 @@ use super::ParsedSymbol;
 /// Handles both [% ... %] and [%- ... -%] patterns
 fn strip_template_toolkit(content: &str) -> String {
     // First, remove multi-line BLOCK definitions
-    let block_re = Regex::new(r"(?s)\[%-?\s*BLOCK\s+\w+\s*-?%\].*?\[%-?\s*END\s*-?%\]").unwrap();
+    static BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)\[%-?\s*BLOCK\s+\w+\s*-?%\].*?\[%-?\s*END\s*-?%\]").unwrap());
+
+    let block_re = &*BLOCK_RE;
     let result = block_re.replace_all(content, "");
 
     // Remove FOREACH loops
-    let foreach_re = Regex::new(r"(?s)\[%-?\s*FOREACH\s+[^%]+%\]").unwrap();
+    static FOREACH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)\[%-?\s*FOREACH\s+[^%]+%\]").unwrap());
+
+    let foreach_re = &*FOREACH_RE;
     let result = foreach_re.replace_all(&result, "");
 
     // Remove END tags
-    let end_re = Regex::new(r"\[%-?\s*END\s*-?%\]").unwrap();
+    static END_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[%-?\s*END\s*-?%\]").unwrap());
+
+    let end_re = &*END_RE;
     let result = end_re.replace_all(&result, "");
 
     // Remove inline directives [% ... %] and [%- ... -%]
-    let inline_re = Regex::new(r"\[%-?[^%]*-?%\]").unwrap();
+    static INLINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[%-?[^%]*-?%\]").unwrap());
+
+    let inline_re = &*INLINE_RE;
     let result = inline_re.replace_all(&result, "");
 
     // Remove PROCESS directives
-    let process_re = Regex::new(r"\[%-?\s*PROCESS\s+[^%]+%\]").unwrap();
+    static PROCESS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[%-?\s*PROCESS\s+[^%]+%\]").unwrap());
+
+    let process_re = &*PROCESS_RE;
     let result = process_re.replace_all(&result, "");
 
     result.to_string()
@@ -51,39 +62,60 @@ pub fn parse_wsdl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let clean_content = strip_template_toolkit(content);
 
     // Complex type: <xsd:complexType name="TypeName">
-    let complex_type_re = Regex::new(
+    static COMPLEX_TYPE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"<xsd:complexType\s+name\s*=\s*"([^"]+)""#
-    )?;
+
+    ).unwrap());
+
+    let complex_type_re = &*COMPLEX_TYPE_RE;
 
     // Simple type with enumeration: <xsd:simpleType name="EnumName">
-    let simple_type_re = Regex::new(
+    static SIMPLE_TYPE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"<xsd:simpleType\s+name\s*=\s*"([^"]+)""#
-    )?;
+
+    ).unwrap());
+
+    let simple_type_re = &*SIMPLE_TYPE_RE;
 
     // Element with name (can define inline complex type)
-    let element_re = Regex::new(
+    static ELEMENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"<xsd:element\s+name\s*=\s*"([^"]+)""#
-    )?;
+
+    ).unwrap());
+
+    let element_re = &*ELEMENT_RE;
 
     // Port type: <wsdl:portType name="PortName">
-    let port_type_re = Regex::new(
+    static PORT_TYPE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"<wsdl:portType\s+name\s*=\s*"([^"]+)""#
-    )?;
+
+    ).unwrap());
+
+    let port_type_re = &*PORT_TYPE_RE;
 
     // Operation: <wsdl:operation name="OperationName">
-    let operation_re = Regex::new(
+    static OPERATION_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"<wsdl:operation\s+name\s*=\s*"([^"]+)""#
-    )?;
+
+    ).unwrap());
+
+    let operation_re = &*OPERATION_RE;
 
     // Service: <wsdl:service name="ServiceName">
-    let service_re = Regex::new(
+    static SERVICE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"<wsdl:service\s+name\s*=\s*"([^"]+)""#
-    )?;
+
+    ).unwrap());
+
+    let service_re = &*SERVICE_RE;
 
     // Target namespace
-    let namespace_re = Regex::new(
+    static NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"targetNamespace\s*=\s*"([^"]+)""#
-    )?;
+
+    ).unwrap());
+
+    let namespace_re = &*NAMESPACE_RE;
 
     // Check if content contains enumeration (to detect enums vs regular simple types)
     let has_enumeration = |start_line: usize, lines: &[&str]| -> bool {

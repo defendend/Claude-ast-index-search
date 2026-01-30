@@ -16,6 +16,7 @@
 
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -26,88 +27,100 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let lines: Vec<&str> = content.lines().collect();
 
     // Class definition: class ClassName extends/implements ...
-    let class_re = Regex::new(
+    static CLASS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?(?:abstract\s+)?class\s+([A-Z][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*(?:extends\s+([A-Z][A-Za-z0-9_.<>,\s]*))?(?:\s+implements\s+([A-Z][A-Za-z0-9_.<>,\s]*))?"
-    )?;
+    ).unwrap());
+    let class_re = &*CLASS_RE;
 
     // Interface definition: interface InterfaceName extends ...
-    let interface_re = Regex::new(
+    static INTERFACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?interface\s+([A-Z][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*(?:extends\s+([A-Z][A-Za-z0-9_.<>,\s]*))?"
-    )?;
+    ).unwrap());
+    let interface_re = &*INTERFACE_RE;
 
     // Type alias: type TypeName = ...
-    let type_alias_re = Regex::new(
+    static TYPE_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?type\s+([A-Z][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*="
-    )?;
+    ).unwrap());
+    let type_alias_re = &*TYPE_ALIAS_RE;
 
     // Enum: enum EnumName { ... }
-    let enum_re = Regex::new(
+    static ENUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?(?:const\s+)?enum\s+([A-Z][A-Za-z0-9_]*)"
-    )?;
+    ).unwrap());
+    let enum_re = &*ENUM_RE;
 
     // Regular function: function functionName(...) or export function
-    let func_re = Regex::new(
+    static FUNC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:<[^>]*>)?\s*\("
-    )?;
+    ).unwrap());
+    let func_re = &*FUNC_RE;
 
     // Arrow function as const: const functionName = (...) => or const functionName = async (...) =>
-    let arrow_func_re = Regex::new(
+    static ARROW_FUNC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?(?:const|let)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?::\s*[^=]+)?\s*=\s*(?:async\s+)?\([^)]*\)\s*(?::\s*[^=]+)?\s*=>"
-    )?;
+    ).unwrap());
+    let arrow_func_re = &*ARROW_FUNC_RE;
 
     // Arrow function without parens: const fn = x =>
-    let arrow_func_simple_re = Regex::new(
+    static ARROW_FUNC_SIMPLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?(?:const|let)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:async\s+)?[a-zA-Z_][a-zA-Z0-9_]*\s*=>"
-    )?;
+    ).unwrap());
+    let arrow_func_simple_re = &*ARROW_FUNC_SIMPLE_RE;
 
     // React functional component as arrow function: const ComponentName = (props) => {
-    let react_arrow_component_re = Regex::new(
+    static REACT_ARROW_COMPONENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?const\s+([A-Z][A-Za-z0-9_]*)\s*(?::\s*(?:React\.)?FC[^=]*)?\s*=\s*(?:\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_]*)\s*(?::\s*[^=]+)?\s*=>"
-    )?;
+    ).unwrap());
+    let react_arrow_component_re = &*REACT_ARROW_COMPONENT_RE;
 
     // React functional component as function: function ComponentName(props) {
-    let react_func_component_re = Regex::new(
+    static REACT_FUNC_COMPONENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?function\s+([A-Z][A-Za-z0-9_]*)\s*\("
-    )?;
+    ).unwrap());
+    let react_func_component_re = &*REACT_FUNC_COMPONENT_RE;
 
     // React hooks: const [state, setState] = useState(...) or custom hooks: function useXxx()
-    let hook_re = Regex::new(
+    static HOOK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?(?:const|function)\s+(use[A-Z][a-zA-Z0-9_]*)"
-    )?;
+    ).unwrap());
+    let hook_re = &*HOOK_RE;
 
     // Decorator: @DecoratorName or @DecoratorName(...)
-    let decorator_re = Regex::new(
+    static DECORATOR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*@([A-Z][a-zA-Z0-9_]*)\s*(?:\([^)]*\))?"
-    )?;
+    ).unwrap());
+    let decorator_re = &*DECORATOR_RE;
 
     // Import: import { X } from 'module' or import X from 'module'
-    let import_re = Regex::new(
+    static IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"(?m)^[ \t]*import\s+(?:\{[^}]*\}|\*\s+as\s+[a-zA-Z_][a-zA-Z0-9_]*|[a-zA-Z_][a-zA-Z0-9_]*)\s+from\s+['"]([^'"]+)['"]"#
-    )?;
+    ).unwrap());
+    let import_re = &*IMPORT_RE;
 
     // Module-level const (UPPER_CASE): const API_URL = ...
-    let const_re = Regex::new(
+    static CONST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^(?:export\s+)?const\s+([A-Z][A-Z0-9_]+)\s*(?::\s*[^=]+)?\s*="
-    )?;
+    ).unwrap());
+    let const_re = &*CONST_RE;
 
     // Namespace: namespace NamespaceName { ... }
-    let namespace_re = Regex::new(
+    static NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:export\s+)?(?:declare\s+)?namespace\s+([A-Z][A-Za-z0-9_]*)"
-    )?;
+    ).unwrap());
+    let namespace_re = &*NAMESPACE_RE;
 
     // Vue defineComponent: export default defineComponent({ name: 'ComponentName' })
-    // Simplified: look for defineComponent
-    let vue_component_re = Regex::new(
+    static VUE_COMPONENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"(?m)defineComponent\s*\(\s*\{[^}]*name\s*:\s*['"]([A-Z][A-Za-z0-9_]*)['"]"#
-    )?;
-
-    // Vue setup script: <script setup> ... </script>
-    // We'll extract the file name as component name if it's a .vue file
+    ).unwrap());
+    let vue_component_re = &*VUE_COMPONENT_RE;
 
     // Svelte: export let propName (props)
-    let svelte_prop_re = Regex::new(
+    static SVELTE_PROP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*export\s+let\s+([a-zA-Z_][a-zA-Z0-9_]*)"
-    )?;
+    ).unwrap());
+    let svelte_prop_re = &*SVELTE_PROP_RE;
 
     // Parse classes
     for cap in class_re.captures_iter(content) {
@@ -472,7 +485,8 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
 
 /// Extract script content from Vue SFC
 pub fn extract_vue_script(content: &str) -> String {
-    let script_re = Regex::new(r"(?s)<script[^>]*>(.*?)</script>").unwrap();
+    static SCRIPT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<script[^>]*>(.*?)</script>").unwrap());
+    let script_re = &*SCRIPT_RE;
 
     script_re.captures_iter(content)
         .filter_map(|cap| cap.get(1))
@@ -483,7 +497,8 @@ pub fn extract_vue_script(content: &str) -> String {
 
 /// Extract script content from Svelte component
 pub fn extract_svelte_script(content: &str) -> String {
-    let script_re = Regex::new(r"(?s)<script[^>]*>(.*?)</script>").unwrap();
+    static SCRIPT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<script[^>]*>(.*?)</script>").unwrap());
+    let script_re = &*SCRIPT_RE;
 
     script_re.captures_iter(content)
         .filter_map(|cap| cap.get(1))

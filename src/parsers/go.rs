@@ -1,5 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -9,35 +10,61 @@ pub fn parse_go_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let mut symbols = Vec::new();
 
     // Package declaration: package name
-    let package_re = Regex::new(r"(?m)^package\s+([a-z][a-z0-9_]*)")?;
+    static PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^package\s+([a-z][a-z0-9_]*)").unwrap());
+
+    let package_re = &*PACKAGE_RE;
 
     // Import: import "module" or import ( "module1" "module2" )
-    let import_single_re = Regex::new(r#"(?m)^import\s+"([^"]+)""#)?;
-    let import_block_re = Regex::new(r#"(?s)import\s*\(\s*([^)]+)\)"#)?;
-    let import_line_re = Regex::new(r#"(?:([a-zA-Z_][a-zA-Z0-9_]*)\s+)?"([^"]+)""#)?;
+    static IMPORT_SINGLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?m)^import\s+"([^"]+)""#).unwrap());
+
+    let import_single_re = &*IMPORT_SINGLE_RE;
+    static IMPORT_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?s)import\s*\(\s*([^)]+)\)"#).unwrap());
+
+    let import_block_re = &*IMPORT_BLOCK_RE;
+    static IMPORT_LINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?:([a-zA-Z_][a-zA-Z0-9_]*)\s+)?"([^"]+)""#).unwrap());
+
+    let import_line_re = &*IMPORT_LINE_RE;
 
     // Type struct: type Name struct { ... }
-    let struct_re = Regex::new(r"(?m)^type\s+([A-Z][a-zA-Z0-9_]*)\s+struct\s*\{")?;
+    static STRUCT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^type\s+([A-Z][a-zA-Z0-9_]*)\s+struct\s*\{").unwrap());
+
+    let struct_re = &*STRUCT_RE;
 
     // Type interface: type Name interface { ... }
-    let interface_re = Regex::new(r"(?m)^type\s+([A-Z][a-zA-Z0-9_]*)\s+interface\s*\{")?;
+    static INTERFACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^type\s+([A-Z][a-zA-Z0-9_]*)\s+interface\s*\{").unwrap());
+
+    let interface_re = &*INTERFACE_RE;
 
     // Type alias: type Name = OtherType or type Name OtherType
-    let type_alias_re = Regex::new(r"(?m)^type\s+([A-Z][a-zA-Z0-9_]*)\s+(?:=\s*)?([a-zA-Z][a-zA-Z0-9_\.\[\]]*)\s*$")?;
+    static TYPE_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^type\s+([A-Z][a-zA-Z0-9_]*)\s+(?:=\s*)?([a-zA-Z][a-zA-Z0-9_\.\[\]]*)\s*$").unwrap());
+
+    let type_alias_re = &*TYPE_ALIAS_RE;
 
     // Function: func Name(...) ... { or func (r *Receiver) Name(...) ... {
-    let func_re = Regex::new(r"(?m)^func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)")?;
+    static FUNC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)").unwrap());
+
+    let func_re = &*FUNC_RE;
 
     // Method with receiver: func (r *Type) Method(...)
-    let method_re = Regex::new(r"(?m)^func\s+\(\s*\w+\s+\*?([A-Z][a-zA-Z0-9_]*)\s*\)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")?;
+    static METHOD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^func\s+\(\s*\w+\s+\*?([A-Z][a-zA-Z0-9_]*)\s*\)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap());
+
+    let method_re = &*METHOD_RE;
 
     // Const declaration: const Name = value or const ( Name = value )
-    let const_single_re = Regex::new(r"(?m)^const\s+([A-Z][A-Za-z0-9_]*)\s*(?:=|[a-zA-Z])")?;
-    let const_block_re = Regex::new(r"(?s)const\s*\(\s*([^)]+)\)")?;
-    let const_line_re = Regex::new(r"(?m)^\s*([A-Z][A-Za-z0-9_]*)\s*(?:=|[a-zA-Z])")?;
+    static CONST_SINGLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^const\s+([A-Z][A-Za-z0-9_]*)\s*(?:=|[a-zA-Z])").unwrap());
+
+    let const_single_re = &*CONST_SINGLE_RE;
+    static CONST_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)const\s*\(\s*([^)]+)\)").unwrap());
+
+    let const_block_re = &*CONST_BLOCK_RE;
+    static CONST_LINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*([A-Z][A-Za-z0-9_]*)\s*(?:=|[a-zA-Z])").unwrap());
+
+    let const_line_re = &*CONST_LINE_RE;
 
     // Var declaration at package level
-    let var_re = Regex::new(r"(?m)^var\s+([A-Z][a-zA-Z0-9_]*)\s+")?;
+    static VAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^var\s+([A-Z][a-zA-Z0-9_]*)\s+").unwrap());
+
+    let var_re = &*VAR_RE;
 
     let lines: Vec<&str> = content.lines().collect();
 

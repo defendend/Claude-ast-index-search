@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -19,29 +20,55 @@ pub fn parse_kotlin_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let mut symbols = Vec::new();
 
     // Simple regex for detecting class/interface start
-    let class_start_re = Regex::new(
+    static CLASS_START_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*((?:public|private|protected|internal|abstract|open|final|sealed|data|value|inline|annotation|inner|enum)[\s]+)*(?:class|object)\s+(\w+)"
-    )?;
 
-    let interface_re = Regex::new(
+    ).unwrap());
+
+    let class_start_re = &*CLASS_START_RE;
+
+    static INTERFACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*((?:public|private|protected|internal|sealed|fun)[\s]+)*interface\s+(\w+)(?:\s*<[^>]*>)?(?:\s*:\s*([^{]+))?"
-    )?;
 
-    let fun_re = Regex::new(
+
+    ).unwrap());
+
+
+    let interface_re = &*INTERFACE_RE;
+
+    static FUN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*((?:public|private|protected|internal|override|suspend|inline|operator|infix|tailrec|external|actual|expect)[\s]+)*fun\s+(?:<[^>]*>\s*)?(?:(\w+)\.)?(\w+)\s*\(([^)]*)\)(?:\s*:\s*(\S+))?"
-    )?;
 
-    let property_re = Regex::new(
+
+    ).unwrap());
+
+
+    let fun_re = &*FUN_RE;
+
+    static PROPERTY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*((?:public|private|protected|internal|override|const|lateinit|lazy)[\s]+)*(?:val|var)\s+(\w+)(?:\s*:\s*(\S+))?"
-    )?;
 
-    let typealias_re = Regex::new(r"(?m)^[\s]*typealias\s+(\w+)(?:\s*<[^>]*>)?\s*=\s*(.+)")?;
-    let enum_re = Regex::new(r"(?m)^[\s]*((?:public|private|protected|internal)[\s]+)*enum\s+class\s+(\w+)")?;
+
+    ).unwrap());
+
+
+    let property_re = &*PROPERTY_RE;
+
+    static TYPEALIAS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^[\s]*typealias\s+(\w+)(?:\s*<[^>]*>)?\s*=\s*(.+)").unwrap());
+
+
+    let typealias_re = &*TYPEALIAS_RE;
+    static ENUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^[\s]*((?:public|private|protected|internal)[\s]+)*enum\s+class\s+(\w+)").unwrap());
+
+    let enum_re = &*ENUM_RE;
 
     // Java static fields: public static final Type NAME = value;
-    let java_field_re = Regex::new(
+    static JAVA_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[\s]*((?:public|private|protected)[\s]+)?(?:static[\s]+)?(?:final[\s]+)?(\w+(?:<[^>]+>)?)\s+([A-Z][A-Z0-9_]*)\s*="
-    )?;
+
+    ).unwrap());
+
+    let java_field_re = &*JAVA_FIELD_RE;
 
     let lines: Vec<&str> = content.lines().collect();
 
@@ -205,7 +232,9 @@ fn extract_parents_from_declaration(decl: &str) -> Vec<(String, String)> {
 
     // Find the inheritance clause after ')' followed by ':'
     // Pattern: ClassName(...) : Parent1, Parent2 {
-    let inheritance_re = Regex::new(r"\)\s*:\s*([^{]+)").ok();
+    static INHERITANCE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\)\s*:\s*([^{]+)").unwrap());
+
+    let inheritance_re = Some(&*INHERITANCE_RE);
 
     if let Some(re) = inheritance_re {
         if let Some(caps) = re.captures(decl) {
@@ -233,7 +262,9 @@ fn extract_parents_from_declaration(decl: &str) -> Vec<(String, String)> {
 
     // Also check for simple inheritance (class Name : Parent)
     if parents.is_empty() {
-        let simple_re = Regex::new(r"(?:class|object)\s+\w+(?:\s*<[^>]*>)?\s*:\s*([^{(]+)").ok();
+        static SIMPLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:class|object)\s+\w+(?:\s*<[^>]*>)?\s*:\s*([^{(]+)").unwrap());
+
+        let simple_re = Some(&*SIMPLE_RE);
         if let Some(re) = simple_re {
             if let Some(caps) = re.captures(decl) {
                 if let Some(parents_str) = caps.get(1) {

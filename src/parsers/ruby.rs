@@ -1,5 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -9,79 +10,124 @@ pub fn parse_ruby_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let mut symbols = Vec::new();
 
     // Class definition: class ClassName < ParentClass
-    let class_re = Regex::new(
+    static CLASS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*class\s+([A-Z][A-Za-z0-9_]*(?:::[A-Z][A-Za-z0-9_]*)*)(?:\s*<\s*([A-Z][A-Za-z0-9_:]*))?"
-    )?;
+
+    ).unwrap());
+
+    let class_re = &*CLASS_RE;
 
     // Module definition: module ModuleName
-    let module_re = Regex::new(
+    static MODULE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*module\s+([A-Z][A-Za-z0-9_]*(?:::[A-Z][A-Za-z0-9_]*)*)"
-    )?;
+
+    ).unwrap());
+
+    let module_re = &*MODULE_RE;
 
     // Instance method: def method_name
-    let def_re = Regex::new(
+    static DEF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*def\s+([a-z_][a-z0-9_]*[?!=]?)\s*(?:\([^)]*\))?"
-    )?;
+
+    ).unwrap());
+
+    let def_re = &*DEF_RE;
 
     // Class method: def self.method_name
-    let def_self_re = Regex::new(
+    static DEF_SELF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*def\s+self\.([a-z_][a-z0-9_]*[?!=]?)\s*(?:\([^)]*\))?"
-    )?;
+
+    ).unwrap());
+
+    let def_self_re = &*DEF_SELF_RE;
 
     // Attribute accessors: attr_reader, attr_writer, attr_accessor
-    let attr_re = Regex::new(
+    static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*attr_(reader|writer|accessor)\s+:([a-z_][a-z0-9_]*)"
-    )?;
+
+    ).unwrap());
+
+    let attr_re = &*ATTR_RE;
 
     // Constants: CONSTANT_NAME = value
-    let const_re = Regex::new(
+    static CONST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*([A-Z][A-Z0-9_]*)\s*="
-    )?;
+
+    ).unwrap());
+
+    let const_re = &*CONST_RE;
 
     // RSpec describe/context blocks
-    let rspec_describe_re = Regex::new(
+    static RSPEC_DESCRIBE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"(?m)^[ \t]*(describe|context)\s+['"]([^'"]+)['"]"#
-    )?;
+
+    ).unwrap());
+
+    let rspec_describe_re = &*RSPEC_DESCRIBE_RE;
 
     // RSpec it/specify blocks
-    let rspec_it_re = Regex::new(
+    static RSPEC_IT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"(?m)^[ \t]*(it|specify)\s+['"]([^'"]+)['"]"#
-    )?;
+
+    ).unwrap());
+
+    let rspec_it_re = &*RSPEC_IT_RE;
 
     // RSpec let/let!/subject
-    let rspec_let_re = Regex::new(
+    static RSPEC_LET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(let|let!|subject)\s*\(\s*:([a-z_][a-z0-9_]*)\s*\)"
-    )?;
+
+    ).unwrap());
+
+    let rspec_let_re = &*RSPEC_LET_RE;
 
     // Rails scope
-    let rails_scope_re = Regex::new(
+    static RAILS_SCOPE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*scope\s+:([a-z_][a-z0-9_]*)"
-    )?;
+
+    ).unwrap());
+
+    let rails_scope_re = &*RAILS_SCOPE_RE;
 
     // Rails has_many/has_one/belongs_to
-    let rails_assoc_re = Regex::new(
+    static RAILS_ASSOC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(has_many|has_one|belongs_to|has_and_belongs_to_many)\s+:([a-z_][a-z0-9_]*)"
-    )?;
+
+    ).unwrap());
+
+    let rails_assoc_re = &*RAILS_ASSOC_RE;
 
     // Rails callbacks: before_action, after_action, etc.
-    let rails_callback_re = Regex::new(
+    static RAILS_CALLBACK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(before_action|after_action|around_action|before_create|after_create|before_save|after_save|before_destroy|after_destroy|before_validation|after_validation)\s+:([a-z_][a-z0-9_]*)"
-    )?;
+
+    ).unwrap());
+
+    let rails_callback_re = &*RAILS_CALLBACK_RE;
 
     // Rails validates
-    let rails_validates_re = Regex::new(
+    static RAILS_VALIDATES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*validates\s+:([a-z_][a-z0-9_]*)"
-    )?;
+
+    ).unwrap());
+
+    let rails_validates_re = &*RAILS_VALIDATES_RE;
 
     // require/require_relative
-    let require_re = Regex::new(
+    static REQUIRE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r#"(?m)^[ \t]*require(?:_relative)?\s+['"]([^'"]+)['"]"#
-    )?;
+
+    ).unwrap());
+
+    let require_re = &*REQUIRE_RE;
 
     // include/extend/prepend
-    let include_re = Regex::new(
+    static INCLUDE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(include|extend|prepend)\s+([A-Z][A-Za-z0-9_:]*)"
-    )?;
+
+    ).unwrap());
+
+    let include_re = &*INCLUDE_RE;
 
     let lines: Vec<&str> = content.lines().collect();
 

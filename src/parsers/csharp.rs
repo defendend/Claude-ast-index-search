@@ -1,5 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -9,74 +10,116 @@ pub fn parse_csharp_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
     let mut symbols = Vec::new();
 
     // Namespace: namespace Name.Space { or namespace Name.Space;
-    let namespace_re = Regex::new(
+    static NAMESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*namespace\s+([A-Za-z_][A-Za-z0-9_\.]*)"
-    )?;
+
+    ).unwrap());
+
+    let namespace_re = &*NAMESPACE_RE;
 
     // Class: class ClassName : Base, IInterface
-    let class_re = Regex::new(
+    static CLASS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal|abstract|sealed|static|partial)\s+)*class\s+([A-Z][A-Za-z0-9_]*)(?:\s*<[^>]*>)?(?:\s*:\s*([A-Za-z0-9_<>,\s]+))?"
-    )?;
+
+    ).unwrap());
+
+    let class_re = &*CLASS_RE;
 
     // Interface: interface IName : IBase
-    let interface_re = Regex::new(
+    static INTERFACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal)\s+)*interface\s+(I[A-Z][A-Za-z0-9_]*)(?:\s*<[^>]*>)?(?:\s*:\s*([A-Za-z0-9_<>,\s]+))?"
-    )?;
+
+    ).unwrap());
+
+    let interface_re = &*INTERFACE_RE;
 
     // Struct: struct Name
-    let struct_re = Regex::new(
+    static STRUCT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal|readonly)\s+)*struct\s+([A-Z][A-Za-z0-9_]*)(?:\s*<[^>]*>)?"
-    )?;
+
+    ).unwrap());
+
+    let struct_re = &*STRUCT_RE;
 
     // Record: record Name or record class Name or record struct Name
-    let record_re = Regex::new(
+    static RECORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal|sealed|abstract)\s+)*record\s+(?:class\s+|struct\s+)?([A-Z][A-Za-z0-9_]*)(?:\s*<[^>]*>)?(?:\s*\([^)]*\))?(?:\s*:\s*([A-Za-z0-9_<>,\s]+))?"
-    )?;
+
+    ).unwrap());
+
+    let record_re = &*RECORD_RE;
 
     // Enum: enum Name
-    let enum_re = Regex::new(
+    static ENUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal)\s+)*enum\s+([A-Z][A-Za-z0-9_]*)"
-    )?;
+
+    ).unwrap());
+
+    let enum_re = &*ENUM_RE;
 
     // Method: returnType MethodName(params)
-    let method_re = Regex::new(
+    static METHOD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal|static|virtual|override|abstract|async|sealed|new|extern)\s+)*(?:[A-Za-z_][A-Za-z0-9_<>\[\]?,\s]*\s+)?([A-Z][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*\([^)]*\)\s*(?:where\s+[^{;]+)?[{;]"
-    )?;
+
+    ).unwrap());
+
+    let method_re = &*METHOD_RE;
 
     // Property: Type PropertyName { get; set; }
-    let property_re = Regex::new(
+    static PROPERTY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal|static|virtual|override|abstract|new)\s+)*(?:required\s+)?(?:[A-Za-z_][A-Za-z0-9_<>\[\]?,\s]*)\s+([A-Z][A-Za-z0-9_]*)\s*\{"
-    )?;
+
+    ).unwrap());
+
+    let property_re = &*PROPERTY_RE;
 
     // Field: private readonly Type _fieldName;
-    let field_re = Regex::new(
+    static FIELD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal|static|readonly|const|volatile)\s+)+(?:[A-Za-z_][A-Za-z0-9_<>\[\]?,\s]*)\s+(_[a-z][A-Za-z0-9_]*)\s*[;=]"
-    )?;
+
+    ).unwrap());
+
+    let field_re = &*FIELD_RE;
 
     // Constant: const Type CONSTANT_NAME = value;
-    let const_re = Regex::new(
+    static CONST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal)\s+)*const\s+(?:[A-Za-z_][A-Za-z0-9_<>\[\]?,\s]*)\s+([A-Z][A-Z0-9_]*)\s*="
-    )?;
+
+    ).unwrap());
+
+    let const_re = &*CONST_RE;
 
     // Delegate: delegate returnType DelegateName(params);
-    let delegate_re = Regex::new(
+    static DELEGATE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal)\s+)*delegate\s+(?:[A-Za-z_][A-Za-z0-9_<>\[\]?,\s]*)\s+([A-Z][A-Za-z0-9_]*)(?:\s*<[^>]*>)?\s*\("
-    )?;
+
+    ).unwrap());
+
+    let delegate_re = &*DELEGATE_RE;
 
     // Event: event EventHandler EventName;
-    let event_re = Regex::new(
+    static EVENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*(?:(?:public|private|protected|internal|static|virtual|override|abstract)\s+)*event\s+(?:[A-Za-z_][A-Za-z0-9_<>\[\]?,\s]*)\s+([A-Z][A-Za-z0-9_]*)\s*[;{]"
-    )?;
+
+    ).unwrap());
+
+    let event_re = &*EVENT_RE;
 
     // Using: using Namespace;
-    let using_re = Regex::new(
+    static USING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*using\s+(?:static\s+)?([A-Za-z_][A-Za-z0-9_\.]*)\s*;"
-    )?;
+
+    ).unwrap());
+
+    let using_re = &*USING_RE;
 
     // Attribute: [AttributeName] or [AttributeName(params)]
-    let attr_re = Regex::new(
+    static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(
         r"(?m)^[ \t]*\[([A-Za-z_][A-Za-z0-9_]*)(?:\([^\]]*\))?\]"
-    )?;
+
+    ).unwrap());
+
+    let attr_re = &*ATTR_RE;
 
     let lines: Vec<&str> = content.lines().collect();
 

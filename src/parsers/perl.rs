@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use crate::db::SymbolKind;
 use super::ParsedSymbol;
@@ -19,22 +20,33 @@ pub fn parse_perl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
 
     // Regex patterns for Perl constructs
     // Package declaration: package Name;
-    let package_re = Regex::new(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;")?;
+    static PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;").unwrap());
+    let package_re = &*PACKAGE_RE;
 
     // Subroutine definition: sub name { } or sub name($proto) { }
-    let sub_re = Regex::new(r"^\s*sub\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\{(]?")?;
+    static SUB_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*sub\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\{(]?").unwrap());
+
+    let sub_re = &*SUB_RE;
 
     // Constant definition: use constant NAME => value;
-    let constant_re = Regex::new(r"^\s*use\s+constant\s+([A-Z_][A-Z0-9_]*)\s*=>")?;
+    static CONSTANT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*use\s+constant\s+([A-Z_][A-Z0-9_]*)\s*=>").unwrap());
+
+    let constant_re = &*CONSTANT_RE;
 
     // Our variable declaration: our $VAR, our @ARRAY, our %HASH
-    let our_re = Regex::new(r"^\s*our\s+([\$@%][A-Za-z_][A-Za-z0-9_]*)")?;
+    static OUR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*our\s+([\$@%][A-Za-z_][A-Za-z0-9_]*)").unwrap());
+
+    let our_re = &*OUR_RE;
 
     // Inheritance patterns
     // use base qw/Parent1 Parent2/; or use base 'Parent';
-    let use_base_re = Regex::new(r#"use\s+(?:base|parent)\s+(?:qw[/(]([^)/\\]+)[)/\\]|['"]([^'"]+)['"])"#)?;
+    static USE_BASE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"use\s+(?:base|parent)\s+(?:qw[/(]([^)/\\]+)[)/\\]|['"]([^'"]+)['"])"#).unwrap());
+
+    let use_base_re = &*USE_BASE_RE;
     // our @ISA = qw(Parent1 Parent2);
-    let isa_re = Regex::new(r#"our\s+@ISA\s*=\s*(?:qw[/(]([^)/\\]+)[)/\\]|\(([^)]+)\))"#)?;
+    static ISA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"our\s+@ISA\s*=\s*(?:qw[/(]([^)/\\]+)[)/\\]|\(([^)]+)\))"#).unwrap());
+
+    let isa_re = &*ISA_RE;
 
     // Track current package for context
     let mut current_package: Option<(String, i64)> = None; // (name, symbol_id placeholder)
