@@ -1,4 +1,4 @@
-# ast-index v3.9.2
+# ast-index v3.9.3
 
 Fast code search CLI for 14 programming languages. Native Rust implementation.
 
@@ -301,6 +301,10 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 
 ## Changelog
 
+### 3.9.3
+- **Simplified plugin installation** — `install-claude-plugin` now calls `claude plugin marketplace add` and `claude plugin install` instead of manual file copying
+- **Updated README** — plugin install instructions now use official `claude plugin` CLI commands
+
 ### 3.9.2
 - **Fix OOM crashes on large projects** (70K+ files)
   - Batched indexing: parse and write to DB in chunks of 500 files instead of loading everything into memory
@@ -517,27 +521,21 @@ Run `ast-index rebuild` in project root before first use.
 
 #### Install Plugin
 
-Add marketplace and install plugin:
+From terminal:
 ```bash
-# In Claude Code
-/plugins add https://github.com/defendend/Claude-ast-index-search
-/plugins install ast-index
+# Add marketplace (once)
+claude plugin marketplace add defendend/Claude-ast-index-search
+
+# Install plugin
+claude plugin install ast-index
 ```
 
-Or manually:
-1. Add to `~/.claude/plugins/known_marketplaces.json`:
-```json
-{
-  "ast-index-marketplace": {
-    "source": {
-      "source": "github",
-      "repo": "defendend/Claude-ast-index-search"
-    }
-  }
-}
+Or if ast-index binary is already installed (via brew or ya tool):
+```bash
+ast-index install-claude-plugin
 ```
 
-2. Restart Claude Code and install plugin
+Restart Claude Code to activate the plugin.
 
 #### Update Plugin
 
@@ -545,24 +543,14 @@ Or manually:
 # Update CLI
 brew upgrade ast-index
 
-# Update plugin (in Claude Code)
-/plugins update ast-index
-```
-
-Or manually update:
-```bash
-# Pull latest marketplace
-cd ~/.claude/plugins/marketplaces/ast-index-marketplace
-git pull origin main
-
-# Update cache
-rm -rf ~/.claude/plugins/cache/ast-index-marketplace/ast-index/*
+# Update plugin
+claude plugin update ast-index
 ```
 
 #### Uninstall Plugin
 
 ```bash
-/plugins uninstall ast-index
+claude plugin uninstall ast-index
 ```
 
 ## License
