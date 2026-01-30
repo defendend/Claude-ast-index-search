@@ -475,104 +475,45 @@ fn main() -> Result<()> {
 }
 
 fn cmd_install_claude_plugin() -> Result<()> {
-    use std::fs;
+    use std::process::Command;
 
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let plugin_dir = home.join(".claude").join("plugins").join("ast-index");
+    println!("Adding ast-index marketplace...");
+    let status = Command::new("claude")
+        .args(["plugin", "marketplace", "add", "defendend/Claude-ast-index-search"])
+        .status();
 
-    // Create plugin directory
-    fs::create_dir_all(&plugin_dir)?;
-    fs::create_dir_all(plugin_dir.join(".claude-plugin"))?;
-    fs::create_dir_all(plugin_dir.join("skills").join("ast-index").join("references"))?;
-    fs::create_dir_all(plugin_dir.join("commands"))?;
-
-    // Write plugin.json
-    let plugin_json = include_str!("../plugin/.claude-plugin/plugin.json");
-    fs::write(plugin_dir.join(".claude-plugin").join("plugin.json"), plugin_json)?;
-
-    // Write skill files
-    let skill_md = include_str!("../plugin/skills/ast-index/SKILL.md");
-    fs::write(plugin_dir.join("skills").join("ast-index").join("SKILL.md"), skill_md)?;
-
-    // Write reference files
-    let refs = [
-        ("android-commands.md", include_str!("../plugin/skills/ast-index/references/android-commands.md")),
-        ("go-commands.md", include_str!("../plugin/skills/ast-index/references/go-commands.md")),
-        ("ios-commands.md", include_str!("../plugin/skills/ast-index/references/ios-commands.md")),
-        ("module-commands.md", include_str!("../plugin/skills/ast-index/references/module-commands.md")),
-        ("perl-commands.md", include_str!("../plugin/skills/ast-index/references/perl-commands.md")),
-        ("python-commands.md", include_str!("../plugin/skills/ast-index/references/python-commands.md")),
-    ];
-    for (name, content) in refs {
-        fs::write(plugin_dir.join("skills").join("ast-index").join("references").join(name), content)?;
+    match status {
+        Ok(s) if s.success() => {
+            println!("Marketplace added successfully.");
+        }
+        Ok(s) => {
+            eprintln!("Warning: marketplace add exited with {}", s);
+        }
+        Err(e) => {
+            eprintln!("Error: could not run 'claude' CLI: {}", e);
+            eprintln!("Make sure Claude Code is installed: https://docs.anthropic.com/en/docs/claude-code");
+            return Err(anyhow::anyhow!("claude CLI not found"));
+        }
     }
 
-    // Write command files
-    let commands = [
-        ("initialize-android.md", include_str!("../plugin/commands/initialize-android.md")),
-        ("initialize-ios.md", include_str!("../plugin/commands/initialize-ios.md")),
-    ];
-    for (name, content) in commands {
-        fs::write(plugin_dir.join("commands").join(name), content)?;
+    println!("Installing ast-index plugin...");
+    let status = Command::new("claude")
+        .args(["plugin", "install", "ast-index"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("Plugin installed successfully.");
+            println!("\nRestart Claude Code to activate the plugin.");
+        }
+        Ok(s) => {
+            eprintln!("Plugin install exited with {}", s);
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to run claude plugin install: {}", e));
+        }
     }
 
-    // Register plugin in installed_plugins.json
-    let installed_plugins_path = home.join(".claude").join("plugins").join("installed_plugins.json");
-    let plugin_key = "ast-index@local";
-    // Simple ISO 8601 timestamp without external crate
-    let now = {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Convert epoch seconds to date components
-        let days = (secs / 86400) as i64;
-        let time_secs = secs % 86400;
-        let h = time_secs / 3600;
-        let m = (time_secs % 3600) / 60;
-        let s = time_secs % 60;
-        // Civil date from days since epoch (algorithm from Howard Hinnant)
-        let z = days + 719468;
-        let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-        let doe = (z - era * 146097) as u64;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let y = yoe as i64 + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-        let yr = if mo <= 2 { y + 1 } else { y };
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z", yr, mo, d, h, m, s)
-    };
-    let version = env!("CARGO_PKG_VERSION");
-
-    let mut root: serde_json::Value = if installed_plugins_path.exists() {
-        let content = fs::read_to_string(&installed_plugins_path).unwrap_or_default();
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({"plugins": {}}))
-    } else {
-        serde_json::json!({"plugins": {}})
-    };
-
-    let plugins = root.as_object_mut()
-        .and_then(|o| o.get_mut("plugins"))
-        .and_then(|p| p.as_object_mut());
-
-    if let Some(plugins) = plugins {
-        plugins.insert(plugin_key.to_string(), serde_json::json!([
-            {
-                "scope": "user",
-                "installPath": plugin_dir.to_string_lossy(),
-                "version": version,
-                "installedAt": now,
-                "lastUpdated": now
-            }
-        ]));
-    }
-
-    fs::write(&installed_plugins_path, serde_json::to_string_pretty(&root)?)?;
-
-    println!("Claude Code plugin installed to: {}", plugin_dir.display());
-    println!("\nRestart Claude Code to activate the plugin.");
     Ok(())
 }
 
