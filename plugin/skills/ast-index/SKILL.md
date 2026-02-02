@@ -202,6 +202,7 @@ ast-index rebuild --no-deps          # Skip module dependency indexing
 ast-index rebuild --no-ignore        # Include gitignored files
 ast-index update                     # Incremental update
 ast-index stats                      # Show index statistics
+ast-index clear                      # Delete index for current project
 ```
 
 ## Utility Commands
