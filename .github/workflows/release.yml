@@ -29,8 +29,8 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             name: darwin-x86_64
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
             name: linux-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -40,6 +40,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
