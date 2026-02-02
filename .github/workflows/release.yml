@@ -26,7 +26,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             name: darwin-arm64
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             name: darwin-x86_64
           - os: ubuntu-latest
