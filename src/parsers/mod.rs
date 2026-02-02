@@ -14,9 +14,11 @@
 //! - Rust (systems programming)
 //! - Ruby (Rails, RSpec)
 //! - C# (.NET, Unity, ASP.NET)
+//! - Dart/Flutter
 
 pub mod cpp;
 pub mod csharp;
+pub mod dart;
 pub mod go;
 pub mod kotlin;
 pub mod objc;
@@ -73,6 +75,7 @@ use std::sync::LazyLock;
 // Re-export parser functions
 pub use cpp::parse_cpp_symbols;
 pub use csharp::parse_csharp_symbols;
+pub use dart::parse_dart_symbols;
 pub use go::parse_go_symbols;
 pub use kotlin::{parse_kotlin_symbols, parse_parents};
 pub use objc::parse_objc_symbols;
@@ -111,7 +114,9 @@ pub fn is_supported_extension(ext: &str) -> bool {
         // Ruby
         "rb" |
         // C#
-        "cs"
+        "cs" |
+        // Dart/Flutter
+        "dart"
     )
 }
 
@@ -129,6 +134,7 @@ pub fn parse_symbols_and_refs(
     is_rust: bool,
     is_ruby: bool,
     is_csharp: bool,
+    is_dart: bool,
     is_typescript: bool,
     is_vue: bool,
     is_svelte: bool,
@@ -155,6 +161,8 @@ pub fn parse_symbols_and_refs(
         parse_ruby_symbols(content)?
     } else if is_csharp {
         parse_csharp_symbols(content)?
+    } else if is_dart {
+        parse_dart_symbols(content)?
     } else if is_typescript {
         parse_typescript_symbols(content)?
     } else if is_vue {

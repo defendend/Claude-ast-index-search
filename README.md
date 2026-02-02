@@ -1,6 +1,6 @@
-# ast-index v3.9.3
+# ast-index v3.10.0
 
-Fast code search CLI for 14 programming languages. Native Rust implementation.
+Fast code search CLI for 15 programming languages. Native Rust implementation.
 
 ## Supported Projects
 
@@ -12,6 +12,7 @@ Fast code search CLI for 14 programming languages. Native Rust implementation.
 | Systems | Rust | `.rs` |
 | Backend | C#, Python, Go, C++ | `.cs`, `.py`, `.go`, `.cpp`, `.cc`, `.c`, `.hpp` |
 | Scripting | Ruby, Perl | `.rb`, `.pm`, `.pl`, `.t` |
+| Mobile | Dart/Flutter | `.dart` |
 | Schema | Protocol Buffers, WSDL/XSD | `.proto`, `.wsdl`, `.xsd` |
 
 Project type is auto-detected.
@@ -233,6 +234,25 @@ ast-index search "[HttpGet]"       # Find API endpoints
 ast-index search "MonoBehaviour"   # Find Unity scripts
 ```
 
+### Dart/Flutter (new in v3.10)
+
+Supported elements:
+- Classes with Dart 3 modifiers (abstract, sealed, final, base, interface, mixin class)
+- Mixins, extensions, extension types
+- Enhanced enums with implements/with
+- Functions, constructors, factory constructors
+- Getters/setters, typedefs, properties
+- Imports/exports
+
+```bash
+ast-index class "Widget"           # Find widget classes
+ast-index class "Provider"         # Find providers
+ast-index search "mixin"           # Find mixins
+ast-index implementations "State"  # Find State implementations
+ast-index outline "main.dart"      # Show file structure
+ast-index imports "app.dart"       # Show imports
+```
+
 ### Python
 
 ```bash
@@ -300,6 +320,19 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.10.0
+- **Dart/Flutter support** — index and search Dart/Flutter codebases
+  - Classes with Dart 3 modifiers: `abstract`, `sealed`, `final`, `base`, `interface`, `mixin class`
+  - Mixins: `mixin Foo on Bar`
+  - Extensions and extension types (Dart 3.3)
+  - Enhanced enums with `with`/`implements`
+  - Functions, constructors, factory constructors
+  - Getters/setters, typedefs, properties
+  - Imports/exports
+  - Multiline class declarations
+  - File types: `.dart`
+- **20 new tests** — comprehensive test coverage for Dart parser
 
 ### 3.9.3
 - **Simplified plugin installation** — `install-claude-plugin` now calls `claude plugin marketplace add` and `claude plugin install` instead of manual file copying

@@ -14,6 +14,8 @@ use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 
+use crate::db::SymbolKind;
+
 use crate::db;
 use super::{search_files, relative_path};
 
@@ -198,6 +200,20 @@ pub fn cmd_outline(root: &Path, file: &str) -> Result<()> {
                 }
                 found = true;
             }
+        }
+    } else if ext == "dart" {
+        // Dart patterns — delegate to parser for correct results
+        let symbols = crate::parsers::parse_dart_symbols(&content)?;
+        for sym in &symbols {
+            // Skip imports/properties for outline (too noisy)
+            match sym.kind {
+                SymbolKind::Import => continue,
+                SymbolKind::Property => continue,
+                _ => {}
+            }
+            let kind_str = sym.kind.as_str();
+            println!("  {} {} [{}]", format!(":{}", sym.line).dimmed(), sym.name.cyan(), kind_str);
+            found = true;
         }
     } else {
         // Kotlin/Java patterns

@@ -1,11 +1,11 @@
 ---
 name: ast-index
-description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", "find Perl subs", "Perl exports", "find Python class", "Go struct", "Go interface", "find React component", "find TypeScript interface", "find Rust struct", "find Ruby class", "find C# controller", or needs fast code search in Android/Kotlin/Java, iOS/Swift/ObjC, TypeScript/JavaScript, Rust, Ruby, C#, Perl, Python, Go, C++, or Protocol Buffers projects. Also triggered by mentions of "ast-index" CLI tool.
+description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", "find Perl subs", "Perl exports", "find Python class", "Go struct", "Go interface", "find React component", "find TypeScript interface", "find Rust struct", "find Ruby class", "find C# controller", "find Dart class", "find Flutter widget", "find mixin", or needs fast code search in Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, Perl, Python, Go, C++, or Protocol Buffers projects. Also triggered by mentions of "ast-index" CLI tool.
 ---
 
 # ast-index - Code Search for Multi-Platform Projects
 
-Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swift/ObjC, TypeScript/JavaScript, Rust, Ruby, C#, Perl, Python, Go, C++, and Proto projects using SQLite + FTS5 index.
+Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, Perl, Python, Go, C++, and Proto projects using SQLite + FTS5 index.
 
 ## Critical Rules
 
@@ -50,6 +50,7 @@ The index is stored at `~/.cache/ast-index/<project-hash>/index.db` and needs re
 | Rust | Rust | Cargo.toml |
 | Ruby | Ruby, Rails, RSpec | Gemfile |
 | .NET | C#, ASP.NET, Unity | *.csproj |
+| Dart/Flutter | Dart | pubspec.yaml |
 | Perl | Perl | Makefile.PL, Build.PL |
 | Python | Python | None (*.py files) |
 | Go | Go | None (*.go files) |
@@ -279,6 +280,14 @@ Consult: `references/csharp-commands.md`
 - Supports: ASP.NET attributes, Unity (`MonoBehaviour`, `SerializeField`)
 - `outline` and `imports` work with C# files
 
+### Dart/Flutter
+
+Consult: `references/dart-commands.md`
+
+- Index: `class`, `mixin`, `extension`, `extension type`, `enum`, `typedef`, functions, constructors
+- Supports: Dart 3 modifiers (sealed, final, base, interface, mixin class)
+- `outline` and `imports` work with Dart files
+
 ### Python
 
 Consult: `references/python-commands.md`
@@ -332,6 +341,7 @@ For detailed platform-specific commands, consult:
 - **`references/rust-commands.md`** - Structs, traits, impl blocks, macros
 - **`references/ruby-commands.md`** - Rails, RSpec, classes, modules
 - **`references/csharp-commands.md`** - ASP.NET, Unity, controllers, interfaces
+- **`references/dart-commands.md`** - Dart/Flutter classes, mixins, extensions
 - **`references/perl-commands.md`** - Perl exports, subs, POD
 - **`references/python-commands.md`** - Python classes, functions
 - **`references/go-commands.md`** - Go structs, interfaces
