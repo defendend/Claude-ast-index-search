@@ -505,8 +505,9 @@ pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ig
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
-    for (chunk_idx, chunk) in files.chunks(CHUNK_SIZE).enumerate() {
-        let root_clone = root.to_path_buf();
+    let root_buf = root.to_path_buf();
+    for (_chunk_idx, chunk) in files.chunks(CHUNK_SIZE).enumerate() {
+        let root_clone = root_buf.clone();
         let counter = parsed_global.clone();
         let total = total_files;
 
@@ -640,31 +641,30 @@ pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress
     let mut files_to_parse: Vec<PathBuf> = Vec::new();
     let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for file_path in &current_files {
+    for file_path in current_files {
         let rel_path = file_path
             .strip_prefix(root)
-            .unwrap_or(file_path)
+            .unwrap_or(&file_path)
             .to_string_lossy()
             .to_string();
-        current_paths.insert(rel_path.clone());
 
-        let file_mtime = fs::metadata(file_path)
+        let file_mtime = fs::metadata(&file_path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        if let Some((_, db_mtime)) = existing_files.get(&rel_path) {
-            if file_mtime > *db_mtime {
-                // File changed
-                files_to_parse.push(file_path.clone());
-            }
-            // else: unchanged, skip
+        let need_parse = if let Some((_, db_mtime)) = existing_files.get(&rel_path) {
+            file_mtime > *db_mtime
         } else {
-            // New file
-            files_to_parse.push(file_path.clone());
+            true
+        };
+
+        if need_parse {
+            files_to_parse.push(file_path);
         }
+        current_paths.insert(rel_path);
     }
 
     // 4. Find deleted files
@@ -1347,16 +1347,16 @@ pub fn index_resources(conn: &mut Connection, root: &Path, progress: bool) -> Re
         }
     }
 
-    // Build resource ID map
-    let resource_ids: std::collections::HashMap<(String, String), i64> = {
+    // Build resource ID map: type -> name -> id (two-level for allocation-free lookup)
+    let resource_ids: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = {
         let mut stmt = tx.prepare("SELECT id, type, name FROM resources")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
         })?;
-        let mut map = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = std::collections::HashMap::new();
         for row in rows {
             let (id, res_type, name) = row?;
-            map.insert((res_type, name), id);
+            map.entry(res_type).or_default().insert(name, id);
         }
         map
     };
@@ -1401,7 +1401,7 @@ pub fn index_resources(conn: &mut Connection, root: &Path, progress: bool) -> Re
                             let res_type = caps.get(1).unwrap().as_str();
                             let res_name = caps.get(2).unwrap().as_str();
 
-                            if let Some(&resource_id) = resource_ids.get(&(res_type.to_string(), res_name.to_string())) {
+                            if let Some(&resource_id) = resource_ids.get(res_type).and_then(|m| m.get(res_name)) {
                                 usage_stmt.execute(rusqlite::params![resource_id, rel_path, line_num as i64, "code"])?;
                                 usage_count += 1;
                             }
@@ -1413,7 +1413,7 @@ pub fn index_resources(conn: &mut Connection, root: &Path, progress: bool) -> Re
                         let res_type = caps.get(1).unwrap().as_str();
                         let res_name = caps.get(2).unwrap().as_str();
 
-                        if let Some(&resource_id) = resource_ids.get(&(res_type.to_string(), res_name.to_string())) {
+                        if let Some(&resource_id) = resource_ids.get(res_type).and_then(|m| m.get(res_name)) {
                             usage_stmt.execute(rusqlite::params![resource_id, rel_path, line_num as i64, "xml"])?;
                             usage_count += 1;
                         }
@@ -1472,13 +1472,15 @@ pub fn build_transitive_deps(conn: &mut Connection, progress: bool) -> Result<us
             "INSERT INTO transitive_deps (module_id, dependency_id, depth, path) VALUES (?1, ?2, ?3, ?4)"
         )?;
 
+        let unknown = "?";
+
         // For each module, BFS to find all transitive dependencies
         for (module_id, dep_id, _) in &direct_deps {
+            let mod_name = module_names.get(module_id).map(|s| s.as_str()).unwrap_or(unknown);
+            let dep_name = module_names.get(dep_id).map(|s| s.as_str()).unwrap_or(unknown);
+
             // Direct dependency
-            let path = format!("{} -> {}",
-                module_names.get(module_id).unwrap_or(&"?".to_string()),
-                module_names.get(dep_id).unwrap_or(&"?".to_string())
-            );
+            let path = format!("{} -> {}", mod_name, dep_name);
             stmt.execute(rusqlite::params![module_id, dep_id, 1, path])?;
             count += 1;
 
@@ -1490,11 +1492,8 @@ pub fn build_transitive_deps(conn: &mut Connection, progress: bool) -> Result<us
             // Add api dependencies of dep_id
             if let Some(next_deps) = api_deps.get(dep_id) {
                 for &next_dep in next_deps {
-                    let next_path = format!("{} -> {} -> {}",
-                        module_names.get(module_id).unwrap_or(&"?".to_string()),
-                        module_names.get(dep_id).unwrap_or(&"?".to_string()),
-                        module_names.get(&next_dep).unwrap_or(&"?".to_string())
-                    );
+                    let next_name = module_names.get(&next_dep).map(|s| s.as_str()).unwrap_or(unknown);
+                    let next_path = format!("{} -> {} -> {}", mod_name, dep_name, next_name);
                     queue.push_back((next_dep, 2, next_path));
                 }
             }
@@ -1512,10 +1511,8 @@ pub fn build_transitive_deps(conn: &mut Connection, progress: bool) -> Result<us
                 if let Some(next_deps) = api_deps.get(&trans_dep) {
                     for &next_dep in next_deps {
                         if !visited.contains(&next_dep) {
-                            let next_path = format!("{} -> {}",
-                                path,
-                                module_names.get(&next_dep).unwrap_or(&"?".to_string())
-                            );
+                            let next_name = module_names.get(&next_dep).map(|s| s.as_str()).unwrap_or(unknown);
+                            let next_path = format!("{} -> {}", path, next_name);
                             queue.push_back((next_dep, depth + 1, next_path));
                         }
                     }
@@ -1971,4 +1968,130 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_detect_android_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("settings.gradle.kts"), "").unwrap();
+        assert_eq!(detect_project_type(dir.path()), ProjectType::Android);
+    }
+
+    #[test]
+    fn test_detect_ios_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Package.swift"), "").unwrap();
+        assert_eq!(detect_project_type(dir.path()), ProjectType::IOS);
+    }
+
+    #[test]
+    fn test_detect_rust_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        assert_eq!(detect_project_type(dir.path()), ProjectType::Rust);
+    }
+
+    #[test]
+    fn test_detect_python_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("pyproject.toml"), "").unwrap();
+        assert_eq!(detect_project_type(dir.path()), ProjectType::Python);
+    }
+
+    #[test]
+    fn test_detect_go_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("go.mod"), "").unwrap();
+        assert_eq!(detect_project_type(dir.path()), ProjectType::Go);
+    }
+
+    #[test]
+    fn test_detect_frontend_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        assert_eq!(detect_project_type(dir.path()), ProjectType::Frontend);
+    }
+
+    #[test]
+    fn test_detect_perl_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("cpanfile"), "").unwrap();
+        assert_eq!(detect_project_type(dir.path()), ProjectType::Perl);
+    }
+
+    #[test]
+    fn test_detect_mixed_project() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        assert_eq!(detect_project_type(dir.path()), ProjectType::Mixed);
+    }
+
+    #[test]
+    fn test_detect_unknown_project() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(detect_project_type(dir.path()), ProjectType::Unknown);
+    }
+
+    #[test]
+    fn test_excluded_dirs_contains_expected() {
+        assert!(EXCLUDED_DIRS.contains(&"node_modules"));
+        assert!(EXCLUDED_DIRS.contains(&"build"));
+        assert!(EXCLUDED_DIRS.contains(&"target"));
+        assert!(EXCLUDED_DIRS.contains(&"bazel-out"));
+        assert!(EXCLUDED_DIRS.contains(&".gradle"));
+        assert!(EXCLUDED_DIRS.contains(&"Pods"));
+        assert!(EXCLUDED_DIRS.contains(&"DerivedData"));
+    }
+
+    #[test]
+    fn test_parse_file_skips_large_files() {
+        let dir = TempDir::new().unwrap();
+        let large_file = dir.path().join("large.kt");
+        let content = "a".repeat(1_100_000);
+        fs::write(&large_file, &content).unwrap();
+
+        let result = parse_file(dir.path(), &large_file).unwrap();
+        assert!(result.symbols.is_empty(), "should skip large files");
+        assert!(result.refs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_file_kotlin() {
+        let dir = TempDir::new().unwrap();
+        let kt_file = dir.path().join("Test.kt");
+        fs::write(&kt_file, "class TestClass {\n    fun doSomething() {}\n}\n").unwrap();
+
+        let result = parse_file(dir.path(), &kt_file).unwrap();
+        assert!(result.symbols.iter().any(|s| s.name == "TestClass"));
+        assert!(result.symbols.iter().any(|s| s.name == "doSomething"));
+    }
+
+    #[test]
+    fn test_parse_file_swift() {
+        let dir = TempDir::new().unwrap();
+        let swift_file = dir.path().join("Test.swift");
+        fs::write(&swift_file, "class MyView: UIView {\n    func setup() {}\n}\n").unwrap();
+
+        let result = parse_file(dir.path(), &swift_file).unwrap();
+        assert!(result.symbols.iter().any(|s| s.name == "MyView"));
+        assert!(result.symbols.iter().any(|s| s.name == "setup"));
+    }
+
+    #[test]
+    fn test_parse_file_python() {
+        let dir = TempDir::new().unwrap();
+        let py_file = dir.path().join("test.py");
+        fs::write(&py_file, "class Service:\n    def process(self):\n        pass\n").unwrap();
+
+        let result = parse_file(dir.path(), &py_file).unwrap();
+        assert!(result.symbols.iter().any(|s| s.name == "Service"));
+        assert!(result.symbols.iter().any(|s| s.name == "process"));
+    }
 }

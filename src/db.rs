@@ -6,15 +6,16 @@ use std::path::{Path, PathBuf};
 
 /// Get the database path for the current project
 pub fn get_db_path(project_root: &Path) -> Result<PathBuf> {
-    // Check environment variable first
-    if let Ok(path) = std::env::var("KOTLIN_INDEX_DB_PATH") {
+    // Check env: new name first, fallback to old
+    if let Ok(path) = std::env::var("AST_INDEX_DB_PATH")
+        .or_else(|_| std::env::var("KOTLIN_INDEX_DB_PATH"))
+    {
         return Ok(PathBuf::from(path));
     }
 
-    // Default to ~/.cache/kotlin-index/<project_hash>/index.db
     let cache_dir = dirs::cache_dir()
         .context("Could not find cache directory")?
-        .join("kotlin-index");
+        .join("ast-index");
 
     // Create hash from project root for unique DB per project
     let project_hash = simple_hash(project_root.to_string_lossy().as_ref());
@@ -30,6 +31,53 @@ fn simple_hash(s: &str) -> String {
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);
     format!("{:x}", hasher.finish())
+}
+
+/// Remove old kotlin-index cache dir entirely
+pub fn cleanup_legacy_cache() {
+    if let Some(cache_dir) = dirs::cache_dir() {
+        let old_dir = cache_dir.join("kotlin-index");
+        if old_dir.exists() {
+            let _ = std::fs::remove_dir_all(&old_dir);
+        }
+    }
+}
+
+/// Migrate project DB from old kotlin-index dir to new ast-index dir
+pub fn migrate_legacy_project(project_root: &Path) {
+    let cache_dir = match dirs::cache_dir() {
+        Some(d) => d,
+        None => return,
+    };
+    let project_hash = simple_hash(project_root.to_string_lossy().as_ref());
+    let old_db_dir = cache_dir.join("kotlin-index").join(&project_hash);
+    let new_db_dir = cache_dir.join("ast-index").join(&project_hash);
+
+    if !old_db_dir.exists() || new_db_dir.join("index.db").exists() {
+        return;
+    }
+
+    let _ = std::fs::create_dir_all(&new_db_dir);
+    for suffix in ["index.db", "index.db-wal", "index.db-shm"] {
+        let src = old_db_dir.join(suffix);
+        if src.exists() {
+            let _ = std::fs::rename(&src, new_db_dir.join(suffix));
+        }
+    }
+    // Remove old project dir if empty
+    let _ = std::fs::remove_dir(&old_db_dir);
+}
+
+/// Delete DB file and WAL/SHM files for the project
+pub fn delete_db(project_root: &Path) -> Result<()> {
+    let db_path = get_db_path(project_root)?;
+    for suffix in ["", "-wal", "-shm"] {
+        let p = db_path.with_extension(format!("db{}", suffix));
+        if p.exists() {
+            std::fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
 }
 
 /// Initialize the database schema
@@ -677,4 +725,157 @@ pub fn find_references(
 /// Count references in the database
 pub fn count_refs(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM refs", [], |row| row.get(0))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_simple_hash_deterministic() {
+        let h1 = simple_hash("/Users/test/project");
+        let h2 = simple_hash("/Users/test/project");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_simple_hash_different() {
+        let h1 = simple_hash("/Users/test/project1");
+        let h2 = simple_hash("/Users/test/project2");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_init_db() {
+        let conn = create_test_db();
+        // Check tables exist
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'",
+            [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_escape_fts5_query_simple() {
+        assert_eq!(escape_fts5_query("MyClass"), "\"MyClass\"");
+    }
+
+    #[test]
+    fn test_escape_fts5_query_empty() {
+        assert_eq!(escape_fts5_query(""), "");
+        assert_eq!(escape_fts5_query("   "), "");
+    }
+
+    #[test]
+    fn test_escape_fts5_query_with_quotes() {
+        assert_eq!(escape_fts5_query("say \"hello\""), "\"say \"\"hello\"\"\"");
+    }
+
+    #[test]
+    fn test_upsert_and_search() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
+        assert!(file_id > 0);
+
+        insert_symbol(&conn, file_id, "MyService", SymbolKind::Class, 10, Some("class MyService")).unwrap();
+        insert_symbol(&conn, file_id, "processData", SymbolKind::Function, 20, Some("fun processData()")).unwrap();
+
+        let results = search_symbols(&conn, "MyService", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "MyService");
+        assert_eq!(results[0].kind, "class");
+        assert_eq!(results[0].path, "src/main.kt");
+    }
+
+    #[test]
+    fn test_search_empty_query() {
+        let conn = create_test_db();
+        let results = search_symbols(&conn, "", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_find_files() {
+        let conn = create_test_db();
+        upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
+        upsert_file(&conn, "src/utils/Helper.kt", 2000, 200).unwrap();
+
+        let files = find_files(&conn, "Helper", 10).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].contains("Helper"));
+    }
+
+    #[test]
+    fn test_find_symbols_by_name() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "src/model.kt", 1000, 100).unwrap();
+        insert_symbol(&conn, file_id, "User", SymbolKind::Class, 5, Some("data class User")).unwrap();
+        insert_symbol(&conn, file_id, "UserRepository", SymbolKind::Interface, 20, Some("interface UserRepository")).unwrap();
+
+        let results = find_symbols_by_name(&conn, "User", None, 10).unwrap();
+        assert!(results.len() >= 1);
+        assert!(results.iter().any(|r| r.name == "User"));
+    }
+
+    #[test]
+    fn test_upsert_file_updates_mtime() {
+        let conn = create_test_db();
+        let _id1 = upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
+        let id2 = upsert_file(&conn, "src/main.kt", 2000, 200).unwrap();
+        assert!(id2 > 0, "upsert should succeed for same path with different mtime");
+    }
+
+    #[test]
+    fn test_clear_db() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
+        insert_symbol(&conn, file_id, "Test", SymbolKind::Class, 1, Some("class Test")).unwrap();
+
+        clear_db(&conn).unwrap();
+
+        let results = search_symbols(&conn, "Test", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_get_stats() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
+        insert_symbol(&conn, file_id, "Foo", SymbolKind::Class, 1, Some("class Foo")).unwrap();
+        insert_symbol(&conn, file_id, "bar", SymbolKind::Function, 5, Some("fun bar()")).unwrap();
+
+        let stats = get_stats(&conn).unwrap();
+        assert_eq!(stats.file_count, 1);
+        assert_eq!(stats.symbol_count, 2);
+    }
+
+    #[test]
+    fn test_insert_and_find_inheritance() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "src/model.kt", 1000, 100).unwrap();
+        insert_symbol(&conn, file_id, "Child", SymbolKind::Class, 1, Some("class Child : Parent()")).unwrap();
+
+        let child_id: i64 = conn.query_row(
+            "SELECT id FROM symbols WHERE name = 'Child'", [], |row| row.get(0)
+        ).unwrap();
+        insert_inheritance(&conn, child_id, "Parent", "extends").unwrap();
+
+        let impls = find_implementations(&conn, "Parent", 10).unwrap();
+        assert_eq!(impls.len(), 1);
+        assert_eq!(impls[0].name, "Child");
+    }
+
+    #[test]
+    fn test_count_refs() {
+        let conn = create_test_db();
+        let count = count_refs(&conn).unwrap();
+        assert_eq!(count, 0);
+    }
 }

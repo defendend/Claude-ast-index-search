@@ -38,6 +38,12 @@ pub fn cmd_init(root: &Path) -> Result<()> {
 pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool) -> Result<()> {
     let start = Instant::now();
 
+    // Delete DB file entirely to avoid WAL hangs
+    db::delete_db(root)?;
+
+    // Remove old kotlin-index cache dir entirely
+    db::cleanup_legacy_cache();
+
     let mut conn = db::open_db(root)?;
     db::init_db(&conn)?;
 
@@ -58,7 +64,6 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     match index_type {
         "all" => {
             println!("{}", "Rebuilding full index...".cyan());
-            db::clear_db(&conn)?;
             let file_count = indexer::index_directory(&mut conn, root, true, no_ignore)?;
             let module_count = indexer::index_modules(&conn, root)?;
 
@@ -204,6 +209,13 @@ pub fn cmd_update(root: &Path) -> Result<()> {
     }
 
     eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+/// Clear index database for current project
+pub fn cmd_clear(root: &Path) -> Result<()> {
+    db::delete_db(root)?;
+    println!("Index cleared for {}", root.display());
     Ok(())
 }
 

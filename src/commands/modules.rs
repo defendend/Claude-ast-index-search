@@ -611,6 +611,9 @@ fn is_symbol_used_in_module(_root: &Path, module_dir: &Path, symbol: &str) -> Re
     }
 
     let mut found = false;
+    let class_pat = format!("class {}", symbol);
+    let iface_pat = format!("interface {}", symbol);
+    let obj_pat = format!("object {}", symbol);
 
     for entry in WalkDir::new(module_dir)
         .into_iter()
@@ -627,9 +630,9 @@ fn is_symbol_used_in_module(_root: &Path, module_dir: &Path, symbol: &str) -> Re
         if let Ok(content) = std::fs::read_to_string(path) {
             // Skip if file is in the same module as the symbol definition
             // (we want usages, not definitions)
-            if content.contains(&format!("class {}", symbol))
-                || content.contains(&format!("interface {}", symbol))
-                || content.contains(&format!("object {}", symbol)) {
+            if content.contains(&class_pat)
+                || content.contains(&iface_pat)
+                || content.contains(&obj_pat) {
                 continue;
             }
 

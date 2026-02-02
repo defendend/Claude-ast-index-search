@@ -165,3 +165,105 @@ pub fn parse_perl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
 
     Ok(symbols)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_package() {
+        let content = "package My::Module;\n";
+        let symbols = parse_perl_symbols(content).unwrap();
+        let pkg = symbols.iter().find(|s| s.name == "My::Module").unwrap();
+        assert_eq!(pkg.kind, SymbolKind::Package);
+    }
+
+    #[test]
+    fn test_parse_subroutine() {
+        let content = "sub process_data {\n    my ($self) = @_;\n}\n";
+        let symbols = parse_perl_symbols(content).unwrap();
+        let f = symbols.iter().find(|s| s.name == "process_data").unwrap();
+        assert_eq!(f.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_constant() {
+        let content = "use constant MAX_RETRIES => 3;\n";
+        let symbols = parse_perl_symbols(content).unwrap();
+        let c = symbols.iter().find(|s| s.name == "MAX_RETRIES").unwrap();
+        assert_eq!(c.kind, SymbolKind::Constant);
+    }
+
+    #[test]
+    fn test_parse_our_variable() {
+        let content = "our $VERSION = '1.0';\nour @EXPORT = qw(foo bar);\nour %CONFIG;\n";
+        let symbols = parse_perl_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "$VERSION" && s.kind == SymbolKind::Property));
+        assert!(symbols.iter().any(|s| s.name == "@EXPORT" && s.kind == SymbolKind::Property));
+        assert!(symbols.iter().any(|s| s.name == "%CONFIG" && s.kind == SymbolKind::Property));
+    }
+
+    #[test]
+    fn test_skip_isa() {
+        let content = "our @ISA = qw(Parent);\n";
+        let symbols = parse_perl_symbols(content).unwrap();
+        assert!(!symbols.iter().any(|s| s.name == "@ISA"), "should skip @ISA variable");
+    }
+
+    #[test]
+    fn test_parse_use_base_inheritance() {
+        let content = "package Child;\nuse base qw/Parent1 Parent2/;\n";
+        let symbols = parse_perl_symbols(content).unwrap();
+        let pkg = symbols.iter().find(|s| s.name == "Child").unwrap();
+        assert!(pkg.parents.iter().any(|(p, k)| p == "Parent1" && k == "extends"));
+        assert!(pkg.parents.iter().any(|(p, k)| p == "Parent2" && k == "extends"));
+    }
+
+    #[test]
+    fn test_parse_use_parent_inheritance() {
+        let content = "package MyModule;\nuse parent 'Base::Class';\n";
+        let symbols = parse_perl_symbols(content).unwrap();
+        let pkg = symbols.iter().find(|s| s.name == "MyModule").unwrap();
+        assert!(pkg.parents.iter().any(|(p, _)| p == "Base::Class"));
+    }
+
+    #[test]
+    fn test_parse_isa_inheritance() {
+        let content = "package Derived;\nour @ISA = qw(Base1 Base2);\n";
+        let symbols = parse_perl_symbols(content).unwrap();
+        let pkg = symbols.iter().find(|s| s.name == "Derived").unwrap();
+        assert!(pkg.parents.iter().any(|(p, _)| p == "Base1"));
+        assert!(pkg.parents.iter().any(|(p, _)| p == "Base2"));
+    }
+
+    #[test]
+    fn test_full_perl_module() {
+        let content = r#"package My::Service;
+use base qw/My::Base/;
+
+use constant TIMEOUT => 30;
+
+our $VERSION = '2.0';
+
+sub new {
+    my ($class, %args) = @_;
+    return bless \%args, $class;
+}
+
+sub process {
+    my ($self, $data) = @_;
+}
+
+1;
+"#;
+        let symbols = parse_perl_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "My::Service" && s.kind == SymbolKind::Package));
+        assert!(symbols.iter().any(|s| s.name == "TIMEOUT" && s.kind == SymbolKind::Constant));
+        assert!(symbols.iter().any(|s| s.name == "$VERSION" && s.kind == SymbolKind::Property));
+        assert!(symbols.iter().any(|s| s.name == "new" && s.kind == SymbolKind::Function));
+        assert!(symbols.iter().any(|s| s.name == "process" && s.kind == SymbolKind::Function));
+
+        let pkg = symbols.iter().find(|s| s.name == "My::Service").unwrap();
+        assert!(pkg.parents.iter().any(|(p, _)| p == "My::Base"));
+    }
+}

@@ -269,3 +269,115 @@ pub fn parse_swift_parents(parents_str: Option<&str>) -> Vec<(String, String)> {
 
     parents
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_class() {
+        let content = "class ViewController: UIViewController {\n}\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "ViewController").unwrap();
+        assert_eq!(cls.kind, SymbolKind::Class);
+        assert!(cls.parents.iter().any(|(p, _)| p == "UIViewController"));
+    }
+
+    #[test]
+    fn test_parse_public_final_class() {
+        let content = "public final class AppDelegate: UIResponder, UIApplicationDelegate {\n}\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "AppDelegate").unwrap();
+        assert_eq!(cls.kind, SymbolKind::Class);
+        assert!(cls.parents.iter().any(|(p, _)| p == "UIResponder"));
+        assert!(cls.parents.iter().any(|(p, _)| p == "UIApplicationDelegate"));
+    }
+
+    #[test]
+    fn test_parse_struct() {
+        let content = "struct User: Codable, Equatable {\n}\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        let s = symbols.iter().find(|s| s.name == "User").unwrap();
+        assert_eq!(s.kind, SymbolKind::Class);
+        assert!(s.parents.iter().any(|(p, _)| p == "Codable"));
+    }
+
+    #[test]
+    fn test_parse_enum() {
+        let content = "enum Direction: String, CaseIterable {\n    case north, south\n}\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        let e = symbols.iter().find(|s| s.name == "Direction").unwrap();
+        assert_eq!(e.kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn test_parse_protocol() {
+        let content = "protocol Fetchable: AnyObject {\n    func fetch() async\n}\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        let p = symbols.iter().find(|s| s.name == "Fetchable").unwrap();
+        assert_eq!(p.kind, SymbolKind::Interface);
+        assert!(p.parents.iter().any(|(p, _)| p == "AnyObject"));
+    }
+
+    #[test]
+    fn test_parse_actor() {
+        let content = "actor DataStore {\n}\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        let a = symbols.iter().find(|s| s.name == "DataStore").unwrap();
+        assert_eq!(a.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn test_parse_extension() {
+        let content = "extension String: CustomProtocol {\n}\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        let ext = symbols.iter().find(|s| s.name == "String+Extension").unwrap();
+        assert_eq!(ext.kind, SymbolKind::Object);
+        assert!(ext.parents.iter().any(|(p, _)| p == "String"));
+    }
+
+    #[test]
+    fn test_parse_function() {
+        let content = "    func loadData(id: Int) async throws -> Data {\n    }\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        let f = symbols.iter().find(|s| s.name == "loadData").unwrap();
+        assert_eq!(f.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_init() {
+        let content = "    public init(name: String) {\n    }\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "init" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_parse_property() {
+        let content = "    var name: String\n    let count: Int\n    static var shared: Service\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "name" && s.kind == SymbolKind::Property));
+        assert!(symbols.iter().any(|s| s.name == "count" && s.kind == SymbolKind::Property));
+        assert!(symbols.iter().any(|s| s.name == "shared" && s.kind == SymbolKind::Property));
+    }
+
+    #[test]
+    fn test_parse_typealias() {
+        let content = "public typealias Completion = (Result<Data, Error>) -> Void\n";
+        let symbols = parse_swift_symbols(content).unwrap();
+        let ta = symbols.iter().find(|s| s.name == "Completion").unwrap();
+        assert_eq!(ta.kind, SymbolKind::TypeAlias);
+    }
+
+    #[test]
+    fn test_parse_swift_parents_none() {
+        let parents = parse_swift_parents(None);
+        assert!(parents.is_empty());
+    }
+
+    #[test]
+    fn test_parse_swift_parents_with_where() {
+        let parents = parse_swift_parents(Some("Equatable where Element: Comparable"));
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].0, "Equatable");
+    }
+}

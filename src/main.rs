@@ -394,6 +394,8 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: usize,
     },
+    /// Clear index database for current project
+    Clear,
     /// Show version
     Version,
     /// Install Claude Code plugin to ~/.claude/plugins/
@@ -403,6 +405,9 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = find_project_root()?;
+
+    // Migrate project DB from old kotlin-index to ast-index
+    db::migrate_legacy_project(&root);
 
     match cli.command {
         // Grep commands
@@ -466,6 +471,7 @@ fn main() -> Result<()> {
         Commands::PerlPod { query, limit } => commands::perl::cmd_perl_pod(&root, query.as_deref(), limit),
         Commands::PerlTests { query, limit } => commands::perl::cmd_perl_tests(&root, query.as_deref(), limit),
         Commands::PerlImports { query, limit } => commands::perl::cmd_perl_imports(&root, query.as_deref(), limit),
+        Commands::Clear => commands::management::cmd_clear(&root),
         Commands::Version => {
             println!("ast-index v{}", env!("CARGO_PKG_VERSION"));
             Ok(())

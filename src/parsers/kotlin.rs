@@ -318,3 +318,161 @@ pub fn parse_parents(parents_str: &str) -> Vec<&str> {
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_class() {
+        let content = "class MyService {\n}\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "MyService").unwrap();
+        assert_eq!(cls.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn test_parse_data_class() {
+        let content = "data class User(val name: String, val age: Int)\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "User").unwrap();
+        assert_eq!(cls.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn test_parse_object() {
+        let content = "object Singleton {\n}\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let obj = symbols.iter().find(|s| s.name == "Singleton").unwrap();
+        assert_eq!(obj.kind, SymbolKind::Object);
+    }
+
+    #[test]
+    fn test_parse_class_with_inheritance() {
+        let content = "class MyFragment(arg: String) : Fragment(), Serializable {\n}\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "MyFragment").unwrap();
+        assert_eq!(cls.kind, SymbolKind::Class);
+        assert!(cls.parents.iter().any(|(p, k)| p == "Fragment" && k == "extends"));
+        assert!(cls.parents.iter().any(|(p, k)| p == "Serializable" && k == "implements"));
+    }
+
+    #[test]
+    fn test_parse_class_simple_inheritance() {
+        let content = "class Child : Parent {\n}\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "Child").unwrap();
+        assert!(!cls.parents.is_empty(), "should have parents: {:?}", cls.parents);
+    }
+
+    #[test]
+    fn test_parse_interface() {
+        let content = "interface Repository {\n    fun getAll(): List<Item>\n}\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let iface = symbols.iter().find(|s| s.name == "Repository").unwrap();
+        assert_eq!(iface.kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn test_parse_interface_with_parent() {
+        let content = "interface UserRepository : BaseRepository<User> {\n}\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let iface = symbols.iter().find(|s| s.name == "UserRepository").unwrap();
+        assert_eq!(iface.kind, SymbolKind::Interface);
+        assert!(iface.parents.iter().any(|(p, _)| p == "BaseRepository"));
+    }
+
+    #[test]
+    fn test_parse_sealed_interface() {
+        let content = "sealed interface Result {\n}\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let iface = symbols.iter().find(|s| s.name == "Result").unwrap();
+        assert_eq!(iface.kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn test_parse_enum_class() {
+        let content = "enum class Direction {\n    NORTH, SOUTH, EAST, WEST\n}\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let e = symbols.iter().find(|s| s.name == "Direction").unwrap();
+        assert_eq!(e.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn test_parse_function() {
+        let content = "fun processPayment(amount: Double): Boolean {\n}\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let f = symbols.iter().find(|s| s.name == "processPayment").unwrap();
+        assert_eq!(f.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_suspend_function() {
+        let content = "    suspend fun fetchData(): Result<Data> {\n    }\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let f = symbols.iter().find(|s| s.name == "fetchData").unwrap();
+        assert_eq!(f.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_extension_function() {
+        let content = "fun String.toSlug(): String = this.lowercase().replace(\" \", \"-\")\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let f = symbols.iter().find(|s| s.name == "toSlug").unwrap();
+        assert_eq!(f.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_property() {
+        let content = "    val name: String = \"test\"\n    var count: Int = 0\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "name" && s.kind == SymbolKind::Property));
+        assert!(symbols.iter().any(|s| s.name == "count" && s.kind == SymbolKind::Property));
+    }
+
+    #[test]
+    fn test_parse_typealias() {
+        let content = "typealias StringMap = Map<String, String>\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let ta = symbols.iter().find(|s| s.name == "StringMap").unwrap();
+        assert_eq!(ta.kind, SymbolKind::TypeAlias);
+    }
+
+    #[test]
+    fn test_parse_java_static_field() {
+        let content = "    public static final String TAG = \"MyClass\";\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "TAG" && s.kind == SymbolKind::Property));
+    }
+
+    #[test]
+    fn test_parse_multiline_class() {
+        let content = r#"class AppModule(
+    private val context: Context
+) : Module(),
+    Serializable {
+}
+"#;
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "AppModule" && s.kind == SymbolKind::Class).unwrap();
+        assert!(cls.parents.iter().any(|(p, k)| p == "Module" && k == "extends"),
+            "should have Module as extends, got: {:?}", cls.parents);
+    }
+
+    #[test]
+    fn test_parse_parents_with_generics() {
+        let parents = parse_parents("BaseAdapter<Item>, Serializable, Comparable<Item>");
+        assert_eq!(parents.len(), 3);
+        assert_eq!(parents[0], "BaseAdapter<Item>");
+        assert_eq!(parents[1], "Serializable");
+        assert_eq!(parents[2], "Comparable<Item>");
+    }
+
+    #[test]
+    fn test_parse_abstract_class() {
+        let content = "abstract class BaseViewModel : ViewModel() {\n}\n";
+        let symbols = parse_kotlin_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "BaseViewModel").unwrap();
+        assert_eq!(cls.kind, SymbolKind::Class);
+    }
+}

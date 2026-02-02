@@ -197,21 +197,24 @@ pub fn extract_references(content: &str, defined_symbols: &[ParsedSymbol]) -> Re
 
     let func_call_re = &*FUNC_CALL_RE; // function calls
 
-    // Keywords to skip
-    let keywords: HashSet<&str> = [
-        "if", "else", "when", "while", "for", "do", "try", "catch", "finally",
-        "return", "break", "continue", "throw", "is", "in", "as", "true", "false",
-        "null", "this", "super", "class", "interface", "object", "fun", "val", "var",
-        "import", "package", "private", "public", "protected", "internal", "override",
-        "abstract", "final", "open", "sealed", "data", "inner", "enum", "companion",
-        "lateinit", "const", "suspend", "inline", "crossinline", "noinline", "reified",
-        "annotation", "typealias", "get", "set", "init", "constructor", "by", "where",
-        // Common standard library that would create too much noise
-        "String", "Int", "Long", "Double", "Float", "Boolean", "Byte", "Short", "Char",
-        "Unit", "Any", "Nothing", "List", "Map", "Set", "Array", "Pair", "Triple",
-        "MutableList", "MutableMap", "MutableSet", "HashMap", "ArrayList", "HashSet",
-        "Exception", "Error", "Throwable", "Result", "Sequence",
-    ].into_iter().collect();
+    // Keywords to skip (static to avoid re-creating on every call)
+    static KEYWORDS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+        [
+            "if", "else", "when", "while", "for", "do", "try", "catch", "finally",
+            "return", "break", "continue", "throw", "is", "in", "as", "true", "false",
+            "null", "this", "super", "class", "interface", "object", "fun", "val", "var",
+            "import", "package", "private", "public", "protected", "internal", "override",
+            "abstract", "final", "open", "sealed", "data", "inner", "enum", "companion",
+            "lateinit", "const", "suspend", "inline", "crossinline", "noinline", "reified",
+            "annotation", "typealias", "get", "set", "init", "constructor", "by", "where",
+            // Common standard library that would create too much noise
+            "String", "Int", "Long", "Double", "Float", "Boolean", "Byte", "Short", "Char",
+            "Unit", "Any", "Nothing", "List", "Map", "Set", "Array", "Pair", "Triple",
+            "MutableList", "MutableMap", "MutableSet", "HashMap", "ArrayList", "HashSet",
+            "Exception", "Error", "Throwable", "Result", "Sequence",
+        ].into_iter().collect()
+    });
+    let keywords = &*KEYWORDS;
 
     for (line_num, line) in content.lines().enumerate() {
         let line_num = line_num + 1;
@@ -261,4 +264,109 @@ pub fn extract_references(content: &str, defined_symbols: &[ParsedSymbol]) -> Re
     }
 
     Ok(refs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_supported_extension() {
+        assert!(is_supported_extension("kt"));
+        assert!(is_supported_extension("java"));
+        assert!(is_supported_extension("swift"));
+        assert!(is_supported_extension("ts"));
+        assert!(is_supported_extension("tsx"));
+        assert!(is_supported_extension("py"));
+        assert!(is_supported_extension("go"));
+        assert!(is_supported_extension("rs"));
+        assert!(is_supported_extension("rb"));
+        assert!(is_supported_extension("cs"));
+        assert!(is_supported_extension("dart"));
+        assert!(is_supported_extension("proto"));
+        assert!(is_supported_extension("cpp"));
+        assert!(is_supported_extension("pm"));
+        assert!(is_supported_extension("vue"));
+        assert!(is_supported_extension("svelte"));
+    }
+
+    #[test]
+    fn test_unsupported_extensions() {
+        assert!(!is_supported_extension("txt"));
+        assert!(!is_supported_extension("md"));
+        assert!(!is_supported_extension("json"));
+        assert!(!is_supported_extension("xml"));
+        assert!(!is_supported_extension("yaml"));
+        assert!(!is_supported_extension("toml"));
+        assert!(!is_supported_extension(""));
+    }
+
+    #[test]
+    fn test_truncate_context_short() {
+        let short = "short string";
+        assert_eq!(truncate_context(short), short);
+    }
+
+    #[test]
+    fn test_truncate_context_long() {
+        let long = "a".repeat(1000);
+        let truncated = truncate_context(&long);
+        assert!(truncated.len() < long.len());
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_references_skips_keywords() {
+        let content = "if (true) return String\n";
+        let symbols = vec![];
+        let refs = extract_references(content, &symbols).unwrap();
+        // "String" is in keywords, should be skipped
+        assert!(!refs.iter().any(|r| r.name == "String"));
+        // "if", "return", "true" are not CamelCase or are keywords
+        assert!(!refs.iter().any(|r| r.name == "if"));
+    }
+
+    #[test]
+    fn test_extract_references_finds_types() {
+        let content = "val repo: PaymentRepository = PaymentRepositoryImpl()\n";
+        let symbols = vec![];
+        let refs = extract_references(content, &symbols).unwrap();
+        assert!(refs.iter().any(|r| r.name == "PaymentRepository"));
+        assert!(refs.iter().any(|r| r.name == "PaymentRepositoryImpl"));
+    }
+
+    #[test]
+    fn test_extract_references_skips_defined_symbols() {
+        let content = "class MyClass {\n    val other: OtherClass\n}\n";
+        let symbols = vec![
+            ParsedSymbol {
+                name: "MyClass".to_string(),
+                kind: SymbolKind::Class,
+                line: 1,
+                signature: "class MyClass".to_string(),
+                parents: vec![],
+            },
+        ];
+        let refs = extract_references(content, &symbols).unwrap();
+        assert!(!refs.iter().any(|r| r.name == "MyClass"), "should skip locally defined symbols");
+        assert!(refs.iter().any(|r| r.name == "OtherClass"));
+    }
+
+    #[test]
+    fn test_extract_references_skips_imports() {
+        let content = "import com.example.MyClass\npackage com.example\n";
+        let symbols = vec![];
+        let refs = extract_references(content, &symbols).unwrap();
+        // import/package lines should be skipped entirely
+        assert!(refs.is_empty() || !refs.iter().any(|r| r.line == 1));
+    }
+
+    #[test]
+    fn test_extract_references_skips_comments() {
+        let content = "// MyService is used here\n/* MyOther */\n";
+        let symbols = vec![];
+        let refs = extract_references(content, &symbols).unwrap();
+        assert!(!refs.iter().any(|r| r.line == 1), "should skip // comments");
+        assert!(!refs.iter().any(|r| r.line == 2), "should skip /* comments");
+    }
 }

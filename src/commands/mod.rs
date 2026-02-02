@@ -78,7 +78,7 @@ where
         .build_parallel();
 
     // Use crossbeam for faster channel (bounded to prevent memory bloat)
-    let (tx, rx) = channel::bounded(10000);
+    let (tx, rx) = channel::bounded::<(Arc<Path>, usize, String)>(10000);
 
     // Use HashSet for O(1) extension lookup instead of O(n) linear search
     let extensions: Arc<HashSet<String>> = Arc::new(
@@ -103,13 +103,13 @@ where
                 if let Some(ext) = path.extension() {
                     // Fast O(1) HashSet lookup
                     if extensions.contains(ext.to_str().unwrap_or("")) {
-                        let path_buf = path.to_path_buf();
+                        let path_arc: Arc<Path> = Arc::from(path);
 
                         let _ = searcher.search_path(
                             &matcher,
                             path,
                             UTF8(|line_num, line| {
-                                let _ = tx.send((path_buf.clone(), line_num as usize, line.trim_end().to_string()));
+                                let _ = tx.send((Arc::clone(&path_arc), line_num as usize, line.trim_end().to_string()));
                                 Ok(true)
                             }),
                         );
@@ -151,7 +151,7 @@ where
         .threads(num_cpus())
         .build_parallel();
 
-    let (tx, rx) = channel::bounded(limit.max(1000));
+    let (tx, rx) = channel::bounded::<(Arc<Path>, usize, String)>(limit.max(1000));
 
     let extensions: Arc<HashSet<String>> = Arc::new(
         extensions.iter().map(|s| s.to_string()).collect()
@@ -184,7 +184,7 @@ where
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
                     if extensions.contains(ext.to_str().unwrap_or("")) {
-                        let path_buf = path.to_path_buf();
+                        let path_arc: Arc<Path> = Arc::from(path);
                         let found_count = Arc::clone(&found_count);
                         let should_stop = Arc::clone(&should_stop);
 
@@ -203,7 +203,7 @@ where
                                     return Ok(false);
                                 }
 
-                                let _ = tx.send((path_buf.clone(), line_num as usize, line.trim_end().to_string()));
+                                let _ = tx.send((Arc::clone(&path_arc), line_num as usize, line.trim_end().to_string()));
                                 Ok(true)
                             }),
                         );

@@ -198,3 +198,74 @@ pub fn parse_objc_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
 
     Ok(symbols)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_interface() {
+        let content = "@interface MyView : UIView <UITableViewDelegate, UITableViewDataSource>\n@end\n";
+        let symbols = parse_objc_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "MyView" && s.kind == SymbolKind::Class).unwrap();
+        assert!(cls.parents.iter().any(|(p, k)| p == "UIView" && k == "extends"));
+        assert!(cls.parents.iter().any(|(p, k)| p == "UITableViewDelegate" && k == "implements"));
+        assert!(cls.parents.iter().any(|(p, k)| p == "UITableViewDataSource" && k == "implements"));
+    }
+
+    #[test]
+    fn test_parse_category() {
+        let content = "@interface NSString (Utilities)\n@end\n";
+        let symbols = parse_objc_symbols(content).unwrap();
+        let cat = symbols.iter().find(|s| s.name == "NSString+Category").unwrap();
+        assert_eq!(cat.kind, SymbolKind::Object);
+        assert!(cat.parents.iter().any(|(p, _)| p == "NSString"));
+    }
+
+    #[test]
+    fn test_parse_protocol() {
+        let content = "@protocol Fetchable <NSObject>\n@end\n";
+        let symbols = parse_objc_symbols(content).unwrap();
+        let p = symbols.iter().find(|s| s.name == "Fetchable").unwrap();
+        assert_eq!(p.kind, SymbolKind::Interface);
+        assert!(p.parents.iter().any(|(p, _)| p == "NSObject"));
+    }
+
+    #[test]
+    fn test_parse_implementation() {
+        let content = "@implementation MyService\n@end\n";
+        let symbols = parse_objc_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "MyService").unwrap();
+        assert_eq!(cls.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn test_implementation_skipped_if_interface_exists() {
+        let content = "@interface MyClass : NSObject\n@end\n@implementation MyClass\n@end\n";
+        let symbols = parse_objc_symbols(content).unwrap();
+        let count = symbols.iter().filter(|s| s.name == "MyClass" && s.kind == SymbolKind::Class).count();
+        assert_eq!(count, 1, "should not duplicate class from @implementation");
+    }
+
+    #[test]
+    fn test_parse_method() {
+        let content = "- (void)viewDidLoad {\n}\n+ (instancetype)sharedInstance {\n}\n";
+        let symbols = parse_objc_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "viewDidLoad" && s.kind == SymbolKind::Function));
+        assert!(symbols.iter().any(|s| s.name == "sharedInstance" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_parse_property() {
+        let content = "@property (nonatomic, strong) NSString *name;\n";
+        let symbols = parse_objc_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "name" && s.kind == SymbolKind::Property));
+    }
+
+    #[test]
+    fn test_parse_typedef() {
+        let content = "typedef struct { int x; int y; } CGPoint;\n";
+        let symbols = parse_objc_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "CGPoint" && s.kind == SymbolKind::TypeAlias));
+    }
+}

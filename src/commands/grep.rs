@@ -252,6 +252,8 @@ pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
 
         if let Ok(content) = std::fs::read_to_string(path) {
             let lines: Vec<&str> = content.lines().collect();
+            let kotlin_re = Regex::new(&format!(r":\s*\w*{}\b", regex::escape(type_name))).ok();
+            let java_re = Regex::new(&format!(r"\b\w*{}\s+\w+\s*\(", regex::escape(type_name))).ok();
             for (i, line) in lines.iter().enumerate() {
                 if results.len() >= limit {
                     break;
@@ -263,10 +265,8 @@ pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
                     // Check if return type matches (allow prefix like AppIconInteractor matches Interactor)
                     // Kotlin pattern: `: ReturnType` (colon before type)
                     // Java pattern: `ReturnType methodName(` (type before method name)
-                    let kotlin_pattern = format!(r":\s*\w*{}\b", regex::escape(type_name));
-                    let java_pattern = format!(r"\b\w*{}\s+\w+\s*\(", regex::escape(type_name));
-                    let matches_kotlin = Regex::new(&kotlin_pattern).map(|re| re.is_match(&context)).unwrap_or(false);
-                    let matches_java = Regex::new(&java_pattern).map(|re| re.is_match(&context)).unwrap_or(false);
+                    let matches_kotlin = kotlin_re.as_ref().map(|re| re.is_match(&context)).unwrap_or(false);
+                    let matches_java = java_re.as_ref().map(|re| re.is_match(&context)).unwrap_or(false);
                     if matches_kotlin || matches_java {
                         let rel_path = relative_path(root, path);
                         // Get the function line (usually next line after annotation)
