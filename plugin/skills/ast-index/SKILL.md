@@ -38,7 +38,7 @@ cd /path/to/project
 ast-index rebuild
 ```
 
-The index is stored at `~/.cache/ast-index/<project-hash>/index.db` and needs rebuilding when project structure changes significantly.
+The index is stored at `~/Library/Caches/ast-index/<project-hash>/index.db` (macOS) or `~/.cache/ast-index/<project-hash>/index.db` (Linux). Rebuild deletes the DB file entirely and creates a fresh index.
 
 ## Supported Projects
 
@@ -223,7 +223,7 @@ ast-index install-claude-plugin      # Install Claude Code plugin to ~/.claude/p
 | usages | ~8ms | Indexed reference search |
 | imports | ~0.3ms | File-based lookup |
 | callers | ~1s | Grep-based search |
-| rebuild | ~25s | Full project indexing |
+| rebuild | ~25s–2m | Full project indexing (depends on size) |
 
 ## Platform-Specific Commands
 
