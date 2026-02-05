@@ -548,7 +548,11 @@ fn main() -> Result<()> {
         Commands::Api { module_path, limit } => commands::files::cmd_api(&root, &module_path, limit),
         Commands::Changed { base } => {
             let vcs = commands::files::detect_vcs(&root);
-            let default_base = if vcs == "arc" { "trunk" } else { "origin/main" };
+            let default_base = if vcs == "arc" {
+                "trunk"
+            } else {
+                commands::files::detect_git_default_branch(&root)
+            };
             let base = base.as_deref().unwrap_or(default_base);
             commands::files::cmd_changed(&root, base)
         }

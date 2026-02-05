@@ -61,6 +61,21 @@ The index is stored at `~/Library/Caches/ast-index/<project-hash>/index.db` (mac
 
 Project type is auto-detected by marker files (build.gradle.kts, Package.swift, Makefile.PL, etc.). Python, Go, Proto, WSDL, and C++ files are indexed alongside main project type.
 
+## JSON Output
+
+Most commands support `--format json` for structured output:
+
+```bash
+ast-index search "Query" --format json
+ast-index symbol "Name" --format json
+ast-index class "Name" --format json
+ast-index usages "Symbol" --format json
+ast-index implementations "Parent" --format json
+ast-index refs "Symbol" --format json
+ast-index stats --format json
+ast-index unused-symbols --format json
+```
+
 ## Core Commands
 
 ### Universal Search
@@ -173,6 +188,13 @@ ast-index todo --limit 10                # Limit results
 ast-index deprecated                     # Find deprecated items
 ```
 
+**`unused-symbols`** - Find potentially unused exported symbols.
+
+```bash
+ast-index unused-symbols --module path/to/module   # In specific module
+ast-index unused-symbols --export-only             # Only exported (public) symbols
+```
+
 ### Git/Arc Integration
 
 **`changed`** - Show symbols changed in git/arc diff. Auto-detects VCS and base branch.
@@ -185,10 +207,11 @@ ast-index changed --base trunk           # For arc projects
 
 ### Public API
 
-**`api`** - Show public API of a module.
+**`api`** - Show public API of a module. Accepts module path or module name (dots converted to slashes).
 
 ```bash
-ast-index api "core"                     # Public classes/functions in module
+ast-index api "path/to/module"           # By path
+ast-index api "module.name"              # By module name (dots → slashes)
 ```
 
 ## Index Management
@@ -204,6 +227,17 @@ ast-index rebuild --no-ignore        # Include gitignored files
 ast-index update                     # Incremental update
 ast-index stats                      # Show index statistics
 ast-index clear                      # Delete index for current project
+ast-index watch                      # Watch for file changes and auto-update index
+```
+
+## Multi-Root Projects
+
+Add additional source roots for monorepos or multi-project setups:
+
+```bash
+ast-index add-root /path/to/other/source    # Add source root
+ast-index remove-root /path/to/other/source # Remove source root
+ast-index list-roots                        # List configured roots
 ```
 
 ## Utility Commands
@@ -321,6 +355,7 @@ Consult: `references/module-commands.md`
 - **Module Search**: `module`
 - **Dependencies**: `deps`, `dependents`
 - **Unused Dependencies**: `unused-deps`
+- **Unused Symbols**: `unused-symbols`
 - **Public API**: `api`
 
 ## Workflow Recommendations

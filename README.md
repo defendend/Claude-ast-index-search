@@ -1,4 +1,4 @@
-# ast-index v3.11.0
+# ast-index v3.11.1
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -321,10 +321,15 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 
 ## Changelog
 
+### 3.11.1
+- **Fix `changed` command** — auto-detect default git branch (`origin/main` or `origin/master`)
+- **Fix `api` command** — accept module names with dots (e.g. `module.name` → `module/name`)
+- **Updated skill docs** — added `--format json`, `unused-symbols`, `watch`, multi-root commands
+
 ### 3.11.0
 - **10x faster `unused-deps`** — replaced filesystem scanning (WalkDir + read_to_string) with index-based SQL queries to `refs` table. `core` module (225 deps) now completes in ~6s instead of 60s+ timeout
 - **Fixed transitive dependency logic** — correctly checks `transitive_deps` table (api chain reachability) instead of re-scanning symbols
-- **Arc (Arcadia) support for `changed`** — auto-detects VCS (arc vs git), auto-selects base branch (`trunk` for arc, `origin/main` for git), normalizes `origin/` prefix
+- **Multi-VCS support for `changed`** — auto-detects VCS, auto-selects base branch (`trunk` for arc, `origin/main` for git), normalizes `origin/` prefix
 - **Removed skill copying from initialize commands** — `/initialize-*` no longer copies skill files to project directory
 
 ### 3.10.4
@@ -332,7 +337,7 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 
 ### 3.10.2
 - **Fix `changed` command** — use `merge-base` instead of direct diff to show only current branch changes
-- **Arc (Arcadia) support** — auto-detect arc vs git, use correct VCS commands
+- **Multi-VCS support** — auto-detect arc vs git, use correct VCS commands
 
 ### 3.10.1
 - **Fix indexing hangs on large monorepos** — disable symlink following, add max depth limit

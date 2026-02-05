@@ -371,7 +371,34 @@ pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
 pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
     let start = Instant::now();
 
-    let module_dir = root.join(module_path);
+    let mut module_dir = root.join(module_path);
+
+    // If path not found, try converting dots to slashes (module name → path)
+    if !module_dir.exists() && module_path.contains('.') {
+        let converted = module_path.replace('.', "/");
+        let alt = root.join(&converted);
+        if alt.exists() {
+            module_dir = alt;
+        }
+    }
+
+    // Also try looking up module path from DB
+    if !module_dir.exists() {
+        if let Ok(conn) = crate::db::open_db(root) {
+            let db_path: Option<String> = conn.query_row(
+                "SELECT path FROM modules WHERE name = ?1",
+                rusqlite::params![module_path],
+                |row| row.get(0),
+            ).ok();
+            if let Some(p) = db_path {
+                let alt = root.join(&p);
+                if alt.exists() {
+                    module_dir = alt;
+                }
+            }
+        }
+    }
+
     if !module_dir.exists() {
         println!("{}", format!("Module not found: {}", module_path).red());
         return Ok(());
@@ -448,6 +475,38 @@ fn get_merge_base(root: &Path, vcs: &str, base: &str) -> Result<String> {
     Ok(std::str::from_utf8(&output.stdout)?.trim().to_string())
 }
 
+/// Detect default git remote branch (origin/main or origin/master)
+pub fn detect_git_default_branch(root: &Path) -> &'static str {
+    // Try symbolic-ref to get remote HEAD
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .current_dir(root)
+        .output()
+    {
+        if output.status.success() {
+            let refname = String::from_utf8_lossy(&output.stdout);
+            if refname.contains("master") {
+                return "origin/master";
+            }
+            return "origin/main";
+        }
+    }
+
+    // Fallback: check if origin/main exists
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "origin/main"])
+        .current_dir(root)
+        .output()
+    {
+        if output.status.success() {
+            return "origin/main";
+        }
+    }
+
+    // Last resort: try origin/master
+    "origin/master"
+}
+
 /// Normalize base branch for the given VCS
 fn normalize_base_for_vcs(vcs: &str, base: &str) -> String {
     if vcs == "arc" {
@@ -475,7 +534,8 @@ pub fn cmd_changed(root: &Path, base: &str) -> Result<()> {
         .output()?;
 
     if !output.status.success() {
-        println!("{}", format!("Failed to get {} diff: {:?}", vcs, output.status).red());
+        let stderr = std::str::from_utf8(&output.stderr).unwrap_or("");
+        println!("{}", format!("Failed to get {} diff: {}", vcs, stderr.trim()).red());
         return Ok(());
     }
 
