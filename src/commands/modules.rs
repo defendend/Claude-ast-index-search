@@ -247,8 +247,6 @@ pub fn cmd_unused_deps(
         println!("  Checking: direct imports only (strict mode)\n");
     }
 
-    let module_dir = root.join(&module_path);
-
     // Results tracking
     #[derive(Default)]
     struct DepUsage {
@@ -273,53 +271,36 @@ pub fn cmd_unused_deps(
     for (dep_name, dep_path, dep_kind) in &deps {
         let mut usage = DepUsage::default();
 
-        // 1. Check direct usage
+        // 1. Check direct usage via index (refs table)
         let dep_symbols = get_module_public_symbols(&conn, root, dep_path)?;
+        let (direct_count, direct_names) = count_symbols_used_in_module(&conn, &dep_symbols, &module_path)?;
+        usage.direct_count = direct_count;
+        usage.direct_symbols = direct_names;
 
-        for symbol in &dep_symbols {
-            if is_symbol_used_in_module(root, &module_dir, symbol)? {
-                usage.direct_count += 1;
-                if usage.direct_symbols.len() < 3 {
-                    usage.direct_symbols.push(symbol.clone());
-                }
-            }
-        }
-
-        // 2. Check transitive usage (via api dependencies)
+        // 2. Check transitive usage (via api dependency chain in transitive_deps table)
         if check_transitive && usage.direct_count == 0 {
-            // Get transitive paths for this dependency
-            let mut stmt = conn.prepare(
-                "SELECT td.path FROM transitive_deps td
+            let trans_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM transitive_deps td
                  JOIN modules m ON td.dependency_id = m.id
-                 WHERE td.module_id = ?1 AND m.name = ?2 AND td.depth > 1"
-            )?;
+                 WHERE td.module_id = ?1 AND m.name = ?2 AND td.depth > 1",
+                params![module_id, dep_name],
+                |row| row.get(0),
+            ).unwrap_or(0);
 
-            let paths: Vec<String> = stmt
-                .query_map(params![module_id, dep_name], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
+            if trans_count > 0 {
+                let path: String = conn.query_row(
+                    "SELECT td.path FROM transitive_deps td
+                     JOIN modules m ON td.dependency_id = m.id
+                     WHERE td.module_id = ?1 AND m.name = ?2 AND td.depth > 1
+                     ORDER BY td.depth LIMIT 1",
+                    params![module_id, dep_name],
+                    |row| row.get(0),
+                ).unwrap_or_default();
 
-            for path in paths {
-                // Parse the path (e.g., "A -> B -> C")
+                usage.transitive_count = 1;
                 let parts: Vec<&str> = path.split(" -> ").collect();
                 if parts.len() >= 2 {
-                    let via_module = parts[1];
-                    // Check if any symbols from dep are re-exported via the intermediate module
-                    for symbol in &dep_symbols {
-                        if is_symbol_used_in_module(root, &module_dir, symbol)? {
-                            usage.transitive_count += 1;
-                            let entry = usage.transitive_via.iter_mut()
-                                .find(|(m, _)| m == via_module);
-                            if let Some((_, symbols)) = entry {
-                                if symbols.len() < 3 {
-                                    symbols.push(symbol.clone());
-                                }
-                            } else {
-                                usage.transitive_via.push((via_module.to_string(), vec![symbol.clone()]));
-                            }
-                            break; // Found transitive usage
-                        }
-                    }
+                    usage.transitive_via.push((parts[1].to_string(), vec!["(api chain)".to_string()]));
                 }
             }
         }
@@ -604,44 +585,34 @@ fn get_module_public_symbols(conn: &Connection, root: &Path, module_path: &str) 
     Ok(symbols)
 }
 
-/// Check if a symbol is used in the module directory
-fn is_symbol_used_in_module(_root: &Path, module_dir: &Path, symbol: &str) -> Result<bool> {
-    if !module_dir.exists() {
-        return Ok(false);
-    }
+/// Check if any symbols from a dependency are used in the target module (index-based)
+///
+/// Uses the refs table for fast lookups instead of scanning files on disk.
+fn count_symbols_used_in_module(
+    conn: &Connection,
+    dep_symbols: &[String],
+    module_path: &str,
+) -> Result<(usize, Vec<String>)> {
+    let module_pattern = format!("{}%", module_path);
+    let mut used_count = 0;
+    let mut used_names = Vec::new();
 
-    let mut found = false;
-    let class_pat = format!("class {}", symbol);
-    let iface_pat = format!("interface {}", symbol);
-    let obj_pat = format!("object {}", symbol);
+    let mut stmt = conn.prepare_cached(
+        "SELECT COUNT(*) FROM refs r
+         JOIN files f ON r.file_id = f.id
+         WHERE r.name = ?1 AND f.path LIKE ?2"
+    )?;
 
-    for entry in WalkDir::new(module_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension()
-                .map(|ext| ext == "kt" || ext == "java")
-                .unwrap_or(false)
-        })
-    {
-        if found { break; }
-
-        let path = entry.path();
-        if let Ok(content) = std::fs::read_to_string(path) {
-            // Skip if file is in the same module as the symbol definition
-            // (we want usages, not definitions)
-            if content.contains(&class_pat)
-                || content.contains(&iface_pat)
-                || content.contains(&obj_pat) {
-                continue;
-            }
-
-            // Check for import or direct usage
-            if content.contains(symbol) {
-                found = true;
+    for symbol in dep_symbols {
+        let count: i64 = stmt.query_row(params![symbol, &module_pattern], |row| row.get(0))
+            .unwrap_or(0);
+        if count > 0 {
+            used_count += 1;
+            if used_names.len() < 3 {
+                used_names.push(symbol.clone());
             }
         }
     }
 
-    Ok(found)
+    Ok((used_count, used_names))
 }

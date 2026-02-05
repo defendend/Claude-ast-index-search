@@ -333,4 +333,72 @@ func NewDeleteAction(avaSrv *avatarsmds.Service) *DeleteAction {
         let symbols = parse_go_symbols(content).unwrap();
         assert!(symbols.iter().any(|s| s.name == "NewDeleteAction" && s.kind == SymbolKind::Function));
     }
+
+    #[test]
+    fn test_parse_import_block() {
+        let content = r#"
+package main
+
+import (
+    "fmt"
+    "net/http"
+    log "github.com/sirupsen/logrus"
+)
+"#;
+        let symbols = parse_go_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "fmt" && s.kind == SymbolKind::Import));
+        assert!(symbols.iter().any(|s| s.name == "http" && s.kind == SymbolKind::Import));
+        assert!(symbols.iter().any(|s| s.name == "log" && s.kind == SymbolKind::Import));
+    }
+
+    #[test]
+    fn test_parse_const_block() {
+        let content = r#"
+const (
+    StatusActive = iota
+    StatusDeleted int = 1
+    MaxRetries int = 5
+)
+"#;
+        let symbols = parse_go_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "StatusActive" && s.kind == SymbolKind::Constant));
+        assert!(symbols.iter().any(|s| s.name == "MaxRetries" && s.kind == SymbolKind::Constant));
+    }
+
+    #[test]
+    fn test_parse_interface_methods() {
+        let content = r#"
+type Repository interface {
+    Get(ctx context.Context, id int64) (*Entity, error)
+    Save(ctx context.Context, entity *Entity) error
+}
+"#;
+        let symbols = parse_go_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
+    }
+
+    #[test]
+    fn test_parse_exported_vs_unexported() {
+        let content = r#"
+type PublicStruct struct {}
+func PublicFunc() {}
+func privateFunc() {}
+var PublicVar string
+"#;
+        let symbols = parse_go_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "PublicStruct"));
+        assert!(symbols.iter().any(|s| s.name == "PublicFunc"));
+        assert!(symbols.iter().any(|s| s.name == "privateFunc"));
+        assert!(symbols.iter().any(|s| s.name == "PublicVar" && s.kind == SymbolKind::Property));
+    }
+
+    #[test]
+    fn test_parse_type_alias() {
+        let content = r#"
+type UserID int64
+type Callback func(string) error
+"#;
+        let symbols = parse_go_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "UserID" && s.kind == SymbolKind::TypeAlias));
+    }
 }

@@ -259,4 +259,86 @@ from typing import Optional, List
         assert!(symbols.iter().any(|s| s.name == "logging" && s.kind == SymbolKind::Import));
         assert!(symbols.iter().any(|s| s.name == "driver_referrals.common" && s.kind == SymbolKind::Import));
     }
+
+    #[test]
+    fn test_parse_decorators() {
+        let content = r#"
+@dataclass
+class Config:
+    host: str
+
+@property
+def name(self):
+    return self._name
+
+@pytest.fixture
+def client():
+    return Client()
+"#;
+        let symbols = parse_python_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "@dataclass"));
+        assert!(symbols.iter().any(|s| s.name == "@property"));
+        assert!(symbols.iter().any(|s| s.name == "@pytest.fixture"));
+    }
+
+    #[test]
+    fn test_parse_async_def() {
+        let content = r#"
+async def fetch_data(url):
+    pass
+
+async def process_event(event):
+    pass
+"#;
+        let symbols = parse_python_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "fetch_data" && s.kind == SymbolKind::Function));
+        assert!(symbols.iter().any(|s| s.name == "process_event" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_parse_class_multiple_inheritance() {
+        let content = r#"
+class MyView(BaseView, PermissionMixin, LoggingMixin):
+    pass
+"#;
+        let symbols = parse_python_symbols(content).unwrap();
+        let cls = symbols.iter().find(|s| s.name == "MyView").unwrap();
+        assert!(cls.parents.iter().any(|(p, _)| p == "BaseView"));
+        assert!(cls.parents.iter().any(|(p, _)| p == "PermissionMixin"));
+        assert!(cls.parents.iter().any(|(p, _)| p == "LoggingMixin"));
+    }
+
+    #[test]
+    fn test_parse_constants() {
+        let content = r#"
+MAX_RETRIES = 5
+DEFAULT_TIMEOUT = 30
+API_KEY = "secret"
+"#;
+        let symbols = parse_python_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Constant));
+        assert!(symbols.iter().any(|s| s.name == "DEFAULT_TIMEOUT" && s.kind == SymbolKind::Constant));
+        assert!(symbols.iter().any(|s| s.name == "API_KEY" && s.kind == SymbolKind::Constant));
+    }
+
+    #[test]
+    fn test_parse_type_aliases() {
+        let content = r#"
+UserList = List[User]
+Callback = Callable[[str], None]
+"#;
+        let symbols = parse_python_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "UserList" && s.kind == SymbolKind::TypeAlias));
+        assert!(symbols.iter().any(|s| s.name == "Callback" && s.kind == SymbolKind::TypeAlias));
+    }
+
+    #[test]
+    fn test_parse_function_with_return_type() {
+        let content = r#"
+def get_name(self) -> str:
+    return ""
+"#;
+        let symbols = parse_python_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "get_name"));
+    }
 }

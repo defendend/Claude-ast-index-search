@@ -173,13 +173,14 @@ ast-index todo --limit 10                # Limit results
 ast-index deprecated                     # Find deprecated items
 ```
 
-### Git Integration
+### Git/Arc Integration
 
-**`changed`** - Show symbols changed in git diff.
+**`changed`** - Show symbols changed in git/arc diff. Auto-detects VCS and base branch.
 
 ```bash
-ast-index changed                        # Changes vs HEAD
-ast-index changed --base main            # Changes vs main branch
+ast-index changed                        # Auto: trunk (arc) or origin/main (git)
+ast-index changed --base main            # Explicit base branch
+ast-index changed --base trunk           # For arc projects
 ```
 
 ### Public API

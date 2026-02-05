@@ -312,4 +312,75 @@ import weak "weak/dep.proto";
         assert!(imports.iter().any(|(p, _)| p == "google/protobuf/timestamp.proto"));
         assert!(imports.iter().any(|(p, _)| p == "other/file.proto"));
     }
+
+    #[test]
+    fn test_parse_nested_messages() {
+        let content = r#"
+message Outer {
+    message Inner {
+        string field = 1;
+    }
+    Inner item = 1;
+}
+"#;
+        let symbols = parse_proto_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "Outer"));
+        assert!(symbols.iter().any(|s| s.name.contains("Inner")));
+    }
+
+    #[test]
+    fn test_parse_service_rpcs_with_types() {
+        let content = r#"
+service UserService {
+    rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+    rpc GetUser(GetUserRequest) returns (User);
+    rpc DeleteUser(DeleteUserRequest) returns (google.protobuf.Empty);
+}
+"#;
+        let symbols = parse_proto_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Interface && s.name == "UserService"));
+        let create_rpc = symbols.iter().find(|s| s.name == "CreateUser").unwrap();
+        assert!(create_rpc.signature.contains("CreateUserRequest"));
+        assert!(create_rpc.signature.contains("CreateUserResponse"));
+    }
+
+    #[test]
+    fn test_parse_java_package_option() {
+        let content = r#"
+syntax = "proto3";
+package api.v1;
+option java_package = "com.example.api.v1";
+
+message Request {}
+"#;
+        let symbols = parse_proto_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "java_package:com.example.api.v1"));
+        assert!(symbols.iter().any(|s| s.name == "api.v1" && s.kind == SymbolKind::Package));
+    }
+
+    #[test]
+    fn test_parse_stream_rpc() {
+        let content = r#"
+service StreamService {
+    rpc StreamEvents(stream EventRequest) returns (stream EventResponse);
+}
+"#;
+        let symbols = parse_proto_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "StreamEvents" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_parse_nested_enum() {
+        let content = r#"
+message Response {
+    enum Status {
+        OK = 0;
+        ERROR = 1;
+    }
+    Status status = 1;
+}
+"#;
+        let symbols = parse_proto_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Enum && s.name.contains("Status")));
+    }
 }

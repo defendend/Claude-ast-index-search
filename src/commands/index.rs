@@ -16,11 +16,11 @@ use colored::Colorize;
 use regex::Regex;
 use rusqlite::{params, Connection};
 
-use crate::db;
+use crate::db::{self, SearchScope};
 use super::{search_files, relative_path};
 
 /// Full-text search across files, symbols, and file contents
-pub fn cmd_search(root: &Path, query: &str, limit: usize) -> Result<()> {
+pub fn cmd_search(root: &Path, query: &str, limit: usize, format: &str, scope: &SearchScope, fuzzy: bool) -> Result<()> {
     let total_start = Instant::now();
 
     if !db::db_exists(root) {
@@ -38,10 +38,14 @@ pub fn cmd_search(root: &Path, query: &str, limit: usize) -> Result<()> {
     let files = db::find_files(&conn, query, limit)?;
     let files_time = files_start.elapsed();
 
-    // 2. Search in symbols using FTS (index)
+    // 2. Search in symbols using FTS or fuzzy (index)
     let symbols_start = Instant::now();
-    let fts_query = format!("{}*", query); // Prefix search
-    let symbols = db::search_symbols(&conn, &fts_query, limit)?;
+    let symbols = if fuzzy {
+        db::search_symbols_fuzzy(&conn, query, limit)?
+    } else {
+        let fts_query = format!("{}*", query); // Prefix search
+        db::search_symbols_scoped(&conn, &fts_query, limit, scope)?
+    };
     let symbols_time = symbols_start.elapsed();
 
     // 3. Search in file contents (grep)
@@ -51,10 +55,29 @@ pub fn cmd_search(root: &Path, query: &str, limit: usize) -> Result<()> {
 
     super::search_files_limited(root, &pattern, &["kt", "java", "swift", "m", "h", "py", "go", "rs", "cpp", "c", "proto"], limit, |path, line_num, line| {
         let rel_path = super::relative_path(root, path);
+        // Apply scope filter for grep results
+        if let Some(in_file) = scope.in_file {
+            if !rel_path.contains(in_file) { return; }
+        }
+        if let Some(module) = scope.module {
+            if !rel_path.starts_with(module) { return; }
+        }
         let content: String = line.trim().chars().take(100).collect();
         content_matches.push((rel_path, line_num, content));
     })?;
     let content_time = content_start.elapsed();
+
+    if format == "json" {
+        let result = serde_json::json!({
+            "files": files,
+            "symbols": symbols,
+            "content_matches": content_matches.iter().map(|(p, l, c)| {
+                serde_json::json!({"path": p, "line": l, "content": c})
+            }).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
 
     // Output results
     println!("{}", format!("Search results for '{}':", query).bold());
@@ -100,7 +123,7 @@ pub fn cmd_search(root: &Path, query: &str, limit: usize) -> Result<()> {
 }
 
 /// Find symbol by name
-pub fn cmd_symbol(root: &Path, name: &str, kind: Option<&str>, limit: usize) -> Result<()> {
+pub fn cmd_symbol(root: &Path, name: &str, kind: Option<&str>, limit: usize, format: &str, scope: &SearchScope, fuzzy: bool) -> Result<()> {
     let start = Instant::now();
 
     if !db::db_exists(root) {
@@ -112,7 +135,16 @@ pub fn cmd_symbol(root: &Path, name: &str, kind: Option<&str>, limit: usize) -> 
     }
 
     let conn = db::open_db(root)?;
-    let symbols = db::find_symbols_by_name(&conn, name, kind, limit)?;
+    let symbols = if fuzzy && kind.is_none() {
+        db::search_symbols_fuzzy(&conn, name, limit)?
+    } else {
+        db::find_symbols_by_name_scoped(&conn, name, kind, limit, scope)?
+    };
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&symbols)?);
+        return Ok(());
+    }
 
     let kind_str = kind.map(|k| format!(" ({})", k)).unwrap_or_default();
     println!(
@@ -137,7 +169,7 @@ pub fn cmd_symbol(root: &Path, name: &str, kind: Option<&str>, limit: usize) -> 
 }
 
 /// Find class by name (classes, interfaces, objects, enums)
-pub fn cmd_class(root: &Path, name: &str, limit: usize) -> Result<()> {
+pub fn cmd_class(root: &Path, name: &str, limit: usize, format: &str, scope: &SearchScope, fuzzy: bool) -> Result<()> {
     let start = Instant::now();
 
     if !db::db_exists(root) {
@@ -151,7 +183,21 @@ pub fn cmd_class(root: &Path, name: &str, limit: usize) -> Result<()> {
     let conn = db::open_db(root)?;
 
     // Single query for all class-like symbols
-    let results = db::find_class_like(&conn, name, limit)?;
+    let results = if fuzzy {
+        // Fuzzy: search all symbols then filter to class-like kinds
+        let all = db::search_symbols_fuzzy(&conn, name, limit * 5)?;
+        all.into_iter()
+            .filter(|s| matches!(s.kind.as_str(), "class" | "interface" | "object" | "enum" | "protocol" | "struct" | "actor" | "package"))
+            .take(limit)
+            .collect()
+    } else {
+        db::find_class_like_scoped(&conn, name, limit, scope)?
+    };
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+        return Ok(());
+    }
 
     println!("{}", format!("Classes matching '{}':", name).bold());
 
@@ -168,7 +214,7 @@ pub fn cmd_class(root: &Path, name: &str, limit: usize) -> Result<()> {
 }
 
 /// Find implementations of interface/class
-pub fn cmd_implementations(root: &Path, parent: &str, limit: usize) -> Result<()> {
+pub fn cmd_implementations(root: &Path, parent: &str, limit: usize, format: &str, scope: &SearchScope) -> Result<()> {
     let start = Instant::now();
 
     if !db::db_exists(root) {
@@ -180,7 +226,26 @@ pub fn cmd_implementations(root: &Path, parent: &str, limit: usize) -> Result<()
     }
 
     let conn = db::open_db(root)?;
-    let impls = db::find_implementations(&conn, parent, limit)?;
+    let impls = if scope.is_empty() {
+        db::find_implementations(&conn, parent, limit)?
+    } else {
+        // For scoped implementations, filter results post-query
+        let all = db::find_implementations(&conn, parent, limit * 5)?;
+        all.into_iter().filter(|s| {
+            if let Some(in_file) = scope.in_file {
+                if !s.path.contains(in_file) { return false; }
+            }
+            if let Some(module) = scope.module {
+                if !s.path.starts_with(module) { return false; }
+            }
+            true
+        }).take(limit).collect()
+    };
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&impls)?);
+        return Ok(());
+    }
 
     println!(
         "{}",
@@ -193,6 +258,69 @@ pub fn cmd_implementations(root: &Path, parent: &str, limit: usize) -> Result<()
 
     if impls.is_empty() {
         println!("  No implementations found.");
+    }
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+/// Show cross-references: definitions, imports, usages
+pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result<()> {
+    let start = Instant::now();
+
+    if !db::db_exists(root) {
+        println!(
+            "{}",
+            "Index not found. Run 'ast-index rebuild' first.".red()
+        );
+        return Ok(());
+    }
+
+    let conn = db::open_db(root)?;
+    let (definitions, imports, usages) = db::find_cross_references(&conn, symbol, limit)?;
+
+    if format == "json" {
+        let result = serde_json::json!({
+            "definitions": definitions,
+            "imports": imports,
+            "usages": usages,
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    println!("{}", format!("Cross-references for '{}':", symbol).bold());
+
+    if !definitions.is_empty() {
+        println!("\n  {}", "Definitions:".cyan());
+        for s in &definitions {
+            println!("    {} [{}]: {}:{}", s.name.cyan(), s.kind, s.path, s.line);
+        }
+    }
+
+    if !imports.is_empty() {
+        println!("\n  {}", "Imports:".cyan());
+        for s in &imports {
+            println!("    {}:{}", s.path.cyan(), s.line);
+            if let Some(sig) = &s.signature {
+                println!("      {}", sig.dimmed());
+            }
+        }
+    }
+
+    if !usages.is_empty() {
+        println!("\n  {}", "Usages:".cyan());
+        for r in &usages {
+            println!("    {}:{}", r.path.cyan(), r.line);
+            if let Some(ctx) = &r.context {
+                let truncated: String = ctx.chars().take(80).collect();
+                println!("      {}", truncated.dimmed());
+            }
+        }
+    }
+
+    if definitions.is_empty() && imports.is_empty() && usages.is_empty() {
+        println!("  No references found.");
     }
 
     eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
@@ -257,7 +385,7 @@ pub fn cmd_hierarchy(root: &Path, name: &str) -> Result<()> {
 }
 
 /// Find symbol usages (indexed or grep-based)
-pub fn cmd_usages(root: &Path, symbol: &str, limit: usize) -> Result<()> {
+pub fn cmd_usages(root: &Path, symbol: &str, limit: usize, format: &str, scope: &SearchScope) -> Result<()> {
     let start = Instant::now();
 
     // Try to use index first
@@ -269,8 +397,13 @@ pub fn cmd_usages(root: &Path, symbol: &str, limit: usize) -> Result<()> {
         let refs_count: i64 = conn.query_row("SELECT COUNT(*) FROM refs WHERE name = ?1 LIMIT 1", params![symbol], |row| row.get(0)).unwrap_or(0);
 
         if refs_count > 0 {
-            // Use indexed references
-            let refs = db::find_references(&conn, symbol, limit)?;
+            // Use indexed references with scope filtering
+            let refs = db::find_references_scoped(&conn, symbol, limit, scope)?;
+
+            if format == "json" {
+                println!("{}", serde_json::to_string_pretty(&refs)?);
+                return Ok(());
+            }
 
             println!("{}", format!("Usages of '{}' ({}):", symbol, refs.len()).bold());
 
@@ -307,9 +440,24 @@ pub fn cmd_usages(root: &Path, symbol: &str, limit: usize) -> Result<()> {
         if def_pattern.is_match(line) { return; }
 
         let rel_path = relative_path(root, path);
+        // Apply scope filter for grep results
+        if let Some(in_file) = scope.in_file {
+            if !rel_path.contains(in_file) { return; }
+        }
+        if let Some(module) = scope.module {
+            if !rel_path.starts_with(module) { return; }
+        }
         let content: String = line.trim().chars().take(80).collect();
         usages.push((rel_path, line_num, content));
     })?;
+
+    if format == "json" {
+        let result: Vec<_> = usages.iter().map(|(p, l, c)| {
+            serde_json::json!({"path": p, "line": l, "content": c})
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
 
     println!("{}", format!("Usages of '{}' ({}):", symbol, usages.len()).bold());
 

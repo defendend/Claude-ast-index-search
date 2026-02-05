@@ -18,6 +18,8 @@ pub mod files;
 pub mod android;
 pub mod ios;
 pub mod perl;
+pub mod watch;
+pub mod analysis;
 
 use std::collections::HashSet;
 use std::path::Path;

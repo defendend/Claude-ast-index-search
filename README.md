@@ -1,4 +1,4 @@
-# ast-index v3.10.4
+# ast-index v3.11.0
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -320,6 +320,12 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.11.0
+- **10x faster `unused-deps`** — replaced filesystem scanning (WalkDir + read_to_string) with index-based SQL queries to `refs` table. `core` module (225 deps) now completes in ~6s instead of 60s+ timeout
+- **Fixed transitive dependency logic** — correctly checks `transitive_deps` table (api chain reachability) instead of re-scanning symbols
+- **Arc (Arcadia) support for `changed`** — auto-detects VCS (arc vs git), auto-selects base branch (`trunk` for arc, `origin/main` for git), normalizes `origin/` prefix
+- **Removed skill copying from initialize commands** — `/initialize-*` no longer copies skill files to project directory
 
 ### 3.10.4
 - **2.6x faster indexing on large projects** — fix Dart parser allocating lines vector per class declaration

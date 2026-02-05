@@ -14,6 +14,10 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Output format: text or json
+    #[arg(long, global = true, default_value = "text")]
+    format: String,
 }
 
 #[derive(Subcommand)]
@@ -160,6 +164,15 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "20")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
+        /// Filter by module path
+        #[arg(long)]
+        module: Option<String>,
+        /// Fuzzy search (exact → prefix → contains)
+        #[arg(long)]
+        fuzzy: bool,
     },
     /// Find files by name
     File {
@@ -182,6 +195,15 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "20")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
+        /// Filter by module path
+        #[arg(long)]
+        module: Option<String>,
+        /// Fuzzy search (exact → prefix → contains)
+        #[arg(long)]
+        fuzzy: bool,
     },
     /// Find class or interface
     Class {
@@ -190,6 +212,15 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "20")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
+        /// Filter by module path
+        #[arg(long)]
+        module: Option<String>,
+        /// Fuzzy search (exact → prefix → contains)
+        #[arg(long)]
+        fuzzy: bool,
     },
     /// Find implementations (subclasses/implementors)
     Implementations {
@@ -198,6 +229,12 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "20")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
+        /// Filter by module path
+        #[arg(long)]
+        module: Option<String>,
     },
     /// Show class hierarchy
     Hierarchy {
@@ -265,6 +302,14 @@ enum Commands {
         #[arg(long)]
         unused: bool,
     },
+    /// Show cross-references: definitions, imports, usages
+    Refs {
+        /// Symbol name
+        symbol: String,
+        /// Max results per section
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
     /// Find usages of a symbol
     Usages {
         /// Symbol name
@@ -272,6 +317,12 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "50")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
+        /// Filter by module path
+        #[arg(long)]
+        module: Option<String>,
     },
     /// Show symbols in a file
     Outline {
@@ -291,11 +342,11 @@ enum Commands {
         #[arg(short, long, default_value = "100")]
         limit: usize,
     },
-    /// Show changed symbols (git diff)
+    /// Show changed symbols (git/arc diff)
     Changed {
-        /// Base branch
-        #[arg(long, default_value = "origin/trunk")]
-        base: String,
+        /// Base branch (auto-detected: trunk for arc, origin/main for git)
+        #[arg(long)]
+        base: Option<String>,
     },
     // === iOS Commands ===
     /// Find class usages in storyboards/xibs (iOS)
@@ -394,6 +445,32 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: usize,
     },
+    /// Find potentially unused symbols
+    UnusedSymbols {
+        /// Filter by module path
+        #[arg(long)]
+        module: Option<String>,
+        /// Only check exported (capitalized) symbols
+        #[arg(long)]
+        export_only: bool,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Add additional source root to project
+    AddRoot {
+        /// Path to add as source root
+        path: String,
+    },
+    /// Remove source root from project
+    RemoveRoot {
+        /// Path to remove
+        path: String,
+    },
+    /// List configured source roots
+    ListRoots,
+    /// Watch for file changes and auto-update index
+    Watch,
     /// Clear index database for current project
     Clear,
     /// Show version
@@ -405,6 +482,7 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = find_project_root()?;
+    let format = cli.format.as_str();
 
     // Migrate project DB from old kotlin-index to ast-index
     db::migrate_legacy_project(&root);
@@ -429,14 +507,30 @@ fn main() -> Result<()> {
         Commands::Init => commands::management::cmd_init(&root),
         Commands::Rebuild { r#type, no_deps, no_ignore } => commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore),
         Commands::Update => commands::management::cmd_update(&root),
-        Commands::Stats => commands::management::cmd_stats(&root),
+        Commands::Stats => commands::management::cmd_stats(&root, format),
         // Index commands
-        Commands::Search { query, limit } => commands::index::cmd_search(&root, &query, limit),
-        Commands::Symbol { name, r#type, limit } => commands::index::cmd_symbol(&root, &name, r#type.as_deref(), limit),
-        Commands::Class { name, limit } => commands::index::cmd_class(&root, &name, limit),
-        Commands::Implementations { parent, limit } => commands::index::cmd_implementations(&root, &parent, limit),
+        Commands::Search { query, limit, in_file, module, fuzzy } => {
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref() };
+            commands::index::cmd_search(&root, &query, limit, format, &scope, fuzzy)
+        }
+        Commands::Symbol { name, r#type, limit, in_file, module, fuzzy } => {
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref() };
+            commands::index::cmd_symbol(&root, &name, r#type.as_deref(), limit, format, &scope, fuzzy)
+        }
+        Commands::Class { name, limit, in_file, module, fuzzy } => {
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref() };
+            commands::index::cmd_class(&root, &name, limit, format, &scope, fuzzy)
+        }
+        Commands::Implementations { parent, limit, in_file, module } => {
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref() };
+            commands::index::cmd_implementations(&root, &parent, limit, format, &scope)
+        }
+        Commands::Refs { symbol, limit } => commands::index::cmd_refs(&root, &symbol, limit, format),
         Commands::Hierarchy { name } => commands::index::cmd_hierarchy(&root, &name),
-        Commands::Usages { symbol, limit } => commands::index::cmd_usages(&root, &symbol, limit),
+        Commands::Usages { symbol, limit, in_file, module } => {
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref() };
+            commands::index::cmd_usages(&root, &symbol, limit, format, &scope)
+        }
         // Module commands
         Commands::Module { pattern, limit } => commands::modules::cmd_module(&root, &pattern, limit),
         Commands::Deps { module } => commands::modules::cmd_deps(&root, &module),
@@ -452,7 +546,12 @@ fn main() -> Result<()> {
         Commands::Outline { file } => commands::files::cmd_outline(&root, &file),
         Commands::Imports { file } => commands::files::cmd_imports(&root, &file),
         Commands::Api { module_path, limit } => commands::files::cmd_api(&root, &module_path, limit),
-        Commands::Changed { base } => commands::files::cmd_changed(&root, &base),
+        Commands::Changed { base } => {
+            let vcs = commands::files::detect_vcs(&root);
+            let default_base = if vcs == "arc" { "trunk" } else { "origin/main" };
+            let base = base.as_deref().unwrap_or(default_base);
+            commands::files::cmd_changed(&root, base)
+        }
         // Android commands
         Commands::XmlUsages { class_name, module } => commands::android::cmd_xml_usages(&root, &class_name, module.as_deref()),
         Commands::ResourceUsages { resource, module, r#type, unused } => {
@@ -471,6 +570,13 @@ fn main() -> Result<()> {
         Commands::PerlPod { query, limit } => commands::perl::cmd_perl_pod(&root, query.as_deref(), limit),
         Commands::PerlTests { query, limit } => commands::perl::cmd_perl_tests(&root, query.as_deref(), limit),
         Commands::PerlImports { query, limit } => commands::perl::cmd_perl_imports(&root, query.as_deref(), limit),
+        Commands::UnusedSymbols { module, export_only, limit } => {
+            commands::analysis::cmd_unused_symbols(&root, module.as_deref(), export_only, limit, format)
+        }
+        Commands::AddRoot { path } => commands::management::cmd_add_root(&root, &path),
+        Commands::RemoveRoot { path } => commands::management::cmd_remove_root(&root, &path),
+        Commands::ListRoots => commands::management::cmd_list_roots(&root),
+        Commands::Watch => commands::watch::cmd_watch(&root),
         Commands::Clear => commands::management::cmd_clear(&root),
         Commands::Version => {
             println!("ast-index v{}", env!("CARGO_PKG_VERSION"));

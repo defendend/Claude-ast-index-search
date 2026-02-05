@@ -35,15 +35,27 @@ Then create or merge into `.claude/settings.json`. If file doesn't exist, create
 
 ```json
 {
+  "extraKnownMarketplaces": {
+    "ast-index": {
+      "source": {
+        "source": "github",
+        "repo": "defendend/Claude-ast-index-search"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "ast-index@ast-index": true
+  },
   "permissions": {
     "allow": [
+      "Bash(ya tool ast-index *)",
       "Bash(ast-index *)"
     ]
   }
 }
 ```
 
-**Important**: If `.claude/settings.json` already exists, MERGE the permissions (don't replace).
+**Important**: If `.claude/settings.json` already exists, MERGE the keys (don't replace the whole file).
 
 ### 3. Create .claude/rules/ast-index.md (CRITICAL)
 
@@ -105,28 +117,7 @@ ast-index is 17-69x faster than grep (1-10ms vs 200ms-3s) and returns structured
 - `ast-index stats` — Show index statistics
 ```
 
-### 4. Copy Skill Documentation to Project (CRITICAL)
-
-**MANDATORY STEP - DO NOT SKIP!** Copy the ast-index skill documentation from the plugin to the project's `.claude/` directory.
-
-Execute these commands:
-
-```bash
-mkdir -p .claude/skills/ast-index/references
-cp "${CLAUDE_PLUGIN_ROOT}/skills/ast-index/SKILL.md" .claude/skills/ast-index/
-cp "${CLAUDE_PLUGIN_ROOT}/skills/ast-index/references/"*.md .claude/skills/ast-index/references/
-```
-
-After executing, verify the files were copied:
-
-```bash
-ls -la .claude/skills/ast-index/
-ls -la .claude/skills/ast-index/references/
-```
-
-You MUST see SKILL.md and multiple .md files in references/. If not, the copy failed and must be retried.
-
-### 5. Build the Index
+### 4. Build the Index
 
 Run initial indexing:
 
@@ -136,7 +127,7 @@ ast-index rebuild
 
 Show progress and report statistics when done.
 
-### 6. Verify Setup
+### 5. Verify Setup
 
 Run a quick search to verify everything works:
 
@@ -150,6 +141,5 @@ ast-index search "ViewController"
 After completion, inform user:
 - settings.json has been configured with ast-index permissions
 - Rules file created at .claude/rules/ast-index.md
-- Skill documentation copied to .claude/skills/ast-index/
 - Index has been built with X files and Y symbols
 - Ready to use ast-index for code search
