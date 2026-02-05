@@ -411,12 +411,26 @@ pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
 }
 
 /// Detect which VCS is used in the project directory
-fn detect_vcs(root: &Path) -> &'static str {
-    if root.join(".arc").exists() || root.join(".arcconfig").exists() {
-        "arc"
-    } else {
-        "git"
+pub fn detect_vcs(root: &Path) -> &'static str {
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+
+    for ancestor in root.ancestors() {
+        // Stop at home directory to avoid false positives from ~/.arc
+        if let Some(ref h) = home {
+            if ancestor == h.as_path() {
+                break;
+            }
+        }
+
+        // .arc/HEAD distinguishes real arc repo from ~/.arc (client storage)
+        if ancestor.join(".arc").join("HEAD").exists() || ancestor.join(".arcconfig").exists() {
+            return "arc";
+        }
+        if ancestor.join(".git").exists() {
+            return "git";
+        }
     }
+    "git"
 }
 
 /// Get merge-base between HEAD and the given base branch
@@ -434,14 +448,25 @@ fn get_merge_base(root: &Path, vcs: &str, base: &str) -> Result<String> {
     Ok(std::str::from_utf8(&output.stdout)?.trim().to_string())
 }
 
+/// Normalize base branch for the given VCS
+fn normalize_base_for_vcs(vcs: &str, base: &str) -> String {
+    if vcs == "arc" {
+        // Arc doesn't use origin/ prefix
+        base.strip_prefix("origin/").unwrap_or(base).to_string()
+    } else {
+        base.to_string()
+    }
+}
+
 /// Show changed symbols in git/arc diff
 pub fn cmd_changed(root: &Path, base: &str) -> Result<()> {
     let start = Instant::now();
 
     let vcs = detect_vcs(root);
+    let base = normalize_base_for_vcs(vcs, base);
 
     // Find merge-base to only show changes from the current branch
-    let merge_base = get_merge_base(root, vcs, base)?;
+    let merge_base = get_merge_base(root, vcs, &base)?;
 
     // Get list of changed files
     let output = std::process::Command::new(vcs)

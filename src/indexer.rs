@@ -13,6 +13,34 @@ use std::time::SystemTime;
 use crate::db::{self, SymbolKind};
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
 
+/// Sorted module lookup for efficient longest-prefix matching.
+/// Entries sorted by path length descending so the longest (most specific) match is found first.
+struct ModuleLookup {
+    sorted: Vec<(String, i64)>, // (path, module_id) sorted by path length desc
+}
+
+impl ModuleLookup {
+    fn from_db(conn: &Connection) -> Result<Self> {
+        let mut stmt = conn.prepare("SELECT id, path FROM modules")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+        })?;
+        let mut sorted: Vec<(String, i64)> = Vec::new();
+        for row in rows {
+            let (path, id) = row?;
+            sorted.push((path, id));
+        }
+        sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        Ok(ModuleLookup { sorted })
+    }
+
+    fn find(&self, file_path: &str) -> Option<i64> {
+        self.sorted.iter()
+            .find(|(path, _)| file_path.starts_with(path.as_str()))
+            .map(|(_, id)| *id)
+    }
+}
+
 /// Project type detected by markers
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProjectType {
@@ -339,53 +367,20 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
 
     // Detect file type by extension
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let is_swift = ext == "swift";
-    let is_objc = ext == "m";  // .h files now handled separately for C++ vs ObjC
-    let is_perl = ext == "pm" || ext == "pl" || ext == "t";
-    let is_proto = ext == "proto";
-    let is_wsdl = ext == "wsdl" || ext == "xsd";
-    let is_cpp = ext == "cpp" || ext == "cc" || ext == "c" || ext == "hpp" || ext == "h";
-    let is_python = ext == "py";
-    let is_go = ext == "go";
-    let is_rust = ext == "rs";
-    let is_ruby = ext == "rb";
-    let is_csharp = ext == "cs";
-    let is_dart = ext == "dart";
-    let is_typescript = ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" || ext == "mjs" || ext == "cjs";
-    let is_vue = ext == "vue";
-    let is_svelte = ext == "svelte";
-
-    let (symbols, refs) = if is_objc {
-        parsers::parse_symbols_and_refs(&content, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false)?
-    } else if is_perl {
-        parsers::parse_symbols_and_refs(&content, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false)?
-    } else if is_proto {
-        parsers::parse_symbols_and_refs(&content, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false)?
-    } else if is_wsdl {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false)?
-    } else if is_cpp {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false)?
-    } else if is_python {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false)?
-    } else if is_go {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false)?
-    } else if is_rust {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false)?
-    } else if is_ruby {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false)?
-    } else if is_csharp {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false)?
-    } else if is_dart {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false)?
-    } else if is_typescript {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false)?
-    } else if is_vue {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false)?
-    } else if is_svelte {
-        parsers::parse_symbols_and_refs(&content, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true)?
-    } else {
-        parsers::parse_symbols_and_refs(&content, is_swift, false, false, false, false, false, false, false, false, false, false, false, false, false, false)?
+    let file_type = match parsers::FileType::from_extension(ext) {
+        Some(ft) => ft,
+        None => {
+            return Ok(ParsedFile {
+                rel_path,
+                mtime,
+                size,
+                symbols: vec![],
+                refs: vec![],
+            });
+        }
     };
+
+    let (symbols, refs) = parsers::parse_file_symbols(&content, file_type)?;
 
     Ok(ParsedFile {
         rel_path,
@@ -733,53 +728,10 @@ pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress
             })
             .collect();
 
-        // Write to DB
-        let tx = conn.transaction()?;
-        {
-            let mut file_stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?1, ?2, ?3)"
-            )?;
-            let mut del_sym_stmt = tx.prepare_cached("DELETE FROM symbols WHERE file_id = ?1")?;
-            let mut del_ref_stmt = tx.prepare_cached("DELETE FROM refs WHERE file_id = ?1")?;
-            let mut sym_stmt = tx.prepare_cached(
-                "INSERT INTO symbols (file_id, name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5)"
-            )?;
-            let mut inh_stmt = tx.prepare_cached(
-                "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)"
-            )?;
-            let mut ref_stmt = tx.prepare_cached(
-                "INSERT INTO refs (file_id, name, line, context) VALUES (?1, ?2, ?3, ?4)"
-            )?;
-
-            for pf in &parsed_files {
-                file_stmt.execute(rusqlite::params![pf.rel_path, pf.mtime, pf.size])?;
-                let file_id = tx.last_insert_rowid();
-                del_sym_stmt.execute(rusqlite::params![file_id])?;
-                del_ref_stmt.execute(rusqlite::params![file_id])?;
-
-                for sym in &pf.symbols {
-                    sym_stmt.execute(rusqlite::params![
-                        file_id,
-                        sym.name,
-                        sym.kind.as_str(),
-                        sym.line as i64,
-                        sym.signature
-                    ])?;
-                    let symbol_id = tx.last_insert_rowid();
-
-                    for (parent_name, inherit_kind) in &sym.parents {
-                        inh_stmt.execute(rusqlite::params![symbol_id, parent_name, inherit_kind])?;
-                    }
-                }
-
-                // Insert refs
-                for r in &pf.refs {
-                    ref_stmt.execute(rusqlite::params![file_id, r.name, r.line as i64, r.context])?;
-                }
-            }
-        }
-        tx.commit()?;
-        parsed_files.len()
+        let count = parsed_files.len();
+        let mut dummy_total = 0;
+        write_batch_to_db(conn, parsed_files, &mut dummy_total)?;
+        count
     } else {
         0
     };
@@ -1079,19 +1031,7 @@ pub struct XmlUsage {
 pub fn index_xml_usages(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
     use ignore::WalkBuilder;
 
-    // Get module IDs map
-    let module_ids: std::collections::HashMap<String, i64> = {
-        let mut stmt = conn.prepare("SELECT id, path FROM modules")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
-        })?;
-        let mut map = std::collections::HashMap::new();
-        for row in rows {
-            let (path, id) = row?;
-            map.insert(path, id);
-        }
-        map
-    };
+    let module_lookup = ModuleLookup::from_db(conn)?;
 
     // Regex for class names in XML
     // Full class name: <com.example.MyView ...>
@@ -1149,9 +1089,7 @@ pub fn index_xml_usages(conn: &mut Connection, root: &Path, progress: bool) -> R
                 .to_string();
 
             // Find module for this file
-            let module_id = module_ids.iter()
-                .find(|(path, _)| rel_path.starts_with(*path))
-                .map(|(_, id)| *id);
+            let module_id = module_lookup.find(&rel_path);
 
             if let Ok(content) = fs::read_to_string(xml_path) {
                 for (line_num, line) in content.lines().enumerate() {
@@ -1250,19 +1188,7 @@ impl ResourceType {
 pub fn index_resources(conn: &mut Connection, root: &Path, progress: bool) -> Result<(usize, usize)> {
     use ignore::WalkBuilder;
 
-    // Get module IDs map
-    let module_ids: std::collections::HashMap<String, i64> = {
-        let mut stmt = conn.prepare("SELECT id, path FROM modules")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
-        })?;
-        let mut map = std::collections::HashMap::new();
-        for row in rows {
-            let (path, id) = row?;
-            map.insert(path, id);
-        }
-        map
-    };
+    let module_lookup = ModuleLookup::from_db(conn)?;
 
     let walker = WalkBuilder::new(root)
         .hidden(true)
@@ -1328,9 +1254,7 @@ pub fn index_resources(conn: &mut Connection, root: &Path, progress: bool) -> Re
                 .to_string_lossy()
                 .to_string();
 
-            let module_id = module_ids.iter()
-                .find(|(path, _)| rel_path.starts_with(*path))
-                .map(|(_, id)| *id);
+            let module_id = module_lookup.find(&rel_path);
 
             // Drawable files
             if rel_path.contains("/drawable") || rel_path.contains("/mipmap") {
@@ -1578,19 +1502,7 @@ pub struct StoryboardUsage {
 pub fn index_storyboard_usages(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
     use ignore::WalkBuilder;
 
-    // Get module IDs map
-    let module_ids: std::collections::HashMap<String, i64> = {
-        let mut stmt = conn.prepare("SELECT id, path FROM modules")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
-        })?;
-        let mut map = std::collections::HashMap::new();
-        for row in rows {
-            let (path, id) = row?;
-            map.insert(path, id);
-        }
-        map
-    };
+    let module_lookup = ModuleLookup::from_db(conn)?;
 
     // Regex for customClass in storyboards/xibs
     // <viewController customClass="MyViewController" ...>
@@ -1641,9 +1553,7 @@ pub fn index_storyboard_usages(conn: &mut Connection, root: &Path, progress: boo
                 .to_string();
 
             // Find module for this file
-            let module_id = module_ids.iter()
-                .find(|(path, _)| rel_path.starts_with(*path))
-                .map(|(_, id)| *id);
+            let module_id = module_lookup.find(&rel_path);
 
             if let Ok(content) = fs::read_to_string(sb_path) {
                 for (line_num, line) in content.lines().enumerate() {
@@ -1730,19 +1640,7 @@ impl IosAssetType {
 pub fn index_ios_assets(conn: &mut Connection, root: &Path, progress: bool) -> Result<(usize, usize)> {
     use ignore::WalkBuilder;
 
-    // Get module IDs map
-    let module_ids: std::collections::HashMap<String, i64> = {
-        let mut stmt = conn.prepare("SELECT id, path FROM modules")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
-        })?;
-        let mut map = std::collections::HashMap::new();
-        for row in rows {
-            let (path, id) = row?;
-            map.insert(path, id);
-        }
-        map
-    };
+    let module_lookup = ModuleLookup::from_db(conn)?;
 
     let walker = WalkBuilder::new(root)
         .hidden(true)
@@ -1786,9 +1684,7 @@ pub fn index_ios_assets(conn: &mut Connection, root: &Path, progress: bool) -> R
                 .to_string_lossy()
                 .to_string();
 
-            let module_id = module_ids.iter()
-                .find(|(path, _)| rel_xcassets.starts_with(*path))
-                .map(|(_, id)| *id);
+            let module_id = module_lookup.find(&rel_xcassets);
 
             // Walk inside xcassets to find imagesets, colorsets, etc.
             let inner_walker = WalkBuilder::new(xcassets_dir)

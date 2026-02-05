@@ -367,4 +367,45 @@ mod tests {
         // SimpleRef is just a type reference, should not be indexed as class
         assert!(!symbols.iter().any(|s| s.name == "SimpleRef"));
     }
+
+    #[test]
+    fn test_parse_complex_type_with_sequence() {
+        let content = r#"
+<xsd:complexType name="Address">
+    <xsd:sequence>
+        <xsd:element name="Street" type="xsd:string"/>
+        <xsd:element name="City" type="xsd:string"/>
+        <xsd:element name="Zip" type="xsd:string"/>
+    </xsd:sequence>
+</xsd:complexType>
+"#;
+        let symbols = parse_wsdl_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Class && s.name == "Address"));
+    }
+
+    #[test]
+    fn test_parse_multiple_operations() {
+        let content = r#"
+<wsdl:portType name="OrderPort">
+    <wsdl:operation name="CreateOrder"/>
+    <wsdl:operation name="GetOrder"/>
+    <wsdl:operation name="DeleteOrder"/>
+</wsdl:portType>
+"#;
+        let symbols = parse_wsdl_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "CreateOrder"));
+        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "GetOrder"));
+        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Function && s.name == "DeleteOrder"));
+    }
+
+    #[test]
+    fn test_parse_wsdl_service() {
+        let content = r#"
+<wsdl:service name="PaymentService">
+    <wsdl:port name="PaymentPort" binding="tns:PaymentBinding"/>
+</wsdl:service>
+"#;
+        let symbols = parse_wsdl_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Class && s.name == "PaymentService"));
+    }
 }

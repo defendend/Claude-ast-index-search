@@ -39,7 +39,14 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     let start = Instant::now();
 
     // Delete DB file entirely to avoid WAL hangs
-    db::delete_db(root)?;
+    if let Err(e) = db::delete_db(root) {
+        eprintln!("{}", format!("Warning: could not delete old index: {}", e).yellow());
+        if let Ok(db_path) = db::get_db_path(root) {
+            eprintln!("Cache path: {}", db_path.parent().unwrap_or(db_path.as_path()).display());
+            eprintln!("Try manually removing the cache directory and re-running rebuild.");
+        }
+        return Err(e);
+    }
 
     // Remove old kotlin-index cache dir entirely
     db::cleanup_legacy_cache();
@@ -64,8 +71,19 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     match index_type {
         "all" => {
             println!("{}", "Rebuilding full index...".cyan());
-            let (file_count, module_files) = indexer::index_directory(&mut conn, root, true, no_ignore)?;
+            let (mut file_count, module_files) = indexer::index_directory(&mut conn, root, true, no_ignore)?;
             let module_count = indexer::index_modules_from_files(&conn, root, &module_files)?;
+
+            // Index extra roots
+            let extra_roots = db::get_extra_roots(&conn)?;
+            for extra_root in &extra_roots {
+                let extra_path = std::path::Path::new(extra_root);
+                if extra_path.exists() {
+                    let (extra_files, _) = indexer::index_directory(&mut conn, extra_path, true, no_ignore)?;
+                    file_count += extra_files;
+                    println!("{}", format!("Indexed {} files from extra root: {}", extra_files, extra_root).dimmed());
+                }
+            }
 
             // Index CocoaPods/Carthage for iOS
             if is_ios {
@@ -220,7 +238,7 @@ pub fn cmd_clear(root: &Path) -> Result<()> {
 }
 
 /// Show index statistics
-pub fn cmd_stats(root: &Path) -> Result<()> {
+pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -235,6 +253,17 @@ pub fn cmd_stats(root: &Path) -> Result<()> {
     let db_size = std::fs::metadata(&db_path)
         .map(|m| m.len())
         .unwrap_or(0);
+
+    if format == "json" {
+        let result = serde_json::json!({
+            "project": indexer::detect_project_type(root).as_str(),
+            "stats": stats,
+            "db_size_bytes": db_size,
+            "db_path": db_path.display().to_string(),
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
 
     // Detect project type
     let project_type = indexer::detect_project_type(root);
@@ -260,6 +289,86 @@ pub fn cmd_stats(root: &Path) -> Result<()> {
 
     println!("  DB size:    {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
     println!("  DB path:    {}", db_path.display());
+
+    // Show extra roots if any
+    let extra_roots = db::get_extra_roots(&conn)?;
+    if !extra_roots.is_empty() {
+        println!("\n  Extra roots:");
+        for r in &extra_roots {
+            println!("    {}", r);
+        }
+    }
+
+    Ok(())
+}
+
+/// Add an extra source root
+pub fn cmd_add_root(root: &Path, path: &str) -> Result<()> {
+    if !db::db_exists(root) {
+        println!(
+            "{}",
+            "Index not found. Run 'ast-index rebuild' first.".red()
+        );
+        return Ok(());
+    }
+
+    let abs_path = if std::path::Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        let cwd = std::env::current_dir()?;
+        cwd.join(path).to_string_lossy().to_string()
+    };
+
+    let conn = db::open_db(root)?;
+    db::add_extra_root(&conn, &abs_path)?;
+    println!("{}", format!("Added source root: {}", abs_path).green());
+    Ok(())
+}
+
+/// Remove an extra source root
+pub fn cmd_remove_root(root: &Path, path: &str) -> Result<()> {
+    if !db::db_exists(root) {
+        println!(
+            "{}",
+            "Index not found. Run 'ast-index rebuild' first.".red()
+        );
+        return Ok(());
+    }
+
+    let abs_path = if std::path::Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        let cwd = std::env::current_dir()?;
+        cwd.join(path).to_string_lossy().to_string()
+    };
+
+    let conn = db::open_db(root)?;
+    if db::remove_extra_root(&conn, &abs_path)? {
+        println!("{}", format!("Removed source root: {}", abs_path).green());
+    } else {
+        println!("{}", format!("Root not found: {}", abs_path).yellow());
+    }
+    Ok(())
+}
+
+/// List configured source roots
+pub fn cmd_list_roots(root: &Path) -> Result<()> {
+    if !db::db_exists(root) {
+        println!(
+            "{}",
+            "Index not found. Run 'ast-index rebuild' first.".red()
+        );
+        return Ok(());
+    }
+
+    let conn = db::open_db(root)?;
+    let extra_roots = db::get_extra_roots(&conn)?;
+
+    println!("{}", "Source roots:".bold());
+    println!("  {} (primary)", root.display());
+    for r in &extra_roots {
+        println!("  {}", r);
+    }
 
     Ok(())
 }
