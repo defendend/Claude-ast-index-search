@@ -1,0 +1,9 @@
+{
+  "name": "mobile-tools",
+  "version": "2.8.0",
+  "description": "Mobile device automation CLI for Android, iOS, Aurora OS, and Desktop platforms",
+  "author": "defendend",
+  "skills": [
+    "skills/mobile-tools/SKILL.md"
+  ]
+}
