@@ -1,4 +1,4 @@
-# ast-index v3.11.1
+# ast-index v3.11.2
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -320,6 +320,9 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.11.2
+- **Fix `watch` command on large projects** — switched from kqueue to FSEvents (macOS) / inotify (Linux), fixes "Too many open files" error
 
 ### 3.11.1
 - **Fix `changed` command** — auto-detect default git branch (`origin/main` or `origin/master`)
