@@ -1,6 +1,6 @@
 [package]
 name = "ast-index"
-version = "3.11.1"
+version = "3.11.2"
 edition = "2021"
 description = "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, Perl, Python, Go, C++, and Protocol Buffers projects"
 license = "MIT"
@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
 rayon = "1"
-notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+notify = "7"
 notify-debouncer-mini = "0.5"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
