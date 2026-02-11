@@ -1,6 +1,6 @@
 {
   "name": "ast-index",
-  "version": "3.13.3",
+  "version": "3.13.4",
   "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, Python, Go, Perl, C++, Protocol Buffers, and WSDL/XSD projects",
   "author": {
     "name": "defendend"
