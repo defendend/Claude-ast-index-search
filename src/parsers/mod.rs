@@ -358,6 +358,7 @@ pub enum FileType {
     TypeScript,
     Vue,
     Svelte,
+    Scala,
 }
 
 impl FileType {
@@ -381,6 +382,7 @@ impl FileType {
             "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(FileType::TypeScript),
             "vue" => Some(FileType::Vue),
             "svelte" => Some(FileType::Svelte),
+            "scala" | "sc" => Some(FileType::Scala),
             _ => None,
         }
     }
@@ -397,7 +399,7 @@ fn strip_comments(content: &str, file_type: FileType) -> String {
         // C-style comments (no nesting)
         FileType::Kotlin | FileType::ObjC | FileType::Go |
         FileType::CSharp | FileType::Proto | FileType::TypeScript |
-        FileType::Dart | FileType::Cpp => strip_c_comments(content, false),
+        FileType::Dart | FileType::Cpp | FileType::Scala => strip_c_comments(content, false),
         // C-style comments with nesting support
         FileType::Swift | FileType::Rust => strip_c_comments(content, true),
         // Hash comments + docstrings

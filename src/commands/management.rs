@@ -63,10 +63,10 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
         println!("{}", "Including gitignored files (build/, etc.)...".yellow());
     }
 
-    // Detect project type
+    // Detect project type — check actual platform markers for Mixed projects
     let project_type = indexer::detect_project_type(root);
-    let is_ios = matches!(project_type, indexer::ProjectType::IOS | indexer::ProjectType::Mixed);
-    let is_android = matches!(project_type, indexer::ProjectType::Android | indexer::ProjectType::Mixed);
+    let is_ios = indexer::has_ios_markers(root);
+    let is_android = indexer::has_android_markers(root);
 
     match index_type {
         "all" => {

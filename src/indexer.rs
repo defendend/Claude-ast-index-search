@@ -48,6 +48,7 @@ pub enum ProjectType {
     Python,    // Python - pyproject.toml, setup.py, setup.cfg
     Go,        // Go - go.mod
     Rust,      // Rust - Cargo.toml
+    Bazel,     // Bazel - BUILD, WORKSPACE
     Mixed,     // Multiple platforms present
     Unknown,
 }
@@ -62,10 +63,34 @@ impl ProjectType {
             ProjectType::Python => "Python",
             ProjectType::Go => "Go",
             ProjectType::Rust => "Rust",
+            ProjectType::Bazel => "Bazel",
             ProjectType::Mixed => "Mixed",
             ProjectType::Unknown => "Unknown",
         }
     }
+}
+
+/// Check if project has Android markers (Gradle build files)
+pub fn has_android_markers(root: &Path) -> bool {
+    root.join("settings.gradle.kts").exists()
+        || root.join("settings.gradle").exists()
+        || root.join("build.gradle.kts").exists()
+        || root.join("build.gradle").exists()
+}
+
+/// Check if project has iOS markers (Xcode/SPM)
+pub fn has_ios_markers(root: &Path) -> bool {
+    if root.join("Package.swift").exists() {
+        return true;
+    }
+    // Check for .xcodeproj
+    fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().extension().map(|ext| ext == "xcodeproj").unwrap_or(false))
+        })
+        .unwrap_or(false)
 }
 
 /// Detect project type by looking for marker files
@@ -122,8 +147,13 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
     // Rust project detection
     let has_rust = root.join("Cargo.toml").exists();
 
+    // Bazel project detection
+    let has_bazel = root.join("WORKSPACE").exists()
+        || root.join("WORKSPACE.bazel").exists()
+        || root.join("MODULE.bazel").exists();
+
     // Count how many platforms are detected
-    let count = [has_gradle, has_swift, has_perl, has_frontend, has_python, has_go, has_rust]
+    let count = [has_gradle, has_swift, has_perl, has_frontend, has_python, has_go, has_rust, has_bazel]
         .iter()
         .filter(|&&x| x)
         .count();
@@ -144,6 +174,8 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
         ProjectType::Go
     } else if has_rust {
         ProjectType::Rust
+    } else if has_bazel {
+        ProjectType::Bazel
     } else {
         ProjectType::Unknown
     }

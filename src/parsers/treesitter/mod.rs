@@ -13,6 +13,7 @@ pub mod proto;
 pub mod python;
 pub mod ruby;
 pub mod rust_lang;
+pub mod scala;
 pub mod swift;
 pub mod typescript;
 
@@ -46,6 +47,7 @@ pub fn get_treesitter_parser(file_type: FileType) -> Option<&'static dyn Languag
         FileType::Python => Some(&python::PYTHON_PARSER),
         FileType::Ruby => Some(&ruby::RUBY_PARSER),
         FileType::Rust => Some(&rust_lang::RUST_PARSER),
+        FileType::Scala => Some(&scala::SCALA_PARSER),
         FileType::Swift => Some(&swift::SWIFT_PARSER),
         FileType::TypeScript => Some(&typescript::TYPESCRIPT_PARSER),
         _ => None,

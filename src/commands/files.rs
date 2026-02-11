@@ -477,7 +477,7 @@ fn get_merge_base(root: &Path, vcs: &str, base: &str) -> Result<String> {
 
 /// Detect default git remote branch (origin/main or origin/master)
 pub fn detect_git_default_branch(root: &Path) -> &'static str {
-    // Try symbolic-ref to get remote HEAD
+    // Try symbolic-ref to get remote HEAD (e.g. "refs/remotes/origin/main")
     if let Ok(output) = std::process::Command::new("git")
         .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
         .current_dir(root)
@@ -485,26 +485,34 @@ pub fn detect_git_default_branch(root: &Path) -> &'static str {
     {
         if output.status.success() {
             let refname = String::from_utf8_lossy(&output.stdout);
-            if refname.contains("master") {
-                return "origin/master";
+            let refname = refname.trim();
+            // Extract branch name after "refs/remotes/origin/"
+            if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+                return match branch {
+                    "main" => "origin/main",
+                    "master" => "origin/master",
+                    "trunk" => "origin/trunk",
+                    "develop" => "origin/develop",
+                    _ => "origin/main",
+                };
             }
-            return "origin/main";
         }
     }
 
-    // Fallback: check if origin/main exists
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["rev-parse", "--verify", "origin/main"])
-        .current_dir(root)
-        .output()
-    {
-        if output.status.success() {
-            return "origin/main";
+    // Fallback: check common branch names
+    for branch in &["origin/main", "origin/master", "origin/trunk"] {
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", branch])
+            .current_dir(root)
+            .output()
+        {
+            if output.status.success() {
+                return branch;
+            }
         }
     }
 
-    // Last resort: try origin/master
-    "origin/master"
+    "origin/main"
 }
 
 /// Normalize base branch for the given VCS

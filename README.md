@@ -1,4 +1,4 @@
-# ast-index v3.12.0
+# ast-index v3.13.0
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -10,7 +10,7 @@ Fast code search CLI for 15 programming languages. Native Rust implementation.
 | iOS | Swift, Objective-C | `.swift`, `.m`, `.h` |
 | Web/Frontend | TypeScript, JavaScript | `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.vue`, `.svelte` |
 | Systems | Rust | `.rs` |
-| Backend | C#, Python, Go, C++ | `.cs`, `.py`, `.go`, `.cpp`, `.cc`, `.c`, `.hpp` |
+| Backend | C#, Python, Go, C++, Scala | `.cs`, `.py`, `.go`, `.cpp`, `.cc`, `.c`, `.hpp`, `.scala`, `.sc` |
 | Scripting | Ruby, Perl | `.rb`, `.pm`, `.pl`, `.t` |
 | Mobile | Dart/Flutter | `.dart` |
 | Schema | Protocol Buffers, WSDL/XSD | `.proto`, `.wsdl`, `.xsd` |
@@ -320,6 +320,12 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.13.0
+- **Scala language support** — tree-sitter parser for class, case class, object, trait, enum (Scala 3), def, val/var, type alias, given
+- **Bazel project detection** — `WORKSPACE`, `WORKSPACE.bazel`, `MODULE.bazel` as project root markers
+- **4x faster rebuild on non-Android/iOS projects** — skip XML layouts, storyboards, iOS assets, CocoaPods phases when no platform markers present (309s → 83s on 83k files)
+- **Git default branch detection** — correctly parse `origin/trunk`, `origin/develop` from symbolic-ref, not just main/master
 
 ### 3.12.0
 - **Tree-sitter AST parsing for 12 languages** — replaced regex-based parsers with tree-sitter for Kotlin, Java, Swift, ObjC, Python, Go, Rust, Ruby, C#, C++, Dart, Proto, and TypeScript. Parsing is now based on real ASTs instead of regex heuristics — more accurate symbol extraction, correct handling of nested constructs, and fewer false positives

@@ -734,6 +734,13 @@ fn find_project_root() -> Result<PathBuf> {
                 }
             }
         }
+        // Bazel markers
+        if ancestor.join("WORKSPACE").exists()
+            || ancestor.join("WORKSPACE.bazel").exists()
+            || ancestor.join("MODULE.bazel").exists()
+        {
+            return Ok(ancestor.to_path_buf());
+        }
     }
     Ok(cwd)
 }
