@@ -1,4 +1,4 @@
-# ast-index v3.13.4
+# ast-index v3.14.0
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -320,6 +320,11 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.14.0
+- **`map` command** — compact project overview: top directories by size with symbol kind counts; `--module` for detailed drill-down with classes and inheritance
+- **`conventions` command** — auto-detect architecture patterns, frameworks, and naming conventions from indexed codebase
+- **`refs` command** documented in skill
 
 ### 3.13.4
 - **Android indexing performance** — eliminate 4 redundant filesystem walks during `rebuild`; XML layout files, resource files collected in the main walk, code file usages queried from DB

@@ -1,6 +1,6 @@
 ---
 name: ast-index
-description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", "find Perl subs", "Perl exports", "find Python class", "Go struct", "Go interface", "find React component", "find TypeScript interface", "find Rust struct", "find Ruby class", "find C# controller", "find Dart class", "find Flutter widget", "find mixin", "find Scala trait", "find case class", "find object", or needs fast code search in Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, Scala, Perl, Python, Go, C++, or Protocol Buffers projects. Also triggered by mentions of "ast-index" CLI tool.
+description: This skill should be used when the user asks to "find a class", "search for symbol", "find usages", "find implementations", "search codebase", "find file", "class hierarchy", "find callers", "module dependencies", "unused dependencies", "project map", "project conventions", "project structure", "what frameworks", "what architecture", "find Perl subs", "Perl exports", "find Python class", "Go struct", "Go interface", "find React component", "find TypeScript interface", "find Rust struct", "find Ruby class", "find C# controller", "find Dart class", "find Flutter widget", "find mixin", "find Scala trait", "find case class", "find object", or needs fast code search in Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, Scala, Perl, Python, Go, C++, or Protocol Buffers projects. Also triggered by mentions of "ast-index" CLI tool.
 ---
 
 # ast-index - Code Search for Multi-Platform Projects
@@ -75,6 +75,8 @@ ast-index implementations "Parent" --format json
 ast-index refs "Symbol" --format json
 ast-index stats --format json
 ast-index unused-symbols --format json
+ast-index map --format json
+ast-index conventions --format json
 ```
 
 ## Core Commands
@@ -125,6 +127,15 @@ ast-index usages "onClick"           # Find all click handler usages
 ```
 
 Performance: ~8ms for indexed symbols.
+
+### Cross-References
+
+**`refs`** - Show cross-references for a symbol: definitions, imports, and usages in one view.
+
+```bash
+ast-index refs "PaymentRepository"   # Definitions + imports + usages
+ast-index refs "BaseFragment" --limit 10  # Limit results per section
+```
 
 ### Implementation Search
 
@@ -215,6 +226,50 @@ ast-index api "path/to/module"           # By path
 ast-index api "module.name"              # By module name (dots → slashes)
 ```
 
+## Project Insights
+
+### Project Map
+
+**`map`** - Show compact project overview: top directories by size with symbol kind counts. Use `--module` to drill down into a specific area with full class/inheritance details.
+
+```bash
+ast-index map                                # Summary: top 50 dirs with kind counts (~54 lines)
+ast-index map --limit 20                     # Show only top 20 directories
+ast-index map --module features/payments     # Detailed: classes with inheritance for a module
+ast-index map --module src/core --per-dir 10 # More symbols per directory in detailed mode
+ast-index map --format json                  # JSON output
+```
+
+Summary mode output (default, no `--module`):
+```
+Project: Android (Kotlin/Java) | 29144 files | 859 modules | top 50 of 728 dirs
+
+  features/taxi_order/impl/          1626 files | 371 iface, 94 obj, 1834 cls
+  features/masstransit/impl/          862 files | 165 obj, 1261 cls, 280 iface
+```
+
+Detailed mode output (with `--module`):
+```
+features/payments/impl/ (250 files)
+  PaymentInteractor : class > BaseInteractor
+  PaymentRepository : interface
+  PaymentMapper : class
+```
+
+### Project Conventions
+
+**`conventions`** - Auto-detect architecture patterns, frameworks, and naming conventions from the indexed codebase. Runs read-only SQL queries — no file scanning needed.
+
+```bash
+ast-index conventions                        # Text output (~30 lines)
+ast-index conventions --format json          # JSON output
+```
+
+Detects:
+- **Architecture**: Clean Architecture, Feature-sliced, BLoC, MVC, MVVM, MVP, Redux, Composition API, Hooks
+- **Frameworks**: DI (Hilt, Dagger, Koin), Async (Coroutines, RxJava, Combine), Network (Retrofit, OkHttp), DB (Room, Realm), UI (Compose, SwiftUI, React, Flutter), Testing (JUnit, Kotest, XCTest, pytest, Jest)
+- **Naming patterns**: ViewModel, Repository, UseCase, Service, Controller, Fragment, etc. (with counts)
+
 ## Index Management
 
 ```bash
@@ -259,7 +314,9 @@ ast-index install-claude-plugin      # Install Claude Code plugin to ~/.claude/p
 | usages | ~8ms | Indexed reference search |
 | imports | ~0.3ms | File-based lookup |
 | callers | ~1s | Grep-based search |
-| rebuild | ~25s–2m | Full project indexing (depends on size) |
+| map | ~1-3s | SQL aggregation (scales with project size) |
+| conventions | ~1-4s | SQL aggregation + import matching |
+| rebuild | ~25s–5m | Full project indexing (depends on size) |
 
 ## Platform-Specific Commands
 
@@ -368,12 +425,14 @@ Consult: `references/module-commands.md`
 ## Workflow Recommendations
 
 1. Run `ast-index rebuild` once in project root to build the index
-2. Use `ast-index search` for quick universal search when exploring
-3. Use `ast-index class` for precise class/interface lookup
-4. Use `ast-index usages` to find all references before refactoring
-5. Use `ast-index implementations` to understand inheritance
-6. Use `ast-index changed --base main` before code review
-7. Run `ast-index update` periodically to keep index fresh
+2. **Start a session** with `ast-index conventions` + `ast-index map` to understand project structure (~80 lines, ~500 tokens)
+3. Use `ast-index map --module <path>` to drill down into specific areas
+4. Use `ast-index search` for quick universal search when exploring
+5. Use `ast-index class` for precise class/interface lookup
+6. Use `ast-index usages` to find all references before refactoring
+7. Use `ast-index implementations` to understand inheritance
+8. Use `ast-index changed --base main` before code review
+9. Run `ast-index update` periodically to keep index fresh
 
 ## Additional Resources
 

@@ -20,6 +20,7 @@ pub mod ios;
 pub mod perl;
 pub mod watch;
 pub mod analysis;
+pub mod project_info;
 
 use std::collections::HashSet;
 use std::path::Path;

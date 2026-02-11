@@ -82,6 +82,10 @@ Perl:
   perl-tests             Find test assertions
   perl-imports           Find use/require statements
 
+Project Insights:
+  map                    Show compact project map (key types per directory)
+  conventions            Detect project conventions (architecture, frameworks, naming)
+
 Project Configuration:
   add-root               Add additional source root
   remove-root            Remove source root
@@ -525,6 +529,21 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: usize,
     },
+    // === Project Insights ===
+    /// Show compact project map (key types per directory)
+    Map {
+        /// Filter by module (enables detailed mode with symbols)
+        #[arg(short, long)]
+        module: Option<String>,
+        /// Max symbols per directory group (detailed mode)
+        #[arg(long, default_value = "5")]
+        per_dir: usize,
+        /// Max directory groups to show
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Detect project conventions (architecture, frameworks, naming)
+    Conventions,
     /// Find potentially unused symbols
     UnusedSymbols {
         /// Filter by module path
@@ -654,6 +673,9 @@ fn main() -> Result<()> {
         Commands::PerlPod { query, limit } => commands::perl::cmd_perl_pod(&root, query.as_deref(), limit),
         Commands::PerlTests { query, limit } => commands::perl::cmd_perl_tests(&root, query.as_deref(), limit),
         Commands::PerlImports { query, limit } => commands::perl::cmd_perl_imports(&root, query.as_deref(), limit),
+        // Project insights
+        Commands::Map { module, per_dir, limit } => commands::project_info::cmd_map(&root, module.as_deref(), per_dir, limit, format),
+        Commands::Conventions => commands::project_info::cmd_conventions(&root, format),
         Commands::UnusedSymbols { module, export_only, limit } => {
             commands::analysis::cmd_unused_symbols(&root, module.as_deref(), export_only, limit, format)
         }
