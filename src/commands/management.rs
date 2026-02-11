@@ -115,7 +115,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             let mut trans_count = 0;
             if index_deps && is_android {
                 println!("{}", "Indexing module dependencies...".cyan());
-                dep_count = indexer::index_module_dependencies(&mut conn, root, true)?;
+                dep_count = indexer::index_module_dependencies(&mut conn, root, &walk.module_files, true)?;
                 trans_count = indexer::build_transitive_deps(&mut conn, true)?;
             }
 
@@ -125,10 +125,10 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             let mut res_usage_count = 0;
             if is_android {
                 println!("{}", "Indexing XML layouts...".cyan());
-                xml_count = indexer::index_xml_usages(&mut conn, root, true)?;
+                xml_count = indexer::index_xml_usages(&mut conn, root, &walk.xml_layout_files, true)?;
 
                 println!("{}", "Indexing resources...".cyan());
-                let (rc, ruc) = indexer::index_resources(&mut conn, root, true)?;
+                let (rc, ruc) = indexer::index_resources(&mut conn, root, &walk.res_files, true)?;
                 res_count = rc;
                 res_usage_count = ruc;
             }
@@ -189,7 +189,8 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
 
             if index_deps {
                 println!("{}", "Indexing module dependencies...".cyan());
-                let dep_count = indexer::index_module_dependencies(&mut conn, root, true)?;
+                let gradle_files = indexer::collect_gradle_files_from_db(&conn, root)?;
+                let dep_count = indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
                 println!(
                     "{}",
                     format!("Indexed {} modules, {} dependencies", module_count, dep_count).green()
@@ -200,7 +201,8 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
         }
         "deps" => {
             println!("{}", "Indexing module dependencies...".cyan());
-            let dep_count = indexer::index_module_dependencies(&mut conn, root, true)?;
+            let gradle_files = indexer::collect_gradle_files_from_db(&conn, root)?;
+            let dep_count = indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
             println!("{}", format!("Indexed {} dependencies", dep_count).green());
         }
         _ => {

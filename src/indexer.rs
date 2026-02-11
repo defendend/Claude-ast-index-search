@@ -315,8 +315,12 @@ fn is_module_file(name: &str) -> bool {
 pub struct WalkResult {
     pub file_count: usize,
     pub module_files: Vec<PathBuf>,
+    // iOS
     pub storyboard_files: Vec<PathBuf>,  // .storyboard, .xib
     pub xcassets_dirs: Vec<PathBuf>,      // .xcassets directories
+    // Android
+    pub xml_layout_files: Vec<PathBuf>,  // .xml in /res/(layout|menu|navigation)
+    pub res_files: Vec<PathBuf>,         // all files under /res/
 }
 
 pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ignore: bool) -> Result<WalkResult> {
@@ -348,6 +352,8 @@ pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ig
     let mut module_files: Vec<PathBuf> = Vec::new();
     let mut storyboard_files: Vec<PathBuf> = Vec::new();
     let mut xcassets_dirs: Vec<PathBuf> = Vec::new();
+    let mut xml_layout_files: Vec<PathBuf> = Vec::new();
+    let mut res_files: Vec<PathBuf> = Vec::new();
 
     for entry in walker.filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -369,6 +375,15 @@ pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ig
             // Collect .xcassets directories (iOS)
             if ext == "xcassets" && path.is_dir() {
                 xcassets_dirs.push(path.to_path_buf());
+            }
+            // Collect Android resource files
+            let path_str = path.to_string_lossy();
+            if path_str.contains("/res/") {
+                res_files.push(path.to_path_buf());
+                // XML layout/menu/navigation files
+                if ext == "xml" && (path_str.contains("/layout") || path_str.contains("/menu") || path_str.contains("/navigation")) {
+                    xml_layout_files.push(path.to_path_buf());
+                }
             }
         }
     }
@@ -428,6 +443,8 @@ pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ig
         module_files,
         storyboard_files,
         xcassets_dirs,
+        xml_layout_files,
+        res_files,
     })
 }
 
@@ -741,9 +758,27 @@ pub fn index_modules_from_files(conn: &Connection, root: &Path, files: &[PathBuf
     Ok(count)
 }
 
+/// Collect build.gradle files from module paths in DB (for standalone rebuild modules/deps)
+pub fn collect_gradle_files_from_db(conn: &Connection, root: &Path) -> Result<Vec<PathBuf>> {
+    let mut stmt = conn.prepare("SELECT path FROM modules")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut files = Vec::new();
+    for row in rows {
+        let module_path = row?;
+        let dir = root.join(&module_path);
+        for name in &["build.gradle.kts", "build.gradle"] {
+            let p = dir.join(name);
+            if p.exists() {
+                files.push(p);
+                break;
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// Parse module dependencies from build.gradle files
-pub fn index_module_dependencies(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
-    use ignore::WalkBuilder;
+pub fn index_module_dependencies(conn: &mut Connection, root: &Path, gradle_files: &[PathBuf], progress: bool) -> Result<usize> {
 
     // Regex patterns for dependency declarations
     // Gradle projects DSL style: modules { api(projects.features.payments.api) }
@@ -785,54 +820,40 @@ pub fn index_module_dependencies(conn: &mut Connection, root: &Path, progress: b
             "INSERT OR IGNORE INTO module_deps (module_id, dep_module_id, dep_kind) VALUES (?1, ?2, ?3)"
         )?;
 
-        let walker = WalkBuilder::new(root)
-            .hidden(true)
-            .git_ignore(has_git_repo(root))
-            .filter_entry(|entry| !is_excluded_dir(entry))
-            .build();
+        for path in gradle_files {
+            if let Some(parent) = path.parent() {
+                let module_path = parent
+                    .strip_prefix(root)
+                    .unwrap_or(parent)
+                    .to_string_lossy()
+                    .to_string();
+                let module_name = module_path.replace('/', ".");
 
-        for entry in walker {
-            let entry = entry?;
-            let path = entry.path();
+                if let Some(&module_id) = module_ids.get(&module_name) {
+                    // Read build.gradle content
+                    if let Ok(content) = fs::read_to_string(path) {
+                        // Parse projects DSL style dependencies
+                        for caps in projects_dep_re.captures_iter(&content) {
+                            let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                            let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
 
-            if let Some(name) = path.file_name() {
-                let name_str = name.to_string_lossy();
-                if name_str == "build.gradle" || name_str == "build.gradle.kts" {
-                    if let Some(parent) = path.parent() {
-                        let module_path = parent
-                            .strip_prefix(root)
-                            .unwrap_or(parent)
-                            .to_string_lossy()
-                            .to_string();
-                        let module_name = module_path.replace('/', ".");
+                            if let Some(&dep_id) = module_ids.get(dep_name) {
+                                dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
+                                dep_count += 1;
+                            }
+                        }
 
-                        if let Some(&module_id) = module_ids.get(&module_name) {
-                            // Read build.gradle content
-                            if let Ok(content) = fs::read_to_string(path) {
-                                // Parse projects DSL style dependencies
-                                for caps in projects_dep_re.captures_iter(&content) {
-                                    let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
-                                    let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                        // Parse standard Gradle style dependencies
+                        for caps in gradle_project_re.captures_iter(&content) {
+                            let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                            let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
 
-                                    if let Some(&dep_id) = module_ids.get(dep_name) {
-                                        dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
-                                        dep_count += 1;
-                                    }
-                                }
+                            // Convert :features:payments:api to features.payments.api
+                            let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
 
-                                // Parse standard Gradle style dependencies
-                                for caps in gradle_project_re.captures_iter(&content) {
-                                    let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
-                                    let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-                                    // Convert :features:payments:api to features.payments.api
-                                    let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
-
-                                    if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                        dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
-                                        dep_count += 1;
-                                    }
-                                }
+                            if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
+                                dep_count += 1;
                             }
                         }
                     }
@@ -903,9 +924,7 @@ pub struct XmlUsage {
 }
 
 /// Index XML layouts for class usages
-pub fn index_xml_usages(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
-    use ignore::WalkBuilder;
-
+pub fn index_xml_usages(conn: &mut Connection, root: &Path, xml_layout_files: &[PathBuf], progress: bool) -> Result<usize> {
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     // Regex for class names in XML
@@ -922,27 +941,8 @@ pub fn index_xml_usages(conn: &mut Connection, root: &Path, progress: bool) -> R
 
     let id_re = &*ID_RE;
 
-    let walker = WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(has_git_repo(root))
-        .filter_entry(|entry| !is_excluded_dir(entry))
-        .build();
-
-    let xml_files: Vec<PathBuf> = walker
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let path = e.path();
-            path.extension().map(|ext| ext == "xml").unwrap_or(false)
-                && path.to_string_lossy().contains("/res/")
-                && (path.to_string_lossy().contains("/layout")
-                    || path.to_string_lossy().contains("/menu")
-                    || path.to_string_lossy().contains("/navigation"))
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
-
     if progress {
-        eprintln!("Found {} XML layout files to index...", xml_files.len());
+        eprintln!("Found {} XML layout files to index...", xml_layout_files.len());
     }
 
     let tx = conn.transaction()?;
@@ -956,7 +956,7 @@ pub fn index_xml_usages(conn: &mut Connection, root: &Path, progress: bool) -> R
             "INSERT INTO xml_usages (module_id, file_path, line, class_name, usage_type, element_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         )?;
 
-        for xml_path in &xml_files {
+        for xml_path in xml_layout_files {
             let rel_path = xml_path
                 .strip_prefix(root)
                 .unwrap_or(xml_path)
@@ -1060,26 +1060,8 @@ impl ResourceType {
 }
 
 /// Index Android resources (drawable, string, color, etc.)
-pub fn index_resources(conn: &mut Connection, root: &Path, progress: bool) -> Result<(usize, usize)> {
-    use ignore::WalkBuilder;
-
+pub fn index_resources(conn: &mut Connection, root: &Path, res_files: &[PathBuf], progress: bool) -> Result<(usize, usize)> {
     let module_lookup = ModuleLookup::from_db(conn)?;
-
-    let walker = WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(has_git_repo(root))
-        .filter_entry(|entry| !is_excluded_dir(entry))
-        .build();
-
-    // Collect resource files
-    let res_files: Vec<PathBuf> = walker
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let path = e.path();
-            path.to_string_lossy().contains("/res/")
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
 
     if progress {
         eprintln!("Found {} resource files to analyze...", res_files.len());
@@ -1122,7 +1104,7 @@ pub fn index_resources(conn: &mut Connection, root: &Path, progress: bool) -> Re
         )?;
 
         // First pass: index resource definitions
-        for res_path in &res_files {
+        for res_path in res_files {
             let rel_path = res_path
                 .strip_prefix(root)
                 .unwrap_or(res_path)
@@ -1200,27 +1182,15 @@ pub fn index_resources(conn: &mut Connection, root: &Path, progress: bool) -> Re
             "INSERT INTO resource_usages (resource_id, usage_file, usage_line, usage_type) VALUES (?1, ?2, ?3, ?4)"
         )?;
 
-        let walker = WalkBuilder::new(root)
-            .hidden(true)
-            .git_ignore(has_git_repo(root))
-            .filter_entry(|entry| !is_excluded_dir(entry))
-            .build();
+        // Query code files from DB instead of walking filesystem again
+        let code_rel_paths: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT path FROM files WHERE path LIKE '%.kt' OR path LIKE '%.java' OR path LIKE '%.xml'")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
 
-        let code_files: Vec<PathBuf> = walker
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let ext = e.path().extension().and_then(|s| s.to_str());
-                matches!(ext, Some("kt") | Some("java") | Some("xml"))
-            })
-            .map(|e| e.path().to_path_buf())
-            .collect();
-
-        for file_path in &code_files {
-            let rel_path = file_path
-                .strip_prefix(root)
-                .unwrap_or(file_path)
-                .to_string_lossy()
-                .to_string();
+        for rel_path in &code_rel_paths {
+            let file_path = root.join(rel_path);
 
             if let Ok(content) = fs::read_to_string(file_path) {
                 let is_xml = rel_path.ends_with(".xml");
