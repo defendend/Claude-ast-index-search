@@ -1,4 +1,4 @@
-# ast-index v3.13.0
+# ast-index v3.13.1
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -320,6 +320,9 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.13.1
+- **Fix plugin skill discovery** — added `"skills"` field to `plugin.json`, fixing "Unknown skill: ast-index" error when invoking `/ast-index`
 
 ### 3.13.0
 - **Scala language support** — tree-sitter parser for class, case class, object, trait, enum (Scala 3), def, val/var, type alias, given
