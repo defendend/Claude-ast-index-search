@@ -1,4 +1,4 @@
-# ast-index v3.13.1
+# ast-index v3.13.2
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -320,6 +320,9 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.13.2
+- **Fix `rebuild` losing extra roots** — `add-root` paths are now preserved across `rebuild` (previously deleted with DB)
 
 ### 3.13.1
 - **Fix plugin skill discovery** — added `"skills"` field to `plugin.json`, fixing "Unknown skill: ast-index" error when invoking `/ast-index`

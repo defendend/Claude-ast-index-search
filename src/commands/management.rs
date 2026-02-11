@@ -38,6 +38,14 @@ pub fn cmd_init(root: &Path) -> Result<()> {
 pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool) -> Result<()> {
     let start = Instant::now();
 
+    // Save extra roots before deleting DB
+    let saved_extra_roots = if db::db_exists(root) {
+        let old_conn = db::open_db(root)?;
+        db::get_extra_roots(&old_conn).unwrap_or_default()
+    } else {
+        vec![]
+    };
+
     // Delete DB file entirely to avoid WAL hangs
     if let Err(e) = db::delete_db(root) {
         eprintln!("{}", format!("Warning: could not delete old index: {}", e).yellow());
@@ -53,6 +61,15 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
 
     let mut conn = db::open_db(root)?;
     db::init_db(&conn)?;
+
+    // Restore extra roots
+    if !saved_extra_roots.is_empty() {
+        let roots_json = serde_json::to_string(&saved_extra_roots)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('extra_roots', ?1)",
+            [&roots_json],
+        )?;
+    }
 
     // Store no_ignore setting in database metadata
     if no_ignore {
