@@ -113,3 +113,29 @@
 (decorator
   (call_expression
     function: (identifier) @decorator_call_id))
+
+; === Class methods ===
+
+; method() {}, constructor() {}, get x() {}, set x(v) {}, static m() {}, async m() {}
+(method_definition
+  name: (property_identifier) @method_name) @method_node
+
+; #privateMethod() {}
+(method_definition
+  name: (private_property_identifier) @private_method_name) @private_method_node
+
+; === Class properties/fields ===
+
+; prop: Type = value
+(public_field_definition
+  name: (property_identifier) @field_name) @field_node
+
+; #privateProp: Type
+(public_field_definition
+  name: (private_property_identifier) @private_field_name) @private_field_node
+
+; === Abstract methods ===
+
+; abstract method(): void
+(abstract_method_signature
+  name: (property_identifier) @abstract_method_name) @abstract_method_node

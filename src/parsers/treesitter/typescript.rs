@@ -211,6 +211,22 @@ impl LanguageParser for TypeScriptParser {
         let idx_decorator_id = idx("decorator_id");
         let idx_decorator_call_id = idx("decorator_call_id");
 
+        // Method captures
+        let idx_method_name = idx("method_name");
+        let idx_method_node = idx("method_node");
+        let idx_private_method_name = idx("private_method_name");
+        let idx_private_method_node = idx("private_method_node");
+
+        // Field captures
+        let idx_field_name = idx("field_name");
+        let idx_field_node = idx("field_node");
+        let idx_private_field_name = idx("private_field_name");
+        let idx_private_field_node = idx("private_field_node");
+
+        // Abstract method captures
+        let idx_abstract_method_name = idx("abstract_method_name");
+        let idx_abstract_method_node = idx("abstract_method_node");
+
         // Track emitted symbols to avoid duplicates
         let mut emitted_lines: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
 
@@ -594,10 +610,72 @@ impl LanguageParser for TypeScriptParser {
                 }
                 continue;
             }
+
+            // === Class methods ===
+
+            if emit_class_member(content, m, idx_method_name, idx_method_node, SymbolKind::Function, &mut symbols, &mut emitted_lines) {
+                continue;
+            }
+            if emit_class_member(content, m, idx_private_method_name, idx_private_method_node, SymbolKind::Function, &mut symbols, &mut emitted_lines) {
+                continue;
+            }
+
+            // === Class fields/properties ===
+
+            if emit_class_member(content, m, idx_field_name, idx_field_node, SymbolKind::Property, &mut symbols, &mut emitted_lines) {
+                continue;
+            }
+            if emit_class_member(content, m, idx_private_field_name, idx_private_field_node, SymbolKind::Property, &mut symbols, &mut emitted_lines) {
+                continue;
+            }
+
+            // === Abstract methods ===
+
+            if emit_class_member(content, m, idx_abstract_method_name, idx_abstract_method_node, SymbolKind::Function, &mut symbols, &mut emitted_lines) {
+                continue;
+            }
         }
 
         Ok(symbols)
     }
+}
+
+/// Check if a node is inside a class_body (class member, not object literal method)
+fn is_inside_class_body(node: &tree_sitter::Node) -> bool {
+    node.parent()
+        .map(|p| p.kind() == "class_body")
+        .unwrap_or(false)
+}
+
+/// Emit a class member symbol (method or field) if it's inside a class body
+fn emit_class_member(
+    content: &str,
+    m: &tree_sitter::QueryMatch,
+    idx_name: Option<u32>,
+    idx_node: Option<u32>,
+    kind: SymbolKind,
+    symbols: &mut Vec<ParsedSymbol>,
+    emitted_lines: &mut std::collections::HashSet<(String, usize)>,
+) -> bool {
+    if let Some(name_cap) = find_capture(m, idx_name) {
+        if let Some(node_cap) = find_capture(m, idx_node) {
+            if is_inside_class_body(&node_cap.node) {
+                let name = node_text(content, &name_cap.node);
+                let line = node_line(&name_cap.node);
+                if emitted_lines.insert((name.to_string(), line)) {
+                    symbols.push(ParsedSymbol {
+                        name: name.to_string(),
+                        kind,
+                        line,
+                        signature: line_text(content, line).trim().to_string(),
+                        parents: vec![],
+                    });
+                }
+            }
+        }
+        return true;
+    }
+    false
 }
 
 /// Classify a function/arrow-function name into the appropriate SymbolKind:
@@ -715,5 +793,92 @@ mod tests {
         assert!(!symbols.iter().any(|s| s.name == "FakeClass"));
         assert!(symbols.iter().any(|s| s.name == "realFunc"));
         assert!(!symbols.iter().any(|s| s.name == "fakeFunc"));
+    }
+
+    #[test]
+    fn test_parse_class_methods() {
+        let content = r#"
+export class UserService {
+    constructor(private http: HttpClient) {}
+    getUser(id: string): User {
+        return this.http.get(id);
+    }
+    private validate(data: any): boolean {
+        return true;
+    }
+}
+"#;
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "UserService" && s.kind == SymbolKind::Class));
+        assert!(symbols.iter().any(|s| s.name == "constructor" && s.kind == SymbolKind::Function));
+        assert!(symbols.iter().any(|s| s.name == "getUser" && s.kind == SymbolKind::Function));
+        assert!(symbols.iter().any(|s| s.name == "validate" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_parse_getters_setters() {
+        let content = r#"
+class Config {
+    get value(): string { return ''; }
+    set value(v: string) {}
+    static create(): Config { return new Config(); }
+}
+"#;
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "value" && s.kind == SymbolKind::Function));
+        assert!(symbols.iter().any(|s| s.name == "create" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_parse_class_fields() {
+        let content = r#"
+class User {
+    name: string;
+    readonly age: number = 0;
+    static count: number = 0;
+}
+"#;
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "name" && s.kind == SymbolKind::Property));
+        assert!(symbols.iter().any(|s| s.name == "age" && s.kind == SymbolKind::Property));
+        assert!(symbols.iter().any(|s| s.name == "count" && s.kind == SymbolKind::Property));
+    }
+
+    #[test]
+    fn test_parse_abstract_methods() {
+        let content = r#"
+abstract class Base {
+    abstract process(data: string): void;
+    abstract get name(): string;
+}
+"#;
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "process" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_object_literal_methods_not_indexed() {
+        let content = r#"
+const obj = {
+    method() { return 1; },
+    get prop() { return 2; },
+};
+"#;
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        assert!(!symbols.iter().any(|s| s.name == "method" && s.kind == SymbolKind::Function));
+        assert!(!symbols.iter().any(|s| s.name == "prop" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_parse_private_class_members() {
+        let content = r#"
+class Foo {
+    #secret: string = '';
+    #process(): void {}
+}
+"#;
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "#secret" && s.kind == SymbolKind::Property));
+        assert!(symbols.iter().any(|s| s.name == "#process" && s.kind == SymbolKind::Function));
     }
 }
