@@ -623,7 +623,7 @@ claude plugin marketplace add defendend/Claude-ast-index-search
 claude plugin install ast-index
 ```
 
-Or if ast-index binary is already installed (via brew or ya tool):
+Or if ast-index binary is already installed (via brew):
 ```bash
 ast-index install-claude-plugin
 ```
