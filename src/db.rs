@@ -829,61 +829,8 @@ pub fn search_symbols_fuzzy(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    // 1. Exact match
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT s.name, s.kind, s.line, s.signature, f.path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE s.name = ?1
-        LIMIT ?2
-        "#,
-    )?;
-    let exact: Vec<SearchResult> = stmt
-        .query_map(params![query, limit as i64], |row| {
-            Ok(SearchResult {
-                name: row.get(0)?,
-                kind: row.get(1)?,
-                line: row.get(2)?,
-                signature: row.get(3)?,
-                path: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if !exact.is_empty() {
-        return Ok(exact);
-    }
-
-    // 2. Prefix match (case-insensitive)
-    let prefix_pattern = format!("{}%", query);
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT s.name, s.kind, s.line, s.signature, f.path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE s.name LIKE ?1
-        ORDER BY length(s.name)
-        LIMIT ?2
-        "#,
-    )?;
-    let prefix: Vec<SearchResult> = stmt
-        .query_map(params![prefix_pattern, limit as i64], |row| {
-            Ok(SearchResult {
-                name: row.get(0)?,
-                kind: row.get(1)?,
-                line: row.get(2)?,
-                signature: row.get(3)?,
-                path: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if !prefix.is_empty() {
-        return Ok(prefix);
-    }
-
-    // 3. Contains match (case-insensitive)
+    // Single query: contains match with ranking by relevance
+    // exact match (name = query) first, then prefix, then contains — sorted by length
     let contains_pattern = format!("%{}%", query);
     let mut stmt = conn.prepare(
         r#"
@@ -891,12 +838,17 @@ pub fn search_symbols_fuzzy(
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.name LIKE ?1
-        ORDER BY length(s.name)
-        LIMIT ?2
+        ORDER BY
+            CASE WHEN s.name = ?2 THEN 0
+                 WHEN s.name LIKE ?3 THEN 1
+                 ELSE 2 END,
+            length(s.name)
+        LIMIT ?4
         "#,
     )?;
-    let contains: Vec<SearchResult> = stmt
-        .query_map(params![contains_pattern, limit as i64], |row| {
+    let prefix_pattern = format!("{}%", query);
+    let results: Vec<SearchResult> = stmt
+        .query_map(params![contains_pattern, query, prefix_pattern, limit as i64], |row| {
             Ok(SearchResult {
                 name: row.get(0)?,
                 kind: row.get(1)?,
@@ -907,7 +859,7 @@ pub fn search_symbols_fuzzy(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(contains)
+    Ok(results)
 }
 
 /// Scope filter for narrowing search results by file path or module
