@@ -93,6 +93,49 @@ pub fn has_ios_markers(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Find immediate subdirectories that are project roots.
+/// Returns list of (path, project_type) for dirs with recognized project markers.
+/// If 2+ subdirs have markers, treats root as monorepo and includes ALL subdirs.
+pub fn find_sub_projects(root: &Path) -> Vec<(PathBuf, ProjectType)> {
+    let mut marked = Vec::new();
+    let mut all_dirs = Vec::new();
+    let entries = match fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return marked,
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // Skip hidden and excluded dirs
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('.') || EXCLUDED_DIRS.contains(&name) {
+                continue;
+            }
+        }
+        let pt = detect_project_type(&path);
+        let has_marker = pt != ProjectType::Unknown || has_build_marker(&path);
+        if has_marker {
+            marked.push((path.clone(), pt));
+        }
+        all_dirs.push((path, pt));
+    }
+    // If 2+ subdirs have markers → monorepo, index ALL subdirs
+    let mut result = if marked.len() >= 2 { all_dirs } else { marked };
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// Check if directory has any build system marker (for monorepo sub-project detection)
+fn has_build_marker(path: &Path) -> bool {
+    path.join("ya.make").exists()
+        || path.join("Makefile").exists()
+        || path.join("BUILD").exists()
+        || path.join("BUILD.bazel").exists()
+        || path.join("CMakeLists.txt").exists()
+}
+
 /// Detect project type by looking for marker files
 pub fn detect_project_type(root: &Path) -> ProjectType {
     let has_gradle = root.join("settings.gradle.kts").exists()
@@ -293,14 +336,15 @@ pub fn has_git_repo(root: &Path) -> bool {
     root.join(".git").exists()
 }
 
-/// Check if root is inside an Arc repository (Yandex Arcadia monorepo).
+/// Find Arc repository root (Yandex Arcadia monorepo).
 /// Searches up from root looking for .arc/HEAD, stops at $HOME.
-pub fn has_arc_repo(root: &Path) -> bool {
+/// Returns the arc repo root path if found.
+pub fn find_arc_root(root: &Path) -> Option<PathBuf> {
     let home = dirs::home_dir();
     let mut current = Some(root.to_path_buf());
     while let Some(dir) = current {
         if dir.join(".arc").join("HEAD").exists() {
-            return true;
+            return Some(dir);
         }
         // Stop at $HOME to avoid confusing ~/.arc (client storage) with repo marker
         if home.as_ref().map(|h| h == &dir).unwrap_or(false) {
@@ -308,7 +352,50 @@ pub fn has_arc_repo(root: &Path) -> bool {
         }
         current = dir.parent().map(|p| p.to_path_buf());
     }
-    false
+    None
+}
+
+/// Check if root is inside an Arc repository
+pub fn has_arc_repo(root: &Path) -> bool {
+    find_arc_root(root).is_some()
+}
+
+/// Quickly count source files in a directory, stopping at `limit`.
+/// Returns the count (capped at `limit`) — avoids full traversal for large dirs.
+pub fn quick_file_count(root: &Path, no_ignore: bool, limit: usize) -> usize {
+    use ignore::WalkBuilder;
+
+    let use_git = has_git_repo(root) && !no_ignore;
+    let arc_root = if no_ignore { None } else { find_arc_root(root) };
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .follow_links(false)
+        .max_depth(Some(50))
+        .git_ignore(use_git)
+        .git_exclude(use_git)
+        .filter_entry(|entry| !is_excluded_dir(entry));
+    if let Some(ref arc) = arc_root {
+        builder.add_custom_ignore_filename(".gitignore");
+        builder.add_custom_ignore_filename(".arcignore");
+        let root_gitignore = arc.join(".gitignore");
+        if root_gitignore.exists() {
+            builder.add_ignore(root_gitignore);
+        }
+    }
+
+    let mut count = 0;
+    for entry in builder.build().filter_map(|e| e.ok()) {
+        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+            if parsers::is_supported_extension(ext) {
+                count += 1;
+                if count >= limit {
+                    return count;
+                }
+            }
+        }
+    }
+    count
 }
 
 /// Check if a path component matches an excluded directory
@@ -342,6 +429,13 @@ pub struct WalkResult {
 }
 
 pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ignore: bool) -> Result<WalkResult> {
+    index_directory_scoped(conn, root, root, progress, no_ignore)
+}
+
+/// Index a directory, walking `walk_dir` but storing paths relative to `root`.
+/// When walk_dir == root, behaves identically to index_directory.
+/// When walk_dir is a subdirectory of root, only indexes that subdirectory.
+pub fn index_directory_scoped(conn: &mut Connection, root: &Path, walk_dir: &Path, progress: bool, no_ignore: bool) -> Result<WalkResult> {
     use ignore::WalkBuilder;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -350,15 +444,16 @@ pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ig
     const CHUNK_SIZE: usize = 500;
 
     // Detect project type
-    let project_type = detect_project_type(root);
+    let project_type = detect_project_type(walk_dir);
     if progress {
         eprintln!("Detected project type: {}", project_type.as_str());
     }
 
     // Collect all file paths (paths are lightweight, OK to keep in memory)
-    let use_git = has_git_repo(root) && !no_ignore;
-    let is_arc = has_arc_repo(root) && !no_ignore;
-    let mut builder = WalkBuilder::new(root);
+    let use_git = has_git_repo(walk_dir) || has_git_repo(root);
+    let use_git = use_git && !no_ignore;
+    let arc_root = if no_ignore { None } else { find_arc_root(walk_dir).or_else(|| find_arc_root(root)) };
+    let mut builder = WalkBuilder::new(walk_dir);
     builder
         .hidden(true)
         .follow_links(false)     // Never follow symlinks — prevents loops in monorepos
@@ -367,9 +462,14 @@ pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ig
         .git_exclude(use_git)
         .filter_entry(|entry| !is_excluded_dir(entry));
     // Arc repos: respect .gitignore and .arcignore without .git directory
-    if is_arc {
+    if let Some(ref arc) = arc_root {
         builder.add_custom_ignore_filename(".gitignore");
         builder.add_custom_ignore_filename(".arcignore");
+        // Add root .gitignore from arc repo root (may be above walk root)
+        let root_gitignore = arc.join(".gitignore");
+        if root_gitignore.exists() {
+            builder.add_ignore(root_gitignore);
+        }
     }
     let walker = builder.build();
 
@@ -552,15 +652,19 @@ pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress
 
     // 2. Walk filesystem and collect files to update
     let is_git = has_git_repo(root);
-    let is_arc = has_arc_repo(root);
+    let arc_root = find_arc_root(root);
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
         .git_ignore(is_git)
         .filter_entry(|entry| !is_excluded_dir(entry));
-    if is_arc {
+    if let Some(ref arc) = arc_root {
         builder.add_custom_ignore_filename(".gitignore");
         builder.add_custom_ignore_filename(".arcignore");
+        let root_gitignore = arc.join(".gitignore");
+        if root_gitignore.exists() {
+            builder.add_ignore(root_gitignore);
+        }
     }
     let walker = builder.build();
 
@@ -668,15 +772,19 @@ pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
     use ignore::WalkBuilder;
 
     let is_git = has_git_repo(root);
-    let is_arc = has_arc_repo(root);
+    let arc_root = find_arc_root(root);
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
         .git_ignore(is_git)
         .filter_entry(|entry| !is_excluded_dir(entry));
-    if is_arc {
+    if let Some(ref arc) = arc_root {
         builder.add_custom_ignore_filename(".gitignore");
         builder.add_custom_ignore_filename(".arcignore");
+        let root_gitignore = arc.join(".gitignore");
+        if root_gitignore.exists() {
+            builder.add_ignore(root_gitignore);
+        }
     }
     let walker = builder.build();
 

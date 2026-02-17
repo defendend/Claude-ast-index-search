@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 /// Get the database path for the current project
@@ -104,6 +105,26 @@ pub fn migrate_legacy_project(project_root: &Path) {
     }
     // Remove old project dir if empty
     let _ = std::fs::remove_dir(&old_db_dir);
+}
+
+/// Acquire an exclusive lock file for rebuild operations.
+/// Returns the lock file handle — lock is held until the handle is dropped.
+/// If another process holds the lock, returns an error immediately.
+pub fn acquire_rebuild_lock(project_root: &Path) -> Result<File> {
+    use fs2::FileExt;
+
+    let db_path = get_db_path(project_root)?;
+    let lock_path = db_path.with_extension("lock");
+
+    // Ensure parent dir exists
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let lock_file = File::create(&lock_path)?;
+    lock_file.try_lock_exclusive()
+        .map_err(|_| anyhow::anyhow!("Another rebuild is already running for this project. Wait for it to finish or remove {}", lock_path.display()))?;
+    Ok(lock_file)
 }
 
 /// Delete DB file and WAL/SHM files for the project
@@ -320,6 +341,7 @@ pub fn open_db(project_root: &Path) -> Result<Connection> {
     let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "cache_size", "-8000")?; // 8 MB cache to limit memory
+    let _: i64 = conn.query_row("PRAGMA busy_timeout = 5000", [], |row| row.get(0))?; // Wait up to 5s if DB is locked
 
     // Store project root for hash migration
     conn.execute(

@@ -34,9 +34,38 @@ pub fn cmd_init(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// File count threshold for auto-switching to sub-projects mode
+const AUTO_SUB_PROJECTS_THRESHOLD: usize = 65_000;
+
 /// Rebuild the index (full or partial)
-pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool) -> Result<()> {
+pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: bool, sub_projects: bool) -> Result<()> {
+    // Explicit sub-projects mode
+    if sub_projects {
+        return cmd_rebuild_sub_projects(root, index_type, index_deps, no_ignore);
+    }
+
+    // Auto-detect: if sub-projects exist and file count >= threshold, switch automatically
+    if index_type == "all" {
+        let subs = indexer::find_sub_projects(root);
+        if subs.len() >= 2 {
+            let file_count = indexer::quick_file_count(root, no_ignore, AUTO_SUB_PROJECTS_THRESHOLD);
+            if file_count >= AUTO_SUB_PROJECTS_THRESHOLD {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "Detected {}+ files and {} sub-projects — switching to sub-projects mode automatically",
+                        AUTO_SUB_PROJECTS_THRESHOLD, subs.len()
+                    ).yellow()
+                );
+                return cmd_rebuild_sub_projects(root, index_type, index_deps, no_ignore);
+            }
+        }
+    }
+
     let start = Instant::now();
+
+    // Acquire exclusive lock to prevent concurrent rebuilds
+    let _lock = db::acquire_rebuild_lock(root)?;
 
     // Save extra roots before deleting DB
     let saved_extra_roots = if db::db_exists(root) {
@@ -211,6 +240,84 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     }
 
     eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
+/// Rebuild index for each sub-project into a single shared DB for root
+fn cmd_rebuild_sub_projects(root: &Path, _index_type: &str, _index_deps: bool, no_ignore: bool) -> Result<()> {
+    let start = Instant::now();
+
+    // Acquire exclusive lock to prevent concurrent rebuilds
+    let _lock = db::acquire_rebuild_lock(root)?;
+
+    let sub_projects = indexer::find_sub_projects(root);
+    if sub_projects.is_empty() {
+        println!("{}", "No sub-projects found. Use 'rebuild' without --sub-projects.".yellow());
+        return Ok(());
+    }
+
+    let total = sub_projects.len();
+    println!(
+        "{}",
+        format!("Found {} sub-projects in {}:", total, root.display()).cyan()
+    );
+    for (path, pt) in &sub_projects {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        println!("  {} [{}]", name, pt.as_str());
+    }
+    println!();
+
+    // Single DB for the whole root
+    if let Err(e) = db::delete_db(root) {
+        eprintln!("{}", format!("Warning: could not delete old index: {}", e).yellow());
+        return Err(e);
+    }
+    let mut conn = db::open_db(root)?;
+    db::init_db(&conn)?;
+
+    if no_ignore {
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('no_ignore', '1')",
+            [],
+        ).ok();
+    }
+
+    let mut total_files = 0;
+    let mut success_count = 0;
+    let mut fail_count = 0;
+
+    for (i, (path, pt)) in sub_projects.iter().enumerate() {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        println!(
+            "{}",
+            format!("[{}/{}] Indexing {} [{}]...", i + 1, total, name, pt.as_str()).cyan()
+        );
+
+        match indexer::index_directory_scoped(&mut conn, root, path, true, no_ignore) {
+            Ok(walk) => {
+                total_files += walk.file_count;
+                println!(
+                    "{}",
+                    format!("  {} files indexed", walk.file_count).dimmed()
+                );
+                success_count += 1;
+            }
+            Err(e) => {
+                println!("{}", format!("  Failed: {}", e).red());
+                fail_count += 1;
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "{}",
+        format!(
+            "Done: {} sub-projects indexed ({} files total), {} failed",
+            success_count, total_files, fail_count
+        ).green()
+    );
+    eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
     Ok(())
 }
 

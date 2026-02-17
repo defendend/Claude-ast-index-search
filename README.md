@@ -1,4 +1,4 @@
-# ast-index v3.16.3
+# ast-index v3.17.0
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -323,9 +323,14 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 
 ## Changelog
 
+### 3.17.0
+- **Auto sub-projects mode** — `rebuild` automatically switches to sub-projects indexing when directory has 65K+ source files and 2+ sub-project directories
+- **`--sub-projects` flag** — explicit sub-projects mode for large monorepos, indexes each subdirectory separately into a single shared DB
+- **Extended VCS support** — respects `.gitignore` and `.arcignore` in monorepos without `.git` directory
+
 ### 3.16.3
 - **FTS5 prefix search fix** — `search` no longer crashes on queries like `SlowUpstream`; prefix `*` operator now correctly placed outside FTS5 quotes
-- **Arc VCS support** — `rebuild`/`search`/`grep` now respect `.gitignore` and `.arcignore` in Arc repositories, preventing hangs on large monorepos
+- **Extended VCS support** — `rebuild`/`search`/`grep` now respect `.gitignore` and `.arcignore` in non-git monorepos, preventing hangs on large codebases
 - **Fuzzy search fix** — `--fuzzy` flag now returns all matching results (exact + prefix + contains) instead of early-returning on exact match only
 
 ### 3.16.0

@@ -72,7 +72,7 @@ where
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
     let no_ignore = is_no_ignore_enabled(root);
     let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
-    let is_arc = crate::indexer::has_arc_repo(root) && !no_ignore;
+    let arc_root = if no_ignore { None } else { crate::indexer::find_arc_root(root) };
 
     let mut wb = WalkBuilder::new(root);
     wb.hidden(true)
@@ -80,9 +80,13 @@ where
         .git_exclude(use_git)
         .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
         .threads(num_cpus());
-    if is_arc {
+    if let Some(ref arc) = arc_root {
         wb.add_custom_ignore_filename(".gitignore");
         wb.add_custom_ignore_filename(".arcignore");
+        let root_gitignore = arc.join(".gitignore");
+        if root_gitignore.exists() {
+            wb.add_ignore(root_gitignore);
+        }
     }
     let walker = wb.build_parallel();
 
@@ -152,7 +156,7 @@ where
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
     let no_ignore = is_no_ignore_enabled(root);
     let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
-    let is_arc = crate::indexer::has_arc_repo(root) && !no_ignore;
+    let arc_root = if no_ignore { None } else { crate::indexer::find_arc_root(root) };
 
     let mut wb = WalkBuilder::new(root);
     wb.hidden(true)
@@ -160,9 +164,13 @@ where
         .git_exclude(use_git)
         .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
         .threads(num_cpus());
-    if is_arc {
+    if let Some(ref arc) = arc_root {
         wb.add_custom_ignore_filename(".gitignore");
         wb.add_custom_ignore_filename(".arcignore");
+        let root_gitignore = arc.join(".gitignore");
+        if root_gitignore.exists() {
+            wb.add_ignore(root_gitignore);
+        }
     }
     let walker = wb.build_parallel();
 

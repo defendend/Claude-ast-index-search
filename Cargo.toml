@@ -1,6 +1,6 @@
 [package]
 name = "ast-index"
-version = "3.16.3"
+version = "3.17.0"
 edition = "2021"
 description = "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, Scala, Perl, Python, Go, C++, and Protocol Buffers projects"
 license = "MIT"
@@ -48,6 +48,7 @@ tree-sitter-dart = "0.0.4"
 tree-sitter-objc = "3.0"
 tree-sitter-proto = "0.4"
 tree-sitter-scala = "0.24"
+fs2 = "0.4.3"
 
 [dev-dependencies]
 tempfile = "3"

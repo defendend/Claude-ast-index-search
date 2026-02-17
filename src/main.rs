@@ -236,6 +236,9 @@ enum Commands {
         /// Include gitignored files (e.g., build/ directories)
         #[arg(long)]
         no_ignore: bool,
+        /// Index each sub-project separately (for large monorepo directories)
+        #[arg(long)]
+        sub_projects: bool,
     },
     /// Update index (incremental)
     Update,
@@ -609,7 +612,7 @@ fn main() -> Result<()> {
         Commands::Previews { query, limit } => commands::grep::cmd_previews(&root, query.as_deref(), limit),
         // Management commands
         Commands::Init => commands::management::cmd_init(&root),
-        Commands::Rebuild { r#type, no_deps, no_ignore } => commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore),
+        Commands::Rebuild { r#type, no_deps, no_ignore, sub_projects } => commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore, sub_projects),
         Commands::Update => commands::management::cmd_update(&root),
         Commands::Restore { path } => commands::management::cmd_restore(&root, &path),
         Commands::Stats => commands::management::cmd_stats(&root, format),
