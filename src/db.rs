@@ -924,6 +924,34 @@ pub fn find_implementations_scoped(
     Ok(results)
 }
 
+/// Find parents (inherited types) of a symbol, scoped to the file that defines it.
+/// When scope is empty, returns parents for all symbols with that name.
+pub fn find_parents_scoped(
+    conn: &Connection,
+    child_name: &str,
+    scope: &SearchScope,
+) -> Result<Vec<(String, String)>> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        "SELECT i.parent_name, i.kind \
+         FROM inheritance i \
+         JOIN symbols s ON i.child_id = s.id \
+         JOIN files f ON s.file_id = f.id \
+         WHERE s.name = ?1{}",
+        scope_clause
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(child_name.to_string())];
+    for p in &scope_params {
+        all_params.push(Box::new(p.clone()));
+    }
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let results = stmt
+        .query_map(param_refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(results)
+}
+
 /// Get database statistics
 pub fn get_stats(conn: &Connection) -> Result<DbStats> {
     let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;

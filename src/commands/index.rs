@@ -436,11 +436,12 @@ pub fn cmd_hierarchy(root: &Path, name: &str, scope: &SearchScope) -> Result<()>
 
     let conn = db::open_db(root)?;
 
-    // Find the class/interface/package
-    let classes = db::find_symbols_by_name(&conn, name, Some("class"), 1)?;
-    let interfaces = db::find_symbols_by_name(&conn, name, Some("interface"), 1)?;
-    let packages = db::find_symbols_by_name(&conn, name, Some("package"), 1)?;
-    let protocols = db::find_symbols_by_name(&conn, name, Some("protocol"), 1)?;
+    // Find the class/interface/package, respecting scope so --in-file picks the right definition
+    // when multiple classes share the same name.
+    let classes    = db::find_symbols_by_name_scoped(&conn, name, Some("class"),     1, scope)?;
+    let interfaces = db::find_symbols_by_name_scoped(&conn, name, Some("interface"), 1, scope)?;
+    let packages   = db::find_symbols_by_name_scoped(&conn, name, Some("package"),   1, scope)?;
+    let protocols  = db::find_symbols_by_name_scoped(&conn, name, Some("protocol"),  1, scope)?;
 
     let target = classes.first().or(interfaces.first()).or(packages.first()).or(protocols.first());
 
@@ -451,13 +452,8 @@ pub fn cmd_hierarchy(root: &Path, name: &str, scope: &SearchScope) -> Result<()>
 
     println!("{}", format!("Hierarchy for '{}':", name).bold());
 
-    // Find parents
-    let mut stmt = conn.prepare(
-        "SELECT i.parent_name, i.kind FROM inheritance i JOIN symbols s ON i.child_id = s.id WHERE s.name = ?1",
-    )?;
-    let parents: Vec<(String, String)> = stmt
-        .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+    // Find parents, scoped to the same file so we get parents of this specific definition only.
+    let parents: Vec<(String, String)> = db::find_parents_scoped(&conn, name, scope)?;
 
     if !parents.is_empty() {
         println!("\n  {}", "Parents:".cyan());
@@ -467,23 +463,7 @@ pub fn cmd_hierarchy(root: &Path, name: &str, scope: &SearchScope) -> Result<()>
     }
 
     // Find children (with optional scope filtering)
-    let mut children: Vec<db::SearchResult> = if scope.is_empty() {
-        db::find_implementations(&conn, name, 50)?
-    } else {
-        let all = db::find_implementations(&conn, name, 200)?;
-        all.into_iter().filter(|s| {
-            if let Some(in_file) = scope.in_file {
-                if !s.path.contains(in_file) { return false; }
-            }
-            if let Some(module) = scope.module {
-                if !s.path.starts_with(module) { return false; }
-            }
-            if let Some(prefix) = scope.dir_prefix {
-                if !s.path.starts_with(prefix) { return false; }
-            }
-            true
-        }).collect()
-    };
+    let mut children: Vec<db::SearchResult> = db::find_implementations_scoped(&conn, name, 50, scope)?;
     let resolver = PathResolver::from_conn(root, &conn);
     for c in &mut children {
         c.path = resolver.resolve(&c.path);
