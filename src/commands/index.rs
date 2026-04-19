@@ -344,7 +344,7 @@ pub fn cmd_implementations(root: &Path, parent: &str, limit: usize, format: &str
 }
 
 /// Show cross-references: definitions, imports, usages
-pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result<()> {
+pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str, scope: &SearchScope) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -354,7 +354,17 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
     }
 
     let conn = db::open_db(root)?;
-    let (mut definitions, mut imports, mut usages) = db::find_cross_references(&conn, symbol, limit)?;
+    let (mut definitions, mut imports, mut usages) = if scope.is_empty() {
+        db::find_cross_references(&conn, symbol, limit)?
+    } else {
+        let defs = db::find_symbols_by_name_scoped(&conn, symbol, None, limit, scope)?
+            .into_iter()
+            .filter(|s| s.kind != "import")
+            .collect();
+        let imps = db::find_symbols_by_name_scoped(&conn, symbol, Some("import"), limit, scope)?;
+        let usages = db::find_references_scoped(&conn, symbol, limit, scope)?;
+        (defs, imps, usages)
+    };
 
     let resolver = PathResolver::from_conn(root, &conn);
     for s in &mut definitions {
