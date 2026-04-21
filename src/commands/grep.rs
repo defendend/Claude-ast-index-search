@@ -153,7 +153,7 @@ pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 }
 
 /// Find function callers
-pub fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()> {
+pub fn cmd_callers(root: &Path, function_name: &str, limit: usize, in_file: Option<&str>) -> Result<()> {
     let pattern = build_caller_pattern(function_name);
     let def_pattern = build_def_skip_pattern(function_name);
 
@@ -164,6 +164,9 @@ pub fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()>
         if def_pattern.is_match(line) { return; } // Skip definitions
 
         let rel_path = relative_path(root, path);
+        if let Some(filter) = in_file {
+            if !rel_path.contains(filter) { return; }
+        }
         let content: String = line.chars().take(70).collect();
 
         by_file.entry(rel_path).or_default().push((line_num, content));
@@ -184,14 +187,14 @@ pub fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()>
 }
 
 /// Show call hierarchy (callers tree) for a function
-pub fn cmd_call_tree(root: &Path, function_name: &str, max_depth: usize, limit_per_level: usize) -> Result<()> {
+pub fn cmd_call_tree(root: &Path, function_name: &str, max_depth: usize, limit_per_level: usize, in_file: Option<&str>) -> Result<()> {
     println!("{}", format!("Call tree for '{}':", function_name).bold());
     println!("  {}", function_name.cyan());
 
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     visited.insert(function_name.to_string());
 
-    build_call_tree(root, function_name, 1, max_depth, limit_per_level, &mut visited)?;
+    build_call_tree(root, function_name, 1, max_depth, limit_per_level, in_file, &mut visited)?;
 
     Ok(())
 }
@@ -203,6 +206,7 @@ fn build_call_tree(
     current_depth: usize,
     max_depth: usize,
     limit: usize,
+    in_file: Option<&str>,
     visited: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
     if current_depth > max_depth {
@@ -210,7 +214,7 @@ fn build_call_tree(
     }
 
     let indent = "  ".repeat(current_depth + 1);
-    let callers = find_caller_functions(root, function_name, limit)?;
+    let callers = find_caller_functions(root, function_name, limit, in_file)?;
 
     if callers.is_empty() {
         return Ok(());
@@ -222,7 +226,7 @@ fn build_call_tree(
         if is_new {
             println!("{}← {} ({}:{})", indent, caller_func.yellow(), file_path, line_num);
             // Recursively find callers of this function
-            build_call_tree(root, &caller_func, current_depth + 1, max_depth, limit, visited)?;
+            build_call_tree(root, &caller_func, current_depth + 1, max_depth, limit, in_file, visited)?;
         } else {
             println!("{}← {} (recursive)", indent, caller_func.dimmed());
         }
@@ -232,7 +236,7 @@ fn build_call_tree(
 }
 
 /// Find functions that call the given function
-fn find_caller_functions(root: &Path, function_name: &str, limit: usize) -> Result<Vec<(String, String, usize)>> {
+fn find_caller_functions(root: &Path, function_name: &str, limit: usize, in_file: Option<&str>) -> Result<Vec<(String, String, usize)>> {
     let pattern = build_caller_pattern(function_name);
     let def_pattern = build_def_skip_pattern(function_name);
 
@@ -254,6 +258,11 @@ fn find_caller_functions(root: &Path, function_name: &str, limit: usize) -> Resu
     // First pass: find all files and line numbers with calls
     search_files_limited(root, &pattern, &ALL_SOURCE_EXTENSIONS, limit * 3, |path, line_num, line| {
         if def_pattern.is_match(line) { return; }
+
+        if let Some(filter) = in_file {
+            let rel = relative_path(root, path);
+            if !rel.contains(filter) { return; }
+        }
 
         files_with_calls.entry(path.to_path_buf()).or_default().push(line_num);
     })?;

@@ -124,6 +124,9 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "50")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
     },
     /// Show call hierarchy (callers tree up) for a function
     CallTree {
@@ -135,6 +138,9 @@ enum Commands {
         /// Max callers per level
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
     },
     /// Find @Provides/@Binds for a type
     Provides {
@@ -440,6 +446,12 @@ enum Commands {
         /// Max results per section
         #[arg(short, long, default_value = "20")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
+        /// Filter by module path
+        #[arg(long)]
+        module: Option<String>,
     },
     /// Find usages of a symbol
     Usages {
@@ -681,8 +693,8 @@ fn main() -> Result<()> {
     match cli.command {
         // Grep commands
         Commands::Todo { pattern, limit } => commands::grep::cmd_todo(&root, &pattern, limit),
-        Commands::Callers { function_name, limit } => commands::grep::cmd_callers(&root, &function_name, limit),
-        Commands::CallTree { function_name, depth, limit } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit),
+        Commands::Callers { function_name, limit, in_file } => commands::grep::cmd_callers(&root, &function_name, limit, in_file.as_deref()),
+        Commands::CallTree { function_name, depth, limit, in_file } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit, in_file.as_deref()),
         Commands::Provides { type_name, limit } => commands::grep::cmd_provides(&root, &type_name, limit),
         Commands::Suspend { query, limit } => commands::grep::cmd_suspend(&root, query.as_deref(), limit),
         Commands::Composables { query, limit } => commands::grep::cmd_composables(&root, query.as_deref(), limit),
@@ -722,7 +734,10 @@ fn main() -> Result<()> {
             let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
             commands::index::cmd_implementations(&root, &parent, limit, format, &scope)
         }
-        Commands::Refs { symbol, limit } => commands::index::cmd_refs(&root, &symbol, limit, format),
+        Commands::Refs { symbol, limit, in_file, module } => {
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
+            commands::index::cmd_refs(&root, &symbol, limit, format, &scope)
+        }
         Commands::Hierarchy { name, in_file, module } => {
             let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
             commands::index::cmd_hierarchy(&root, &name, &scope)
