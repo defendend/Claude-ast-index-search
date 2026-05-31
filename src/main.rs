@@ -253,7 +253,7 @@ enum Commands {
         /// Verbose logging with timing for each step
         #[arg(long, short)]
         verbose: bool,
-        /// Experimental: use more aggressive rebuild heuristics (parallel side-index phases, higher update parallelism, and large-monorepo shortcuts)
+        /// Compatibility flag; fast rebuild heuristics are now enabled by default
         #[arg(long)]
         experimental_fast_rebuild: bool,
         /// Number of parallel threads (default: CPU cores, max 8; increase for network filesystems)
@@ -964,7 +964,7 @@ fn main() -> Result<()> {
             pattern,
             exact,
             limit,
-        } => commands::files::cmd_file(&root, &pattern, exact, limit),
+        } => commands::files::cmd_file(&root, &pattern, exact, limit, format),
         Commands::Outline { file } => commands::files::cmd_outline(&root, &file),
         Commands::Imports { file } => commands::files::cmd_imports(&root, &file),
         Commands::Api { module_path, limit } => {

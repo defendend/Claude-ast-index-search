@@ -4,7 +4,7 @@
 //! commands (`cmd_file`, `cmd_outline`, `cmd_imports`, `cmd_changed`)
 //! that are user-facing entry points but had zero integration coverage.
 
-use std::fs;
+use std::{fs, process::Command};
 
 use ast_index::commands::files::{
     cmd_changed, cmd_file, cmd_imports, cmd_outline, detect_git_default_branch, detect_vcs,
@@ -96,7 +96,8 @@ fn detect_git_default_branch_falls_back_when_not_a_git_repo() {
 fn cmd_file_returns_ok_without_index() {
     let dir = TempDir::new().unwrap();
     // No DB present — must short-circuit with an Ok message, not error.
-    cmd_file(dir.path(), "anything", false, 10).expect("cmd_file must not error without index");
+    cmd_file(dir.path(), "anything", false, 10, "text")
+        .expect("cmd_file must not error without index");
 }
 
 #[test]
@@ -107,13 +108,47 @@ fn cmd_file_finds_indexed_files() {
     db::upsert_file(&conn, "src/main/Bar.kt", 0, 100).unwrap();
     drop(conn);
 
-    cmd_file(dir.path(), "Foo", false, 10).unwrap();
+    cmd_file(dir.path(), "Foo", false, 10, "text").unwrap();
 
     // Verify via the same public DB API the command uses internally.
     let conn = db::open_db(dir.path()).unwrap();
     let hits = db::find_files(&conn, "Foo", 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].ends_with("Foo.kt"));
+}
+
+#[test]
+fn file_cli_emits_json_when_requested() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    db::upsert_file(&conn, "src/main/Foo.kt", 0, 100).unwrap();
+    drop(conn);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ast-index"))
+        .current_dir(dir.path())
+        .args(["file", "Foo", "--format", "json"])
+        .output()
+        .expect("ast-index binary must run");
+
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let files: Vec<String> = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be valid JSON: {e}; stdout={stdout}"));
+    assert_eq!(files.len(), 1, "expected exactly one file; stdout={stdout}");
+    assert!(
+        files[0].ends_with("src/main/Foo.kt"),
+        "resolved file path must end with indexed file path; stdout={stdout}"
+    );
+    assert!(
+        !out.stdout.windows(2).any(|w| w == b"\x1b["),
+        "JSON output must not contain ANSI codes; stdout={stdout}"
+    );
 }
 
 // ----------------------------------------------------------------------

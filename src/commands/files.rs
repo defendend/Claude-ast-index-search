@@ -43,7 +43,7 @@ fn outline_via_treesitter(
 }
 
 /// Find files by pattern
-pub fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize) -> Result<()> {
+pub fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize, format: &str) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -65,6 +65,11 @@ pub fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize) -> Result
         .into_iter()
         .map(|file| resolver.resolve_with_root(&file.path, file.root_path.as_deref()))
         .collect();
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&files)?);
+        return Ok(());
+    }
 
     println!("{}", format!("Files matching '{}':", pattern).bold());
 
