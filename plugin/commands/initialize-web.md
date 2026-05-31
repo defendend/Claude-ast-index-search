@@ -1,6 +1,6 @@
 ---
 name: initialize-web
-description: Initialize ast-index for TypeScript/JavaScript/React/Vue/Svelte project - configures .claude/settings.json, rules, and CLAUDE.md
+description: "Manual override: initialize ast-index for TypeScript/JavaScript web project"
 ---
 
 # Initialize ast-index for Web Project

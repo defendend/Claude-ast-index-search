@@ -1,6 +1,6 @@
 ---
 name: initialize-csharp
-description: Initialize ast-index for C#/.NET project - configures .claude/settings.json, rules, and CLAUDE.md
+description: "Manual override: initialize ast-index for C#/.NET project"
 ---
 
 # Initialize ast-index for C# Project

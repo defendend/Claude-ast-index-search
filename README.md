@@ -130,6 +130,12 @@ ast-index install-claude-plugin
 
 Restart Claude Code to activate. Update: `brew upgrade ast-index && claude plugin update ast-index`. Uninstall: `claude plugin uninstall ast-index`.
 
+The Claude plugin ships `/initialize` as the default setup command. It
+auto-detects project stack(s), including KMP and polyglot repos, then writes
+`.claude/settings.json` and `.claude/rules/ast-index.md`. Use
+`/initialize-android`, `/initialize-ios`, `/initialize-web`, `/initialize-rust`,
+`/initialize-csharp`, or `/initialize-ruby` only as manual overrides.
+
 See [`examples/.claude/rules/ast-index.md`](examples/.claude/rules/ast-index.md) for a template rules file that teaches the agent to prefer ast-index over grep, outline before reading large files, and pass the same instructions to subagents. Adapt before dropping into your project's `.claude/rules/`.
 
 ### Codex

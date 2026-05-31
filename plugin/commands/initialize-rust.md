@@ -1,6 +1,6 @@
 ---
 name: initialize-rust
-description: Initialize ast-index for Rust project - configures .claude/settings.json, rules, and CLAUDE.md
+description: "Manual override: initialize ast-index for Rust project"
 ---
 
 # Initialize ast-index for Rust Project

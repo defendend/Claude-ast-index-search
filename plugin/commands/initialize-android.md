@@ -1,6 +1,6 @@
 ---
 name: initialize-android
-description: Initialize ast-index for Android/Kotlin/Java project - configures .claude/settings.json, rules, and CLAUDE.md
+description: "Manual override: initialize ast-index for Android/Kotlin/Java project"
 ---
 
 # Initialize ast-index for Android Project

@@ -12,6 +12,11 @@ This directory is the shared payload for agent integrations.
 The Claude commands are intentionally separate from the Cursor command because
 they write different project configuration files.
 
+For Claude Code, use `/initialize` as the default entrypoint. It auto-detects
+single-stack, KMP, and polyglot repos, then configures `.claude/settings.json`
+and `.claude/rules/ast-index.md`. The platform-specific `/initialize-*`
+commands remain available as manual overrides.
+
 ## Local Testing
 
 Codex can load the skill directly from `~/.codex/skills`:
@@ -39,4 +44,5 @@ ln -s /absolute/path/to/Claude-ast-index-search/plugin ~/.cursor/plugins/local/a
 ```
 
 Then reload Cursor and verify the `ast-index` skill, rule, and
-`initialize-ast-index` command appear.
+`initialize-ast-index` command appear. For Claude Code plugin testing, verify
+that `/initialize` and the manual override `/initialize-*` commands appear.

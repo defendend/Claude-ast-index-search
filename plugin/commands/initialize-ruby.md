@@ -1,6 +1,6 @@
 ---
 name: initialize-ruby
-description: Initialize ast-index for Ruby/Rails project - configures .claude/settings.json, rules, and CLAUDE.md
+description: "Manual override: initialize ast-index for Ruby/Rails project"
 ---
 
 # Initialize ast-index for Ruby Project

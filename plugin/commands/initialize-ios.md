@@ -1,6 +1,6 @@
 ---
 name: initialize-ios
-description: Initialize ast-index for iOS/Swift/ObjC project - configures .claude/settings.json, rules, and CLAUDE.md
+description: "Manual override: initialize ast-index for iOS/Swift/ObjC project"
 ---
 
 # Initialize ast-index for iOS Project
