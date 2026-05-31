@@ -22,10 +22,6 @@ use crate::parsers::{self, ParsedRef, ParsedSymbol};
 const RAYON_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 const DEFAULT_PARALLELISM_CAP: usize = 8;
 
-fn is_experimental_fast_rebuild_enabled() -> bool {
-    std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok()
-}
-
 fn effective_num_threads() -> usize {
     std::env::var("AST_INDEX_THREADS")
         .ok()
@@ -39,9 +35,6 @@ fn effective_num_threads() -> usize {
 }
 
 fn effective_chunk_size(total_files: usize) -> usize {
-    if !is_experimental_fast_rebuild_enabled() {
-        return 500;
-    }
     if total_files >= 20_000 {
         1_000
     } else {
@@ -1612,13 +1605,7 @@ pub fn update_directory_incremental(
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                if is_experimental_fast_rebuild_enabled() {
-                    effective_num_threads().max(16)
-                } else {
-                    32
-                }
-            });
+            .unwrap_or_else(|| effective_num_threads().max(16));
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .stack_size(RAYON_WORKER_STACK_SIZE)
@@ -2109,7 +2096,6 @@ pub fn index_module_dependencies(
     gradle_files: &[PathBuf],
     progress: bool,
 ) -> Result<usize> {
-    let experimental_fast_rebuild = std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     // Regex patterns for dependency declarations
     // Gradle projects DSL style: modules { api(projects.features.payments.api) }
     static PROJECTS_DEP_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -2199,7 +2185,7 @@ pub fn index_module_dependencies(
         });
         let maven_dep_re = &*MAVEN_DEP_RE;
 
-        let edges: Vec<(i64, i64, String)> = if experimental_fast_rebuild {
+        let edges: Vec<(i64, i64, String)> = {
             let num_threads = effective_num_threads();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(num_threads)
@@ -2407,185 +2393,6 @@ pub fn index_module_dependencies(
                     })
                     .collect()
             })
-        } else {
-            let mut edges = Vec::new();
-            for path in gradle_files {
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let parent = match path.parent() {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                let source_module_name: String = match file_name {
-                    "ya.make" => {
-                        let rel = if let Some(ref mono) = mono_root {
-                            parent.strip_prefix(mono).ok()
-                        } else {
-                            None
-                        }
-                        .or_else(|| parent.strip_prefix(root).ok())
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| parent.to_path_buf());
-                        rel.to_string_lossy().replace('\\', "/")
-                    }
-                    "pyproject.toml" | "setup.py" | "setup.cfg" => {
-                        let module_path = parent
-                            .strip_prefix(root)
-                            .unwrap_or(parent)
-                            .to_string_lossy()
-                            .to_string();
-                        if module_path.is_empty() {
-                            if file_name == "pyproject.toml" {
-                                fs::read_to_string(path)
-                                    .ok()
-                                    .as_deref()
-                                    .and_then(extract_python_module_name)
-                                    .unwrap_or_else(|| {
-                                        root.file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or("root")
-                                            .to_string()
-                                    })
-                            } else {
-                                root.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("root")
-                                    .to_string()
-                            }
-                        } else {
-                            module_path.replace('/', ".")
-                        }
-                    }
-                    _ => parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .replace('/', "."),
-                };
-
-                let module_id = match module_ids.get(&source_module_name) {
-                    Some(&id) => id,
-                    None => continue,
-                };
-
-                let content = match fs::read_to_string(path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-
-                match file_name {
-                    "pom.xml" => {
-                        for caps in maven_dep_re.captures_iter(&content) {
-                            let artifact_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            for (mod_name, &mod_id) in &module_ids {
-                                let last_segment = mod_name.rsplit('.').next().unwrap_or(mod_name);
-                                if last_segment == artifact_id {
-                                    edges.push((module_id, mod_id, "compile".to_string()));
-                                }
-                            }
-                        }
-                    }
-                    "ya.make" => {
-                        for caps in peerdir_re.captures_iter(&content) {
-                            let raw = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            for token in raw.split_ascii_whitespace() {
-                                let dep_name = token.trim_end_matches(',').trim();
-                                if dep_name.is_empty() || dep_name.starts_with('#') {
-                                    continue;
-                                }
-                                let dep_name = dep_name.replace('\\', "/");
-                                if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                    edges.push((module_id, dep_id, "peerdir".to_string()));
-                                }
-                            }
-                        }
-                    }
-                    "pyproject.toml" => {
-                        for caps in py_project_deps_re.captures_iter(&content) {
-                            let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            for raw in extract_py_list_strings(body) {
-                                let dep_name = strip_py_version(&raw);
-                                if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                    edges.push((module_id, dep_id, "compile".to_string()));
-                                }
-                            }
-                        }
-                        if let Some(caps) = py_poetry_section_re.captures(&content) {
-                            let section = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            for line in section.lines() {
-                                let line = line.trim();
-                                if line.is_empty() || line.starts_with('#') || line.starts_with('[')
-                                {
-                                    continue;
-                                }
-                                if let Some(eq_pos) = line.find('=') {
-                                    let dep_name =
-                                        line[..eq_pos].trim().trim_matches('"').trim_matches('\'');
-                                    if dep_name == "python" || dep_name.is_empty() {
-                                        continue;
-                                    }
-                                    if let Some(&dep_id) = module_ids.get(dep_name) {
-                                        edges.push((module_id, dep_id, "compile".to_string()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "setup.py" | "setup.cfg" => {
-                        for caps in py_setup_deps_re.captures_iter(&content) {
-                            let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            for raw in extract_py_list_strings(body) {
-                                let dep_name = strip_py_version(&raw);
-                                if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                    edges.push((module_id, dep_id, "compile".to_string()));
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        let mut inserted: std::collections::HashSet<(i64, i64)> =
-                            std::collections::HashSet::new();
-                        for caps in projects_dep_re.captures_iter(&content) {
-                            let dep_kind =
-                                caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
-                            let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                            if let Some(&dep_id) = module_ids.get(dep_name) {
-                                if inserted.insert((module_id, dep_id)) {
-                                    edges.push((module_id, dep_id, dep_kind.to_string()));
-                                }
-                            }
-                        }
-                        for caps in gradle_project_re.captures_iter(&content) {
-                            let dep_kind =
-                                caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
-                            let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                            let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
-                            if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                if inserted.insert((module_id, dep_id)) {
-                                    edges.push((module_id, dep_id, dep_kind.to_string()));
-                                }
-                            }
-                        }
-                        for (b_start, b_end) in find_forma_deps_blocks(&content) {
-                            let block = strip_kt_line_comments(&content[b_start..b_end]);
-                            for caps in project_only_re.captures_iter(&block) {
-                                let dep_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                                let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
-                                if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                    if inserted.insert((module_id, dep_id)) {
-                                        edges.push((
-                                            module_id,
-                                            dep_id,
-                                            "implementation".to_string(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            edges
         };
 
         for (module_id, dep_id, dep_kind) in edges {
@@ -2668,7 +2475,6 @@ pub fn index_xml_usages(
     xml_layout_files: &[PathBuf],
     progress: bool,
 ) -> Result<usize> {
-    let experimental_fast_rebuild = std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     // Regex for class names in XML
@@ -2715,7 +2521,7 @@ pub fn index_xml_usages(
             String,
             &'static str,
             Option<String>,
-        )> = if experimental_fast_rebuild {
+        )> = {
             let num_threads = effective_num_threads();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(num_threads)
@@ -2791,59 +2597,6 @@ pub fn index_xml_usages(
                     })
                     .collect()
             })
-        } else {
-            let mut rows = Vec::new();
-            for xml_path in xml_layout_files {
-                let rel_path = xml_path
-                    .strip_prefix(root)
-                    .unwrap_or(xml_path)
-                    .to_string_lossy()
-                    .to_string();
-                let module_id = module_lookup.find(&rel_path);
-
-                if let Ok(content) = fs::read_to_string(xml_path) {
-                    for (line_num, line) in content.lines().enumerate() {
-                        let line_num = line_num as i64 + 1;
-
-                        let element_id = id_re
-                            .captures(line)
-                            .map(|c| c.get(1).unwrap().as_str().to_string());
-
-                        if line.contains('<') && line.contains('.') {
-                            for caps in full_class_re.captures_iter(line) {
-                                rows.push((
-                                    module_id,
-                                    rel_path.clone(),
-                                    line_num,
-                                    caps.get(1).unwrap().as_str().to_string(),
-                                    "view_tag",
-                                    element_id.clone(),
-                                ));
-                            }
-                        }
-
-                        if line.contains("class") || line.contains("android:name") {
-                            let usage_type =
-                                if line.contains("<fragment") || line.contains("android:name") {
-                                    "fragment"
-                                } else {
-                                    "view_class_attr"
-                                };
-                            for caps in class_attr_re.captures_iter(line) {
-                                rows.push((
-                                    module_id,
-                                    rel_path.clone(),
-                                    line_num,
-                                    caps.get(1).unwrap().as_str().to_string(),
-                                    usage_type,
-                                    element_id.clone(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            rows
         };
 
         for (module_id, rel_path, line_num, class_name, usage_type, element_id) in usage_rows {
@@ -2910,7 +2663,6 @@ pub fn index_resources(
     res_files: &[PathBuf],
     progress: bool,
 ) -> Result<(usize, usize)> {
-    let experimental_fast_rebuild = std::env::var("AST_INDEX_EXPERIMENTAL_FAST_REBUILD").is_ok();
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     if progress {
@@ -3085,101 +2837,36 @@ pub fn index_resources(
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.filter_map(|r| r.ok()).collect()
         };
-        if experimental_fast_rebuild {
-            if progress {
-                eprintln!("Experimental fast rebuild: scanning resource usages in parallel...");
-            }
+        if progress {
+            eprintln!("Scanning resource usages in parallel...");
+        }
 
-            let num_threads = effective_num_threads();
+        let num_threads = effective_num_threads();
 
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .stack_size(RAYON_WORKER_STACK_SIZE)
-                .build()
-                .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .stack_size(RAYON_WORKER_STACK_SIZE)
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
-            let root_buf = root.to_path_buf();
-            let resource_ids = Arc::new(resource_ids);
-            let usage_batches: Vec<Vec<(i64, String, i64, &'static str)>> = pool.install(|| {
-                code_rel_paths
-                    .par_iter()
-                    .map(|rel_path| {
-                        let file_path = root_buf.join(rel_path);
-                        let content = match fs::read_to_string(file_path) {
-                            Ok(content) => content,
-                            Err(_) => return Vec::new(),
-                        };
+        let root_buf = root.to_path_buf();
+        let resource_ids = Arc::new(resource_ids);
+        let usage_batches: Vec<Vec<(i64, String, i64, &'static str)>> = pool.install(|| {
+            code_rel_paths
+                .par_iter()
+                .map(|rel_path| {
+                    let file_path = root_buf.join(rel_path);
+                    let content = match fs::read_to_string(file_path) {
+                        Ok(content) => content,
+                        Err(_) => return Vec::new(),
+                    };
 
-                        let is_xml = rel_path.ends_with(".xml");
-                        let mut usages = Vec::new();
-
-                        for (line_idx, line) in content.lines().enumerate() {
-                            let line_num = line_idx as i64 + 1;
-
-                            if !is_xml && line.contains("R.") {
-                                for caps in r_ref_re.captures_iter(line) {
-                                    let res_type = caps.get(1).unwrap().as_str();
-                                    let res_name = caps.get(2).unwrap().as_str();
-
-                                    if let Some(&resource_id) =
-                                        resource_ids.get(res_type).and_then(|m| m.get(res_name))
-                                    {
-                                        usages.push((
-                                            resource_id,
-                                            rel_path.clone(),
-                                            line_num,
-                                            "code",
-                                        ));
-                                    }
-                                }
-                            }
-
-                            if line.contains('@') {
-                                for caps in xml_ref_re.captures_iter(line) {
-                                    let res_type = caps.get(1).unwrap().as_str();
-                                    let res_name = caps.get(2).unwrap().as_str();
-
-                                    if let Some(&resource_id) =
-                                        resource_ids.get(res_type).and_then(|m| m.get(res_name))
-                                    {
-                                        usages.push((
-                                            resource_id,
-                                            rel_path.clone(),
-                                            line_num,
-                                            "xml",
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-
-                        usages
-                    })
-                    .collect()
-            });
-
-            for batch in usage_batches {
-                for (resource_id, rel_path, line_num, usage_type) in batch {
-                    usage_stmt.execute(rusqlite::params![
-                        resource_id,
-                        rel_path,
-                        line_num,
-                        usage_type
-                    ])?;
-                    usage_count += 1;
-                }
-            }
-        } else {
-            for rel_path in &code_rel_paths {
-                let file_path = root.join(rel_path);
-
-                if let Ok(content) = fs::read_to_string(file_path) {
                     let is_xml = rel_path.ends_with(".xml");
+                    let mut usages = Vec::new();
 
-                    for (line_num, line) in content.lines().enumerate() {
-                        let line_num = line_num + 1;
+                    for (line_idx, line) in content.lines().enumerate() {
+                        let line_num = line_idx as i64 + 1;
 
-                        // R.type.name references (Kotlin/Java)
                         if !is_xml && line.contains("R.") {
                             for caps in r_ref_re.captures_iter(line) {
                                 let res_type = caps.get(1).unwrap().as_str();
@@ -3188,18 +2875,11 @@ pub fn index_resources(
                                 if let Some(&resource_id) =
                                     resource_ids.get(res_type).and_then(|m| m.get(res_name))
                                 {
-                                    usage_stmt.execute(rusqlite::params![
-                                        resource_id,
-                                        rel_path,
-                                        line_num as i64,
-                                        "code"
-                                    ])?;
-                                    usage_count += 1;
+                                    usages.push((resource_id, rel_path.clone(), line_num, "code"));
                                 }
                             }
                         }
 
-                        // @type/name references (XML)
                         if line.contains('@') {
                             for caps in xml_ref_re.captures_iter(line) {
                                 let res_type = caps.get(1).unwrap().as_str();
@@ -3208,18 +2888,26 @@ pub fn index_resources(
                                 if let Some(&resource_id) =
                                     resource_ids.get(res_type).and_then(|m| m.get(res_name))
                                 {
-                                    usage_stmt.execute(rusqlite::params![
-                                        resource_id,
-                                        rel_path,
-                                        line_num as i64,
-                                        "xml"
-                                    ])?;
-                                    usage_count += 1;
+                                    usages.push((resource_id, rel_path.clone(), line_num, "xml"));
                                 }
                             }
                         }
                     }
-                }
+
+                    usages
+                })
+                .collect()
+        });
+
+        for batch in usage_batches {
+            for (resource_id, rel_path, line_num, usage_type) in batch {
+                usage_stmt.execute(rusqlite::params![
+                    resource_id,
+                    rel_path,
+                    line_num,
+                    usage_type
+                ])?;
+                usage_count += 1;
             }
         }
     }

@@ -16,9 +16,9 @@ use crate::indexer;
 
 /// File count threshold for auto-switching to sub-projects mode
 const AUTO_SUB_PROJECTS_THRESHOLD: usize = 65_000;
-/// In experimental fast rebuild mode, a root with this many sub-projects is
-/// treated as a monorepo immediately and skips the expensive quick file count.
-const EXPERIMENTAL_SUB_PROJECTS_SHORTCUT_THRESHOLD: usize = 20;
+/// A root with this many sub-projects is treated as a monorepo immediately and
+/// skips the expensive quick file count.
+const SUB_PROJECTS_SHORTCUT_THRESHOLD: usize = 20;
 
 pub(crate) struct ScopedEnvVar {
     key: &'static str,
@@ -219,13 +219,11 @@ pub fn cmd_rebuild(
         }
 
         if subs.len() >= 2 {
-            if experimental_fast_rebuild
-                && subs.len() >= EXPERIMENTAL_SUB_PROJECTS_SHORTCUT_THRESHOLD
-            {
+            if subs.len() >= SUB_PROJECTS_SHORTCUT_THRESHOLD {
                 eprintln!(
                     "{}",
                     format!(
-                        "Experimental fast rebuild: detected {} sub-projects — skipping quick file count and switching to sub-projects mode",
+                        "Detected {} sub-projects — skipping quick file count and switching to sub-projects mode",
                         subs.len()
                     ).yellow()
                 );

@@ -217,16 +217,14 @@ impl LanguageParser for PythonParser {
             if let Some(cap) = find_capture(m, idx_decorated_func_name) {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
-                if !name.starts_with('_') || name == "__init__" || name == "__call__" {
-                    if emitted_funcs.insert(line) {
-                        symbols.push(ParsedSymbol {
-                            name: name.to_string(),
-                            kind: SymbolKind::Function,
-                            line,
-                            signature: line_text(content, line).trim().to_string(),
-                            parents: vec![],
-                        });
-                    }
+                if emitted_funcs.insert(line) {
+                    symbols.push(ParsedSymbol {
+                        name: name.to_string(),
+                        kind: SymbolKind::Function,
+                        line,
+                        signature: line_text(content, line).trim().to_string(),
+                        parents: vec![],
+                    });
                 }
                 continue;
             }
@@ -235,16 +233,14 @@ impl LanguageParser for PythonParser {
             if let Some(cap) = find_capture(m, idx_func_name) {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
-                if !name.starts_with('_') || name == "__init__" || name == "__call__" {
-                    if emitted_funcs.insert(line) {
-                        symbols.push(ParsedSymbol {
-                            name: name.to_string(),
-                            kind: SymbolKind::Function,
-                            line,
-                            signature: line_text(content, line).trim().to_string(),
-                            parents: vec![],
-                        });
-                    }
+                if emitted_funcs.insert(line) {
+                    symbols.push(ParsedSymbol {
+                        name: name.to_string(),
+                        kind: SymbolKind::Function,
+                        line,
+                        signature: line_text(content, line).trim().to_string(),
+                        parents: vec![],
+                    });
                 }
                 continue;
             }
@@ -253,15 +249,13 @@ impl LanguageParser for PythonParser {
             if let Some(cap) = find_capture(m, idx_method_name) {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
-                if !name.starts_with('_') || name == "__init__" || name == "__call__" {
-                    symbols.push(ParsedSymbol {
-                        name: name.to_string(),
-                        kind: SymbolKind::Function,
-                        line,
-                        signature: line_text(content, line).trim().to_string(),
-                        parents: vec![],
-                    });
-                }
+                symbols.push(ParsedSymbol {
+                    name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    line,
+                    signature: line_text(content, line).trim().to_string(),
+                    parents: vec![],
+                });
                 continue;
             }
 
@@ -269,15 +263,13 @@ impl LanguageParser for PythonParser {
             if let Some(cap) = find_capture(m, idx_decorated_method_name) {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
-                if !name.starts_with('_') || name == "__init__" || name == "__call__" {
-                    symbols.push(ParsedSymbol {
-                        name: name.to_string(),
-                        kind: SymbolKind::Function,
-                        line,
-                        signature: line_text(content, line).trim().to_string(),
-                        parents: vec![],
-                    });
-                }
+                symbols.push(ParsedSymbol {
+                    name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    line,
+                    signature: line_text(content, line).trim().to_string(),
+                    parents: vec![],
+                });
                 continue;
             }
 
@@ -408,6 +400,35 @@ mod tests {
         assert!(symbols
             .iter()
             .any(|s| s.name == "async_handler" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_parse_private_functions() {
+        let content = r#"
+def _module_helper():
+    pass
+
+@pytest.fixture
+def _client():
+    return Client()
+
+class Worker:
+    def _run(self):
+        pass
+
+    @property
+    def _value(self):
+        return 1
+"#;
+        let symbols = PYTHON_PARSER.parse_symbols(content).unwrap();
+        for name in ["_module_helper", "_client", "_run", "_value"] {
+            assert!(
+                symbols
+                    .iter()
+                    .any(|s| s.name == name && s.kind == SymbolKind::Function),
+                "expected private Python function {name} to be indexed"
+            );
+        }
     }
 
     #[test]
