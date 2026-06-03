@@ -1,4 +1,4 @@
-# ast-index v3.44.2
+# ast-index v3.45.0
 
 Fast code search CLI for 34 programming languages. Native Rust implementation.
 
