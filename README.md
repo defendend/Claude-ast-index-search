@@ -592,6 +592,12 @@ exclude:
 
 ## Changelog
 
+### 3.45.0
+- **Add `ast-index detect-stacks` for reliable multi-stack detection** — emits the full list of stacks present at the project root with their marker files, plus `is_kmp` and `is_polyglot` flags; Kotlin Multiplatform is recognised by requiring both a `kotlin("multiplatform")` plugin reference and a `commonMain`/`androidMain`/`iosMain`-style source set, so an Android-only Kotlin app no longer trips KMP detection (#44).
+- **Smart `/initialize` now drives off the new detector** — instead of hand-scanning markers, the command parses `ast-index --format json detect-stacks` output and composes per-stack rules for single-stack, KMP, and polyglot/monorepo repos in one go (#44).
+- **Ship event-driven hooks in the Claude plugin** — `plugin/hooks/hooks.json` adds a `PostToolUse` (Edit/Write/MultiEdit/NotebookEdit) debounced incremental update and a `SessionStart` refresh; both hooks no-op when an `ast-index watch` daemon is running and when no index exists, so they never block agent sessions (#45).
+- **Add `ast-index install-git-hooks`** — installs idempotent `post-checkout`, `post-merge`, and `post-rewrite` hooks under `.git/hooks/` that re-run `ast-index update` in the background after each git operation; supports `--dry-run` and `--force`, and uses a comment marker so re-runs detect previously installed scripts and skip them instead of complaining (#45).
+
 ### 3.44.2
 - **Allow colliding relative paths across extra roots without crashing rebuild** — files are now keyed by both owning root and relative path, so `rebuild`/`update` no longer fail with `UNIQUE constraint failed: files.path` when the primary root and an extra root both contain files like `Workspace.swift` or `Geko/Config.swift`; path resolution now also preserves the correct absolute file for each root
 

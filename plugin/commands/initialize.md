@@ -34,63 +34,71 @@ Stop there until the binary exists.
 
 ### 2. Detect stack(s) from actual repo markers
 
-Inspect the current repo root and at least the first two directory levels. Use
-targeted file searches or lightweight content checks; do not guess. Build a
-**set of stacks**, not a single label.
+Run the built-in detector and parse its JSON output. Do not scan markers by
+hand — `ast-index` already implements the same checks and adds Kotlin
+Multiplatform recognition.
 
-Use these markers:
+```bash
+ast-index --format json detect-stacks
+```
 
-- Android/Kotlin/JVM: `settings.gradle*`, `build.gradle*`,
-  `libs.versions.toml`, `pom.xml`
-- Kotlin Multiplatform (KMP): `kotlin("multiplatform")`,
-  `id("org.jetbrains.kotlin.multiplatform")`, `commonMain`, `androidMain`,
-  `iosMain`, `iosArm64Main`, `iosSimulatorArm64Main`, `jsMain`, `wasmJsMain`
-- iOS/Swift/ObjC: `Package.swift`, `*.xcodeproj`, `*.xcworkspace`, `Podfile`
-- Web/TS/JS: `package.json`, `tsconfig.json`, `vite.config.*`, `next.config.*`,
-  `nuxt.config.*`, `angular.json`
-- Rust: `Cargo.toml`
-- C#/.NET: `*.csproj`, `*.sln`, `Directory.Build.props`
-- Ruby: `Gemfile`, `*.gemspec`
-- Additional supported single-stack hints:
-  - Python: `pyproject.toml`, `setup.py`, `setup.cfg`
-  - Go: `go.mod`
-  - Dart/Flutter: `pubspec.yaml`
-  - PHP: `composer.json`
-  - Scala: `build.sbt`
+The command prints:
+
+```json
+{
+  "stacks": [
+    { "kind": "android", "label": "Android (Kotlin/Java/JVM)", "markers": ["build.gradle.kts"] },
+    { "kind": "ios",     "label": "iOS (Swift/ObjC)",          "markers": ["Package.swift"] },
+    { "kind": "kmp",     "label": "Kotlin Multiplatform",      "markers": ["composeApp/commonMain", "build.gradle.kts"] }
+  ],
+  "is_kmp": true,
+  "is_polyglot": false
+}
+```
 
 Interpretation rules:
 
-- If Android/Kotlin markers and iOS markers coexist with multiplatform markers,
-  treat the repo as **KMP**. Include both Android and iOS guidance plus the
-  KMP note below.
-- If multiple unrelated stacks are present, treat the repo as a
-  **polyglot/monorepo** and keep every relevant stack.
-- If detection is ambiguous, tell the user exactly which markers were found and
-  ask one concise clarification question before writing files.
+- `is_kmp: true` → treat the repo as **KMP**. Include both Android and iOS
+  guidance plus the KMP note below.
+- `is_polyglot: true` → **polyglot/monorepo**. Include every detected stack's
+  guidance.
+- Otherwise → **single-stack**. Use the matching per-platform command file as
+  the source of truth.
+- `stacks` empty → tell the user "no known project markers in this directory"
+  and ask whether to proceed against the current root anyway, or to point at
+  another path.
+
+If you need to double-check, the supported short `kind` ids are: `android`,
+`ios`, `kmp`, `web`, `rust`, `csharp`, `ruby`, `python`, `go`, `dart`, `php`,
+`scala`, `zig`, `cpp`, `perl`. Each `marker` is a real path relative to the
+repo root, suitable for showing the user in the final summary.
 
 ### 3. Choose the source command(s)
 
-For each detected primary stack, use the matching existing command file as the
+Map detected `kind` values to existing per-platform command files as the
 source of truth for stack-specific guidance:
 
-- Android -> `plugin/commands/initialize-android.md`
-- iOS -> `plugin/commands/initialize-ios.md`
-- Web -> `plugin/commands/initialize-web.md`
-- Rust -> `plugin/commands/initialize-rust.md`
-- C# -> `plugin/commands/initialize-csharp.md`
-- Ruby -> `plugin/commands/initialize-ruby.md`
+| `kind`   | Source command                              |
+|----------|---------------------------------------------|
+| `android` | `plugin/commands/initialize-android.md`     |
+| `ios`    | `plugin/commands/initialize-ios.md`          |
+| `web`    | `plugin/commands/initialize-web.md`          |
+| `rust`   | `plugin/commands/initialize-rust.md`         |
+| `csharp` | `plugin/commands/initialize-csharp.md`       |
+| `ruby`   | `plugin/commands/initialize-ruby.md`         |
 
 Rules:
 
-- If exactly one of those six stacks is detected, follow that command's flow
-  exactly for the stack-specific parts. Do **not** ask the user to choose.
-- If KMP or multiple primary stacks are detected, compose the union of the
-  relevant stack-specific guidance from those files. Deduplicate shared setup,
-  common rules, and repeated index-management text.
-- If only Python, Go, Dart, PHP, or Scala are detected, use the common rules
-  below plus a short language-specific note with 3-5 representative
-  `ast-index` commands. Keep it concise and do not invent commands that do not
-  exist.
+- Single-stack and one of those six → follow that command's flow exactly.
+  Do **not** ask the user to choose.
+- `is_kmp: true` → compose the union of `initialize-android.md` and
+  `initialize-ios.md` guidance, plus the KMP note below. Deduplicate the shared
+  setup, common rules, and repeated index-management text.
+- `is_polyglot: true` → compose the union of every detected `kind`'s guidance.
+- For `python`, `go`, `dart`, `php`, `scala`, `zig`, `cpp`, `perl`: use the
+  common rules below plus a short language-specific note with 3-5
+  representative `ast-index` commands. Keep it concise and do not invent
+  commands that do not exist.
 
 ### 4. Create or merge `.claude/settings.json`
 

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -670,6 +671,17 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Detect every stack present in the current project root by marker files
+    DetectStacks,
+    /// Install git hooks that auto-update the index on checkout / merge / rewrite
+    InstallGitHooks {
+        /// Overwrite existing ast-index hook scripts
+        #[arg(long)]
+        force: bool,
+        /// Print the hook script paths and contents without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
     // === Programmatic Access ===
     /// Structural code search via ast-grep (requires `sg` installed)
     Agrep {
@@ -1071,6 +1083,10 @@ fn main() -> Result<()> {
         }
         Commands::InstallClaudePlugin => cmd_install_claude_plugin(),
         Commands::InstallCodexMcp { dry_run } => cmd_install_codex_mcp(&root, dry_run),
+        Commands::DetectStacks => cmd_detect_stacks(&root, format),
+        Commands::InstallGitHooks { force, dry_run } => {
+            cmd_install_git_hooks(&root, force, dry_run)
+        }
         // Programmatic access
         Commands::Agrep {
             pattern,
@@ -1238,6 +1254,158 @@ fn cmd_install_codex_mcp(root: &Path, dry_run: bool) -> Result<()> {
 fn print_codex_fallback(install: &CodexMcpInstall) {
     eprintln!("\nAdd this to ~/.codex/config.toml manually:");
     eprintln!("{}", install.fallback_config_toml());
+}
+
+fn cmd_detect_stacks(root: &Path, format: &str) -> Result<()> {
+    let detection = ast_index::indexer::detect_stacks(root);
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&detection)?);
+        return Ok(());
+    }
+
+    if detection.stacks.is_empty() {
+        println!("{}", "No known project stacks detected at this root.".yellow());
+        println!(
+            "Markers checked: settings.gradle*, package.json, Cargo.toml, Package.swift, \
+             go.mod, pyproject.toml, Gemfile, composer.json, *.csproj, build.sbt, build.zig, \
+             CMakeLists.txt, Makefile.PL, pubspec.yaml."
+        );
+        return Ok(());
+    }
+
+    let kind = if detection.is_kmp {
+        "Kotlin Multiplatform"
+    } else if detection.is_polyglot {
+        "Polyglot / monorepo"
+    } else {
+        "Single-stack"
+    };
+    println!("Detected setup: {}", kind.bold());
+    println!();
+    for stack in &detection.stacks {
+        println!("  {} ({})", stack.label.cyan(), stack.kind);
+        for marker in &stack.markers {
+            println!("    - {}", marker.dimmed());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool) -> Result<()> {
+    let git_dir = resolve_git_hooks_dir(root)?;
+    let events = ["post-checkout", "post-merge", "post-rewrite"];
+    let script_body = git_hook_script();
+
+    if dry_run {
+        println!("Would write the following hooks under {}:", git_dir.display());
+        for event in events {
+            println!("\n=== {} ===", event);
+            println!("{}", script_body);
+        }
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&git_dir)?;
+    let mut wrote = 0;
+    let mut skipped: Vec<String> = Vec::new();
+    for event in events {
+        let path = git_dir.join(event);
+        if path.exists() && !force {
+            if let Ok(existing) = std::fs::read_to_string(&path) {
+                if existing.contains(GIT_HOOK_MARKER) {
+                    skipped.push(event.to_string());
+                    continue;
+                }
+            }
+            eprintln!(
+                "Hook {} already exists; rerun with --force to overwrite.",
+                path.display()
+            );
+            continue;
+        }
+        std::fs::write(&path, &script_body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms)?;
+        }
+        wrote += 1;
+    }
+
+    println!(
+        "{}",
+        format!(
+            "Installed {} hook(s) into {}.",
+            wrote,
+            git_dir.display()
+        )
+        .green()
+    );
+    if !skipped.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "Already installed (skipped): {}",
+                skipped.join(", ")
+            )
+            .dimmed()
+        );
+    }
+    println!("Each hook runs `ast-index update` in the background after the git operation.");
+    Ok(())
+}
+
+const GIT_HOOK_MARKER: &str = "# ast-index git hook";
+
+fn git_hook_script() -> String {
+    format!(
+        "#!/usr/bin/env bash\n\
+         {}\n\
+         # Auto-installed by `ast-index install-git-hooks`.\n\
+         # Re-run that command with --force to update this script.\n\
+         set -u\n\
+         if ! command -v ast-index >/dev/null 2>&1; then\n\
+           exit 0\n\
+         fi\n\
+         # Skip if a watcher is already running for this tree.\n\
+         if pgrep -f \"ast-index watch\" >/dev/null 2>&1; then\n\
+           exit 0\n\
+         fi\n\
+         (ast-index update >/dev/null 2>&1 &) >/dev/null 2>&1\n\
+         exit 0\n",
+        GIT_HOOK_MARKER
+    )
+}
+
+fn resolve_git_hooks_dir(root: &Path) -> Result<PathBuf> {
+    let git_path = root.join(".git");
+    if git_path.is_dir() {
+        return Ok(git_path.join("hooks"));
+    }
+    if git_path.is_file() {
+        // Worktree / submodule: .git is a file containing `gitdir: <path>`.
+        let content = std::fs::read_to_string(&git_path)
+            .with_context(|| format!("could not read {}", git_path.display()))?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("gitdir:") {
+                let raw = rest.trim();
+                let candidate = Path::new(raw);
+                let real = if candidate.is_absolute() {
+                    candidate.to_path_buf()
+                } else {
+                    root.join(candidate)
+                };
+                return Ok(real.join("hooks"));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "{} is not a git repository — `.git` not found.",
+        root.display()
+    ))
 }
 
 fn resolve_ast_index_bin_from(

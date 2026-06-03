@@ -533,6 +533,345 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
     }
 }
 
+/// One stack detected in the project root by marker files.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DetectedStack {
+    /// Short id: "android", "ios", "kmp", "web", "rust", ...
+    pub kind: String,
+    /// Human-readable label suitable for CLI output.
+    pub label: String,
+    /// Specific marker files that triggered the detection (relative to root).
+    pub markers: Vec<String>,
+}
+
+/// Result of `detect_stacks()`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StackDetection {
+    pub stacks: Vec<DetectedStack>,
+    /// Kotlin Multiplatform: Kotlin plugin + commonMain/<platform>Main source sets.
+    pub is_kmp: bool,
+    /// True when more than one independent stack is present and it is not a KMP repo.
+    pub is_polyglot: bool,
+}
+
+fn collect_markers(root: &Path, candidates: &[&str]) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|name| root.join(name).exists())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn any_ext_in_root(root: &Path, ext: &str) -> bool {
+    fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().extension().map(|x| x == ext).unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+
+fn collect_ext_markers(root: &Path, ext: &str, limit: usize) -> Vec<String> {
+    fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map(|x| x == ext).unwrap_or(false))
+                .take(limit)
+                .filter_map(|e| {
+                    e.path()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
+    // KMP requires two independent signals:
+    //   * a Kotlin multiplatform source set directory (commonMain / *Main),
+    //   * a Gradle plugin reference (`kotlin("multiplatform")` or
+    //     `org.jetbrains.kotlin.multiplatform`).
+    // Either alone is too weak — non-KMP Android repos sometimes have stray
+    // `commonMain` folders, and some Gradle catalogs declare the plugin without
+    // applying it.
+    let mut markers = Vec::new();
+
+    let kmp_source_sets = [
+        "commonMain",
+        "commonTest",
+        "androidMain",
+        "iosMain",
+        "iosArm64Main",
+        "iosSimulatorArm64Main",
+        "iosX64Main",
+        "jsMain",
+        "wasmJsMain",
+        "jvmMain",
+        "nativeMain",
+    ];
+    'sources: for top in ["src", "shared", "common", "core", "kmp", "composeApp", "androidApp"] {
+        let top_path = root.join(top);
+        if !top_path.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&top_path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if kmp_source_sets.contains(&name.as_str()) {
+                    markers.push(format!("{}/{}", top, name));
+                    break 'sources;
+                }
+            }
+        }
+    }
+    let has_source_set = !markers.is_empty();
+
+    let plugin_files = [
+        "build.gradle.kts",
+        "build.gradle",
+        "settings.gradle.kts",
+        "settings.gradle",
+    ];
+    let mut has_plugin = false;
+    'gradle: for file in plugin_files {
+        let subdirs: Vec<PathBuf> = fs::read_dir(root)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for base in std::iter::once(root.to_path_buf()).chain(subdirs) {
+            let path = base.join(file);
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(&path) {
+                if content.contains("kotlin(\"multiplatform\")")
+                    || content.contains("org.jetbrains.kotlin.multiplatform")
+                {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+                    markers.push(rel);
+                    has_plugin = true;
+                    break 'gradle;
+                }
+            }
+        }
+    }
+
+    (has_source_set && has_plugin, markers)
+}
+
+/// Detect every stack present in `root` by inspecting marker files.
+///
+/// Unlike `detect_project_type` (which collapses multiple stacks to
+/// `ProjectType::Mixed`), this returns the full list with the specific
+/// marker files that triggered each detection. The smart `initialize`
+/// command consumes this to compose Android+iOS rules for KMP repos and
+/// per-stack rules for polyglot monorepos.
+pub fn detect_stacks(root: &Path) -> StackDetection {
+    let mut stacks: Vec<DetectedStack> = Vec::new();
+
+    let android_markers = collect_markers(
+        root,
+        &[
+            "settings.gradle.kts",
+            "settings.gradle",
+            "build.gradle.kts",
+            "build.gradle",
+            "libs.versions.toml",
+            "pom.xml",
+        ],
+    );
+    if !android_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "android".to_string(),
+            label: "Android (Kotlin/Java/JVM)".to_string(),
+            markers: android_markers,
+        });
+    }
+
+    let mut ios_markers = collect_markers(root, &["Package.swift", "Podfile"]);
+    ios_markers.extend(collect_ext_markers(root, "xcodeproj", 3));
+    ios_markers.extend(collect_ext_markers(root, "xcworkspace", 3));
+    if !ios_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "ios".to_string(),
+            label: "iOS (Swift/ObjC)".to_string(),
+            markers: ios_markers,
+        });
+    }
+
+    let (kmp_found, kmp_markers) = has_kmp_markers(root);
+    if kmp_found {
+        stacks.push(DetectedStack {
+            kind: "kmp".to_string(),
+            label: "Kotlin Multiplatform".to_string(),
+            markers: kmp_markers,
+        });
+    }
+
+    let web_markers = collect_markers(
+        root,
+        &[
+            "package.json",
+            "tsconfig.json",
+            "vite.config.ts",
+            "vite.config.js",
+            "next.config.js",
+            "next.config.mjs",
+            "nuxt.config.ts",
+            "angular.json",
+        ],
+    );
+    if !web_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "web".to_string(),
+            label: "Web (TypeScript/JavaScript)".to_string(),
+            markers: web_markers,
+        });
+    }
+
+    let rust_markers = collect_markers(root, &["Cargo.toml"]);
+    if !rust_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "rust".to_string(),
+            label: "Rust".to_string(),
+            markers: rust_markers,
+        });
+    }
+
+    let mut csharp_markers = collect_markers(root, &["Directory.Build.props"]);
+    csharp_markers.extend(collect_ext_markers(root, "sln", 3));
+    csharp_markers.extend(collect_ext_markers(root, "csproj", 3));
+    if !csharp_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "csharp".to_string(),
+            label: "C# / .NET".to_string(),
+            markers: csharp_markers,
+        });
+    }
+
+    let mut ruby_markers = collect_markers(root, &["Gemfile"]);
+    ruby_markers.extend(collect_ext_markers(root, "gemspec", 3));
+    if !ruby_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "ruby".to_string(),
+            label: "Ruby".to_string(),
+            markers: ruby_markers,
+        });
+    }
+
+    let python_markers = collect_markers(root, &["pyproject.toml", "setup.py", "setup.cfg"]);
+    if !python_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "python".to_string(),
+            label: "Python".to_string(),
+            markers: python_markers,
+        });
+    }
+
+    let go_markers = collect_markers(root, &["go.mod"]);
+    if !go_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "go".to_string(),
+            label: "Go".to_string(),
+            markers: go_markers,
+        });
+    }
+
+    let dart_markers = collect_markers(root, &["pubspec.yaml"]);
+    if !dart_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "dart".to_string(),
+            label: "Dart / Flutter".to_string(),
+            markers: dart_markers,
+        });
+    }
+
+    let php_markers = collect_markers(root, &["composer.json"]);
+    if !php_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "php".to_string(),
+            label: "PHP".to_string(),
+            markers: php_markers,
+        });
+    }
+
+    let scala_markers = collect_markers(root, &["build.sbt"]);
+    if !scala_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "scala".to_string(),
+            label: "Scala".to_string(),
+            markers: scala_markers,
+        });
+    }
+
+    let zig_markers = collect_markers(root, &["build.zig", "build.zig.zon"]);
+    if !zig_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "zig".to_string(),
+            label: "Zig".to_string(),
+            markers: zig_markers,
+        });
+    }
+
+    let cpp_markers = collect_markers(root, &["CMakeLists.txt"]);
+    if !cpp_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "cpp".to_string(),
+            label: "C / C++".to_string(),
+            markers: cpp_markers,
+        });
+    }
+
+    let mut perl_markers = collect_markers(root, &["Makefile.PL", "Build.PL", "cpanfile"]);
+    if any_ext_in_root(root, "pm") {
+        perl_markers.push("*.pm".to_string());
+    }
+    if !perl_markers.is_empty() {
+        stacks.push(DetectedStack {
+            kind: "perl".to_string(),
+            label: "Perl".to_string(),
+            markers: perl_markers,
+        });
+    }
+
+    let is_kmp = stacks.iter().any(|s| s.kind == "kmp");
+    // Distinct top-level stacks excluding KMP itself: android+ios pair under KMP
+    // does NOT count as polyglot.
+    let distinct_primary = stacks
+        .iter()
+        .filter(|s| {
+            if is_kmp {
+                // KMP repos legitimately have android+ios+kmp markers.
+                !matches!(s.kind.as_str(), "android" | "ios" | "kmp")
+            } else {
+                true
+            }
+        })
+        .count();
+    let is_polyglot = if is_kmp {
+        distinct_primary >= 1 // KMP + at least one extra stack
+    } else {
+        stacks.len() >= 2
+    };
+
+    StackDetection {
+        stacks,
+        is_kmp,
+        is_polyglot,
+    }
+}
+
 /// Parsed file data for parallel processing
 struct ParsedFile {
     rel_path: String,
