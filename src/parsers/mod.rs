@@ -44,12 +44,30 @@ pub struct ParsedRef {
 /// Max length for context strings stored in DB (characters)
 const MAX_CONTEXT_LEN: usize = 500;
 
+/// Max length for symbol signatures stored in DB. Parsers commonly use
+/// `line_text(content, line)` as the signature, which copies the *entire*
+/// source line. On a minified bundle one line can be the whole file (tens of
+/// megabytes), and there are thousands of symbols per file — multiplying out
+/// to easily 100+ GB of heap during a single rebuild. Truncating at the DB
+/// insert side caps that at `(MAX_SIGNATURE_LEN + 3) bytes per row`.
+const MAX_SIGNATURE_LEN: usize = 500;
+
 /// Truncate context to avoid storing huge minified lines
 fn truncate_context(s: &str) -> String {
-    if s.len() <= MAX_CONTEXT_LEN {
+    truncate_to_len(s, MAX_CONTEXT_LEN)
+}
+
+/// Public truncation for signatures, called from `indexer::write_batch_to_db`
+/// just before INSERT — one chokepoint instead of 220 callsites.
+pub fn truncate_signature(s: &str) -> String {
+    truncate_to_len(s, MAX_SIGNATURE_LEN)
+}
+
+fn truncate_to_len(s: &str, max: usize) -> String {
+    if s.len() <= max {
         s.to_string()
     } else {
-        let mut end = MAX_CONTEXT_LEN;
+        let mut end = max;
         while end < s.len() && !s.is_char_boundary(end) {
             end += 1;
         }

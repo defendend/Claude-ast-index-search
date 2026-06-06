@@ -13,6 +13,46 @@ use std::time::SystemTime;
 use crate::db;
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
 
+/// File-size cap for parsing. Larger files are recorded in the `files`
+/// table (so `update` still tracks their mtime) but never parsed — their
+/// symbol contribution is 0. This prevents pathological RAM peaks on
+/// minified bundles / generated proto bundles / vendor blobs.
+///
+/// Configurable via `AST_INDEX_MAX_FILE_SIZE` (bytes). Default: 1 MB.
+fn max_file_size_bytes() -> u64 {
+    std::env::var("AST_INDEX_MAX_FILE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1_000_000)
+}
+
+/// Soft cap on the number of candidate files the walker accepts before
+/// aborting. Protects against accidental `rebuild` on a VCS / monorepo
+/// root that would index hundreds of millions of files.
+///
+/// Configurable via `AST_INDEX_MAX_FILES`. Default: 500_000. Set to 0 to
+/// disable entirely.
+fn max_files_cap() -> usize {
+    std::env::var("AST_INDEX_MAX_FILES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(500_000)
+}
+
+/// Read the per-project `bypass_size_check` opt-in flag.
+///
+/// Set by `ast-index rebuild --force --remember` for projects where the
+/// user has explicitly accepted the cost of indexing a very large root.
+/// Future `rebuild`/`update` runs on that project skip the cap silently.
+fn cap_disabled_for_root(conn: &Connection) -> bool {
+    let row: rusqlite::Result<String> = conn.query_row(
+        "SELECT value FROM metadata WHERE key = 'bypass_size_check'",
+        [],
+        |row| row.get(0),
+    );
+    matches!(row.as_deref(), Ok("1") | Ok("true") | Ok("yes"))
+}
+
 /// Per-worker stack size for the rayon parsing pool.
 ///
 /// Tree-sitter parsers recurse on each node of the AST; pathological inputs
@@ -899,8 +939,11 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         .to_string_lossy()
         .to_string();
 
-    // Skip files larger than 1 MB (likely generated/minified)
-    if size > 1_000_000 {
+    // Skip files larger than the configured cap (likely generated/minified).
+    // Recorded in `files` so `update` still notices on-disk changes, but
+    // never read into memory or parsed — that's how a single 200 MB vendor
+    // bundle used to push rebuild to 20+ GB RSS.
+    if (size as u64) > max_file_size_bytes() {
         return Ok(ParsedFile {
             rel_path,
             root_path,
@@ -1137,6 +1180,10 @@ pub struct WalkResult {
     // Android
     pub xml_layout_files: Vec<PathBuf>, // .xml in /res/(layout|menu|navigation)
     pub res_files: Vec<PathBuf>,        // all files under /res/
+    /// True when the walker aborted because `AST_INDEX_MAX_FILES` was hit.
+    /// The caller should surface a clear error with bypass instructions
+    /// instead of pretending the partial result is complete.
+    pub aborted_by_cap: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1294,6 +1341,8 @@ struct ParallelWalkCollectorBuilder {
     entries_seen: Arc<AtomicUsize>,
     verbose: bool,
     walk_start: std::time::Instant,
+    max_files: usize,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct ParallelWalkCollector {
@@ -1301,6 +1350,8 @@ struct ParallelWalkCollector {
     entries_seen: Arc<AtomicUsize>,
     verbose: bool,
     walk_start: std::time::Instant,
+    max_files: usize,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
     local: CollectedWalkData,
 }
 
@@ -1311,6 +1362,8 @@ impl<'s> ignore::ParallelVisitorBuilder<'s> for ParallelWalkCollectorBuilder {
             entries_seen: self.entries_seen.clone(),
             verbose: self.verbose,
             walk_start: self.walk_start,
+            max_files: self.max_files,
+            aborted: self.aborted.clone(),
             local: CollectedWalkData::default(),
         })
     }
@@ -1318,6 +1371,12 @@ impl<'s> ignore::ParallelVisitorBuilder<'s> for ParallelWalkCollectorBuilder {
 
 impl ignore::ParallelVisitor for ParallelWalkCollector {
     fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
+        // Cooperative early-stop when another worker has tripped the cap.
+        if self.max_files > 0
+            && self.aborted.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return ignore::WalkState::Quit;
+        }
         match entry {
             Ok(entry) => {
                 let seen = self.entries_seen.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1327,6 +1386,11 @@ impl ignore::ParallelVisitor for ParallelWalkCollector {
                         seen,
                         self.walk_start.elapsed()
                     );
+                }
+                if self.max_files > 0 && seen > self.max_files {
+                    self.aborted
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return ignore::WalkState::Quit;
                 }
                 collect_walk_entry(&mut self.local, &entry);
             }
@@ -1536,6 +1600,12 @@ fn index_directory_scoped_with_max_depth(
     let walk_start = Instant::now();
     let mut collected = CollectedWalkData::default();
 
+    let max_files = if cap_disabled_for_root(conn) {
+        0
+    } else {
+        max_files_cap()
+    };
+    let aborted_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let walk_entries = if experimental_parallel_walk {
         builder.threads(num_threads);
         let shared = Arc::new(Mutex::new(CollectedWalkData::default()));
@@ -1545,6 +1615,8 @@ fn index_directory_scoped_with_max_depth(
             entries_seen: entries_seen.clone(),
             verbose,
             walk_start,
+            max_files,
+            aborted: aborted_flag.clone(),
         };
         builder.build_parallel().visit(&mut collector);
         let mut shared = shared.lock().unwrap();
@@ -1569,10 +1641,34 @@ fn index_directory_scoped_with_max_depth(
                     walk_start.elapsed()
                 );
             }
+            if max_files > 0 && walk_entries > max_files {
+                aborted_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
             collect_walk_entry(&mut collected, &entry);
         }
         walk_entries
     };
+    let aborted_by_cap = aborted_flag.load(std::sync::atomic::Ordering::Relaxed);
+
+    if aborted_by_cap {
+        return Err(anyhow::anyhow!(
+            "walker stopped after {} candidate files (configurable cap).\n\
+             \n\
+             ast-index is tuned for a project subtree, not for a monorepo /\n\
+             VCS root. Re-run from a narrower subdirectory, or override:\n\
+             \n  ast-index rebuild --force\n\
+                 index this root anyway for one run (slow, may use a lot of memory)\n\
+             \n  ast-index rebuild --force --remember\n\
+                 same, but persist the opt-in for this project — subsequent\n\
+                 `ast-index rebuild` runs no longer hit the cap\n\
+             \n  ast-index rebuild --max-files 2000000\n\
+                 raise the cap explicitly for one run\n\
+             \n\
+             The cap also respects AST_INDEX_MAX_FILES (set to 0 to disable).",
+            max_files
+        ));
+    }
 
     let files = collected.files;
     let module_files = collected.module_files;
@@ -1704,6 +1800,7 @@ fn index_directory_scoped_with_max_depth(
         xcassets_dirs,
         xml_layout_files,
         res_files,
+        aborted_by_cap: false,
     })
 }
 
@@ -1765,7 +1862,7 @@ fn write_batch_to_db(
                     qualified_name,
                     sym.kind.as_str(),
                     sym.line as i64,
-                    sym.signature
+                    parsers::truncate_signature(&sym.signature)
                 ])?;
                 let symbol_id = tx.last_insert_rowid();
 
@@ -4009,8 +4106,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
         .as_secs() as i64;
     let size = metadata.len() as i64;
 
-    // Skip files larger than 1 MB
-    if size > 1_000_000 {
+    if (size as u64) > max_file_size_bytes() {
         return Ok(ParsedFile {
             rel_path: rel_path.to_string(),
             root_path: root_path.to_string(),

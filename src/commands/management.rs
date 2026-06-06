@@ -399,6 +399,22 @@ pub fn cmd_rebuild(
             "Including gitignored files (build/, etc.)...".yellow()
         );
     }
+    // Persist the cap bypass when the user passed `--force --remember`.
+    // Set early so the walker (called below) already sees `bypass_size_check`
+    // in metadata and doesn't trip the cap on this very run.
+    if std::env::var("AST_INDEX_REMEMBER_BYPASS").is_ok() {
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('bypass_size_check', '1')",
+            [],
+        )
+        .ok();
+        println!(
+            "{}",
+            "Persisted --force opt-in for this project. Future `rebuild` runs \
+             will not hit the candidate-file cap on this root."
+                .green()
+        );
+    }
     db::set_experimental_fast_rebuild_enabled(&conn, experimental_fast_rebuild).ok();
 
     // Check actual platform markers for mixed mobile repos.

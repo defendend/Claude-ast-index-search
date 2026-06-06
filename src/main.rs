@@ -271,6 +271,20 @@ enum Commands {
         /// Additional paths to index (can be specified multiple times).
         #[arg(long = "path")]
         paths: Vec<String>,
+        /// Bypass the candidate-file cap (AST_INDEX_MAX_FILES) for this run.
+        /// Use when you really want to index a monorepo / VCS root that
+        /// would otherwise be aborted with an oversize warning.
+        #[arg(long)]
+        force: bool,
+        /// Persist the cap bypass for this project, so future
+        /// `ast-index rebuild` runs on the same root no longer abort.
+        /// Requires `--force` to take effect.
+        #[arg(long)]
+        remember: bool,
+        /// Override the candidate-file cap for this run only.
+        /// Default 500_000; set to 0 to disable. See AST_INDEX_MAX_FILES.
+        #[arg(long = "max-files")]
+        max_files: Option<usize>,
     },
     /// Update index (incremental)
     Update {
@@ -800,9 +814,26 @@ fn main() -> Result<()> {
             include,
             exclude,
             paths,
+            force,
+            remember,
+            max_files,
         } => {
             if let Some(t) = threads {
                 std::env::set_var("AST_INDEX_THREADS", t.to_string());
+            }
+            // Convert per-run flags → env vars so they reach the walker
+            // without threading them through six function signatures.
+            if force {
+                std::env::set_var("AST_INDEX_MAX_FILES", "0");
+            } else if let Some(n) = max_files {
+                std::env::set_var("AST_INDEX_MAX_FILES", n.to_string());
+            }
+            if remember && force {
+                std::env::set_var("AST_INDEX_REMEMBER_BYPASS", "1");
+            } else if remember && !force {
+                eprintln!(
+                    "[ast-index] --remember has no effect without --force; ignoring"
+                );
             }
             commands::management::cmd_rebuild(
                 &root,
