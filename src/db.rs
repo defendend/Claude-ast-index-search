@@ -226,6 +226,126 @@ pub fn delete_db(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
+const SWAP_SUFFIXES: &[&str] = &["", "-wal", "-shm"];
+
+fn swap_extension(suffix: &str) -> String {
+    format!("db.swap{}", suffix)
+}
+
+fn live_extension(suffix: &str) -> String {
+    format!("db{}", suffix)
+}
+
+/// Atomically move the current DB aside (rename to `index.db.swap*`).
+///
+/// Returns `true` when there was an old DB to move. The caller is expected
+/// to wrap the rebuild in a `RebuildSwap` guard so the swap is either
+/// committed (deleted) on success or restored on failure.
+///
+/// Any pre-existing swap files (left behind by a previous crashed rebuild)
+/// are deleted first — keeping them around would prevent rename and risk
+/// resurrecting a stale half-finished index.
+pub fn move_db_to_swap(project_root: &Path) -> Result<bool> {
+    let db_path = get_db_path(project_root)?;
+    let mut moved = false;
+    for suffix in SWAP_SUFFIXES {
+        let live = db_path.with_extension(live_extension(suffix));
+        let swap = db_path.with_extension(swap_extension(suffix));
+        if swap.exists() {
+            let _ = std::fs::remove_file(&swap);
+        }
+        if live.exists() {
+            std::fs::rename(&live, &swap)?;
+            moved = true;
+        }
+    }
+    Ok(moved)
+}
+
+/// Restore the previously-swapped DB. Used when a rebuild aborts.
+/// Removes any partial new DB the failed rebuild wrote before renaming
+/// the swap back into place.
+pub fn restore_db_from_swap(project_root: &Path) -> Result<()> {
+    let db_path = get_db_path(project_root)?;
+    for suffix in SWAP_SUFFIXES {
+        let live = db_path.with_extension(live_extension(suffix));
+        let swap = db_path.with_extension(swap_extension(suffix));
+        if swap.exists() {
+            if live.exists() {
+                let _ = std::fs::remove_file(&live);
+            }
+            std::fs::rename(&swap, &live)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove the swap aside (called after a successful rebuild commits).
+pub fn remove_swap(project_root: &Path) -> Result<()> {
+    let db_path = get_db_path(project_root)?;
+    for suffix in SWAP_SUFFIXES {
+        let swap = db_path.with_extension(swap_extension(suffix));
+        if swap.exists() {
+            let _ = std::fs::remove_file(&swap);
+        }
+    }
+    Ok(())
+}
+
+/// RAII guard for atomic rebuild.
+///
+/// `begin()` swaps the live DB to `.db.swap` so the rebuild starts from a
+/// clean state without losing the previous index. If the guard is dropped
+/// without `commit()` (an error bubbled up, walker aborted on cap, etc.),
+/// `restore_db_from_swap` runs in the destructor and the previous index
+/// is back in place. On `commit()` the swap is deleted.
+pub struct RebuildSwap {
+    project_root: PathBuf,
+    had_old_db: bool,
+    committed: bool,
+}
+
+impl RebuildSwap {
+    pub fn begin(project_root: &Path) -> Result<Self> {
+        let had_old_db = move_db_to_swap(project_root)?;
+        Ok(Self {
+            project_root: project_root.to_path_buf(),
+            had_old_db,
+            committed: false,
+        })
+    }
+
+    pub fn commit(mut self) -> Result<()> {
+        remove_swap(&self.project_root).ok();
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for RebuildSwap {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.had_old_db {
+            eprintln!(
+                "[ast-index] rebuild failed — restoring previous index from swap"
+            );
+            if let Err(e) = restore_db_from_swap(&self.project_root) {
+                eprintln!(
+                    "[ast-index] failed to restore previous index: {e}. \
+                     A backup may remain at .db.swap*"
+                );
+            }
+        } else {
+            // No old DB to restore — drop the half-written new one (if any)
+            // and clean up the (likely absent) swap files.
+            let _ = delete_db(&self.project_root);
+            let _ = remove_swap(&self.project_root);
+        }
+    }
+}
+
 fn create_base_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"

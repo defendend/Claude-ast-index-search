@@ -592,6 +592,9 @@ exclude:
 
 ## Changelog
 
+### 3.46.1
+- **Preserve the previous index when `rebuild` aborts** — pre-3.46.1, `rebuild` ran `delete_db` before the walker, so any abort (file-count cap hit, IO error, parser panic that propagates) left the user with an empty database and no working index. Now `cmd_rebuild` (both the regular and `--sub-projects` branches) atomically renames the live DB aside via a new `RebuildSwap` RAII guard. On success the guard's `commit()` removes the swap; on any error the destructor restores the swap back into place. The next `rebuild` also cleans up any leftover swap from a previous crashed run before it starts.
+
 ### 3.46.0
 - **Index Android resources in `--sub-projects` mode even without layout XML** — sub-projects with `res/values/`, `res/drawable/`, `res/colors/` etc. but no `res/layout|menu|navigation/` now correctly run through `index_resources`. The guard `any_android && !all_xml_files.is_empty()` is split, and `any_android` is also promoted from collected `res_files` so a monorepo sub-project whose `build.gradle` lives one level deeper still indexes resources.
 - **Narrow the `/res/` walker filter to canonical Android subdirs** — `res/values`, `res/layout`, `res/drawable`, `res/menu`, `res/navigation`, `res/mipmap`, `res/anim`, `res/animator`, `res/color`, `res/font`, `res/interpolator`, `res/raw`, `res/transition`, `res/xml` (plus their `-<qualifier>` variants). A non-Android `assets/res/dataset/labels.xml` no longer leaks into resource indexing, and `res/values-pl/layout_attrs.xml` no longer gets misclassified as a layout file.

@@ -308,27 +308,33 @@ pub fn cmd_rebuild(
         vec![]
     };
 
-    // Delete DB file entirely to avoid WAL hangs
+    // Swap the live DB aside instead of deleting it outright. The guard
+    // restores the swap if rebuild fails (walker cap aborted, IO error,
+    // anything that propagates an Err) so the user never loses a working
+    // index because of a failed rebuild attempt.
     if verbose {
-        eprintln!("[verbose] deleting old DB...");
+        eprintln!("[verbose] swapping old DB aside...");
     }
     let t = Instant::now();
-    if let Err(e) = db::delete_db(root) {
-        eprintln!(
-            "{}",
-            format!("Warning: could not delete old index: {}", e).yellow()
-        );
-        if let Ok(db_path) = db::get_db_path(root) {
+    let swap_guard = match db::RebuildSwap::begin(root) {
+        Ok(g) => g,
+        Err(e) => {
             eprintln!(
-                "Cache path: {}",
-                db_path.parent().unwrap_or(db_path.as_path()).display()
+                "{}",
+                format!("Warning: could not move old index aside: {}", e).yellow()
             );
-            eprintln!("Try manually removing the cache directory and re-running rebuild.");
+            if let Ok(db_path) = db::get_db_path(root) {
+                eprintln!(
+                    "Cache path: {}",
+                    db_path.parent().unwrap_or(db_path.as_path()).display()
+                );
+                eprintln!("Try manually removing the cache directory and re-running rebuild.");
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
     if verbose {
-        eprintln!("[verbose] DB deleted in {:?}", t.elapsed());
+        eprintln!("[verbose] DB swapped in {:?}", t.elapsed());
     }
 
     // Remove old kotlin-index cache dir entirely
@@ -743,6 +749,10 @@ pub fn cmd_rebuild(
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
     restore_rebuild_pragmas(&conn, verbose)?;
+    // Drop conn first so WAL/SHM files are quiescent before the swap is
+    // removed.
+    drop(conn);
+    swap_guard.commit()?;
     Ok(())
 }
 
@@ -800,22 +810,25 @@ fn cmd_rebuild_sub_projects(
     }
     println!();
 
-    // Single DB for the whole root
+    // Swap aside instead of delete — see cmd_rebuild for rationale.
     if verbose {
-        eprintln!("[verbose] deleting old DB...");
+        eprintln!("[verbose] swapping old DB aside...");
     }
     let t = Instant::now();
-    if let Err(e) = db::delete_db(root) {
-        eprintln!(
-            "{}",
-            format!("Warning: could not delete old index: {}", e).yellow()
-        );
-        return Err(e);
-    }
+    let swap_guard = match db::RebuildSwap::begin(root) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("Warning: could not move old index aside: {}", e).yellow()
+            );
+            return Err(e);
+        }
+    };
     let mut conn = db::open_db(root)?;
     init_rebuild_schema(&conn)?;
     if verbose {
-        eprintln!("[verbose] DB created in {:?}", t.elapsed());
+        eprintln!("[verbose] DB swapped in {:?}", t.elapsed());
     }
 
     if no_ignore {
@@ -1024,6 +1037,8 @@ fn cmd_rebuild_sub_projects(
         eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
     }
     restore_rebuild_pragmas(&conn, verbose)?;
+    drop(conn);
+    swap_guard.commit()?;
     Ok(())
 }
 
