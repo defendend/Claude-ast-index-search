@@ -30,13 +30,13 @@ fn max_file_size_bytes() -> u64 {
 /// aborting. Protects against accidental `rebuild` on a VCS / monorepo
 /// root that would index hundreds of millions of files.
 ///
-/// Configurable via `AST_INDEX_MAX_FILES`. Default: 500_000. Set to 0 to
-/// disable entirely.
+/// Configurable via `AST_INDEX_MAX_FILES`. Default: 2_000_000. Set to 0
+/// to disable entirely.
 fn max_files_cap() -> usize {
     std::env::var("AST_INDEX_MAX_FILES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(500_000)
+        .unwrap_or(2_000_000)
 }
 
 /// Read the per-project `bypass_size_check` opt-in flag.
@@ -1662,7 +1662,7 @@ fn index_directory_scoped_with_max_depth(
              \n  ast-index rebuild --force --remember\n\
                  same, but persist the opt-in for this project — subsequent\n\
                  `ast-index rebuild` runs no longer hit the cap\n\
-             \n  ast-index rebuild --max-files 2000000\n\
+             \n  ast-index rebuild --max-files 5000000\n\
                  raise the cap explicitly for one run\n\
              \n\
              The cap also respects AST_INDEX_MAX_FILES (set to 0 to disable).",

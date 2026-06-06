@@ -6,18 +6,30 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use ast_index::{db, indexer};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
+/// Tests in this file mutate process-wide env vars
+/// (AST_INDEX_MAX_FILES, AST_INDEX_MAX_FILE_SIZE). `cargo test` runs them in
+/// parallel by default, so without serialization they race and flake. Acquire
+/// this lock at the top of every test to force one-at-a-time execution
+/// regardless of test thread count.
+static ENV_SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 /// Reset the indexer's env knobs so tests don't bleed into each other.
 struct EnvScope {
     keys: Vec<(&'static str, Option<String>)>,
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl EnvScope {
     fn new(keys: &[&'static str]) -> Self {
+        // Recover from a poisoned lock (a previous panicked test) — we only
+        // care about serialization, not about preserving any shared state.
+        let guard = ENV_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let saved = keys
             .iter()
             .map(|k| (*k, std::env::var(k).ok()))
@@ -25,7 +37,10 @@ impl EnvScope {
         for k in keys {
             std::env::remove_var(k);
         }
-        Self { keys: saved }
+        Self {
+            keys: saved,
+            _guard: guard,
+        }
     }
 
     fn set(&self, k: &str, v: &str) {

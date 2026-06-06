@@ -599,7 +599,7 @@ exclude:
 - **Cap memory peaks during rebuild** — three independent guards stop a single big-blob file or an accidental monorepo-root rebuild from blowing past dozens of GB:
   - Symbol signatures are truncated to 500 chars at the DB insert chokepoint, so minified bundles no longer multiply `N_symbols × line_length` into the heap.
   - File-size cap (default 1 MB, env `AST_INDEX_MAX_FILE_SIZE`) — oversized files are recorded for change tracking but never read into memory.
-  - Walker file-count cap (default 500,000, env `AST_INDEX_MAX_FILES`) — exits with an actionable message pointing at `rebuild --force`, `rebuild --force --remember`, and `rebuild --max-files N`. `--remember` persists the opt-in for the project via a `bypass_size_check=1` metadata flag.
+  - Walker file-count cap (default 2,000,000, env `AST_INDEX_MAX_FILES`) — exits with an actionable message pointing at `rebuild --force`, `rebuild --force --remember`, and `rebuild --max-files N`. `--remember` persists the opt-in for the project via a `bypass_size_check=1` metadata flag.
 - **More verbose checkpoints in `rebuild`** — every potentially blocking syscall (db path resolution, `.ast-index.yaml` load, `find_sub_projects`) now prints its own `[verbose]` line before running, so any future "hangs after X" report points at the exact failing step.
 
 ### 3.45.0

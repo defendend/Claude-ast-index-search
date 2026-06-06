@@ -282,7 +282,7 @@ enum Commands {
         #[arg(long)]
         remember: bool,
         /// Override the candidate-file cap for this run only.
-        /// Default 500_000; set to 0 to disable. See AST_INDEX_MAX_FILES.
+        /// Default 2_000_000; set to 0 to disable. See AST_INDEX_MAX_FILES.
         #[arg(long = "max-files")]
         max_files: Option<usize>,
     },
