@@ -9,7 +9,7 @@ default-members = ["."]
 
 [package]
 name = "ast-index"
-version = "3.45.0"
+version = "3.46.0"
 edition = "2021"
 description = "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, Scala, PHP, Perl, Python, Go, C++, and Protocol Buffers projects"
 license = "MIT"
