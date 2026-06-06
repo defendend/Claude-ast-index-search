@@ -1174,9 +1174,7 @@ impl CodexMcpInstall {
                 resolve_ast_index_mcp_bin_from(&current_exe, path_env.as_ref()).map_err(|_| err)
             }
         })?;
-        let project_root = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.to_path_buf());
+        let project_root = db::safe_canonicalize(project_root);
 
         Ok(Self {
             project_root,

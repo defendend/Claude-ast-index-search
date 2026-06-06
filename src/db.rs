@@ -6,14 +6,58 @@ use serde::Serialize;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+/// Canonicalize a path with a hard timeout.
+///
+/// `Path::canonicalize` is a blocking syscall and on macOS it can hang
+/// indefinitely when the path lives on a FUSE mount that has gone away
+/// (arc unmount during a session, stale worktree, dead sshfs). That
+/// turns `ast-index rebuild` into a silent hang.
+///
+/// We run the canonicalize on a side thread and wait for at most
+/// `AST_INDEX_CANONICALIZE_TIMEOUT_MS` (default 5s). On timeout or any
+/// canonicalize error we warn to stderr and fall back to the path as-is
+/// — the orphan thread is left to live; the OS reaps it on process exit.
+///
+/// Set `AST_INDEX_NO_CANONICALIZE=1` to skip canonicalize entirely (useful
+/// when you already know the mount is dead and don't want the 5s wait).
+pub fn safe_canonicalize(path: &Path) -> PathBuf {
+    if std::env::var("AST_INDEX_NO_CANONICALIZE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        return path.to_path_buf();
+    }
+
+    let timeout_ms = std::env::var("AST_INDEX_CANONICALIZE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5_000);
+
+    let p = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(p.canonicalize());
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)) {
+        Ok(Ok(canonical)) => canonical,
+        Ok(Err(_)) => path.to_path_buf(),
+        Err(_) => {
+            eprintln!(
+                "[ast-index] filesystem unresponsive at {} — proceeding with raw path \
+                 (set AST_INDEX_NO_CANONICALIZE=1 to skip the {}ms wait next time)",
+                path.display(),
+                timeout_ms
+            );
+            path.to_path_buf()
+        }
+    }
+}
+
 /// Normalize project root path: canonicalize if possible, fallback to original.
-/// This ensures the same DB is found after VFS remount (e.g. arc mount in Arcadia).
+/// This ensures the same DB is found after VFS remount (e.g. arc mount).
 fn normalize_root(project_root: &Path) -> String {
-    project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+    safe_canonicalize(project_root).to_string_lossy().into_owned()
 }
 
 /// Stable storage key for a root that owns indexed relative paths.
@@ -78,11 +122,11 @@ pub fn get_db_path(project_root: &Path) -> Result<PathBuf> {
                                 |row| row.get(0),
                             );
                             if let Ok(root_val) = root_str {
-                                // Match against both raw and normalized paths
-                                let stored_normalized = normalize_root(Path::new(&root_val));
-                                if stored_normalized == normalized
-                                    || root_val == project_root.to_string_lossy().as_ref()
-                                {
+                                // Match by string equality only — do NOT canonicalize
+                                // `root_val`. That foreign path may live on a dead FUSE
+                                // mount (stale arc worktree etc.) and hang the syscall.
+                                let raw = project_root.to_string_lossy();
+                                if root_val == normalized || root_val == raw.as_ref() {
                                     // Found old DB for this project — migrate
                                     let _ = std::fs::create_dir_all(&db_dir);
                                     for suffix in ["index.db", "index.db-wal", "index.db-shm"] {

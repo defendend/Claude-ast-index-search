@@ -110,7 +110,14 @@ pub fn cmd_rebuild(
             "[verbose] index_type={}, index_deps={}, no_ignore={}, sub_projects={}",
             index_type, index_deps, no_ignore, sub_projects
         );
-        eprintln!("[verbose] db path: {:?}", db::get_db_path(root).ok());
+        // Each line below is a separate verbose checkpoint so that a future
+        // "hangs after X" report points to the exact failing syscall.
+        eprintln!("[verbose] resolving db path...");
+    }
+    let db_path_lookup = db::get_db_path(root).ok();
+    if verbose {
+        eprintln!("[verbose] db path: {:?}", db_path_lookup);
+        eprintln!("[verbose] loading .ast-index.yaml...");
     }
 
     // Load project config (.ast-index.yaml)
