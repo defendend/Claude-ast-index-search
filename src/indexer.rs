@@ -1219,6 +1219,49 @@ struct CollectedWalkData {
     walk_errors: WalkErrorSummary,
 }
 
+/// Canonical Android resource directory prefixes under `/res/`.
+///
+/// Used to (1) keep `res_files` Android-specific instead of grabbing any
+/// `/res/` substring (a Python project's `assets/res/` would otherwise leak
+/// in and falsely mark the tree as Android), and (2) narrow `xml_layout_files`
+/// to actual layout/menu/navigation directories without matching `values-pl/
+/// layout_attrs.xml`.
+const ANDROID_RES_SUBDIRS: &[&str] = &[
+    "values",
+    "layout",
+    "drawable",
+    "menu",
+    "navigation",
+    "mipmap",
+    "anim",
+    "animator",
+    "color",
+    "font",
+    "interpolator",
+    "raw",
+    "transition",
+    "xml",
+];
+
+/// `path_str` is under one of `<name>` or `<name>-<qualifier>` subdirs of `/res/`.
+fn android_res_subdir_match(path_str: &str, name: &str) -> bool {
+    let needle_slash = format!("/res/{}/", name);
+    let needle_dash = format!("/res/{}-", name);
+    path_str.contains(&needle_slash) || path_str.contains(&needle_dash)
+}
+
+fn is_android_res_path(path_str: &str) -> bool {
+    ANDROID_RES_SUBDIRS
+        .iter()
+        .any(|name| android_res_subdir_match(path_str, name))
+}
+
+fn is_android_layout_path(path_str: &str) -> bool {
+    ["layout", "menu", "navigation"]
+        .iter()
+        .any(|name| android_res_subdir_match(path_str, name))
+}
+
 fn collect_walk_entry(data: &mut CollectedWalkData, entry: &ignore::DirEntry) {
     let path = entry.path();
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -1237,13 +1280,9 @@ fn collect_walk_entry(data: &mut CollectedWalkData, entry: &ignore::DirEntry) {
             data.xcassets_dirs.push(path.to_path_buf());
         }
         let path_str = path.to_string_lossy();
-        if path_str.contains("/res/") {
+        if is_android_res_path(&path_str) {
             data.res_files.push(path.to_path_buf());
-            if ext == "xml"
-                && (path_str.contains("/layout")
-                    || path_str.contains("/menu")
-                    || path_str.contains("/navigation"))
-            {
+            if ext == "xml" && is_android_layout_path(&path_str) {
                 data.xml_layout_files.push(path.to_path_buf());
             }
         }

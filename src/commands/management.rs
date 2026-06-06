@@ -395,8 +395,13 @@ pub fn cmd_rebuild(
     db::set_experimental_fast_rebuild_enabled(&conn, experimental_fast_rebuild).ok();
 
     // Check actual platform markers for mixed mobile repos.
-    let is_ios = indexer::has_ios_markers(root);
-    let is_android = indexer::has_android_markers(root);
+    //
+    // Marker check covers the canonical case (build.gradle / Package.swift
+    // at the root). Both flags are promoted below from walker output as well
+    // — a monorepo where the marker lives one level deeper still gets its
+    // resources / storyboards indexed.
+    let mut is_ios = indexer::has_ios_markers(root);
+    let mut is_android = indexer::has_android_markers(root);
 
     match index_type {
         "all" => {
@@ -419,6 +424,15 @@ pub fn cmd_rebuild(
                     file_count,
                     t.elapsed()
                 );
+            }
+
+            // Promote platform flags from collected artefacts — see comment at
+            // the marker-based detection above.
+            if !walk.res_files.is_empty() {
+                is_android = true;
+            }
+            if !walk.storyboard_files.is_empty() || !walk.xcassets_dirs.is_empty() {
+                is_ios = true;
             }
 
             // Collect module_files from primary root
@@ -858,6 +872,16 @@ fn cmd_rebuild_sub_projects(
         {
             Ok(walk) => {
                 total_files += walk.file_count;
+                // Promote Android/iOS flags from collected artefacts as well —
+                // a sub-project may carry res/storyboard files even when the
+                // canonical marker file (build.gradle, Package.swift) lives one
+                // level deeper and `has_*_markers(path)` returned false.
+                if !walk.res_files.is_empty() {
+                    any_android = true;
+                }
+                if !walk.storyboard_files.is_empty() || !walk.xcassets_dirs.is_empty() {
+                    any_ios = true;
+                }
                 all_module_files.extend(walk.module_files);
                 all_xml_files.extend(walk.xml_layout_files);
                 all_res_files.extend(walk.res_files);
@@ -918,17 +942,24 @@ fn cmd_rebuild_sub_projects(
         }
     }
 
-    // Android-specific: XML layouts and resources
-    if any_android && !all_xml_files.is_empty() {
-        let t = Instant::now();
-        let xml_count = indexer::index_xml_usages(&mut conn, root, &all_xml_files, verbose)?;
-        if verbose {
-            eprintln!("[verbose] xml_usages: {} in {:?}", xml_count, t.elapsed());
+    // Android-specific: XML layouts and resources.
+    // Split: a sub-project with values/drawables/colors but no layout/menu/
+    // navigation XML still needs resources indexed.
+    if any_android {
+        if !all_xml_files.is_empty() {
+            let t = Instant::now();
+            let xml_count = indexer::index_xml_usages(&mut conn, root, &all_xml_files, verbose)?;
+            if verbose {
+                eprintln!("[verbose] xml_usages: {} in {:?}", xml_count, t.elapsed());
+            }
         }
-        let t = Instant::now();
-        let (res_count, _) = indexer::index_resources(&mut conn, root, &all_res_files, verbose)?;
-        if verbose {
-            eprintln!("[verbose] resources: {} in {:?}", res_count, t.elapsed());
+        if !all_res_files.is_empty() {
+            let t = Instant::now();
+            let (res_count, _) =
+                indexer::index_resources(&mut conn, root, &all_res_files, verbose)?;
+            if verbose {
+                eprintln!("[verbose] resources: {} in {:?}", res_count, t.elapsed());
+            }
         }
     }
 
