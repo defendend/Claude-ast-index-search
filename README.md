@@ -592,6 +592,16 @@ exclude:
 
 ## Changelog
 
+### 3.46.0
+- **Index Android resources in `--sub-projects` mode even without layout XML** — sub-projects with `res/values/`, `res/drawable/`, `res/colors/` etc. but no `res/layout|menu|navigation/` now correctly run through `index_resources`. The guard `any_android && !all_xml_files.is_empty()` is split, and `any_android` is also promoted from collected `res_files` so a monorepo sub-project whose `build.gradle` lives one level deeper still indexes resources.
+- **Narrow the `/res/` walker filter to canonical Android subdirs** — `res/values`, `res/layout`, `res/drawable`, `res/menu`, `res/navigation`, `res/mipmap`, `res/anim`, `res/animator`, `res/color`, `res/font`, `res/interpolator`, `res/raw`, `res/transition`, `res/xml` (plus their `-<qualifier>` variants). A non-Android `assets/res/dataset/labels.xml` no longer leaks into resource indexing, and `res/values-pl/layout_attrs.xml` no longer gets misclassified as a layout file.
+- **Add `safe_canonicalize` to survive dead FUSE mounts during rebuild** — `Path::canonicalize` now runs on a side thread with a 5s timeout (`AST_INDEX_CANONICALIZE_TIMEOUT_MS`) and falls back to the raw path with a stderr warning if the filesystem stops responding (stale VFS mounts, unreachable network paths). The migration loop inside `db::get_db_path` also stopped canonicalizing foreign `project_root` strings stored in old cache databases, which previously could pin rebuild forever. Set `AST_INDEX_NO_CANONICALIZE=1` to skip canonicalize entirely.
+- **Cap memory peaks during rebuild** — three independent guards stop a single big-blob file or an accidental monorepo-root rebuild from blowing past dozens of GB:
+  - Symbol signatures are truncated to 500 chars at the DB insert chokepoint, so minified bundles no longer multiply `N_symbols × line_length` into the heap.
+  - File-size cap (default 1 MB, env `AST_INDEX_MAX_FILE_SIZE`) — oversized files are recorded for change tracking but never read into memory.
+  - Walker file-count cap (default 500,000, env `AST_INDEX_MAX_FILES`) — exits with an actionable message pointing at `rebuild --force`, `rebuild --force --remember`, and `rebuild --max-files N`. `--remember` persists the opt-in for the project via a `bypass_size_check=1` metadata flag.
+- **More verbose checkpoints in `rebuild`** — every potentially blocking syscall (db path resolution, `.ast-index.yaml` load, `find_sub_projects`) now prints its own `[verbose]` line before running, so any future "hangs after X" report points at the exact failing step.
+
 ### 3.45.0
 - **Add `ast-index detect-stacks` for reliable multi-stack detection** — emits the full list of stacks present at the project root with their marker files, plus `is_kmp` and `is_polyglot` flags; Kotlin Multiplatform is recognised by requiring both a `kotlin("multiplatform")` plugin reference and a `commonMain`/`androidMain`/`iosMain`-style source set, so an Android-only Kotlin app no longer trips KMP detection (#44).
 - **Smart `/initialize` now drives off the new detector** — instead of hand-scanning markers, the command parses `ast-index --format json detect-stacks` output and composes per-stack rules for single-stack, KMP, and polyglot/monorepo repos in one go (#44).
