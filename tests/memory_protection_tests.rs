@@ -245,3 +245,38 @@ fn walker_cap_disabled_when_env_is_zero() {
     indexer::index_directory(&mut conn, root, false, false)
         .expect("cap = 0 must disable the limit entirely");
 }
+
+#[test]
+fn soft_warn_threshold_does_not_abort_rebuild() {
+    // Soft warning at 5 entries, hard cap disabled. Rebuild must succeed
+    // (warning is informational, not fatal). We can't easily assert on
+    // stderr from inside the test process because eprintln! is not
+    // captured by libtest, so we focus on "rebuild succeeded despite
+    // crossing the warn threshold".
+    let env = EnvScope::new(&["AST_INDEX_WARN_FILES", "AST_INDEX_MAX_FILES"]);
+    env.set("AST_INDEX_WARN_FILES", "5");
+    env.set("AST_INDEX_MAX_FILES", "0");
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write(&root.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    for i in 0..30 {
+        write(
+            &root.join(format!("src/file_{i}.rs")),
+            "pub fn placeholder() {}\n",
+        );
+    }
+
+    let mut conn = open_fresh_db(root);
+    let result = indexer::index_directory(&mut conn, root, false, false);
+    assert!(
+        result.is_ok(),
+        "soft warning must not abort rebuild, got: {:?}",
+        result.err()
+    );
+    // Symbols should be indexed normally.
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+        .unwrap();
+    assert!(count >= 10, "expected indexed symbols, got {count}");
+}

@@ -39,6 +39,19 @@ fn max_files_cap() -> usize {
         .unwrap_or(2_000_000)
 }
 
+/// Soft threshold at which the walker prints a one-shot warning to stderr
+/// but keeps going. Lets the user notice "I'm rebuilding something huge"
+/// without aborting projects that legitimately have ~1M files.
+///
+/// Configurable via `AST_INDEX_WARN_FILES`. Default: 500_000. Set to 0 to
+/// silence entirely.
+fn warn_files_threshold() -> usize {
+    std::env::var("AST_INDEX_WARN_FILES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(500_000)
+}
+
 /// Read the per-project `bypass_size_check` opt-in flag.
 ///
 /// Set by `ast-index rebuild --force --remember` for projects where the
@@ -1342,7 +1355,9 @@ struct ParallelWalkCollectorBuilder {
     verbose: bool,
     walk_start: std::time::Instant,
     max_files: usize,
+    warn_threshold: usize,
     aborted: Arc<std::sync::atomic::AtomicBool>,
+    warned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct ParallelWalkCollector {
@@ -1351,7 +1366,9 @@ struct ParallelWalkCollector {
     verbose: bool,
     walk_start: std::time::Instant,
     max_files: usize,
+    warn_threshold: usize,
     aborted: Arc<std::sync::atomic::AtomicBool>,
+    warned: Arc<std::sync::atomic::AtomicBool>,
     local: CollectedWalkData,
 }
 
@@ -1363,10 +1380,23 @@ impl<'s> ignore::ParallelVisitorBuilder<'s> for ParallelWalkCollectorBuilder {
             verbose: self.verbose,
             walk_start: self.walk_start,
             max_files: self.max_files,
+            warn_threshold: self.warn_threshold,
             aborted: self.aborted.clone(),
+            warned: self.warned.clone(),
             local: CollectedWalkData::default(),
         })
     }
+}
+
+fn emit_soft_warning(seen: usize, walk_start: std::time::Instant) {
+    eprintln!(
+        "[ast-index] warning: scanning a very large root ({}+ candidate files in {:?}). \
+         Indexing will continue, but rebuild may take a while and consume substantial \
+         memory. Consider scoping via .ast-index.yaml `include` or running from a deeper \
+         subdirectory. The hard abort cap is AST_INDEX_MAX_FILES (default 2,000,000).",
+        seen,
+        walk_start.elapsed()
+    );
 }
 
 impl ignore::ParallelVisitor for ParallelWalkCollector {
@@ -1386,6 +1416,14 @@ impl ignore::ParallelVisitor for ParallelWalkCollector {
                         seen,
                         self.walk_start.elapsed()
                     );
+                }
+                if self.warn_threshold > 0
+                    && seen > self.warn_threshold
+                    && !self
+                        .warned
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    emit_soft_warning(seen, self.walk_start);
                 }
                 if self.max_files > 0 && seen > self.max_files {
                     self.aborted
@@ -1605,7 +1643,12 @@ fn index_directory_scoped_with_max_depth(
     } else {
         max_files_cap()
     };
+    // The soft warning fires regardless of the hard cap bypass — even users
+    // who opt into indexing the whole monorepo deserve a heads-up that the
+    // run is going to be heavy.
+    let warn_threshold = warn_files_threshold();
     let aborted_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let warned_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let walk_entries = if experimental_parallel_walk {
         builder.threads(num_threads);
         let shared = Arc::new(Mutex::new(CollectedWalkData::default()));
@@ -1616,7 +1659,9 @@ fn index_directory_scoped_with_max_depth(
             verbose,
             walk_start,
             max_files,
+            warn_threshold,
             aborted: aborted_flag.clone(),
+            warned: warned_flag.clone(),
         };
         builder.build_parallel().visit(&mut collector);
         let mut shared = shared.lock().unwrap();
@@ -1640,6 +1685,12 @@ fn index_directory_scoped_with_max_depth(
                     walk_entries,
                     walk_start.elapsed()
                 );
+            }
+            if warn_threshold > 0
+                && walk_entries > warn_threshold
+                && !warned_flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                emit_soft_warning(walk_entries, walk_start);
             }
             if max_files > 0 && walk_entries > max_files {
                 aborted_flag.store(true, std::sync::atomic::Ordering::Relaxed);
