@@ -490,6 +490,19 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        -- Named workspace subtrees (#31). Each row represents an extra source
+        -- root attached to this project: the user gives it a short `name`
+        -- (used in CLI filters and in output prefixes), `original_path` is
+        -- what the user typed (relative or absolute, kept for portability),
+        -- and `canonical_path` is the normalized absolute form actually
+        -- written into `files.root_path` during indexing.
+        CREATE TABLE IF NOT EXISTS subtrees (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            canonical_path TEXT NOT NULL UNIQUE,
+            original_path TEXT NOT NULL
+        );
         "#,
     )?;
     Ok(())
@@ -2178,20 +2191,174 @@ pub fn find_references_scoped(
     Ok(results)
 }
 
-/// Get extra source roots stored in metadata
-pub fn get_extra_roots(conn: &Connection) -> Result<Vec<String>> {
-    let result: Result<String, _> = conn.query_row(
+/// A named workspace subtree attached to the current project (#31).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Subtree {
+    pub name: String,
+    /// Canonical absolute path used as `files.root_path` during indexing.
+    pub canonical_path: String,
+    /// Path as the user originally provided it (kept verbatim so a project
+    /// committed with relative paths stays portable across machines).
+    pub original_path: String,
+}
+
+/// List every subtree attached to this project, ordered by name.
+pub fn list_subtrees(conn: &Connection) -> Result<Vec<Subtree>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, canonical_path, original_path FROM subtrees ORDER BY name",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Subtree {
+            name: row.get(0)?,
+            canonical_path: row.get(1)?,
+            original_path: row.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn find_subtree_by_name(conn: &Connection, name: &str) -> Result<Option<Subtree>> {
+    let result: rusqlite::Result<Subtree> = conn.query_row(
+        "SELECT name, canonical_path, original_path FROM subtrees WHERE name = ?1",
+        params![name],
+        |row| {
+            Ok(Subtree {
+                name: row.get(0)?,
+                canonical_path: row.get(1)?,
+                original_path: row.get(2)?,
+            })
+        },
+    );
+    match result {
+        Ok(s) => Ok(Some(s)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn find_subtree_by_root_path(
+    conn: &Connection,
+    canonical_path: &str,
+) -> Result<Option<Subtree>> {
+    let result: rusqlite::Result<Subtree> = conn.query_row(
+        "SELECT name, canonical_path, original_path FROM subtrees WHERE canonical_path = ?1",
+        params![canonical_path],
+        |row| {
+            Ok(Subtree {
+                name: row.get(0)?,
+                canonical_path: row.get(1)?,
+                original_path: row.get(2)?,
+            })
+        },
+    );
+    match result {
+        Ok(s) => Ok(Some(s)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Insert a new subtree row. Errors when the name or canonical_path are
+/// already taken (UNIQUE constraint).
+pub fn insert_subtree(
+    conn: &Connection,
+    name: &str,
+    canonical_path: &str,
+    original_path: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO subtrees (name, canonical_path, original_path) VALUES (?1, ?2, ?3)",
+        params![name, canonical_path, original_path],
+    )?;
+    Ok(())
+}
+
+pub fn remove_subtree_by_name(conn: &Connection, name: &str) -> Result<bool> {
+    let n = conn.execute("DELETE FROM subtrees WHERE name = ?1", params![name])?;
+    Ok(n > 0)
+}
+
+/// Derive a short, filesystem-friendly default subtree name from a path.
+/// Strips trailing slashes, takes the last meaningful component, and falls
+/// back to `subtree` when the path has no usable basename (e.g. just `/`).
+pub fn default_subtree_name(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    let base = Path::new(trimmed)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let clean = base
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect::<String>();
+    let clean = clean.trim_matches('-').to_string();
+    if clean.is_empty() {
+        "subtree".to_string()
+    } else {
+        clean
+    }
+}
+
+/// Pick a name that's not yet taken in the subtrees table. Starts with the
+/// caller's preferred name and appends `-2`, `-3`, ... on collision.
+pub fn allocate_subtree_name(conn: &Connection, preferred: &str) -> Result<String> {
+    if find_subtree_by_name(conn, preferred)?.is_none() {
+        return Ok(preferred.to_string());
+    }
+    for n in 2..1000 {
+        let candidate = format!("{}-{}", preferred, n);
+        if find_subtree_by_name(conn, &candidate)?.is_none() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not allocate a free subtree name based on '{}'",
+        preferred
+    ))
+}
+
+/// One-time migration of pre-3.47 `metadata.extra_roots` JSON into the
+/// new `subtrees` table. Idempotent: deletes the metadata row after a
+/// successful migration so we don't run this twice.
+fn migrate_extra_roots_to_subtrees(conn: &Connection) -> Result<()> {
+    let json: rusqlite::Result<String> = conn.query_row(
         "SELECT value FROM metadata WHERE key = 'extra_roots'",
         [],
         |row| row.get(0),
     );
-    match result {
-        Ok(json) => {
-            let roots: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
-            Ok(roots)
+    let json = match json {
+        Ok(j) => j,
+        Err(_) => return Ok(()),
+    };
+    let roots: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+    for raw in roots {
+        if find_subtree_by_root_path(conn, &raw)?.is_some() {
+            continue;
         }
-        Err(_) => Ok(vec![]),
+        let preferred = default_subtree_name(&raw);
+        let name = allocate_subtree_name(conn, &preferred)?;
+        // Original_path falls back to canonical_path for migrated rows —
+        // we no longer know what the user originally typed.
+        insert_subtree(conn, &name, &raw, &raw)?;
     }
+    // Clear the legacy row so the migration is a no-op on next open.
+    conn.execute("DELETE FROM metadata WHERE key = 'extra_roots'", [])?;
+    Ok(())
+}
+
+/// Get extra source roots — backwards-compatible shim over the new
+/// `subtrees` table. Returns the canonical_path of each subtree, ignoring
+/// the name (existing callers do not yet care about subtree names).
+pub fn get_extra_roots(conn: &Connection) -> Result<Vec<String>> {
+    migrate_extra_roots_to_subtrees(conn).ok();
+    Ok(list_subtrees(conn)?
+        .into_iter()
+        .map(|s| s.canonical_path)
+        .collect())
 }
 
 pub fn is_experimental_fast_rebuild_enabled_in_db(conn: &Connection) -> bool {
@@ -2212,34 +2379,31 @@ pub fn set_experimental_fast_rebuild_enabled(conn: &Connection, enabled: bool) -
     Ok(())
 }
 
-/// Add an extra source root
+/// Add an extra source root with an auto-generated subtree name.
+///
+/// Backwards-compatible shim for the pre-3.47 `add-root` CLI command.
+/// Picks a default name from the path basename and falls back to
+/// `<base>-2`, `<base>-3`, ... on collision. Stores `path` verbatim in
+/// `original_path` so the user's preference (relative vs absolute) is
+/// preserved.
 pub fn add_extra_root(conn: &Connection, path: &str) -> Result<()> {
-    let mut roots = get_extra_roots(conn)?;
-    if !roots.contains(&path.to_string()) {
-        roots.push(path.to_string());
+    migrate_extra_roots_to_subtrees(conn).ok();
+    if find_subtree_by_root_path(conn, path)?.is_some() {
+        return Ok(());
     }
-    let json = serde_json::to_string(&roots)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('extra_roots', ?1)",
-        params![json],
-    )?;
-    Ok(())
+    let preferred = default_subtree_name(path);
+    let name = allocate_subtree_name(conn, &preferred)?;
+    insert_subtree(conn, &name, path, path)
 }
 
-/// Remove an extra source root
+/// Remove an extra source root identified by its canonical path.
 pub fn remove_extra_root(conn: &Connection, path: &str) -> Result<bool> {
-    let mut roots = get_extra_roots(conn)?;
-    let len_before = roots.len();
-    roots.retain(|r| r != path);
-    if roots.len() == len_before {
-        return Ok(false);
-    }
-    let json = serde_json::to_string(&roots)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('extra_roots', ?1)",
-        params![json],
+    migrate_extra_roots_to_subtrees(conn).ok();
+    let n = conn.execute(
+        "DELETE FROM subtrees WHERE canonical_path = ?1",
+        params![path],
     )?;
-    Ok(true)
+    Ok(n > 0)
 }
 
 /// Normalize a module name input so that `:core:utils`, `core/utils`, and
