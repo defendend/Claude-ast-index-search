@@ -592,6 +592,13 @@ exclude:
 
 ## Changelog
 
+### 3.47.0
+- **Named workspace subtrees (#31)** — attach sibling project trees to the current index under short names. `ast-index subtree add <name> <path>` stores the path verbatim (relative or absolute) and indexes its files alongside the primary root. `ast-index subtree remove <name>` detaches by name. `ast-index subtree list` prints `name | original_path | canonical_path` (or JSON via `--format json`). The legacy `add-root` / `remove-root` / `list-roots` commands still work; they auto-generate a subtree name from the path basename for the same effect.
+- **`[name]` prefix in text output for subtree-owned files** — `search`, `symbol`, `class`, `usages`, `refs`, `implementations`, `outline`, and `file` print `[name] /abs/path` when the result lives in a named subtree. Primary-project paths stay unprefixed. `--format json` keeps the raw absolute path in the `path` field so downstream tooling doesn't have to parse the prefix.
+- **Global `--subtree <name>` and `--local` filters** — restrict search results to one subtree or to the primary project only. The two flags are mutually exclusive and exit with a clear error when combined. Note: the filter is applied after `--limit`, so the visible result count may be lower than the limit when a subtree matches few rows.
+- **Soft warning at 500k candidate files** (env `AST_INDEX_WARN_FILES`) — walker prints a one-shot stderr warning when crossing the threshold, then keeps going. Hard abort cap stays at 2,000,000 (`AST_INDEX_MAX_FILES`).
+- **Auto-migration of pre-3.47 `extra_roots` metadata** — the old JSON-encoded list of extra roots is rewritten into the new `subtrees` table on the first `open_db`, deriving each subtree's name from its path basename and deleting the legacy row. Idempotent: subsequent opens find no legacy row and exit early.
+
 ### 3.46.1
 - **Preserve the previous index when `rebuild` aborts** — pre-3.46.1, `rebuild` ran `delete_db` before the walker, so any abort (file-count cap hit, IO error, parser panic that propagates) left the user with an empty database and no working index. Now `cmd_rebuild` (both the regular and `--sub-projects` branches) atomically renames the live DB aside via a new `RebuildSwap` RAII guard. On success the guard's `commit()` removes the swap; on any error the destructor restores the swap back into place. The next `rebuild` also cleans up any leftover swap from a previous crashed run before it starts.
 
