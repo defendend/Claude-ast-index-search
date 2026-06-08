@@ -1307,25 +1307,214 @@ pub fn cmd_remove_root(root: &Path, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// List configured source roots
-pub fn cmd_list_roots(root: &Path) -> Result<()> {
+/// Legacy `list-roots` — lists subtrees by their canonical path only.
+/// New code should prefer `subtree list`, which also shows names.
+pub fn cmd_list_roots(root: &Path, format: &str) -> Result<()> {
+    cmd_subtree_list(root, format)
+}
+
+fn ensure_index_exists(root: &Path) -> bool {
     if !db::db_exists(root) {
         println!(
             "{}",
             "Index not found. Run 'ast-index rebuild' first.".red()
         );
+        return false;
+    }
+    true
+}
+
+/// Resolve a user-supplied path into (canonical_path, original_path).
+///
+/// `canonical_path` is the absolute form used as `files.root_path` during
+/// indexing. `original_path` preserves the user's input verbatim so a
+/// project committed with relative paths stays portable across machines.
+fn resolve_subtree_path(path: &str) -> (String, String) {
+    let original = path.to_string();
+    let candidate = if std::path::Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(path)
+    };
+    let canonical = db::safe_canonicalize(&candidate)
+        .to_string_lossy()
+        .into_owned();
+    (canonical, original)
+}
+
+/// Reject obvious overlaps with the primary project root unless --force.
+fn reject_overlap_with_root(
+    root: &Path,
+    canonical_new: &str,
+    force: bool,
+) -> Result<bool> {
+    if force {
+        return Ok(true);
+    }
+    let canonical_root = db::safe_canonicalize(root)
+        .to_string_lossy()
+        .into_owned();
+    let canonical_new_pb = std::path::Path::new(canonical_new);
+    let canonical_root_pb = std::path::Path::new(&canonical_root);
+
+    if canonical_new_pb.starts_with(canonical_root_pb) {
+        println!(
+            "{}",
+            format!(
+                "Warning: '{}' is inside the project root '{}'. \
+                 Files would be indexed twice.",
+                canonical_new,
+                root.display()
+            )
+            .yellow()
+        );
+        println!("Use --force to attach anyway, or scope via .ast-index.yaml `include`.");
+        return Ok(false);
+    }
+    if canonical_root_pb.starts_with(canonical_new_pb) {
+        println!(
+            "{}",
+            format!(
+                "Warning: '{}' is a parent of the project root. \
+                 This would cause massive duplication.",
+                canonical_new
+            )
+            .yellow()
+        );
+        println!("Use --force to attach anyway.");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub fn cmd_subtree_add(
+    root: &Path,
+    name: &str,
+    path: &str,
+    force: bool,
+    format: &str,
+) -> Result<()> {
+    if !ensure_index_exists(root) {
+        return Ok(());
+    }
+    let (canonical, original) = resolve_subtree_path(path);
+    if !reject_overlap_with_root(root, &canonical, force)? {
         return Ok(());
     }
 
     let conn = db::open_db(root)?;
-    let extra_roots = db::get_extra_roots(&conn)?;
+    if let Some(existing) = db::find_subtree_by_name(&conn, name)? {
+        println!(
+            "{}",
+            format!(
+                "Subtree name '{}' already attached to {}",
+                name, existing.canonical_path
+            )
+            .yellow()
+        );
+        println!("Pick a different name, or remove the existing entry first.");
+        return Ok(());
+    }
+    if let Some(existing) = db::find_subtree_by_root_path(&conn, &canonical)? {
+        println!(
+            "{}",
+            format!(
+                "This path is already attached as subtree '{}'",
+                existing.name
+            )
+            .yellow()
+        );
+        return Ok(());
+    }
+    db::insert_subtree(&conn, name, &canonical, &original)?;
 
-    println!("{}", "Source roots:".bold());
-    println!("  {} (primary)", root.display());
-    for r in &extra_roots {
-        println!("  {}", r);
+    if format == "json" {
+        let payload = db::Subtree {
+            name: name.to_string(),
+            canonical_path: canonical.clone(),
+            original_path: original.clone(),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "{}",
+            format!("Attached subtree {} → {}", name, canonical).green()
+        );
+        if original != canonical {
+            println!("  source: {}", original);
+        }
+    }
+    Ok(())
+}
+
+pub fn cmd_subtree_remove(root: &Path, name: &str, format: &str) -> Result<()> {
+    if !ensure_index_exists(root) {
+        return Ok(());
+    }
+    let conn = db::open_db(root)?;
+    let existing = db::find_subtree_by_name(&conn, name)?;
+    let removed = db::remove_subtree_by_name(&conn, name)?;
+
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::json!({ "removed": removed, "name": name }).to_string()
+        );
+        return Ok(());
     }
 
+    if removed {
+        if let Some(s) = existing {
+            println!(
+                "{}",
+                format!("Detached subtree {} ({}).", name, s.canonical_path).green()
+            );
+        } else {
+            println!("{}", format!("Detached subtree {}.", name).green());
+        }
+        println!("Run `ast-index rebuild` to drop its files from the index.");
+    } else {
+        println!(
+            "{}",
+            format!("Subtree '{}' not found.", name).yellow()
+        );
+    }
+    Ok(())
+}
+
+pub fn cmd_subtree_list(root: &Path, format: &str) -> Result<()> {
+    if !ensure_index_exists(root) {
+        return Ok(());
+    }
+    let conn = db::open_db(root)?;
+    let subtrees = db::list_subtrees(&conn)?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&subtrees)?);
+        return Ok(());
+    }
+
+    println!("{}", "Subtrees attached to this project:".bold());
+    println!("  {} (primary)", root.display());
+    if subtrees.is_empty() {
+        println!(
+            "  {}",
+            "No extra subtrees attached. Use `ast-index subtree add <name> <path>` to add one."
+                .dimmed()
+        );
+        return Ok(());
+    }
+    let name_w = subtrees.iter().map(|s| s.name.len()).max().unwrap_or(4);
+    for s in &subtrees {
+        let display = if s.original_path == s.canonical_path {
+            s.canonical_path.clone()
+        } else {
+            format!("{} ({})", s.original_path, s.canonical_path)
+        };
+        println!("  {:<width$}  {}", s.name.cyan(), display, width = name_w);
+    }
     Ok(())
 }
 

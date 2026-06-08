@@ -656,7 +656,7 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: usize,
     },
-    /// Add additional source root to project
+    /// Add additional source root to project (legacy; prefer `subtree add`)
     AddRoot {
         /// Path to add as source root
         path: String,
@@ -664,13 +664,18 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Remove source root from project
+    /// Remove source root from project (legacy; prefer `subtree remove`)
     RemoveRoot {
         /// Path to remove
         path: String,
     },
-    /// List configured source roots
+    /// List configured source roots (legacy; prefer `subtree list`)
     ListRoots,
+    /// Manage named workspace subtrees attached to this project
+    Subtree {
+        #[command(subcommand)]
+        action: SubtreeAction,
+    },
     /// Watch for file changes and auto-update index
     Watch,
     /// Clear index database for current project
@@ -720,6 +725,27 @@ enum Commands {
     DbPath,
     /// Show database schema (tables and columns)
     Schema,
+}
+
+#[derive(Subcommand)]
+enum SubtreeAction {
+    /// Attach a named subtree to this project (the path may be relative or absolute)
+    Add {
+        /// Short human-friendly name shown in CLI output and used with `--subtree`
+        name: String,
+        /// Path to attach (relative to the current directory or absolute)
+        path: String,
+        /// Allow attaching a subtree that overlaps with the project root
+        #[arg(long)]
+        force: bool,
+    },
+    /// Detach a subtree by name
+    Remove {
+        /// Subtree name (use `subtree list` to discover existing names)
+        name: String,
+    },
+    /// List every subtree attached to this project
+    List,
 }
 
 fn main() -> Result<()> {
@@ -1105,7 +1131,16 @@ fn main() -> Result<()> {
             commands::management::cmd_add_root(&root, &path, force)
         }
         Commands::RemoveRoot { path } => commands::management::cmd_remove_root(&root, &path),
-        Commands::ListRoots => commands::management::cmd_list_roots(&root),
+        Commands::ListRoots => commands::management::cmd_list_roots(&root, format),
+        Commands::Subtree { action } => match action {
+            SubtreeAction::Add { name, path, force } => {
+                commands::management::cmd_subtree_add(&root, &name, &path, force, format)
+            }
+            SubtreeAction::Remove { name } => {
+                commands::management::cmd_subtree_remove(&root, &name, format)
+            }
+            SubtreeAction::List => commands::management::cmd_subtree_list(&root, format),
+        },
         Commands::Watch => commands::watch::cmd_watch(&root),
         Commands::Clear => commands::management::cmd_clear(&root),
         Commands::Version => {

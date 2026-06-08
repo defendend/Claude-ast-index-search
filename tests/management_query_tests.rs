@@ -207,7 +207,7 @@ fn list_roots_works_without_extras() {
     let primary = TempDir::new().unwrap();
     let _ = open_fresh_db(primary.path());
 
-    cmd_list_roots(primary.path()).expect("list_roots with no extras must succeed");
+    cmd_list_roots(primary.path(), "text").expect("list_roots with no extras must succeed");
 }
 
 #[test]
