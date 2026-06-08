@@ -115,6 +115,23 @@ impl PathResolver {
             .map(|(_, name)| name.as_str())
     }
 
+    /// Does the file at this `root_path` satisfy the user's `--subtree NAME`
+    /// or `--local` filter for the current run?
+    ///
+    /// `--subtree NAME` keeps only rows whose subtree name matches (case
+    /// sensitive). `--local` drops every named-subtree row, keeping only
+    /// primary-project files. When neither env hint is set, everything
+    /// passes.
+    pub fn matches_filter(&self, root_path: Option<&str>) -> bool {
+        if std::env::var("AST_INDEX_LOCAL_SCOPE").is_ok() {
+            return self.subtree_name(root_path).is_none();
+        }
+        if let Ok(name) = std::env::var("AST_INDEX_SUBTREE") {
+            return self.subtree_name(root_path) == Some(name.as_str());
+        }
+        true
+    }
+
     /// Format a path for human-readable output: prefixes `[name] ` when the
     /// file belongs to a named subtree, otherwise returns the resolved
     /// absolute path unchanged. Use for text output; structured JSON output

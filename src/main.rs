@@ -116,6 +116,19 @@ struct Cli {
     /// AST_INDEX_WALK_UP=1.
     #[arg(long, global = true)]
     walk_up: bool,
+
+    /// Restrict search/listing commands to a single named subtree.
+    /// Use `subtree list` to discover names. Conflicts with `--local`.
+    /// May trim the result below `--limit` because the cap is applied to
+    /// the unfiltered SQL query.
+    #[arg(long, global = true)]
+    subtree: Option<String>,
+
+    /// Restrict search/listing commands to the primary project root
+    /// (files indexed from the current directory; ignore all named
+    /// subtrees for this run). Conflicts with `--subtree`.
+    #[arg(long, global = true)]
+    local: bool,
 }
 
 #[derive(Subcommand)]
@@ -754,6 +767,21 @@ fn main() -> Result<()> {
     // formatters in subagents) can branch on text vs JSON without us
     // threading `format` through every signature.
     std::env::set_var("AST_INDEX_FORMAT", cli.format.as_str());
+    // Conflict guard: --subtree and --local both narrow the workspace, but
+    // they narrow it differently, so combining them is meaningless.
+    if cli.subtree.is_some() && cli.local {
+        eprintln!(
+            "{}",
+            "Error: --subtree and --local are mutually exclusive."
+        );
+        std::process::exit(2);
+    }
+    if let Some(name) = &cli.subtree {
+        std::env::set_var("AST_INDEX_SUBTREE", name);
+    }
+    if cli.local {
+        std::env::set_var("AST_INDEX_LOCAL_SCOPE", "1");
+    }
     // Walk-up is opt-in via CLI flag OR AST_INDEX_WALK_UP env var. CLI wins.
     let walk_up = cli.walk_up
         || std::env::var("AST_INDEX_WALK_UP")

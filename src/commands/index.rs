@@ -175,10 +175,14 @@ pub fn cmd_search(
     )?;
 
     let resolver = PathResolver::from_conn(root, &conn);
+    // Apply --subtree / --local filters before resolving paths so we don't
+    // do extra work on rows the user will throw away.
     let files: Vec<String> = files
         .into_iter()
+        .filter(|f| resolver.matches_filter(f.root_path.as_deref()))
         .map(|file| resolver.resolve_with_root(&file.path, file.root_path.as_deref()))
         .collect();
+    symbols.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
     for s in &mut symbols {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
@@ -296,6 +300,7 @@ pub fn cmd_symbol(
     };
 
     let resolver = PathResolver::from_conn(root, &conn);
+    symbols.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
     for s in &mut symbols {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
@@ -389,6 +394,7 @@ pub fn cmd_class(
     };
 
     let resolver = PathResolver::from_conn(root, &conn);
+    results.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
     for s in &mut results {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
@@ -471,6 +477,7 @@ pub fn cmd_implementations(
     let mut impls = db::find_implementations_scoped(&conn, parent, limit, scope)?;
 
     let resolver = PathResolver::from_conn(root, &conn);
+    impls.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
     for s in &mut impls {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
@@ -514,6 +521,9 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
         db::find_cross_references(&conn, symbol, limit)?;
 
     let resolver = PathResolver::from_conn(root, &conn);
+    definitions.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
+    imports.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
+    usages.retain(|r| resolver.matches_filter(r.root_path.as_deref()));
     for s in &mut definitions {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
@@ -655,6 +665,7 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
             .collect()
     };
     let resolver = PathResolver::from_conn(root, &conn);
+    children.retain(|c| resolver.matches_filter(c.root_path.as_deref()));
     for c in &mut children {
         c.path = resolver.resolve_with_root(&c.path, c.root_path.as_deref());
     }
@@ -712,6 +723,7 @@ pub fn cmd_usages(
             // Use indexed references with scope filtering
             let mut refs = db::find_references_scoped(&conn, symbol, limit, scope)?;
             let resolver = PathResolver::from_conn(root, &conn);
+            refs.retain(|r| resolver.matches_filter(r.root_path.as_deref()));
             for r in &mut refs {
                 r.path = resolver.resolve_with_root(&r.path, r.root_path.as_deref());
             }
