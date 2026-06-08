@@ -750,6 +750,10 @@ enum SubtreeAction {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Export the chosen output format so deeply-nested helpers (PathResolver,
+    // formatters in subagents) can branch on text vs JSON without us
+    // threading `format` through every signature.
+    std::env::set_var("AST_INDEX_FORMAT", cli.format.as_str());
     // Walk-up is opt-in via CLI flag OR AST_INDEX_WALK_UP env var. CLI wins.
     let walk_up = cli.walk_up
         || std::env::var("AST_INDEX_WALK_UP")

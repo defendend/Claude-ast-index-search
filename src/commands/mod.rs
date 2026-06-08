@@ -51,6 +51,15 @@ pub struct PathResolver {
     primary: PathBuf,
     primary_key: String,
     extra: Vec<(String, PathBuf)>,
+    /// Map from canonical_path → subtree name. Used by `decorate_for_display`
+    /// to render `[name] /abs/path/file.rs` in text output. Empty when no
+    /// named subtrees are attached, in which case `decorate_for_display`
+    /// falls back to the bare resolved path.
+    subtree_names: Vec<(String, String)>,
+    /// When `true`, `resolve` and `resolve_with_root` prefix subtree-owned
+    /// paths with `[name] `. Used for text output; disabled in JSON mode
+    /// so downstream tooling sees raw absolute paths.
+    decorate_subtrees: bool,
 }
 
 impl PathResolver {
@@ -64,10 +73,70 @@ impl PathResolver {
                 (db::normalize_root_for_storage(&path), path)
             })
             .collect();
+        let subtree_names = db::list_subtrees(conn)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.canonical_path, s.name))
+            .collect();
+        // Default to text-mode decoration when the env hint says so. main.rs
+        // exports AST_INDEX_FORMAT right after clap parse so we don't have
+        // to thread `format` through every command signature.
+        let decorate_subtrees = std::env::var("AST_INDEX_FORMAT")
+            .map(|v| v != "json")
+            .unwrap_or(true);
         Self {
             primary: primary.to_path_buf(),
             primary_key,
             extra,
+            subtree_names,
+            decorate_subtrees,
+        }
+    }
+
+    /// Toggle subtree-name decoration on resolved paths. Call sites pass
+    /// `format != "json"` so that text output gets `[name] /abs/path` while
+    /// structured JSON output stays raw.
+    pub fn with_decoration(mut self, decorate: bool) -> Self {
+        self.decorate_subtrees = decorate;
+        self
+    }
+
+    /// Return the subtree name owning the given `root_path`, if any.
+    /// `None` when the file belongs to the primary project or when no named
+    /// subtrees are attached.
+    pub fn subtree_name(&self, root_path: Option<&str>) -> Option<&str> {
+        let root = root_path?;
+        if root == self.primary_key {
+            return None;
+        }
+        self.subtree_names
+            .iter()
+            .find(|(canon, _)| canon == root)
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// Format a path for human-readable output: prefixes `[name] ` when the
+    /// file belongs to a named subtree, otherwise returns the resolved
+    /// absolute path unchanged. Use for text output; structured JSON output
+    /// keeps the raw absolute path so downstream tooling doesn't have to
+    /// parse the prefix.
+    pub fn decorate_for_display(&self, rel: &str, root_path: Option<&str>) -> String {
+        let resolved = self.resolve_with_root(rel, root_path);
+        match self.subtree_name(root_path) {
+            Some(name) => format!("[{}] {}", name, resolved),
+            None => resolved,
+        }
+    }
+
+    /// Wrap a resolved path with `[name] ` when decoration is on and the
+    /// file's owning root maps to a named subtree.
+    fn maybe_decorate(&self, resolved: String, root_path: Option<&str>) -> String {
+        if !self.decorate_subtrees {
+            return resolved;
+        }
+        match self.subtree_name(root_path) {
+            Some(name) => format!("[{}] {}", name, resolved),
+            None => resolved,
         }
     }
 
@@ -91,7 +160,16 @@ impl PathResolver {
 
     /// Absolute path of a stored relative path when the owning root is known.
     /// Falls back to generic probing when the hint is absent or stale.
+    /// Applies subtree decoration when enabled via `with_decoration(true)`.
     pub fn resolve_with_root(&self, rel: &str, root_path: Option<&str>) -> String {
+        let raw = self.resolve_with_root_raw(rel, root_path);
+        self.maybe_decorate(raw, root_path)
+    }
+
+    /// Raw version of `resolve_with_root` — never decorates, always returns
+    /// just the absolute path. Useful when callers want the path for both
+    /// text and JSON output and apply decoration themselves.
+    pub fn resolve_with_root_raw(&self, rel: &str, root_path: Option<&str>) -> String {
         if self.extra.is_empty() {
             return rel.to_string();
         }
