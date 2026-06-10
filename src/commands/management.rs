@@ -297,13 +297,20 @@ pub fn cmd_rebuild(
         eprintln!("[verbose] lock acquired in {:?}", t.elapsed());
     }
 
-    // Save extra roots before deleting DB
-    let saved_extra_roots = if db::db_exists(root) {
+    // Save subtree triples (name + canonical_path + original_path) before
+    // swapping the old DB aside. Going through `get_extra_roots` (legacy
+    // shim) would collapse each row to a bare canonical path string and
+    // lose the user-chosen name + original (relative) path form on every
+    // rebuild — re-importing them as `<basename>` and `original=canonical`.
+    let saved_subtrees = if db::db_exists(root) {
         if verbose {
-            eprintln!("[verbose] reading extra roots from existing DB...");
+            eprintln!("[verbose] reading subtrees from existing DB...");
         }
         let old_conn = db::open_db(root)?;
-        db::get_extra_roots(&old_conn).unwrap_or_default()
+        // Side-effect: migrates any pre-3.47 `metadata.extra_roots` JSON
+        // into the subtrees table so list_subtrees below sees everything.
+        db::get_extra_roots(&old_conn).ok();
+        db::list_subtrees(&old_conn).unwrap_or_default()
     } else {
         vec![]
     };
@@ -350,47 +357,48 @@ pub fn cmd_rebuild(
         eprintln!("[verbose] DB opened + schema created in {:?}", t.elapsed());
     }
 
-    // Merge config roots + saved extra roots + CLI --path args
-    let mut all_extra_roots = saved_extra_roots;
+    // Reattach saved subtrees verbatim so user-chosen names and the
+    // original path form (relative vs absolute) survive the rebuild.
+    let mut taken_canonicals: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for sub in &saved_subtrees {
+        db::insert_subtree(&conn, &sub.name, &sub.canonical_path, &sub.original_path)?;
+        taken_canonicals.insert(sub.canonical_path.clone());
+    }
+
+    // Append config-supplied roots and CLI `--path` args. Each new path
+    // gets an auto-allocated subtree name (basename, with `-N` suffix on
+    // collision). Paths that already match an existing subtree by their
+    // canonical form are deduplicated.
+    let mut attach_extra = |raw: &str, label: &str| -> Result<()> {
+        let candidate = if std::path::Path::new(raw).is_absolute() {
+            std::path::PathBuf::from(raw)
+        } else {
+            root.join(raw)
+        };
+        let canonical = db::safe_canonicalize(&candidate)
+            .to_string_lossy()
+            .into_owned();
+        if taken_canonicals.contains(&canonical) {
+            return Ok(());
+        }
+        let preferred = db::default_subtree_name(&canonical);
+        let name = db::allocate_subtree_name(&conn, &preferred)?;
+        db::insert_subtree(&conn, &name, &canonical, raw)?;
+        taken_canonicals.insert(canonical);
+        if verbose {
+            eprintln!("[verbose] attached {}: {}", label, raw);
+        }
+        Ok(())
+    };
+
     if let Some(ref config_roots) = config_roots {
         for cr in config_roots {
-            let resolved = if std::path::Path::new(cr).is_absolute() {
-                cr.clone()
-            } else {
-                root.join(cr)
-                    .canonicalize()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| root.join(cr).to_string_lossy().to_string())
-            };
-            if !all_extra_roots.contains(&resolved) {
-                all_extra_roots.push(resolved);
-            }
+            attach_extra(cr, "config root")?;
         }
     }
     for p in extra_paths {
-        let resolved = if std::path::Path::new(p).is_absolute() {
-            p.clone()
-        } else {
-            root.join(p)
-                .canonicalize()
-                .map(|pp| pp.to_string_lossy().to_string())
-                .unwrap_or_else(|_| root.join(p).to_string_lossy().to_string())
-        };
-        if !all_extra_roots.contains(&resolved) {
-            if verbose {
-                eprintln!("[verbose] adding --path: {}", resolved);
-            }
-            all_extra_roots.push(resolved);
-        }
-    }
-
-    // Restore extra roots
-    if !all_extra_roots.is_empty() {
-        let roots_json = serde_json::to_string(&all_extra_roots)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('extra_roots', ?1)",
-            [&roots_json],
-        )?;
+        attach_extra(p, "--path")?;
     }
 
     // Store no_ignore setting in database metadata

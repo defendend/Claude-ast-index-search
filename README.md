@@ -592,6 +592,9 @@ exclude:
 
 ## Changelog
 
+### 3.47.1
+- **Preserve subtree names and original paths across `rebuild`** — pre-3.47.1, `cmd_rebuild` round-tripped attached subtrees through the legacy `metadata.extra_roots` JSON column (canonical paths only), so every rebuild re-imported each subtree as `(name = <basename>, original_path = canonical_path)`. A subtree attached as `my-extra1 ../extra1` came back as `extra1 /abs/path/extra1`, breaking `--subtree my-extra1` filters and erasing the relative path form. The fix snapshots full `(name, canonical_path, original_path)` triples via `list_subtrees` before the rebuild swap and reinserts them verbatim into the new DB. `--path` and config-supplied roots still get an auto-allocated name (basename with `-N` collision suffix).
+
 ### 3.47.0
 - **Named workspace subtrees (#31)** — attach sibling project trees to the current index under short names. `ast-index subtree add <name> <path>` stores the path verbatim (relative or absolute) and indexes its files alongside the primary root. `ast-index subtree remove <name>` detaches by name. `ast-index subtree list` prints `name | original_path | canonical_path` (or JSON via `--format json`). The legacy `add-root` / `remove-root` / `list-roots` commands still work; they auto-generate a subtree name from the path basename for the same effect.
 - **`[name]` prefix in text output for subtree-owned files** — `search`, `symbol`, `class`, `usages`, `refs`, `implementations`, `outline`, and `file` print `[name] /abs/path` when the result lives in a named subtree. Primary-project paths stay unprefixed. `--format json` keeps the raw absolute path in the `path` field so downstream tooling doesn't have to parse the prefix.

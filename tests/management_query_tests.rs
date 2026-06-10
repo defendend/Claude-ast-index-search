@@ -281,3 +281,103 @@ fn rebuild_sub_projects_keeps_root_direct_entries() {
     assert!(db_has_module(&conn, "workspace", ""));
     assert!(db_has_module(&conn, "workspace/app", "app"));
 }
+
+/// Regression: `cmd_rebuild` used to round-trip subtrees through the legacy
+/// `metadata.extra_roots` JSON column (just canonical paths), wiping the
+/// user-chosen name and the original (relative) path form on every rebuild.
+/// After the fix, both fields survive verbatim.
+#[test]
+fn rebuild_preserves_subtree_names_and_original_paths() {
+    let primary = TempDir::new().unwrap();
+    let extra1 = TempDir::new().unwrap();
+    let extra2 = TempDir::new().unwrap();
+
+    fs::write(primary.path().join("main.rs"), "fn main() {}\n").unwrap();
+    fs::write(extra1.path().join("a.rs"), "fn a() {}\n").unwrap();
+    fs::write(extra2.path().join("b.rs"), "fn b() {}\n").unwrap();
+
+    // Initial rebuild + manually attach two named subtrees with distinct
+    // original_path forms (one absolute, one relative-style).
+    cmd_rebuild(
+        primary.path(),
+        "all",
+        false,
+        false,
+        false,
+        false,
+        true,
+        &[],
+        &[],
+        &[],
+    )
+    .expect("initial rebuild must succeed");
+
+    {
+        let conn = db::open_db(primary.path()).unwrap();
+        let extra1_canonical = db::safe_canonicalize(extra1.path())
+            .to_string_lossy()
+            .into_owned();
+        let extra2_canonical = db::safe_canonicalize(extra2.path())
+            .to_string_lossy()
+            .into_owned();
+        db::insert_subtree(
+            &conn,
+            "my-extra1",
+            &extra1_canonical,
+            &extra1.path().to_string_lossy(),
+        )
+        .unwrap();
+        db::insert_subtree(
+            &conn,
+            "my-extra2",
+            &extra2_canonical,
+            "../extra2-relative",
+        )
+        .unwrap();
+    }
+
+    // Rebuild again. Pre-fix, this collapsed `(name, canonical, original)`
+    // to bare canonical-only and re-imported as `(basename, canonical,
+    // canonical)`.
+    cmd_rebuild(
+        primary.path(),
+        "all",
+        false,
+        false,
+        false,
+        false,
+        true,
+        &[],
+        &[],
+        &[],
+    )
+    .expect("second rebuild must succeed");
+
+    let conn = db::open_db(primary.path()).unwrap();
+    let subtrees = db::list_subtrees(&conn).unwrap();
+    assert_eq!(
+        subtrees.len(),
+        2,
+        "both subtrees must survive rebuild, got: {:?}",
+        subtrees
+    );
+
+    let s1 = subtrees
+        .iter()
+        .find(|s| s.name == "my-extra1")
+        .expect("user-chosen name 'my-extra1' must survive rebuild");
+    assert_eq!(
+        s1.original_path,
+        extra1.path().to_string_lossy(),
+        "original_path must survive verbatim, not be replaced by canonical"
+    );
+
+    let s2 = subtrees
+        .iter()
+        .find(|s| s.name == "my-extra2")
+        .expect("user-chosen name 'my-extra2' must survive rebuild");
+    assert_eq!(
+        s2.original_path, "../extra2-relative",
+        "relative original_path must survive verbatim across rebuild"
+    );
+}
