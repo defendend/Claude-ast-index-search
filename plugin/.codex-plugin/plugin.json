@@ -1,6 +1,6 @@
 {
   "name": "ast-index",
-  "version": "3.47.1",
+  "version": "3.47.2",
   "description": "Fast structural code search for multi-language projects using the ast-index CLI.",
   "author": {
     "name": "defendend"
