@@ -592,6 +592,11 @@ exclude:
 
 ## Changelog
 
+### 3.47.2
+- **Fix Claude plugin hook loading on Windows** — `hooks/hooks.json` is now left to the standard plugin auto-loader instead of being referenced from the manifest as well, preventing duplicate hook registration in Claude Code 3.47.1. The plugin validation script now blocks this manifest shape so the duplicate cannot come back.
+- **Keep `node_modules` `.d.ts` declarations stable across `update`** — `rebuild` indexes TypeScript declaration files from `node_modules`, and `update` now reconciles the same declaration set instead of treating those rows as deleted. Changed declarations are re-parsed; declarations removed from disk are still deleted from the index.
+- **Track TypeScript generic calls through aliases and local rebinding** — usages now follow calls like `targetFn<T>()`, `targetFn as alias`, and local wrappers that store a generic function before invoking it, so `usages targetFn` reports the call sites consistently.
+
 ### 3.47.1
 - **Preserve subtree names and original paths across `rebuild`** — pre-3.47.1, `cmd_rebuild` round-tripped attached subtrees through the legacy `metadata.extra_roots` JSON column (canonical paths only), so every rebuild re-imported each subtree as `(name = <basename>, original_path = canonical_path)`. A subtree attached as `my-extra1 ../extra1` came back as `extra1 /abs/path/extra1`, breaking `--subtree my-extra1` filters and erasing the relative path form. The fix snapshots full `(name, canonical_path, original_path)` triples via `list_subtrees` before the rebuild swap and reinserts them verbatim into the new DB. `--path` and config-supplied roots still get an auto-allocated name (basename with `-N` collision suffix).
 

@@ -57,6 +57,17 @@ fn has_file(conn: &Connection, rel_path: &str) -> bool {
     count > 0
 }
 
+fn has_symbol_in_file(conn: &Connection, rel_path: &str, symbol: &str) -> bool {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols s JOIN files f ON s.file_id = f.id WHERE f.path = ?1 AND s.name = ?2",
+            rusqlite::params![rel_path, symbol],
+            |row| row.get(0),
+        )
+        .unwrap();
+    count > 0
+}
+
 /// Rebuild the index for the given primary + extra roots, mimicking the
 /// relevant slice of `cmd_rebuild`.
 fn rebuild(conn: &mut Connection, primary: &Path, extras: &[&Path]) {
@@ -161,6 +172,79 @@ fn update_indexes_new_files_in_both_roots() {
     assert_eq!(updated, 2, "both new files should be parsed and stored");
     assert!(has_file(&conn, "New.swift"));
     assert!(has_file(&conn, "pkgs/NewLib.swift"));
+}
+
+#[test]
+fn update_preserves_node_modules_dts_files_indexed_by_rebuild() {
+    let primary_dir = TempDir::new().unwrap();
+    let primary = primary_dir.path();
+
+    write_file(&primary.join("src/App.ts"), "export const app = 1;\n");
+    write_file(
+        &primary.join("node_modules/@types/react/index.d.ts"),
+        "export interface ReactNode {}\n",
+    );
+
+    let mut conn = open_fresh_db(primary);
+    indexer::index_directory_with_config(&mut conn, primary, false, false, None).unwrap();
+    let dts_count = indexer::index_node_modules_dts(&mut conn, primary, false).unwrap();
+
+    assert_eq!(
+        dts_count, 1,
+        "rebuild-style .d.ts indexing should seed one file"
+    );
+    assert_eq!(count_files(&conn), 2);
+    assert!(has_file(&conn, "src/App.ts"));
+    assert!(has_file(&conn, "node_modules/@types/react/index.d.ts"));
+
+    let (updated, changed, deleted) =
+        indexer::update_directory_incremental(&mut conn, primary, false, None, None).unwrap();
+
+    assert_eq!(deleted, 0, "update must not delete node_modules .d.ts rows");
+    assert_eq!(updated, 0);
+    assert_eq!(changed, 0);
+    assert_eq!(count_files(&conn), 2);
+    assert!(has_file(&conn, "node_modules/@types/react/index.d.ts"));
+}
+
+#[test]
+fn update_reconciles_changed_and_deleted_node_modules_dts_files() {
+    let primary_dir = TempDir::new().unwrap();
+    let primary = primary_dir.path();
+    let keep_rel = "node_modules/pkg/keep.d.ts";
+    let drop_rel = "node_modules/pkg/drop.d.ts";
+
+    write_file(&primary.join("src/App.ts"), "export const app = 1;\n");
+    write_file(&primary.join(keep_rel), "export interface KeepBefore {}\n");
+    write_file(&primary.join(drop_rel), "export interface DropMe {}\n");
+
+    let mut conn = open_fresh_db(primary);
+    indexer::index_directory_with_config(&mut conn, primary, false, false, None).unwrap();
+    let dts_count = indexer::index_node_modules_dts(&mut conn, primary, false).unwrap();
+    assert_eq!(dts_count, 2);
+    assert_eq!(count_files(&conn), 3);
+
+    write_file(&primary.join(keep_rel), "export interface KeepAfter {}\n");
+    fs::remove_file(primary.join(drop_rel)).unwrap();
+    conn.execute(
+        "UPDATE files SET mtime = 0 WHERE path = ?1",
+        rusqlite::params![keep_rel],
+    )
+    .unwrap();
+
+    let (updated, changed, deleted) =
+        indexer::update_directory_incremental(&mut conn, primary, false, None, None).unwrap();
+
+    assert_eq!(
+        deleted, 1,
+        "removed node_modules .d.ts should still be deleted"
+    );
+    assert_eq!(changed, 1, "changed node_modules .d.ts should be scheduled");
+    assert_eq!(updated, 1, "changed node_modules .d.ts should be re-parsed");
+    assert_eq!(count_files(&conn), 2);
+    assert!(has_file(&conn, keep_rel));
+    assert!(!has_file(&conn, drop_rel));
+    assert!(has_symbol_in_file(&conn, keep_rel, "KeepAfter"));
 }
 
 /// If an extra root has been removed from disk entirely (e.g. user wiped a

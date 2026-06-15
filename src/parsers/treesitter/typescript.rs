@@ -1,12 +1,13 @@
 //! Tree-sitter based TypeScript/JavaScript parser
 
 use anyhow::Result;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
-use crate::parsers::ParsedSymbol;
+use crate::parsers::{truncate_context, FileType, ParsedRef, ParsedSymbol};
 
 static TS_LANGUAGE: LazyLock<Language> =
     LazyLock::new(|| tree_sitter_typescript::LANGUAGE_TSX.into());
@@ -19,6 +20,15 @@ static TS_QUERY: LazyLock<Query> = LazyLock::new(|| {
 pub static TYPESCRIPT_PARSER: TypeScriptParser = TypeScriptParser;
 
 pub struct TypeScriptParser;
+
+type ScopeChain = Vec<(usize, usize)>;
+
+#[derive(Debug, Clone)]
+struct AliasBinding {
+    declared_line: usize,
+    scope_chain: ScopeChain,
+    target: String,
+}
 
 /// Significant decorators to track
 const SIGNIFICANT_DECORATORS: &[&str] = &[
@@ -260,6 +270,19 @@ fn extract_interface_parents(
 }
 
 impl LanguageParser for TypeScriptParser {
+    fn extract_refs(&self, content: &str, defined: &[ParsedSymbol]) -> Result<Vec<ParsedRef>> {
+        self.typescript_extract_refs(content, defined, None)
+    }
+
+    fn extract_refs_for_lang(
+        &self,
+        content: &str,
+        defined: &[ParsedSymbol],
+        file_type: FileType,
+    ) -> Result<Vec<ParsedRef>> {
+        self.typescript_extract_refs(content, defined, Some(file_type))
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &TS_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -900,6 +923,26 @@ impl LanguageParser for TypeScriptParser {
     }
 }
 
+impl TypeScriptParser {
+    fn typescript_extract_refs(
+        &self,
+        content: &str,
+        defined: &[ParsedSymbol],
+        file_type: Option<FileType>,
+    ) -> Result<Vec<ParsedRef>> {
+        // Keep the existing generic extraction as a baseline; add AST-aware refs
+        // for TypeScript-specific constructs it cannot see, then deduplicate.
+        let mut refs = super::super::extract_references_for_lang(content, defined, file_type)?;
+        let tree = parse_tree(content, &TS_LANGUAGE)?;
+
+        let mut bindings: HashMap<String, Vec<AliasBinding>> = HashMap::new();
+        collect_alias_bindings(content, &tree.root_node(), &mut bindings);
+        collect_call_refs(content, &tree.root_node(), &bindings, &mut refs);
+        dedup_refs(&mut refs);
+        Ok(refs)
+    }
+}
+
 /// Check if a node is inside a class_body (class member, not object literal method)
 fn is_inside_class_body(node: &tree_sitter::Node) -> bool {
     node.parent()
@@ -958,6 +1001,233 @@ fn find_capture<'a>(
 ) -> Option<&'a tree_sitter::QueryCapture<'a>> {
     let idx = idx?;
     m.captures.iter().find(|c| c.index == idx)
+}
+
+fn collect_alias_bindings(
+    content: &str,
+    node: &tree_sitter::Node,
+    bindings: &mut HashMap<String, Vec<AliasBinding>>,
+) {
+    match node.kind() {
+        "import_specifier" => {
+            let imported = node
+                .child_by_field_name("name")
+                .map(|n| node_text(content, &n).to_string());
+            let local = node
+                .child_by_field_name("alias")
+                .map(|n| node_text(content, &n).to_string())
+                .or_else(|| imported.clone());
+            if let (Some(imported), Some(local)) = (imported, local) {
+                if imported != local {
+                    add_alias_binding(
+                        bindings,
+                        local,
+                        imported,
+                        node_line(node),
+                        scope_chain(node),
+                    );
+                }
+            }
+        }
+        "variable_declarator" => {
+            let local = node
+                .child_by_field_name("name")
+                .filter(|n| n.kind() == "identifier")
+                .map(|n| node_text(content, &n).to_string());
+            let value = node.child_by_field_name("value");
+            if let (Some(local), Some(value)) = (local, value) {
+                let line = node_line(node);
+                let scope = scope_chain(node);
+                if let Some(target) =
+                    resolve_root_identifier(content, &value, line, &scope, bindings)
+                {
+                    if local != target {
+                        add_alias_binding(bindings, local, target, line, scope);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_alias_bindings(content, &child, bindings);
+    }
+}
+
+fn collect_call_refs(
+    content: &str,
+    node: &tree_sitter::Node,
+    bindings: &HashMap<String, Vec<AliasBinding>>,
+    refs: &mut Vec<ParsedRef>,
+) {
+    if node.kind() == "call_expression" {
+        if let Some(function_node) = node.child_by_field_name("function") {
+            let line = node_line(node);
+            let scope = scope_chain(node);
+            if let Some(local_name) = direct_identifier_name(content, &function_node) {
+                push_ref(refs, &local_name, line, content);
+                if let Some(target) = resolve_binding_target(&local_name, line, &scope, bindings) {
+                    if target != local_name {
+                        push_ref(refs, &target, line, content);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_call_refs(content, &child, bindings, refs);
+    }
+}
+
+fn add_alias_binding(
+    bindings: &mut HashMap<String, Vec<AliasBinding>>,
+    local: String,
+    target: String,
+    declared_line: usize,
+    scope_chain: ScopeChain,
+) {
+    bindings.entry(local).or_default().push(AliasBinding {
+        declared_line,
+        scope_chain,
+        target,
+    });
+}
+
+fn resolve_root_identifier(
+    content: &str,
+    node: &tree_sitter::Node,
+    line: usize,
+    scope: &ScopeChain,
+    bindings: &HashMap<String, Vec<AliasBinding>>,
+) -> Option<String> {
+    let local_name = direct_identifier_name(content, node)?;
+    Some(resolve_binding_target(&local_name, line, scope, bindings).unwrap_or(local_name))
+}
+
+fn resolve_binding_target(
+    name: &str,
+    line: usize,
+    scope: &ScopeChain,
+    bindings: &HashMap<String, Vec<AliasBinding>>,
+) -> Option<String> {
+    let mut current = name.to_string();
+    let mut seen = HashSet::new();
+
+    while seen.insert(current.clone()) {
+        let next = bindings
+            .get(&current)
+            .and_then(|candidates| best_binding(candidates, line, scope))
+            .map(|binding| binding.target.clone());
+
+        match next {
+            Some(ref target) if target != &current => current = target.clone(),
+            _ => break,
+        }
+    }
+
+    if current == name {
+        None
+    } else {
+        Some(current)
+    }
+}
+
+fn best_binding<'a>(
+    bindings: &'a [AliasBinding],
+    line: usize,
+    scope: &ScopeChain,
+) -> Option<&'a AliasBinding> {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.declared_line <= line && scope_starts_with(scope, &binding.scope_chain)
+        })
+        .max_by_key(|binding| (binding.scope_chain.len(), binding.declared_line))
+}
+
+fn scope_starts_with(scope: &ScopeChain, prefix: &ScopeChain) -> bool {
+    prefix.len() <= scope.len() && scope.iter().zip(prefix.iter()).all(|(a, b)| a == b)
+}
+
+fn scope_chain(node: &tree_sitter::Node) -> ScopeChain {
+    let mut chain = Vec::new();
+    let mut current = Some(*node);
+
+    while let Some(node) = current {
+        if is_scope_node(node.kind()) {
+            chain.push((node.start_byte(), node.end_byte()));
+        }
+        current = node.parent();
+    }
+
+    chain.reverse();
+    chain
+}
+
+fn is_scope_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "program"
+            | "statement_block"
+            | "function_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "method_definition"
+            | "generator_function"
+            | "class_static_block"
+    )
+}
+
+fn direct_identifier_name(content: &str, node: &tree_sitter::Node) -> Option<String> {
+    let node = unwrap_ref_expr(*node);
+    if node.kind() == "identifier" {
+        Some(node_text(content, &node).to_string())
+    } else {
+        None
+    }
+}
+
+fn unwrap_ref_expr(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    loop {
+        let next = match node.kind() {
+            "instantiation_expression" => node
+                .child_by_field_name("expression")
+                .or_else(|| node.named_child(0)),
+            "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "type_assertion"
+            | "non_null_expression" => node.named_child(0),
+            _ => None,
+        };
+
+        match next {
+            Some(inner) => node = inner,
+            None => return node,
+        }
+    }
+}
+
+fn push_ref(refs: &mut Vec<ParsedRef>, name: &str, line: usize, content: &str) {
+    let context = content
+        .lines()
+        .nth(line.saturating_sub(1))
+        .map(str::trim)
+        .unwrap_or("");
+    refs.push(ParsedRef {
+        name: name.to_string(),
+        line,
+        context: truncate_context(context),
+    });
+}
+
+fn dedup_refs(refs: &mut Vec<ParsedRef>) {
+    let mut seen = HashSet::new();
+    refs.retain(|r| seen.insert((r.name.clone(), r.line, r.context.clone())));
 }
 
 #[cfg(test)]
@@ -1061,6 +1331,53 @@ mod tests {
         assert!(symbols
             .iter()
             .any(|s| s.name == "MAX_RETRIES" && s.kind == SymbolKind::Constant));
+    }
+
+    #[test]
+    fn test_extract_refs_generic_calls_and_aliases() {
+        let content = r#"
+import { targetFn as bus } from './bus';
+import { targetFn } from './bus';
+
+export const baseline = targetFn();
+export const generic = targetFn<{ id: string }>();
+export const aliased = bus();
+
+const localBus = targetFn<{ id: string }>;
+
+export const c1 = localBus().run({ id: 'c-1' });
+export const c2 = localBus().run({ id: 'c-2' });
+export const c3 = localBus().run({ id: 'c-3' });
+"#;
+
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        let refs = TYPESCRIPT_PARSER
+            .extract_refs_for_lang(content, &symbols, FileType::TypeScript)
+            .unwrap();
+
+        let target_lines: Vec<usize> = refs
+            .iter()
+            .filter(|r| r.name == "targetFn")
+            .map(|r| r.line)
+            .collect();
+
+        for line in [5, 6, 7, 11, 12, 13] {
+            assert!(
+                target_lines.contains(&line),
+                "expected targetFn usage on line {line}; got refs: {:?}",
+                refs.iter()
+                    .map(|r| (r.name.as_str(), r.line))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            refs.iter().any(|r| r.name == "bus" && r.line == 7),
+            "aliased local name should still be indexed"
+        );
+        assert!(
+            refs.iter().filter(|r| r.name == "localBus").count() >= 3,
+            "rebound local name should still be indexed"
+        );
     }
 
     #[test]

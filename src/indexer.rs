@@ -936,6 +936,19 @@ struct ParsedFile {
     refs: Vec<ParsedRef>,
 }
 
+/// File scheduled by incremental update.
+enum PendingUpdateFile {
+    Regular {
+        root: PathBuf,
+        path: PathBuf,
+    },
+    NodeModulesDts {
+        path: PathBuf,
+        rel_path: String,
+        root_path: String,
+    },
+}
+
 /// Parse a single file without DB access (thread-safe)
 fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     let metadata = fs::metadata(file_path)?;
@@ -2017,7 +2030,7 @@ pub fn update_directory_incremental(
 
     // 3. Walk each (walk_dir, anchor) pair and categorize its files. Paths are
     //    stored relative to `anchor`, matching `index_directory_scoped`'s scheme.
-    let mut files_to_parse: Vec<(PathBuf, PathBuf)> = Vec::new(); // (anchor, file_path)
+    let mut files_to_parse: Vec<PendingUpdateFile> = Vec::new();
     let mut current_paths: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
 
@@ -2083,10 +2096,37 @@ pub fn update_directory_incremental(
             };
 
             if need_parse {
-                files_to_parse.push((anchor.clone(), file_path));
+                files_to_parse.push(PendingUpdateFile::Regular {
+                    root: anchor.clone(),
+                    path: file_path,
+                });
             }
             current_paths.insert((root_key, rel_path));
         }
+    }
+
+    let root_key = db::normalize_root_for_storage(root);
+    for (file_path, rel_path) in collect_node_modules_dts_files(root) {
+        let file_mtime = fs::metadata(&file_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
+            Some((_, db_mtime)) => file_mtime > *db_mtime,
+            None => true,
+        };
+
+        if need_parse {
+            files_to_parse.push(PendingUpdateFile::NodeModulesDts {
+                path: file_path,
+                rel_path: rel_path.clone(),
+                root_path: root_key.clone(),
+            });
+        }
+        current_paths.insert((root_key.clone(), rel_path));
     }
 
     // 4. Find deleted files
@@ -2141,8 +2181,16 @@ pub fn update_directory_incremental(
         let parsed_files: Vec<ParsedFile> = pool.install(|| {
             files_to_parse
                 .par_iter()
-                .filter_map(|(file_root, path)| {
-                    let result = parse_file(file_root, path).ok();
+                .filter_map(|pending| {
+                    let result = match pending {
+                        PendingUpdateFile::Regular { root, path } => parse_file(root, path),
+                        PendingUpdateFile::NodeModulesDts {
+                            path,
+                            rel_path,
+                            root_path,
+                        } => parse_dts_file(path, rel_path, root_path),
+                    }
+                    .ok();
                     let c = parsed_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
                     if progress && c % 500 == 0 {
                         eprintln!("Parsed {} / {} changed files...", c, total_files);
@@ -3968,30 +4016,15 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     Ok(count)
 }
 
-/// Index .d.ts files from node_modules (type declarations for external libraries).
-/// These provide symbol definitions for imported libraries (e.g., React, lodash).
-/// Only .d.ts files are indexed — not full JS/TS source from node_modules.
-///
-/// Handles pnpm (symlinks to store) by resolving top-level package symlinks
-/// and mapping paths back to node_modules/... for storage.
-/// Does NOT use follow_links to avoid loops on FUSE mounts (Arcadia).
-pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
+fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {
     use ignore::WalkBuilder;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
 
     let node_modules = root.join("node_modules");
     if !node_modules.exists() || !node_modules.is_dir() {
-        return Ok(0);
+        return Vec::new();
     }
 
     let verbose = std::env::var("AST_INDEX_VERBOSE").is_ok();
-
-    if progress {
-        eprintln!("Scanning node_modules for .d.ts type declarations...");
-    }
-
-    let walk_start = Instant::now();
 
     // Collect (resolved_dir, node_modules_prefix) pairs.
     // Resolves symlinks only at the package level (safe for pnpm).
@@ -4078,6 +4111,33 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
             }
         }
     }
+
+    dts_files
+}
+
+/// Index .d.ts files from node_modules (type declarations for external libraries).
+/// These provide symbol definitions for imported libraries (e.g., React, lodash).
+/// Only .d.ts files are indexed — not full JS/TS source from node_modules.
+///
+/// Handles pnpm (symlinks to store) by resolving top-level package symlinks
+/// and mapping paths back to node_modules/... for storage.
+/// Does NOT use follow_links to avoid loops on FUSE mounts (Arcadia).
+pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let node_modules = root.join("node_modules");
+    if !node_modules.exists() || !node_modules.is_dir() {
+        return Ok(0);
+    }
+
+    if progress {
+        eprintln!("Scanning node_modules for .d.ts type declarations...");
+    }
+
+    let walk_start = Instant::now();
+    let verbose = std::env::var("AST_INDEX_VERBOSE").is_ok();
+    let dts_files = collect_node_modules_dts_files(root);
 
     if dts_files.is_empty() {
         if verbose {

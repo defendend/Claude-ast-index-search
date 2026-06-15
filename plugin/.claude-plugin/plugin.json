@@ -6,6 +6,5 @@
     "name": "defendend"
   },
   "commands": "./commands",
-  "skills": "./skills",
-  "hooks": "./hooks/hooks.json"
+  "skills": "./skills"
 }

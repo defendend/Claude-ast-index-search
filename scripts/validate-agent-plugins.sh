@@ -86,6 +86,22 @@ for path in shared_plugin_files:
     if not plugin_name_re.match(manifest.get("name", "")):
         errors.append(f"{path}: invalid plugin name")
 
+claude_manifest = load_json("plugin/.claude-plugin/plugin.json")
+manifest_hooks = claude_manifest.get("hooks", [])
+if isinstance(manifest_hooks, str):
+    manifest_hooks = [manifest_hooks]
+normalized_manifest_hooks = []
+for hook_path in manifest_hooks:
+    hook_path = str(hook_path).replace("\\", "/")
+    if hook_path.startswith("./"):
+        hook_path = hook_path[2:]
+    normalized_manifest_hooks.append(hook_path)
+if "hooks/hooks.json" in normalized_manifest_hooks:
+    errors.append(
+        "plugin/.claude-plugin/plugin.json: hooks/hooks.json is auto-loaded; "
+        "manifest.hooks must only reference additional hook files"
+    )
+
 cursor_manifest = load_json("plugin/.cursor-plugin/plugin.json")
 extra = sorted(set(cursor_manifest) - cursor_allowed)
 if extra:
