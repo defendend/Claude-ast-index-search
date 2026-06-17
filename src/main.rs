@@ -515,6 +515,9 @@ enum Commands {
         /// Max source files to include
         #[arg(short = 'f', long, default_value = "6")]
         max_files: usize,
+        /// Stage B: re-rank by RWR over an in-memory call/inheritance graph
+        #[arg(long)]
+        rwr: bool,
     },
     /// Find usages of a symbol
     Usages {
@@ -1006,9 +1009,11 @@ fn main() -> Result<()> {
         Commands::Refs { symbol, limit } => {
             commands::index::cmd_refs(&root, &symbol, limit, format)
         }
-        Commands::Explore { query, max_files } => {
-            commands::explore::cmd_explore(&root, &query, max_files, format)
-        }
+        Commands::Explore {
+            query,
+            max_files,
+            rwr,
+        } => commands::explore::cmd_explore(&root, &query, max_files, rwr, format),
         Commands::Hierarchy {
             name,
             in_file,

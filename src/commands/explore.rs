@@ -9,7 +9,7 @@
 //! inheritance + refs). It deliberately does NOT build a call graph or run
 //! RWR ranking — that is Stage B.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -34,7 +34,13 @@ struct Cand {
     vendor: bool,
 }
 
-pub fn cmd_explore(root: &Path, query: &[String], max_files: usize, format: &str) -> Result<()> {
+pub fn cmd_explore(
+    root: &Path,
+    query: &[String],
+    max_files: usize,
+    use_rwr: bool,
+    format: &str,
+) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -90,6 +96,11 @@ pub fn cmd_explore(root: &Path, query: &[String], max_files: usize, format: &str
         c.score = score(c, &terms, dom_lang.as_deref());
     }
     cands.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    // Stage B: re-rank by RWR over an in-memory call/inheritance graph.
+    if use_rwr {
+        apply_rwr(&conn, &resolver, &mut cands)?;
+    }
 
     // 4. Pick distinct source files from the top non-vendor candidates.
     let mut file_order: Vec<usize> = Vec::new();
@@ -483,4 +494,182 @@ fn abs_path(root: &Path, rel: &str, root_path: Option<&str>) -> PathBuf {
         Some(rp) if !rp.is_empty() => Path::new(rp).join(rel),
         _ => root.join(rel),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage B: graph + RWR (personalized PageRank)
+// ---------------------------------------------------------------------------
+
+/// In-memory undirected graph of symbols, keyed by (path, line).
+struct Graph {
+    idx: HashMap<(String, i64), usize>,
+    syms: Vec<SearchResult>,
+    restart: Vec<f64>,
+    adj: Vec<HashSet<usize>>,
+}
+
+impl Graph {
+    fn new() -> Self {
+        Graph {
+            idx: HashMap::new(),
+            syms: Vec::new(),
+            restart: Vec::new(),
+            adj: Vec::new(),
+        }
+    }
+
+    fn intern(&mut self, s: &SearchResult) -> usize {
+        let key = (s.path.clone(), s.line);
+        if let Some(&i) = self.idx.get(&key) {
+            return i;
+        }
+        let i = self.syms.len();
+        self.idx.insert(key, i);
+        self.syms.push(s.clone());
+        self.restart.push(0.0);
+        self.adj.push(HashSet::new());
+        i
+    }
+
+    fn edge(&mut self, a: usize, b: usize) {
+        if a != b {
+            self.adj[a].insert(b);
+            self.adj[b].insert(a);
+        }
+    }
+}
+
+/// Re-rank candidates by personalized PageRank over a call/inheritance graph
+/// built on the fly around the lexical seed. Restart vector = lexical scores;
+/// edges = callers (each reference attributed to its owning symbol) and
+/// inheritance. This surfaces structurally-central symbols the lexical pass
+/// ranked low and demotes lexical matches that connect to nothing — the role
+/// RWR plays in codegraph, but here on a graph assembled at query time
+/// (no schema migration, no parser changes).
+fn apply_rwr(conn: &Connection, resolver: &PathResolver, cands: &mut Vec<Cand>) -> Result<()> {
+    const SEED_NODES: usize = 30;
+    const REF_LIMIT: usize = 40;
+    const ALPHA: f64 = 0.25;
+    const ITERS: usize = 25;
+
+    let seed_n = SEED_NODES.min(cands.len());
+    if seed_n == 0 {
+        return Ok(());
+    }
+
+    let mut g = Graph::new();
+    for c in cands.iter().take(seed_n) {
+        let id = g.intern(&c.sym);
+        g.restart[id] += c.score.max(0.0);
+    }
+
+    // Build edges around each seed: callers (refs → owning symbol) + inheritance.
+    let seeds: Vec<SearchResult> = cands.iter().take(seed_n).map(|c| c.sym.clone()).collect();
+    let mut file_cache: HashMap<String, Vec<SearchResult>> = HashMap::new();
+    for sym in &seeds {
+        let sid = g.intern(sym);
+        for r in db::find_references(conn, &sym.name, REF_LIMIT)? {
+            if !resolver.matches_filter(r.root_path.as_deref()) {
+                continue;
+            }
+            let fsyms = file_cache
+                .entry(r.path.clone())
+                .or_insert_with(|| db::get_file_symbols(conn, &r.path).unwrap_or_default());
+            if let Some(owner) = fsyms.iter().rev().find(|s| s.line <= r.line).cloned() {
+                let oid = g.intern(&owner);
+                g.edge(sid, oid);
+            }
+        }
+        for child in db::find_implementations(conn, &sym.name, REF_LIMIT)? {
+            if !resolver.matches_filter(child.root_path.as_deref()) {
+                continue;
+            }
+            let cid = g.intern(&child);
+            g.edge(sid, cid);
+        }
+    }
+
+    let n = g.syms.len();
+    if n == 0 {
+        return Ok(());
+    }
+
+    // Normalize restart to a probability distribution.
+    let sum: f64 = g.restart.iter().sum();
+    if sum > 0.0 {
+        for x in g.restart.iter_mut() {
+            *x /= sum;
+        }
+    } else {
+        for x in g.restart.iter_mut() {
+            *x = 1.0 / n as f64;
+        }
+    }
+
+    // Power iteration. Dangling nodes (no edges) redistribute via the restart vector.
+    let mut s = g.restart.clone();
+    for _ in 0..ITERS {
+        let mut next = vec![0.0; n];
+        for i in 0..n {
+            let deg = g.adj[i].len();
+            if deg == 0 {
+                for (j, nx) in next.iter_mut().enumerate() {
+                    *nx += s[i] * g.restart[j];
+                }
+            } else {
+                let share = s[i] / deg as f64;
+                for &j in &g.adj[i] {
+                    next[j] += share;
+                }
+            }
+        }
+        for i in 0..n {
+            s[i] = (1.0 - ALPHA) * next[i] + ALPHA * g.restart[i];
+        }
+    }
+
+    // Blend normalized RWR mass with normalized lexical score. Lexical is
+    // weighted higher so an exact query hit stays near the top, while RWR
+    // lifts structurally-connected symbols (callers, subclasses) the lexical
+    // pass ranked low or missed entirely. Unconnected lexical-only matches are
+    // halved so graph-relevant results win ties.
+    let max_rwr = s.iter().cloned().fold(0.0_f64, f64::max).max(1e-9);
+    let max_lex = cands
+        .iter()
+        .map(|c| c.score.max(0.0))
+        .fold(0.0_f64, f64::max)
+        .max(1e-9);
+
+    let mut rwr_by_key: HashMap<(String, i64), f64> = HashMap::new();
+    for (i, sym) in g.syms.iter().enumerate() {
+        rwr_by_key.insert((sym.path.clone(), sym.line), s[i]);
+    }
+
+    // Surface graph-discovered neighbours the lexical pass never produced.
+    let existing: HashSet<(String, i64)> = cands
+        .iter()
+        .map(|c| (c.sym.path.clone(), c.sym.line))
+        .collect();
+    for sym in &g.syms {
+        let key = (sym.path.clone(), sym.line);
+        if !existing.contains(&key) {
+            let vendor = is_vendor(&sym.path);
+            cands.push(Cand {
+                sym: sym.clone(),
+                score: 0.0,
+                vendor,
+            });
+        }
+    }
+
+    for c in cands.iter_mut() {
+        let key = (c.sym.path.clone(), c.sym.line);
+        let lex = c.score.max(0.0) / max_lex;
+        let rwr = rwr_by_key.get(&key).copied().unwrap_or(0.0) / max_rwr;
+        let connected = rwr_by_key.contains_key(&key);
+        let blended = 0.6 * lex + 0.4 * rwr;
+        c.score = blended * 1000.0 * if connected { 1.0 } else { 0.5 };
+    }
+    cands.sort_by(|a, b| b.score.total_cmp(&a.score));
+    Ok(())
 }
