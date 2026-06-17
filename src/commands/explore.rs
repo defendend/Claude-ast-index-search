@@ -495,21 +495,68 @@ fn read_snippet(root: &Path, sym: &SearchResult) -> Option<String> {
     Some(out)
 }
 
-/// Determine the end (exclusive) of a block starting at `start`, by indentation.
-/// Language-agnostic: include the start line, following blank lines and any
-/// line indented deeper than the start; stop at the first line indented at or
-/// below the start (including one trailing closer like `}` / `end`). Capped.
+/// Determine the end (exclusive) of a block starting at `start`.
+///
+/// Hybrid, language-agnostic: brace-delimited languages (C/C++/C#/Java/JS/TS/
+/// Go/Rust/Swift/Kotlin/PHP) close on `{`/`}` balance — this captures full
+/// method bodies that the pure-indentation heuristic missed (it returned only
+/// the signature when the body opened with a brace). Indentation-delimited
+/// languages (Python/Ruby) fall back to the indent rule. Capped either way.
 fn block_end(lines: &[&str], start: usize) -> usize {
+    let cap = (start + SNIPPET_CAP_LINES).min(lines.len());
+    // Brace-style if an opening `{` appears on the signature lines — covers
+    // both `fn f() {` and the Allman `fn f()\n{`.
+    let probe = (start + 4).min(lines.len());
+    let brace_style = lines[start..probe].iter().any(|l| l.contains('{'));
+    if brace_style {
+        return brace_block_end(lines, start, cap);
+    }
+    indent_block_end(lines, start, cap)
+}
+
+/// End of a brace-delimited block: first line where `{`/`}` balance returns to
+/// zero after the opening brace. Ignores `//` line comments; string/`/* */`
+/// edge cases are tolerated (rare in a signature+body window).
+fn brace_block_end(lines: &[&str], start: usize, cap: usize) -> usize {
+    let mut depth: i32 = 0;
+    let mut opened = false;
+    let mut j = start;
+    while j < cap {
+        let code = match lines[j].find("//") {
+            Some(i) => &lines[j][..i],
+            None => lines[j],
+        };
+        for ch in code.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        j += 1;
+        if opened && depth <= 0 {
+            return j;
+        }
+    }
+    j
+}
+
+/// End of an indentation-delimited block: blank lines and any line indented
+/// deeper than the start are included; stop at the first line at/below the
+/// start indent, keeping a lone trailing closer (`}` / `end`).
+fn indent_block_end(lines: &[&str], start: usize, cap: usize) -> usize {
     let base = indent_width(lines[start]);
     let mut j = start + 1;
-    while j < lines.len() && (j - start) < SNIPPET_CAP_LINES {
+    while j < cap {
         let line = lines[j];
         if line.trim().is_empty() {
             j += 1;
             continue;
         }
         if indent_width(line) <= base {
-            // Include a lone closing delimiter at base indent (}, end, ), ]).
             let t = line.trim();
             if matches!(t, "}" | "end" | ")" | "]" | "};" | "})" | "end;") {
                 j += 1;
@@ -890,6 +937,21 @@ mod tests {
             lines.push(l);
         }
         assert!(block_end(&lines, 0) - 0 <= SNIPPET_CAP_LINES);
+    }
+
+    #[test]
+    fn block_end_brace_balanced_captures_full_body() {
+        let lines = vec![
+            "func f() {",     // 0
+            "  if (x) {",     // 1
+            "    g();",       // 2
+            "  }",            // 3
+            "}",              // 4
+            "func next() {}", // 5
+        ];
+        // Brace balance closes at line 4 → end (exclusive) = 5, full body, not
+        // just the signature.
+        assert_eq!(block_end(&lines, 0), 5);
     }
 
     #[test]
