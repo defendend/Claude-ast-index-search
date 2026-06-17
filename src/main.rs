@@ -507,6 +507,15 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
+    /// Explore an area: ranked relevant symbols' source + tests, in one shot
+    Explore {
+        /// Query: natural-language question or a bag of symbol/file names
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Max source files to include
+        #[arg(short = 'f', long, default_value = "6")]
+        max_files: usize,
+    },
     /// Find usages of a symbol
     Usages {
         /// Symbol name
@@ -996,6 +1005,9 @@ fn main() -> Result<()> {
         }
         Commands::Refs { symbol, limit } => {
             commands::index::cmd_refs(&root, &symbol, limit, format)
+        }
+        Commands::Explore { query, max_files } => {
+            commands::explore::cmd_explore(&root, &query, max_files, format)
         }
         Commands::Hierarchy {
             name,
