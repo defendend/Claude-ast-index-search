@@ -592,6 +592,9 @@ exclude:
 
 ## Changelog
 
+### 3.48.0
+- **Fix Claude plugin post-edit hook debounce on Git Bash** — the hook now reads marker mtimes with GNU `stat` first, falls back to BSD/macOS `stat`, and ignores non-numeric timestamp output before doing shell arithmetic. This prevents `set -u` failures like `File: unbound variable` in Windows Git Bash while keeping the hook non-blocking.
+
 ### 3.47.2
 - **Fix Claude plugin hook loading on Windows** — `hooks/hooks.json` is now left to the standard plugin auto-loader instead of being referenced from the manifest as well, preventing duplicate hook registration in Claude Code 3.47.1. The plugin validation script now blocks this manifest shape so the duplicate cannot come back.
 - **Keep `node_modules` `.d.ts` declarations stable across `update`** — `rebuild` indexes TypeScript declaration files from `node_modules`, and `update` now reconciles the same declaration set instead of treating those rows as deleted. Changed declarations are re-parsed; declarations removed from disk are still deleted from the index.

@@ -38,10 +38,22 @@ if [ -z "$hash" ]; then
 fi
 marker="$cache_dir/post-edit-${hash}.stamp"
 debounce_sec="${AST_INDEX_HOOK_DEBOUNCE_SEC:-5}"
+case "$debounce_sec" in
+  ''|*[!0-9]*) debounce_sec=5 ;;
+esac
+
+marker_mtime() {
+  stat -c %Y "$1" 2>/dev/null && return 0
+  stat -f %m "$1" 2>/dev/null && return 0
+  printf '0\n'
+}
 
 now=$(date +%s)
 if [ -f "$marker" ]; then
-  last=$(stat -f %m "$marker" 2>/dev/null || stat -c %Y "$marker" 2>/dev/null || echo 0)
+  last=$(marker_mtime "$marker")
+  case "$last" in
+    ''|*[!0-9]*) last=0 ;;
+  esac
   delta=$((now - last))
   if [ "$delta" -lt "$debounce_sec" ]; then
     exit 0
