@@ -32,6 +32,9 @@ struct Cand {
     sym: SearchResult,
     score: f64,
     vendor: bool,
+    /// How this symbol entered the graph in Stage B: "caller" (references the
+    /// seed) or "subclass" (inherits from it). `None` for lexical matches.
+    link: Option<&'static str>,
 }
 
 pub fn cmd_explore(
@@ -79,6 +82,7 @@ pub fn cmd_explore(
                 sym: s,
                 score: 0.0,
                 vendor,
+                link: None,
             });
         }
     }
@@ -318,6 +322,28 @@ fn emit_text(
         );
     }
 
+    let neighbours: Vec<&Cand> = cands
+        .iter()
+        .filter(|c| c.link.is_some() && !c.vendor)
+        .collect();
+    if !neighbours.is_empty() {
+        println!(
+            "\n{}",
+            "Graph neighbours (callers / subclasses via graph):".cyan()
+        );
+        for c in neighbours.iter().take(10) {
+            let disp = resolver.resolve_with_root(&c.sym.path, c.sym.root_path.as_deref());
+            println!(
+                "  [{}] {} [{}]  {}:{}",
+                c.link.unwrap_or("?").magenta(),
+                c.sym.display_name(),
+                c.sym.kind,
+                disp,
+                c.sym.line
+            );
+        }
+    }
+
     println!("\n{} ({} files)", "Source (from disk):".cyan(), n_files);
     for &i in file_order {
         let c = &cands[i];
@@ -378,10 +404,25 @@ fn emit_json(
         .iter()
         .map(|(rel, found)| json!({ "source": rel, "tests": found }))
         .collect();
+    let neighbours: Vec<_> = cands
+        .iter()
+        .filter(|c| c.link.is_some() && !c.vendor)
+        .take(10)
+        .map(|c| {
+            json!({
+                "link": c.link,
+                "name": c.sym.display_name(),
+                "kind": c.sym.kind,
+                "path": c.sym.path,
+                "line": c.sym.line,
+            })
+        })
+        .collect();
     let out = json!({
         "query": raw,
         "dominant_language": dom_lang,
         "symbols": symbols,
+        "neighbours": neighbours,
         "files": files,
         "tests": tests_json,
     });
@@ -566,6 +607,8 @@ fn apply_rwr(conn: &Connection, resolver: &PathResolver, cands: &mut Vec<Cand>) 
     // Build edges around each seed: callers (refs → owning symbol) + inheritance.
     let seeds: Vec<SearchResult> = cands.iter().take(seed_n).map(|c| c.sym.clone()).collect();
     let mut file_cache: HashMap<String, Vec<SearchResult>> = HashMap::new();
+    // Role a node plays relative to the seed — for the "Graph neighbours" section.
+    let mut link_role: HashMap<(String, i64), &'static str> = HashMap::new();
     for sym in &seeds {
         let sid = g.intern(sym);
         for r in db::find_references(conn, &sym.name, REF_LIMIT)? {
@@ -576,6 +619,9 @@ fn apply_rwr(conn: &Connection, resolver: &PathResolver, cands: &mut Vec<Cand>) 
                 .entry(r.path.clone())
                 .or_insert_with(|| db::get_file_symbols(conn, &r.path).unwrap_or_default());
             if let Some(owner) = fsyms.iter().rev().find(|s| s.line <= r.line).cloned() {
+                link_role
+                    .entry((owner.path.clone(), owner.line))
+                    .or_insert("caller");
                 let oid = g.intern(&owner);
                 g.edge(sid, oid);
             }
@@ -584,6 +630,9 @@ fn apply_rwr(conn: &Connection, resolver: &PathResolver, cands: &mut Vec<Cand>) 
             if !resolver.matches_filter(child.root_path.as_deref()) {
                 continue;
             }
+            link_role
+                .entry((child.path.clone(), child.line))
+                .or_insert("subclass");
             let cid = g.intern(&child);
             g.edge(sid, cid);
         }
@@ -654,10 +703,12 @@ fn apply_rwr(conn: &Connection, resolver: &PathResolver, cands: &mut Vec<Cand>) 
         let key = (sym.path.clone(), sym.line);
         if !existing.contains(&key) {
             let vendor = is_vendor(&sym.path);
+            let link = link_role.get(&key).copied();
             cands.push(Cand {
                 sym: sym.clone(),
                 score: 0.0,
                 vendor,
+                link,
             });
         }
     }
