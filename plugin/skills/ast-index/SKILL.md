@@ -67,6 +67,27 @@ Project type is auto-detected by marker files (build.gradle.kts, Package.swift, 
 
 ## Core Commands
 
+### Explore (one-shot context)
+
+**`explore`** - Rank the symbols most relevant to a query, print their source
+(read fresh from disk), list graph neighbours (callers/subclasses), and locate
+tests by path convention — in a single call. Prefer this over a search + read
+loop when you want to understand an area. Language-agnostic and vendor-aware
+(`node_modules` `.d.ts` and cross-stack matches are down-ranked, never deleted).
+
+```bash
+ast-index explore applicant merge MergeService   # bag of symbol/file names
+ast-index explore "how does auth session work"   # natural-language question
+ast-index explore PaymentService --rwr           # --rwr: re-rank via call/inheritance graph
+ast-index explore Repository --max-files 8        # cap source files shown (default 6)
+ast-index explore Session request --rwr --format json
+```
+
+- Default (Stage A) ranks by lexical match + multi-term corroboration.
+- `--rwr` (Stage B) builds a call/inheritance graph in memory and re-ranks by
+  personalized PageRank, surfacing callers/subclasses in a "Graph neighbours"
+  section. Slightly slower; best when you care about who-calls-what.
+
 ### Universal Search
 
 **`search`** - Perform universal search across files, symbols, and modules simultaneously.
