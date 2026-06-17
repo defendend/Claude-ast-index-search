@@ -173,7 +173,7 @@ fn tool_descriptors() -> Vec<Value> {
     vec![
         json!({
             "name": "explore",
-            "description": "Explore an area in ONE shot: ranked verbatim source of the most relevant symbols (read fresh from disk), their graph neighbours (callers/subclasses), and tests located by path convention. Prefer this over a search+read loop when you want to understand how something works or survey an area. Language-agnostic and vendor-aware (node_modules .d.ts and cross-stack matches are down-ranked). Set `rwr` to re-rank by an in-memory call/inheritance graph (personalized PageRank) — surfaces callers/subclasses.",
+            "description": "Call this FIRST for almost any 'how does X work', 'where/what is X', architecture, or area-survey question — one call returns the ranked verbatim source of the relevant symbols (read fresh from disk), their graph neighbours (callers/subclasses), and tests located by path convention. It REPLACES a grep + read loop: more precise (no comment/string false positives) and far fewer tool calls and tokens. Reach for raw grep/read only to confirm a detail this didn't cover. Language-agnostic and vendor-aware (node_modules .d.ts and cross-stack matches are down-ranked). Set `rwr` to re-rank by an in-memory call/inheritance graph (personalized PageRank) — surfaces callers/subclasses.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
