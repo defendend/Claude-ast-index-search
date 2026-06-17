@@ -103,7 +103,7 @@ pub fn cmd_explore(
 
     // Stage B: re-rank by RWR over an in-memory call/inheritance graph.
     if use_rwr {
-        apply_rwr(&conn, &resolver, &mut cands)?;
+        apply_rwr(&conn, &resolver, dom_lang.as_deref(), &mut cands)?;
     }
 
     // 4. Pick distinct source files from the top non-vendor candidates.
@@ -199,19 +199,28 @@ fn score(c: &Cand, terms: &[String], dom_lang: Option<&str>) -> f64 {
     // Prefer concise names on ties (long auto-generated names rank lower).
     s -= c.sym.name.chars().count() as f64 * 0.05;
 
-    // Penalties (multiplicative, applied last).
-    if c.vendor {
-        s *= 0.05; // .d.ts / node_modules — keep out of the top, never delete.
+    s * penalty_mult(&c.sym, c.vendor, dom_lang)
+}
+
+/// Multiplicative down-ranking shared by the lexical pass (Stage A) and the
+/// RWR blend (Stage B), so penalties are not lost when graph re-ranking runs.
+fn penalty_mult(sym: &SearchResult, vendor: bool, dom_lang: Option<&str>) -> f64 {
+    let mut m = 1.0;
+    if vendor {
+        m *= 0.05; // .d.ts / node_modules — keep out of the top, never delete.
     }
-    if is_test_path(&c.sym.path) {
-        s *= 0.3; // tests shown in their own section, not as primary source.
+    if sym.kind == "import" {
+        m *= 0.15; // import lines must not outrank real definitions.
     }
-    if let (Some(dom), Some(ext)) = (dom_lang, ext_of(&c.sym.path)) {
+    if is_test_path(&sym.path) {
+        m *= 0.3; // tests live in their own section, not as primary source.
+    }
+    if let (Some(dom), Some(ext)) = (dom_lang, ext_of(&sym.path)) {
         if ext != dom {
-            s *= 0.4; // cross-stack down-rank.
+            m *= 0.4; // cross-stack down-rank (e.g. JMH .java in a Kotlin repo).
         }
     }
-    s
+    m
 }
 
 fn kind_base(kind: &str) -> f64 {
@@ -262,9 +271,35 @@ fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>>
             patterns.push(format!("test_{stem}.py"));
             patterns.push(format!("{stem}_test.py"));
         }
+        // JVM family: both singular `Test`/`Spec` and plural `Tests` are common.
         "kt" | "java" | "scala" => {
             patterns.push(format!("{stem}Test.{ext}"));
+            patterns.push(format!("{stem}Tests.{ext}"));
             patterns.push(format!("{stem}Spec.{ext}"));
+        }
+        // Swift / XCTest convention is plural `XTests.swift`.
+        "swift" => {
+            patterns.push(format!("{stem}Tests.swift"));
+            patterns.push(format!("{stem}Test.swift"));
+            patterns.push(format!("{stem}Spec.swift"));
+        }
+        // C#: NUnit/xUnit use `XTests.cs` / `XTest.cs`.
+        "cs" => {
+            patterns.push(format!("{stem}Tests.cs"));
+            patterns.push(format!("{stem}Test.cs"));
+        }
+        // PHP / PHPUnit: `XTest.php` (usually under tests/).
+        "php" => {
+            patterns.push(format!("{stem}Test.php"));
+            patterns.push(format!("{stem}_test.php"));
+        }
+        // C / C++: no single standard — probe the common ones.
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" => {
+            for e in ["cpp", "cc", "cxx", "c"] {
+                patterns.push(format!("{stem}_test.{e}"));
+                patterns.push(format!("test_{stem}.{e}"));
+                patterns.push(format!("{stem}_tests.{e}"));
+            }
         }
         "rs" => {
             // Rust tests are usually inline (#[cfg(test)]) — not path-detectable.
@@ -274,8 +309,15 @@ fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>>
     }
     let mut found = Vec::new();
     for p in patterns {
-        for hit in db::find_files(conn, &p, 3)? {
-            if !found.contains(&hit) {
+        for hit in db::find_files(conn, &p, 5)? {
+            // find_files matches `%p%` (substring), so `JsonConverter.cs` would
+            // falsely match `GenericJsonConverterTests.cs`. Keep only exact
+            // basename matches.
+            let base = Path::new(&hit)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if base == p && !found.contains(&hit) {
                 found.push(hit);
             }
         }
@@ -520,14 +562,24 @@ fn is_vendor(path: &str) -> bool {
 
 fn is_test_path(path: &str) -> bool {
     let p = path.to_lowercase();
-    p.contains("/spec/")
+    let dir_or_infix = p.contains("/spec/")
         || p.contains("/test/")
         || p.contains("/tests/")
         || p.contains("/__tests__/")
+        || p.starts_with("spec/")
+        || p.starts_with("test/")
+        || p.starts_with("tests/")
         || p.contains("_spec.")
         || p.contains("_test.")
         || p.contains(".spec.")
-        || p.contains(".test.")
+        || p.contains(".test.");
+    if dir_or_infix {
+        return true;
+    }
+    // CamelCase filename suffix: FooTest.java, SessionTests.swift, BarSpec.kt.
+    // Use original case so plain words ("latest", "contest") are not flagged.
+    let stem = path_stem(path);
+    stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("Spec")
 }
 
 fn abs_path(root: &Path, rel: &str, root_path: Option<&str>) -> PathBuf {
@@ -587,7 +639,12 @@ impl Graph {
 /// ranked low and demotes lexical matches that connect to nothing — the role
 /// RWR plays in codegraph, but here on a graph assembled at query time
 /// (no schema migration, no parser changes).
-fn apply_rwr(conn: &Connection, resolver: &PathResolver, cands: &mut Vec<Cand>) -> Result<()> {
+fn apply_rwr(
+    conn: &Connection,
+    resolver: &PathResolver,
+    dom_lang: Option<&str>,
+    cands: &mut Vec<Cand>,
+) -> Result<()> {
     const SEED_NODES: usize = 30;
     const REF_LIMIT: usize = 40;
     const ALPHA: f64 = 0.25;
@@ -719,8 +776,126 @@ fn apply_rwr(conn: &Connection, resolver: &PathResolver, cands: &mut Vec<Cand>) 
         let rwr = rwr_by_key.get(&key).copied().unwrap_or(0.0) / max_rwr;
         let connected = rwr_by_key.contains_key(&key);
         let blended = 0.6 * lex + 0.4 * rwr;
-        c.score = blended * 1000.0 * if connected { 1.0 } else { 0.5 };
+        c.score = blended
+            * 1000.0
+            * if connected { 1.0 } else { 0.5 }
+            * penalty_mult(&c.sym, c.vendor, dom_lang);
     }
     cands.sort_by(|a, b| b.score.total_cmp(&a.score));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sym(name: &str, kind: &str, path: &str, line: i64) -> SearchResult {
+        SearchResult {
+            name: name.to_string(),
+            qualified_name: None,
+            kind: kind.to_string(),
+            line,
+            signature: None,
+            path: path.to_string(),
+            root_path: None,
+        }
+    }
+
+    fn cand(name: &str, kind: &str, path: &str) -> Cand {
+        let vendor = is_vendor(path);
+        Cand {
+            sym: sym(name, kind, path, 1),
+            score: 0.0,
+            vendor,
+            link: None,
+        }
+    }
+
+    #[test]
+    fn tokenize_splits_filters_and_dedups() {
+        let t = tokenize("applicant merge MergeService a, of");
+        assert_eq!(t, vec!["applicant", "merge", "mergeservice"]);
+        // "a"/"of" dropped (<3 chars); dedup keeps first occurrence.
+        assert_eq!(tokenize("Foo foo FOO"), vec!["foo"]);
+    }
+
+    #[test]
+    fn vendor_detection() {
+        assert!(is_vendor("node_modules/@types/react/index.d.ts"));
+        assert!(is_vendor("frontend/types/global.d.ts"));
+        assert!(!is_vendor("app/services/applicant/merge_service.rb"));
+    }
+
+    #[test]
+    fn test_path_detection() {
+        assert!(is_test_path("spec/services/applicant/merge_service_spec.rb"));
+        assert!(is_test_path("src/foo.test.ts"));
+        assert!(is_test_path("pkg/foo_test.go"));
+        assert!(is_test_path("Tests/SessionTests.swift"));
+        assert!(!is_test_path("app/services/applicant/merge_service.rb"));
+    }
+
+    #[test]
+    fn penalties_downrank_noise_not_real_code() {
+        let real = penalty_mult(&sym("MergeService", "class", "app/x.rb", 1), false, Some("rb"));
+        let imp = penalty_mult(&sym("foo", "import", "app/x.rb", 1), false, Some("rb"));
+        let vendor = penalty_mult(&sym("X", "interface", "node_modules/x.d.ts", 1), true, Some("rb"));
+        let test = penalty_mult(&sym("X", "class", "spec/x_spec.rb", 1), false, Some("rb"));
+        let cross = penalty_mult(&sym("X", "class", "bench/x.java", 1), false, Some("kt"));
+        assert_eq!(real, 1.0);
+        assert!(imp < real && imp > vendor);
+        assert!(vendor < 0.1);
+        assert!(test < real);
+        assert!(cross < real);
+    }
+
+    #[test]
+    fn corroboration_beats_single_common_term() {
+        let terms = vec![
+            "applicant".to_string(),
+            "merge".to_string(),
+            "mergeservice".to_string(),
+        ];
+        let dom = Some("rb");
+        // Matches all three terms (name + path).
+        let strong = score(
+            &cand("MergeService", "class", "app/services/applicant/merge_service.rb"),
+            &terms,
+            dom,
+        );
+        // A trivial getter matching only "applicant".
+        let weak = score(
+            &cand("applicant", "method", "app/contexts/security_form_context.rb"),
+            &terms,
+            dom,
+        );
+        assert!(
+            strong > weak,
+            "multi-term symbol ({strong}) must outrank single-term getter ({weak})"
+        );
+    }
+
+    #[test]
+    fn block_end_stops_at_dedent_and_keeps_closer() {
+        let lines = vec!["def foo", "  body1", "  body2", "end", "def bar"];
+        // Includes def..end (closer at base indent kept), stops before `def bar`.
+        assert_eq!(block_end(&lines, 0), 4);
+    }
+
+    #[test]
+    fn block_end_respects_cap() {
+        let mut lines = vec!["def big"];
+        let deep: Vec<String> = (0..200).map(|i| format!("  line{i}")).collect();
+        for l in &deep {
+            lines.push(l);
+        }
+        assert!(block_end(&lines, 0) - 0 <= SNIPPET_CAP_LINES);
+    }
+
+    #[test]
+    fn ext_and_stem_helpers() {
+        assert_eq!(ext_of("app/x/merge_service.rb").as_deref(), Some("rb"));
+        assert_eq!(ext_of("noext"), None);
+        assert_eq!(path_stem("app/x/merge_service.rb"), "merge_service");
+    }
 }
