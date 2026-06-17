@@ -266,6 +266,14 @@ fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>>
                 patterns.push(format!("{stem}.spec.{e}"));
             }
         }
+        // Vue/Svelte components are tested with JS/TS test files next to them
+        // or under __tests__ (X.spec.ts / X.test.ts / X.spec.js …).
+        "vue" | "svelte" => {
+            for e in ["ts", "js", "tsx", "jsx"] {
+                patterns.push(format!("{stem}.spec.{e}"));
+                patterns.push(format!("{stem}.test.{e}"));
+            }
+        }
         "go" => patterns.push(format!("{stem}_test.go")),
         "py" => {
             patterns.push(format!("test_{stem}.py"));
