@@ -487,7 +487,14 @@ fn read_snippet(root: &Path, sym: &SearchResult) -> Option<String> {
     if start >= lines.len() {
         return None;
     }
-    let end = block_end(&lines, start);
+    // Vue/Svelte single-file components are whole files, not brace/indent
+    // blocks — the synthetic component symbol sits at line 1, so show an
+    // overview window (script + start of template) instead of a misfired
+    // brace/indent slice.
+    let end = match ext_of(&sym.path).as_deref() {
+        Some("vue") | Some("svelte") => (start + 30).min(lines.len()),
+        _ => block_end(&lines, start),
+    };
     let mut out = String::new();
     for (n, line) in lines[start..end].iter().enumerate() {
         out.push_str(&format!("{:>5}\t{}\n", start + n + 1, line));

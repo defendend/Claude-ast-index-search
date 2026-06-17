@@ -1025,6 +1025,28 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         }
     }
 
+    // Vue/Svelte single-file components export an anonymous `export default {}`,
+    // so the component itself has no named symbol — its identity is the file
+    // name (e.g. NavBar.vue → component `NavBar`). Emit a synthetic symbol so
+    // the component is discoverable by name (search/explore/go-to), in addition
+    // to the script-block symbols the parser already extracts.
+    if matches!(
+        file_type,
+        parsers::FileType::Vue | parsers::FileType::Svelte
+    ) {
+        if let Some(stem) = Path::new(&rel_path).file_stem().and_then(|s| s.to_str()) {
+            if !symbols.iter().any(|s| s.name == stem && s.line == 1) {
+                symbols.push(parsers::ParsedSymbol {
+                    name: stem.to_string(),
+                    kind: crate::db::SymbolKind::Class,
+                    line: 1,
+                    signature: format!("component {}", stem),
+                    parents: vec![],
+                });
+            }
+        }
+    }
+
     Ok(ParsedFile {
         rel_path,
         root_path,
