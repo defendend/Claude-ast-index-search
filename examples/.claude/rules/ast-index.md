@@ -71,6 +71,7 @@ in the subagent's prompt:
 
 ```
 Use `ast-index` via Bash for code search (NOT grep / the Grep tool):
+  ast-index explore "how does X work" — one-shot context: ranked source + neighbours + tests (--rwr for graph)
   ast-index search "query"           — universal search
   ast-index file "Name"              — find a file by name fragment
   ast-index symbol "Name"            — find a symbol definition

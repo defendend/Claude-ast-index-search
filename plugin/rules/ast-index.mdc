@@ -21,6 +21,7 @@ literals, comments, or when `ast-index` returns no useful result.
 Useful commands:
 
 ```bash
+ast-index explore "how does X work"   # one-shot: ranked source + neighbours + tests (--rwr for graph)
 ast-index search "Query"
 ast-index file "FileName"
 ast-index symbol "SymbolName"

@@ -219,10 +219,11 @@ cargo build --release -p ast-index-mcp
 # Binary: target/release/ast-index-mcp
 ```
 
-Exposed tools (20):
+Exposed tools (21):
 
 | Tool | Purpose |
 |------|---------|
+| `explore` | One-shot context: ranked source of relevant symbols + graph neighbours + tests (use first for "how does X work" / surveying an area; `rwr` for graph re-ranking) |
 | `search` | Universal search across files, symbols, imports, content |
 | `symbol` | Find symbols by exact name / glob / kind filter (precise alternative to `search`) |
 | `class` | Find classes, interfaces, protocols, enums, structs by name or pattern |
@@ -269,7 +270,7 @@ Available commands: search, class, implementations, usages, callers, call-tree, 
 
 ---
 
-## Commands (46+)
+## Commands (47+)
 
 ### Grep-based (no index required)
 
@@ -293,6 +294,7 @@ ast-index usages <SYMBOL>          # Symbol usages (falls back to grep)
 ### Index-based (requires rebuild)
 
 ```bash
+ast-index explore <QUERY...>       # One-shot context: ranked source + neighbours + tests (--rwr for graph)
 ast-index search <QUERY>           # Universal search
 ast-index file <PATTERN>           # Find files
 ast-index symbol <NAME>            # Find symbols

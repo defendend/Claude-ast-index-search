@@ -26,6 +26,7 @@ Index Management:
   watch                  Watch for file changes and auto-update
 
 Search & Navigation:
+  explore                Ranked relevant symbols' source + neighbours + tests (one-shot; --rwr for graph)
   search                 Universal search (files + symbols)
   file                   Find files by name
   symbol                 Find symbols (classes, interfaces, functions)
