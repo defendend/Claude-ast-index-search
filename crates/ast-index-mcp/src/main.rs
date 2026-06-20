@@ -172,6 +172,21 @@ fn handle_request(
 fn tool_descriptors() -> Vec<Value> {
     vec![
         json!({
+            "name": "explore",
+            "description": "Call this FIRST for almost any 'how does X work', 'where/what is X', architecture, or area-survey question — one call returns the ranked verbatim source of the relevant symbols (read fresh from disk), their graph neighbours (callers/subclasses), and tests located by path convention. It REPLACES a grep + read loop: more precise (no comment/string false positives) and far fewer tool calls and tokens. Reach for raw grep/read only to confirm a detail this didn't cover. Language-agnostic and vendor-aware (node_modules .d.ts and cross-stack matches are down-ranked). Set `rwr` to re-rank by an in-memory call/inheritance graph (personalized PageRank) — surfaces callers/subclasses.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query":        { "type": "string",  "description": "Natural-language question or a bag of symbol/file names." },
+                    "max_files":    { "type": "integer", "description": "Max source files to include (default 6)." },
+                    "rwr":          { "type": "boolean", "description": "Re-rank via in-memory call/inheritance graph (RWR). Surfaces callers/subclasses; slightly slower." },
+                    "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient)." }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
             "name": "search",
             "description": "Universal code search across file paths, symbol definitions, imports/usages, and file contents. Use this FIRST for any 'find X in the codebase' question — it returns files, matching symbols (classes, functions, etc.), and content matches in one call. Prefer this over grep.",
             "inputSchema": {
@@ -498,7 +513,14 @@ fn call_tool(params: Value, ast_index_bin: &str, default_root: &PathBuf) -> Resu
 fn supports_json_format(tool: &str) -> bool {
     matches!(
         tool,
-        "search" | "usages" | "implementations" | "refs" | "stats" | "symbol" | "class"
+        "explore"
+            | "search"
+            | "usages"
+            | "implementations"
+            | "refs"
+            | "stats"
+            | "symbol"
+            | "class"
     )
 }
 
@@ -508,6 +530,19 @@ fn supports_json_format(tool: &str) -> bool {
 pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
     let mut argv: Vec<String> = Vec::new();
     match name {
+        "explore" => {
+            argv.push("explore".into());
+            // query is a single string; the CLI tokenizes it into terms.
+            argv.push(require_string(&arguments, "query")?);
+            push_if_num(&mut argv, &arguments, "max_files", "--max-files");
+            if arguments
+                .get("rwr")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                argv.push("--rwr".into());
+            }
+        }
         "search" => {
             argv.push("search".into());
             argv.push(require_string(&arguments, "query")?);
@@ -687,12 +722,12 @@ mod tests {
     // --- tool_descriptors metadata ---
 
     #[test]
-    fn descriptors_expose_exactly_twenty_tools() {
+    fn descriptors_expose_exactly_twentyone_tools() {
         let names: Vec<String> = tool_descriptors()
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
             .collect();
-        assert_eq!(names.len(), 20, "MCP must expose 20 tools, got {names:?}");
+        assert_eq!(names.len(), 21, "MCP must expose 21 tools, got {names:?}");
     }
 
     #[test]

@@ -26,6 +26,7 @@ Index Management:
   watch                  Watch for file changes and auto-update
 
 Search & Navigation:
+  explore                Ranked relevant symbols' source + neighbours + tests (one-shot; --rwr for graph)
   search                 Universal search (files + symbols)
   file                   Find files by name
   symbol                 Find symbols (classes, interfaces, functions)
@@ -506,6 +507,18 @@ enum Commands {
         /// Max results per section
         #[arg(short, long, default_value = "20")]
         limit: usize,
+    },
+    /// Explore an area: ranked relevant symbols' source + tests, in one shot
+    Explore {
+        /// Query: natural-language question or a bag of symbol/file names
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Max source files to include
+        #[arg(short = 'f', long, default_value = "6")]
+        max_files: usize,
+        /// Stage B: re-rank by RWR over an in-memory call/inheritance graph
+        #[arg(long)]
+        rwr: bool,
     },
     /// Find usages of a symbol
     Usages {
@@ -997,6 +1010,11 @@ fn main() -> Result<()> {
         Commands::Refs { symbol, limit } => {
             commands::index::cmd_refs(&root, &symbol, limit, format)
         }
+        Commands::Explore {
+            query,
+            max_files,
+            rwr,
+        } => commands::explore::cmd_explore(&root, &query, max_files, rwr, format),
         Commands::Hierarchy {
             name,
             in_file,

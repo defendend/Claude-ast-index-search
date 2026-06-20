@@ -845,7 +845,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
 }
 
 /// Search result
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1619,6 +1619,26 @@ pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Ve
         .query_map(params![name, limit as i64], row_to_ref_result)?
         .collect::<Result<Vec<_>, _>>()?;
 
+    Ok(results)
+}
+
+/// All symbols defined in a file, ordered by line. Used by `explore --rwr`
+/// to attribute a reference (file + line) to its owning symbol — the last
+/// symbol whose start line is <= the reference line. Approximate without
+/// `end_line`, but good enough to build a caller→callee graph in memory.
+pub fn get_file_symbols(conn: &Connection, path: &str) -> Result<Vec<SearchResult>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM symbols s
+        JOIN files f ON s.file_id = f.id
+        WHERE f.path = ?1
+        ORDER BY s.line
+        "#,
+    )?;
+    let results = stmt
+        .query_map(params![path], row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }
 
