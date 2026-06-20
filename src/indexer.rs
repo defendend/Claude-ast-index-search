@@ -1058,7 +1058,9 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     })
 }
 
-/// Directories to always exclude from indexing (regardless of .gitignore)
+/// Directories to always exclude from indexing (regardless of .gitignore).
+/// Keep this list to generated caches/build outputs only; ordinary dependency
+/// or source directories can be excluded via .gitignore or .ast-index.yaml.
 const EXCLUDED_DIRS: &[&str] = &[
     "node_modules",
     "__pycache__",
@@ -1066,7 +1068,6 @@ const EXCLUDED_DIRS: &[&str] = &[
     "build",
     "dist",
     "target",
-    "vendor",
     ".gradle",
     ".idea",
     "Pods",
