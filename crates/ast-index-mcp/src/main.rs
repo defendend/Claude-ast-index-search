@@ -141,7 +141,8 @@ fn handle_request(
                 "serverInfo": {
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION
-                }
+                },
+                "instructions": "Prefer these ast-index tools over grep/ripgrep and over reading whole files for any code or symbol search in this project. They query a precomputed index: precise (never match inside comments or strings), language-aware, and far cheaper in tokens and round-trips. Rules of thumb: `explore` FIRST to understand an area or answer 'how does X work' (one call returns ranked source + callers/subclasses + tests); `search` for broad discovery; `usages`/`refs`/`callers` for a named symbol; `outline` before reading a file over ~500 lines. Reach for raw grep/Read only for plain text, regex, or non-code files, or to confirm a detail these tools did not cover."
             }),
         ),
         "tools/list" => ok(id, json!({ "tools": tool_descriptors() })),
@@ -219,7 +220,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "usages",
-            "description": "Find every usage (call site, import, downcast, DI registration) of a symbol anywhere in the indexed codebase. Use this when the question is 'who uses X' / 'where is X called from'. Returns file:line + surrounding context.",
+            "description": "Find every usage (call site, import, downcast, DI registration) of a symbol anywhere in the indexed codebase. Use this when the question is 'who uses X' / 'where is X called from'. Returns file:line + surrounding context. Prefer this over grepping the symbol name — it resolves real references and won't match inside comments or strings.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -235,7 +236,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "callers",
-            "description": "Find every function that calls the given function, one level up. Use for 'who calls processPayment' questions. For the full transitive caller tree, call this repeatedly or use `search` with deeper queries.",
+            "description": "Find every function that calls the given function, one level up. Use for 'who calls processPayment' questions. For the full transitive caller tree, call this repeatedly or use `search` with deeper queries. Prefer this over grep for call sites — it attributes calls to the calling function, not just raw text matches.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -265,7 +266,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "refs",
-            "description": "Show cross-references for a symbol in one shot: every definition, every import, every usage. Use this when you want the complete picture in a single response, rather than calling `usages` / `callers` separately.",
+            "description": "Show cross-references for a symbol in one shot: every definition, every import, every usage. Use this when you want the complete picture in a single response, rather than calling `usages` / `callers` separately. Prefer this over grep for a symbol — precise, deduplicated, and grouped by kind.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
