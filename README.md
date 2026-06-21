@@ -1,4 +1,4 @@
-# ast-index v3.48.0
+# ast-index v3.48.1
 
 Structural, AST-aware code navigation CLI for large, multi-language
 repositories. It builds a local SQLite index of symbols, references, imports,
