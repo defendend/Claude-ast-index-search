@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.48.1
+- **Index project-owned `vendor/` directories** — `vendor/` is no longer hard-excluded by ast-index itself, so projects that keep real source code there can index, search, and resolve symbols from those files. Generated caches and build outputs remain on the internal exclude list, and projects can still exclude `vendor/` through `.gitignore` or `.ast-index.yaml`.
+- **Clarify AST-based agent navigation in the README** — the top-level docs now focus on structural navigation, compact parseable context, and the ~40-50% token savings agents can get on large repositories by reading targeted code slices instead of whole files.
+
 ## 3.48.0
 - **Fix Claude plugin post-edit hook debounce on Git Bash** — the hook now reads marker mtimes with GNU `stat` first, falls back to BSD/macOS `stat`, and ignores non-numeric timestamp output before doing shell arithmetic. This prevents `set -u` failures like `File: unbound variable` in Windows Git Bash while keeping the hook non-blocking.
 
