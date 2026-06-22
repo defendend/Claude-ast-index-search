@@ -5,6 +5,8 @@ repositories. It builds a local SQLite index of symbols, references, imports,
 modules, dependencies, and inheritance so humans and agents can move through
 code by exact structure instead of grep-style text matches.
 
+https://t.me/defendend_ai_dev
+
 ## What It Gives You
 
 - Navigate classes, functions, files, imports, usages, callers, implementations,
