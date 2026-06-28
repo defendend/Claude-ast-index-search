@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.49.1
+- **Publish the multi-root rebuild fix from the current mainline** — re-release
+  the 3.49.0 changes on top of 3.48.1 so the release tag points at the current
+  `main` history after the vendor-dir hotfix.
+
 ## 3.49.0
 - **Preserve extra roots in sub-project rebuilds** — `rebuild --sub-projects`
   now snapshots attached subtrees before the DB swap, restores them into the
