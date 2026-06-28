@@ -5,6 +5,7 @@
 //! - update: Incrementally update the index
 //! - stats: Show index statistics
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
@@ -84,6 +85,71 @@ fn build_exclude_matcher(
         gb.add_line(None, p).ok();
     }
     gb.build().ok()
+}
+
+fn snapshot_subtrees(root: &Path, verbose: bool) -> Result<Vec<db::Subtree>> {
+    if !db::db_exists(root) {
+        return Ok(Vec::new());
+    }
+    if verbose {
+        eprintln!("[verbose] reading subtrees from existing DB...");
+    }
+    let old_conn = db::open_db(root)?;
+    // Side-effect: migrates any pre-3.47 `metadata.extra_roots` JSON into
+    // the subtrees table so list_subtrees below sees everything.
+    db::get_extra_roots(&old_conn).ok();
+    db::list_subtrees(&old_conn)
+}
+
+fn attach_rebuild_subtrees(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    saved_subtrees: &[db::Subtree],
+    config_roots: Option<&[String]>,
+    extra_paths: &[String],
+    verbose: bool,
+) -> Result<()> {
+    let mut taken_canonicals: HashSet<String> = HashSet::new();
+    for sub in saved_subtrees {
+        db::insert_subtree(conn, &sub.name, &sub.canonical_path, &sub.original_path)?;
+        taken_canonicals.insert(sub.canonical_path.clone());
+    }
+
+    // Append config-supplied roots and CLI `--path` args. Each new path
+    // gets an auto-allocated subtree name (basename, with `-N` suffix on
+    // collision). Paths that already match an existing subtree by their
+    // canonical form are deduplicated.
+    let mut attach_extra = |raw: &str, label: &str| -> Result<()> {
+        let candidate = if std::path::Path::new(raw).is_absolute() {
+            std::path::PathBuf::from(raw)
+        } else {
+            root.join(raw)
+        };
+        let canonical = db::safe_canonicalize(&candidate)
+            .to_string_lossy()
+            .into_owned();
+        if taken_canonicals.contains(&canonical) {
+            return Ok(());
+        }
+        let preferred = db::default_subtree_name(&canonical);
+        let name = db::allocate_subtree_name(conn, &preferred)?;
+        db::insert_subtree(conn, &name, &canonical, raw)?;
+        taken_canonicals.insert(canonical);
+        if verbose {
+            eprintln!("[verbose] attached {}: {}", label, raw);
+        }
+        Ok(())
+    };
+
+    if let Some(config_roots) = config_roots {
+        for cr in config_roots {
+            attach_extra(cr, "config root")?;
+        }
+    }
+    for p in extra_paths {
+        attach_extra(p, "--path")?;
+    }
+    Ok(())
 }
 
 /// Rebuild the index (full or partial)
@@ -182,6 +248,8 @@ pub fn cmd_rebuild(
             experimental_fast_rebuild,
             config_exclude.as_deref(),
             config_include.as_deref(),
+            config_roots.as_deref(),
+            extra_paths,
             exclude_matcher.as_ref(),
         );
     }
@@ -221,6 +289,8 @@ pub fn cmd_rebuild(
                 experimental_fast_rebuild,
                 config_exclude.as_deref(),
                 config_include.as_deref(),
+                config_roots.as_deref(),
+                extra_paths,
                 exclude_matcher.as_ref(),
             );
         }
@@ -243,6 +313,8 @@ pub fn cmd_rebuild(
                     experimental_fast_rebuild,
                     config_exclude.as_deref(),
                     config_include.as_deref(),
+                    config_roots.as_deref(),
+                    extra_paths,
                     exclude_matcher.as_ref(),
                 );
             }
@@ -279,6 +351,8 @@ pub fn cmd_rebuild(
                     experimental_fast_rebuild,
                     config_exclude.as_deref(),
                     config_include.as_deref(),
+                    config_roots.as_deref(),
+                    extra_paths,
                     exclude_matcher.as_ref(),
                 );
             }
@@ -302,18 +376,7 @@ pub fn cmd_rebuild(
     // shim) would collapse each row to a bare canonical path string and
     // lose the user-chosen name + original (relative) path form on every
     // rebuild — re-importing them as `<basename>` and `original=canonical`.
-    let saved_subtrees = if db::db_exists(root) {
-        if verbose {
-            eprintln!("[verbose] reading subtrees from existing DB...");
-        }
-        let old_conn = db::open_db(root)?;
-        // Side-effect: migrates any pre-3.47 `metadata.extra_roots` JSON
-        // into the subtrees table so list_subtrees below sees everything.
-        db::get_extra_roots(&old_conn).ok();
-        db::list_subtrees(&old_conn).unwrap_or_default()
-    } else {
-        vec![]
-    };
+    let saved_subtrees = snapshot_subtrees(root, verbose)?;
 
     // Swap the live DB aside instead of deleting it outright. The guard
     // restores the swap if rebuild fails (walker cap aborted, IO error,
@@ -359,47 +422,14 @@ pub fn cmd_rebuild(
 
     // Reattach saved subtrees verbatim so user-chosen names and the
     // original path form (relative vs absolute) survive the rebuild.
-    let mut taken_canonicals: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    for sub in &saved_subtrees {
-        db::insert_subtree(&conn, &sub.name, &sub.canonical_path, &sub.original_path)?;
-        taken_canonicals.insert(sub.canonical_path.clone());
-    }
-
-    // Append config-supplied roots and CLI `--path` args. Each new path
-    // gets an auto-allocated subtree name (basename, with `-N` suffix on
-    // collision). Paths that already match an existing subtree by their
-    // canonical form are deduplicated.
-    let mut attach_extra = |raw: &str, label: &str| -> Result<()> {
-        let candidate = if std::path::Path::new(raw).is_absolute() {
-            std::path::PathBuf::from(raw)
-        } else {
-            root.join(raw)
-        };
-        let canonical = db::safe_canonicalize(&candidate)
-            .to_string_lossy()
-            .into_owned();
-        if taken_canonicals.contains(&canonical) {
-            return Ok(());
-        }
-        let preferred = db::default_subtree_name(&canonical);
-        let name = db::allocate_subtree_name(&conn, &preferred)?;
-        db::insert_subtree(&conn, &name, &canonical, raw)?;
-        taken_canonicals.insert(canonical);
-        if verbose {
-            eprintln!("[verbose] attached {}: {}", label, raw);
-        }
-        Ok(())
-    };
-
-    if let Some(ref config_roots) = config_roots {
-        for cr in config_roots {
-            attach_extra(cr, "config root")?;
-        }
-    }
-    for p in extra_paths {
-        attach_extra(p, "--path")?;
-    }
+    attach_rebuild_subtrees(
+        &conn,
+        root,
+        &saved_subtrees,
+        config_roots.as_deref(),
+        extra_paths,
+        verbose,
+    )?;
 
     // Store no_ignore setting in database metadata
     if no_ignore {
@@ -776,6 +806,8 @@ fn cmd_rebuild_sub_projects(
     experimental_fast_rebuild: bool,
     extra_exclude: Option<&[String]>,
     config_include: Option<&[String]>,
+    config_roots: Option<&[String]>,
+    extra_paths: &[String],
     exclude_matcher: Option<&ignore::gitignore::Gitignore>,
 ) -> Result<()> {
     let start = Instant::now();
@@ -818,6 +850,8 @@ fn cmd_rebuild_sub_projects(
     }
     println!();
 
+    let saved_subtrees = snapshot_subtrees(root, verbose)?;
+
     // Swap aside instead of delete — see cmd_rebuild for rationale.
     if verbose {
         eprintln!("[verbose] swapping old DB aside...");
@@ -838,6 +872,15 @@ fn cmd_rebuild_sub_projects(
     if verbose {
         eprintln!("[verbose] DB swapped in {:?}", t.elapsed());
     }
+
+    attach_rebuild_subtrees(
+        &conn,
+        root,
+        &saved_subtrees,
+        config_roots,
+        extra_paths,
+        verbose,
+    )?;
 
     if no_ignore {
         conn.execute(
@@ -953,6 +996,52 @@ fn cmd_rebuild_sub_projects(
                 fail_count += 1;
             }
         }
+    }
+
+    let extra_roots = db::get_extra_roots(&conn)?;
+    for extra_root in &extra_roots {
+        let extra_path = std::path::Path::new(extra_root);
+        if !extra_path.exists() {
+            continue;
+        }
+        if verbose {
+            eprintln!("[verbose] indexing extra root: {}", extra_root);
+        }
+        let t = Instant::now();
+        let extra_walk = indexer::index_directory_with_config(
+            &mut conn,
+            extra_path,
+            true,
+            no_ignore,
+            extra_exclude,
+        )?;
+        total_files += extra_walk.file_count;
+        if !extra_walk.res_files.is_empty() {
+            any_android = true;
+        }
+        if !extra_walk.storyboard_files.is_empty() || !extra_walk.xcassets_dirs.is_empty() {
+            any_ios = true;
+        }
+        all_module_files.extend(extra_walk.module_files);
+        all_xml_files.extend(extra_walk.xml_layout_files);
+        all_res_files.extend(extra_walk.res_files);
+        all_storyboard_files.extend(extra_walk.storyboard_files);
+        all_xcassets_dirs.extend(extra_walk.xcassets_dirs);
+        if verbose {
+            eprintln!(
+                "[verbose] extra root: {} files in {:?}",
+                extra_walk.file_count,
+                t.elapsed()
+            );
+        }
+        println!(
+            "{}",
+            format!(
+                "Indexed {} files from extra root: {}",
+                extra_walk.file_count, extra_root
+            )
+            .dimmed()
+        );
     }
 
     // Index modules and dependencies from collected build files

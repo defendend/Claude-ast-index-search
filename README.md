@@ -1,37 +1,65 @@
 # ast-index v3.48.0
 
-Fast code search CLI for 34 programming languages. Native Rust implementation.
+Structural, AST-aware code navigation CLI for large, multi-language
+repositories. It builds a local SQLite index of symbols, references, imports,
+modules, dependencies, and inheritance so humans and agents can move through
+code by exact structure instead of grep-style text matches.
 
-## Supported Projects
+## What It Gives You
 
-| Platform | Languages | File Extensions |
-|----------|-----------|-----------------|
-| Android | Kotlin, Java | `.kt`, `.java` |
-| iOS | Swift, Objective-C | `.swift`, `.m`, `.h` |
-| Web/Frontend | TypeScript, JavaScript | `.ts`, `.tsx`, `.mts`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.vue`, `.svelte` |
-| Web/Frontend | CSS, SCSS, Less | `.css`, `.pcss`, `.postcss`, `.scss`, `.less` |
-| Systems | Rust | `.rs` |
-| Systems | Zig | `.zig`, `.zon` |
-| Backend | C#, Python, Go, C++, Scala | `.cs`, `.py`, `.go`, `.cpp`, `.cc`, `.c`, `.hpp`, `.scala`, `.sc` |
-| Backend | PHP | `.php`, `.phtml` |
-| Scripting | Ruby, Perl | `.rb`, `.pm`, `.pl`, `.t` |
-| Mobile | Dart/Flutter | `.dart` |
-| Schema | Protocol Buffers, WSDL/XSD | `.proto`, `.wsdl`, `.xsd` |
-| Enterprise | BSL (1C:Enterprise) | `.bsl`, `.os` |
-| Scripting | Lua, Bash | `.lua`, `.sh`, `.bash`, `.zsh` |
-| Functional | Elixir | `.ex`, `.exs` |
-| Data | SQL, R | `.sql`, `.r`, `.R` |
-| Scientific | Matlab | `.m` |
-| JVM | Groovy | `.groovy`, `.gradle` |
-| Functional | Common Lisp | `.lisp`, `.lsp`, `.cl`, `.asd` |
-| Game | GDScript (Godot) | `.gd` |
+- Navigate classes, functions, files, imports, usages, callers, implementations,
+  inheritance, modules, and dependency paths.
+- Start broad with `explore`, then jump to exact definitions with `symbol`,
+  `class`, `outline`, and `refs`.
+- Keep the index current with `ast-index update` after the first `rebuild`.
+- Give coding agents compact, parseable context instead of raw file dumps.
+- Save ~40-50% of agent tokens on large repositories by returning structural
+  slices of code instead of whole files.
 
-Project type is auto-detected.
+**Languages:** Kotlin, Java, Swift, Objective-C, TypeScript, JavaScript, Vue,
+Svelte, CSS, SCSS, Less, Rust, Zig, C#, Python, Go, C, C++, Scala, PHP, Ruby,
+Perl, Dart, Protocol Buffers, WSDL, XSD, BSL (1C:Enterprise), Lua, Bash, Elixir,
+SQL, R, Matlab, Groovy, Common Lisp, GDScript. Project type is auto-detected.
 
-**New to ast-index? Start with the [User guide](USER_GUIDE.md).** It covers
-project setup, index updates, git checkouts, worktrees, and AI agent usage.
+## How To
 
-**[Command setup guide](docs/setup-guide.md)** — install, commands, and usage examples.
+```bash
+# Install
+brew tap defendend/ast-index
+brew install ast-index
+
+# Build an index once per project
+cd /path/to/project
+ast-index rebuild
+
+# Ask code questions
+ast-index explore "payment flow"
+ast-index search ViewModel
+ast-index class BaseFragment
+ast-index usages Repository
+ast-index implementations Presenter
+ast-index deps app
+```
+
+Use `ast-index update` after edits or branch switches. In monorepos with nested
+project markers, add `--walk-up` or `AST_INDEX_WALK_UP=1` to reuse the root
+index.
+
+**Guides:** [User guide](USER_GUIDE.md) for everyday workflow;
+[Command setup guide](docs/setup-guide.md) for install/options/examples.
+
+## Performance
+
+Benchmarks on large Android project (~29k files, ~300k symbols):
+
+| Command | ast-index | grep | Speedup |
+|---------|-----------|------|---------|
+| imports | 0.3ms | 90ms | **260x** |
+| dependents | 2ms | 100ms | **100x** |
+| deps | 3ms | 90ms | **90x** |
+| class | 1ms | 90ms | **90x** |
+| search | 11ms | 280ms | **14x** |
+| usages | 8ms | 90ms | **12x** |
 
 ## Installation
 
@@ -43,6 +71,7 @@ brew install ast-index
 ```
 
 ### Winget (Windows)
+
 ```shell
 winget install --id defendend.ast-index
 ```
@@ -78,22 +107,7 @@ git reset --hard origin/main
 brew install ast-index
 ```
 
-## Quick Start
-
-```bash
-cd /path/to/project
-
-# Build index
-ast-index rebuild
-
-# Search
-ast-index search ViewModel
-ast-index class BaseFragment
-ast-index implementations Presenter
-ast-index usages Repository
-```
-
-### Monorepo workflow
+## Monorepo Workflow
 
 If your repo has subdirectories with their own VCS markers (git submodules,
 subtrees, nested `Cargo.toml` / `settings.gradle`), read-commands normally
@@ -128,7 +142,10 @@ claude plugin install ast-index
 ast-index install-claude-plugin
 ```
 
-Restart Claude Code to activate. Update: `brew upgrade ast-index && claude plugin update ast-index`. Uninstall: `claude plugin uninstall ast-index`.
+Restart Claude Code to activate.
+
+Update: `brew upgrade ast-index && claude plugin update ast-index`.
+Uninstall: `claude plugin uninstall ast-index`.
 
 The Claude plugin ships `/initialize` as the default setup command. It
 auto-detects project stack(s), including KMP and polyglot repos, then writes
@@ -136,22 +153,11 @@ auto-detects project stack(s), including KMP and polyglot repos, then writes
 `/initialize-android`, `/initialize-ios`, `/initialize-web`, `/initialize-rust`,
 `/initialize-csharp`, or `/initialize-ruby` only as manual overrides.
 
-See [`examples/.claude/rules/ast-index.md`](examples/.claude/rules/ast-index.md) for a template rules file that teaches the agent to prefer ast-index over grep, outline before reading large files, and pass the same instructions to subagents. Adapt before dropping into your project's `.claude/rules/`.
-
-### Codex
-
-```bash
-cd /path/to/project
-ast-index rebuild
-ast-index install-codex-mcp
-```
-
-`install-codex-mcp` registers `ast-index-mcp` with Codex via
-`codex mcp add`, sets `AST_INDEX_ROOT` to the current project, and sets
-`AST_INDEX_BIN` to the current `ast-index` binary. It expects
-`ast-index-mcp` next to `ast-index` or on `PATH`. Use
-`ast-index install-codex-mcp --dry-run` to print the command and
-`~/.codex/config.toml` fallback without changing Codex config.
+See [`examples/.claude/rules/ast-index.md`](examples/.claude/rules/ast-index.md)
+for a template rules file that teaches the agent to use ast-index for
+structural navigation, outline before reading large files, and pass the same
+instructions to subagents. Adapt before dropping into your project's
+`.claude/rules/`.
 
 ### Codex Skill / Plugin
 
@@ -177,8 +183,8 @@ codex plugin marketplace add defendend/Claude-ast-index-search
 ```
 
 The Codex package exposes the same `ast-index` skill. Command-style project
-setup is kept out of the Codex manifest because Codex uses skills, MCP config,
-apps, and hooks as first-class components.
+setup is kept out of the Codex manifest because Codex uses skills and local
+project configuration as first-class components.
 
 ### Cursor Skill / Plugin
 
@@ -204,65 +210,11 @@ Reload Cursor after creating the symlink. The Cursor plugin package exposes the
 shared `ast-index` skill, a project rule in `plugin/rules/`, and a Cursor-specific
 `initialize-ast-index` command that writes `.cursor/rules/ast-index.mdc`.
 
-### MCP server (Cursor, Codex, Cline, Continue, OpenCode, Windsurf, …)
-
-An MCP server that exposes ast-index tools to any MCP-compatible agent. Each
-tool call spawns `ast-index <subcommand>`, parses the output, and returns a
-compact TOON-inspired text blob (≈2-3× fewer tokens than pretty JSON). Agents
-can opt into raw JSON per-call via `format: "json"` when they need structured
-parsing.
-
-Build:
-
-```bash
-cargo build --release -p ast-index-mcp
-# Binary: target/release/ast-index-mcp
-```
-
-Exposed tools (21):
-
-| Tool | Purpose |
-|------|---------|
-| `explore` | One-shot context: ranked source of relevant symbols + graph neighbours + tests (use first for "how does X work" / surveying an area; `rwr` for graph re-ranking) |
-| `search` | Universal search across files, symbols, imports, content |
-| `symbol` | Find symbols by exact name / glob / kind filter (precise alternative to `search`) |
-| `class` | Find classes, interfaces, protocols, enums, structs by name or pattern |
-| `outline` | Structural outline of a file (call before reading >500-line files) |
-| `usages` | Every usage of a symbol (file:line + context) |
-| `callers` | Direct callers of a function |
-| `call_tree` | Recursive caller tree, configurable depth |
-| `implementations` | Types that implement/extend an interface or parent |
-| `hierarchy` | Full inheritance tree — superclasses + subclasses in one call |
-| `refs` | Definitions + imports + usages in one shot |
-| `imports` | Imports / includes of a source file |
-| `api` | Public API of a module (refactoring & changelog prep) |
-| `changed` | Symbols that changed since a base branch (code review) |
-| `module` | Find modules matching a pattern |
-| `deps` | Module dependencies |
-| `dependents` | Reverse deps — who depends on this module |
-| `find_file` | Locate files by name pattern |
-| `stats` | Project type, counts, DB size, extra roots |
-| `rebuild` | Full reindex (slow — prefer `update`) |
-| `update` | Incremental reindex (fast) |
-
-Setup instructions per agent: [`docs/mcp-setup.md`](docs/mcp-setup.md).
-
 ### Gemini CLI
 
 ```bash
 gemini skills install https://github.com/defendend/Claude-ast-index-search.git --path plugin/skills/ast-index
 ```
-
-### Generic Rule-Based Agents
-
-Add to `.cursor/rules` or project-specific agent rules:
-
-```markdown
-Use `ast-index` CLI for fast code search. Run `ast-index rebuild` before first use.
-Available commands: search, class, implementations, usages, callers, call-tree, deps, outline, deprecated.
-```
-
----
 
 ## 💝 Support Development
 
@@ -272,37 +224,25 @@ Available commands: search, class, implementations, usages, callers, call-tree, 
 
 ## Commands (47+)
 
-### Grep-based (no index required)
-
-```bash
-ast-index todo [PATTERN]           # TODO/FIXME/HACK comments
-ast-index callers <FUNCTION>       # Function call sites
-ast-index provides <TYPE>          # @Provides/@Binds for type
-ast-index suspend [QUERY]          # Suspend functions
-ast-index composables [QUERY]      # @Composable functions
-ast-index deprecated [QUERY]       # @Deprecated items
-ast-index suppress [QUERY]         # @Suppress annotations
-ast-index inject <TYPE>            # @Inject points
-ast-index annotations <ANN>        # Classes with annotation
-ast-index deeplinks [QUERY]        # Deeplinks
-ast-index extensions <TYPE>        # Extension functions
-ast-index flows [QUERY]            # Flow/StateFlow/SharedFlow
-ast-index previews [QUERY]         # @Preview functions
-ast-index usages <SYMBOL>          # Symbol usages (falls back to grep)
-```
-
-### Index-based (requires rebuild)
+Run `ast-index rebuild` once per project, then use `ast-index update` to keep
+the index fresh.
 
 ```bash
 ast-index explore <QUERY...>       # One-shot context: ranked source + neighbours + tests (--rwr for graph)
-ast-index search <QUERY>           # Universal search
+ast-index search <QUERY>           # Universal structural search
 ast-index file <PATTERN>           # Find files
 ast-index symbol <NAME>            # Find symbols
 ast-index class <NAME>             # Find classes/interfaces
-ast-index symbol <NAME>            # Find any symbol by name
+ast-index outline <FILE>           # Symbols in file
+ast-index imports <FILE>           # Imports in file
+ast-index refs <SYMBOL>            # Definitions + imports + usages
+ast-index usages <SYMBOL>          # Symbol usages
+ast-index callers <FUNCTION>       # Function call sites
 ast-index implementations <PARENT> # Find implementations
 ast-index hierarchy <CLASS>        # Class hierarchy tree
-ast-index usages <SYMBOL>          # Symbol usages (indexed, ~8ms)
+ast-index changed [--base BRANCH]  # Changed symbols
+ast-index todo [PATTERN]           # TODO/FIXME/HACK comments
+ast-index deprecated [QUERY]       # Deprecated items
 ```
 
 ### Module analysis
@@ -352,14 +292,6 @@ Options:
 ast-index xml-usages <CLASS>       # Find class usages in XML layouts
 ast-index resource-usages <RES>    # Find resource usages (@drawable/ic_name, R.string.x)
 ast-index resource-usages --unused --module <MODULE>  # Find unused resources
-```
-
-### File analysis
-
-```bash
-ast-index outline <FILE>           # Symbols in file
-ast-index imports <FILE>           # Imports in file
-ast-index changed [--base BRANCH]  # Changed symbols (git diff)
 ```
 
 ### iOS-specific commands
@@ -503,54 +435,6 @@ ast-index outline "file.go"        # Show file structure
 ast-index imports "file.go"        # Show imports
 ```
 
-## Performance
-
-Benchmarks on large Android project (~29k files, ~300k symbols):
-
-| Command | Rust | grep | Speedup |
-|---------|------|------|---------|
-| imports | 0.3ms | 90ms | **260x** |
-| dependents | 2ms | 100ms | **100x** |
-| deps | 3ms | 90ms | **90x** |
-| class | 1ms | 90ms | **90x** |
-| search | 11ms | 280ms | **14x** |
-| usages | 8ms | 90ms | **12x** |
-
-### Size Comparison
-
-| Metric | Rust | Python |
-|--------|------|--------|
-| Binary | ~44 MB | ~273 MB (venv) |
-| DB size | 180 MB | ~100 MB |
-| Symbols | 299,393 | 264,023 |
-| Refs | 900,079 | 438,208 |
-
-## Architecture
-
-- **grep-searcher** — ripgrep internals for fast searching
-- **SQLite + FTS5** — full-text search index
-- **rayon** — parallel file parsing
-- **ignore** — gitignore-aware directory traversal
-
-### Database Schema
-
-```sql
-files (id, path, mtime, size)
-symbols (id, file_id, name, kind, line, signature)
-symbols_fts (name, signature)  -- FTS5
-inheritance (child_id, parent_name, kind)
-modules (id, name, path)
-module_deps (module_id, dep_module_id, dep_kind)
-refs (id, file_id, name, line, context)
-xml_usages (id, module_id, file_path, line, class_name, usage_type, element_id)
-resources (id, module_id, type, name, file_path, line)
-resource_usages (id, resource_id, usage_file, usage_line, usage_type)
-transitive_deps (id, module_id, dependency_id, depth, path)
-storyboard_usages (id, module_id, file_path, line, class_name, usage_type, storyboard_id)
-ios_assets (id, module_id, type, name, file_path)
-ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
-```
-
 ## Configuration File
 
 Create `.ast-index.yaml` in your project root to configure ast-index:
@@ -573,9 +457,6 @@ no_ignore: false
 
 All fields are optional. CLI flags override config file values.
 
-Legacy `project_type:` keys are ignored for backward compatibility, so old
-configs keep working unchanged.
-
 ### Examples
 
 **Monorepo with shared libraries:**
@@ -591,11 +472,3 @@ exclude:
   - "generated"
   - "proto/gen"
 ```
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for release history.
-
-## License
-
-MIT

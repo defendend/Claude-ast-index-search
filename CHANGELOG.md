@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.49.0
+- **Preserve extra roots in sub-project rebuilds** — `rebuild --sub-projects`
+  now snapshots attached subtrees before the DB swap, restores them into the
+  new index, and indexes those extra roots so a following `update` no longer
+  drops their files. Project-owned `vendor/` directories are indexed as normal
+  source unless excluded by `.gitignore` or `.ast-index.yaml`.
+
 ## 3.48.0
 - **Fix Claude plugin post-edit hook debounce on Git Bash** — the hook now reads marker mtimes with GNU `stat` first, falls back to BSD/macOS `stat`, and ignores non-numeric timestamp output before doing shell arithmetic. This prevents `set -u` failures like `File: unbound variable` in Windows Git Bash while keeping the hook non-blocking.
 
