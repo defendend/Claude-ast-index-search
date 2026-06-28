@@ -1,6 +1,6 @@
 {
   "name": "@ast-index/cli-linux-arm64",
-  "version": "3.48.0",
+  "version": "3.49.0",
   "description": "linux arm64 binary for @ast-index/cli",
   "os": ["linux"],
   "cpu": ["arm64"],

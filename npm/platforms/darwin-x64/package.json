@@ -1,6 +1,6 @@
 {
   "name": "@ast-index/cli-darwin-x64",
-  "version": "3.48.0",
+  "version": "3.49.0",
   "description": "darwin x64 binary for @ast-index/cli",
   "os": ["darwin"],
   "cpu": ["x64"],
