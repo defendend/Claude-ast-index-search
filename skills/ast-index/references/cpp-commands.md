@@ -1,187 +1,144 @@
 # C/C++ Commands Reference
 
-ast-index supports parsing and indexing C and C++ source files, with focus on JNI bindings and modern C++ (C++11/14/17).
+ast-index supports parsing and indexing C/C++ source files (`.cpp`, `.c`, `.h`, `.hpp`, `.cc`, `.cxx`).
 
 ## Supported Elements
 
-| C++ Element | Symbol Kind | Example |
-|-------------|-------------|---------|
-| `class ClassName` | Class | `TJavaException` → Class |
-| `struct StructName` | Class | `TData` → Class |
-| `template<...> class` | Class | `TJniReference<T>` → Class |
-| `JNIEXPORT ... JNICALL Java_...` | Function | `analyze2` → Function |
-| `template<...> func()` | Function | `jniWrapExceptions` → Function |
-| `namespace name` | Package | `NDirect` → Package |
-| `enum class Name` | Enum | `Color` → Enum |
-| `typedef ... Name` | TypeAlias | `StringType` → TypeAlias |
-| `using Name = ...` | TypeAlias | `Callback` → TypeAlias |
-| `#define MACRO(...)` | Constant | `MAX_SIZE` → Constant |
-
-## JNI Support
-
-JNI (Java Native Interface) functions are automatically detected:
-
-```cpp
-JNIEXPORT jobject JNICALL Java_ru_yandex_direct_textprocessing_TextProcessing_analyze2
-  (JNIEnv *, jclass, jstring, jint, jboolean);
-```
-
-Indexed as: `analyze2 [function]`
-
-The parser extracts the method name from the full JNI signature.
+| C/C++ Element | Symbol Kind | Example |
+|---------------|-------------|---------|
+| `class ClassName` | Class | `FileHandler` → Class |
+| `struct Name` | Class | `RequestData` → Class |
+| `namespace Name` | Namespace | `utils` → Namespace |
+| `void function()` | Function | `ProcessRequest` → Function |
+| `void Class::method()` | Function | `Handle` → Function (with parent) |
+| `#include "header"` | Import | `handler.h` → Import |
+| `typedef` | TypeAlias | `Handler` → TypeAlias |
+| `enum Name` | Enum | `Status` → Enum |
+| `#define MACRO` | Macro | `MAX_SIZE` → Macro |
 
 ## Core Commands
 
-### Search Classes
+### Search Classes and Structs
 
 Find class and struct definitions:
 
 ```bash
-ast-index class "TJavaException"      # Find specific class
-ast-index class "Reference"           # Find classes containing "Reference"
-ast-index search "Converter"          # Find all converters
+ast-index class "Handler"           # Find handler classes
+ast-index class "Request"           # Find request structs
+ast-index search "Service"          # Find service classes
 ```
 
 ### Search Functions
 
-Find function definitions including JNI exports:
+Find functions and methods:
 
 ```bash
-ast-index symbol "analyze"            # Find analyze functions
-ast-index callers "jniWrapExceptions" # Find callers
+ast-index symbol "Process"          # Find process functions
+ast-index symbol "Handle"           # Find handle methods
+ast-index callers "Init"            # Find Init callers
 ```
 
 ### Search Namespaces
 
-Find namespace definitions:
-
 ```bash
-ast-index search "NDirect"            # Find NDirect namespace
+ast-index search "namespace"        # Find all namespaces
+ast-index symbol "utils"            # Find utils namespace
 ```
 
-### Search with Inheritance
-
-Find classes with inheritance:
+### File Analysis
 
 ```bash
-ast-index class "TJniClass"           # Shows inheritance from TJniReference
-ast-index implementations "TNonCopyable" # Find all implementations
+ast-index outline "handler.cpp"     # Show classes, functions, structs
+ast-index imports "service.cpp"     # Show #include statements
 ```
 
 ## Example Workflow
 
 ```bash
-# 1. Index C++ directory
-cd /path/to/cpp/files
+# 1. Index C++ project
+cd /path/to/cpp/project
 ast-index rebuild
 
 # 2. Check index statistics
 ast-index stats
 
-# 3. Find JNI functions
-ast-index symbol "Java_"
+# 3. Find all classes
+ast-index search "class"
 
-# 4. Find specific class
-ast-index class "TJniReference"
+# 4. Find header usages
+ast-index usages "RequestHandler"
 
 # 5. Show file structure
-ast-index outline "util.h"
-
-# 6. Find usages
-ast-index usages "TJavaException"
+ast-index outline "src/handler.cpp"
 ```
 
-## Yandex C++ Patterns
+## C++ Patterns
 
-### RAII Wrapper Classes
+### Class Definition
 
 ```cpp
-template<class T>
-class TJniReference : public TNonCopyable {
-    JNIEnv* env_;
-    T value_;
+namespace myapp {
+
+class RequestHandler {
 public:
-    TJniReference(JNIEnv* env, T value);
-    T Get() const;
-    void Reset();
+    RequestHandler(Database* db);
+    ~RequestHandler();
+
+    bool Handle(const Request& req, Response* resp);
+
+private:
+    Database* db_;
 };
+
+}  // namespace myapp
 ```
 
-Indexed as: `TJniReference [class]` with parent `TNonCopyable`
+Indexed as:
+- `myapp` [namespace]
+- `RequestHandler` [class]
+- `RequestHandler` [function] (constructor)
+- `~RequestHandler` [function] (destructor)
+- `Handle` [function] with parent `RequestHandler`
 
-### Exception Wrapper
+### JNI Functions
 
 ```cpp
-template<class Func>
-inline auto jniWrapExceptions(JNIEnv* env, Func&& func) {
-    try { return func(); }
-    catch (const std::exception& e) { ... }
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_MyClass_nativeMethod(JNIEnv* env, jobject obj) {
+    return env->NewStringUTF("Hello from JNI");
 }
 ```
 
-Indexed as: `jniWrapExceptions [function]`
+Indexed as: `Java_com_example_MyClass_nativeMethod` [function]
 
-### JNI Class Helper
+Find JNI functions:
 
-```cpp
-class TJniClass : public TJniReference<jclass> {
-public:
-    TJniClass(JNIEnv* env, const char* name);
-    jmethodID GetMethodID(const char* name, const char* sig);
-};
+```bash
+ast-index symbol "Java_"            # Find all JNI functions
+ast-index search "JNICALL"          # Find JNI exports
 ```
 
-Indexed as: `TJniClass [class]` with parent `TJniReference`
+## Include Handling
 
-## File Extensions
+Both include styles are tracked:
 
-Supported extensions:
-- `.cpp` - C++ source
-- `.cc` - C++ source (alternative)
-- `.c` - C source
-- `.h` - C/C++ header
-- `.hpp` - C++ header
+```cpp
+#include <iostream>
+#include <vector>
+#include "myheader.h"
+#include "utils/helpers.h"
+```
+
+```bash
+ast-index imports "main.cpp"        # Shows all includes
+ast-index usages "myheader.h"       # Find where header is included
+```
 
 ## Performance
 
 | Operation | Time |
 |-----------|------|
-| Rebuild (10 C++ files) | ~60ms |
-| Search class | ~2ms |
-| Find usages | ~10ms |
-
-## Limitations
-
-Current implementation focuses on simple patterns:
-
-**Supported:**
-- Basic class/struct definitions
-- Template class declarations
-- JNI function exports
-- Template functions
-- Single inheritance
-- Namespaces
-- Enums (including enum class)
-- Typedefs and using aliases
-- Function-like macros
-
-**Not supported:**
-- Complex template metaprogramming
-- Multiple inheritance tracking
-- Preprocessor conditionals (#ifdef blocks)
-- Operator overloading detection
-- Nested class detection
-- Lambda expressions as symbols
-
-## Forward Declarations
-
-Forward declarations are automatically skipped:
-
-```cpp
-class Foo;      // Skipped (forward declaration)
-struct Bar;     // Skipped (forward declaration)
-
-class Foo {     // Indexed
-    // ...
-};
-```
+| Rebuild (200 C++ files) | ~400ms |
+| Search class | ~1ms |
+| Find usages | ~5ms |
+| File outline | ~1ms |

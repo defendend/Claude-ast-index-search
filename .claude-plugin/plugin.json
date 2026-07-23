@@ -1,9 +1,10 @@
 {
   "name": "ast-index",
-  "version": "3.8.5",
-  "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Python, Go, Perl, C++, Protocol Buffers, and WSDL/XSD projects",
+  "version": "3.49.2",
+  "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, PHP, Python, Go, Perl, C++, Protocol Buffers, and WSDL/XSD projects",
   "author": {
     "name": "defendend"
   },
-  "commands": "./commands"
+  "commands": "./commands",
+  "skills": "./skills"
 }

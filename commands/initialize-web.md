@@ -1,11 +1,11 @@
 ---
-name: initialize-ios
-description: "Manual override: initialize ast-index for iOS/Swift/ObjC project"
+name: initialize-web
+description: "Manual override: initialize ast-index for TypeScript/JavaScript web project"
 ---
 
-# Initialize ast-index for iOS Project
+# Initialize ast-index for Web Project
 
-This command sets up ast-index integration for an iOS/Swift/Objective-C project.
+This command sets up ast-index integration for TypeScript/JavaScript web projects (React, Vue, Svelte, Angular, NestJS, etc.).
 
 ## Steps to Execute
 
@@ -90,25 +90,24 @@ ast-index is 17-69x faster than grep (1-10ms vs 200ms-3s) and returns structured
 | Task | Command | Time |
 |------|---------|------|
 | Universal search | `ast-index search "query"` | ~10ms |
-| Find class/protocol | `ast-index class "ClassName"` | ~1ms |
+| Find class/component | `ast-index class "ComponentName"` | ~1ms |
+| Find symbol | `ast-index symbol "SymbolName"` | ~1ms |
 | Find usages | `ast-index usages "SymbolName"` | ~8ms |
-| Find conformances | `ast-index implementations "Protocol"` | ~5ms |
+| Find implementations | `ast-index implementations "Interface"` | ~5ms |
 | Call hierarchy | `ast-index call-tree "function" --depth 3` | ~1s |
-| Class hierarchy | `ast-index hierarchy "ClassName"` | ~5ms |
 | Find callers | `ast-index callers "functionName"` | ~1s |
-| Module deps | `ast-index deps "ModuleName"` | ~10ms |
-| File outline | `ast-index outline "File.swift"` | ~1ms |
+| Module deps | `ast-index deps "module-name"` | ~10ms |
+| File outline | `ast-index outline "File.tsx"` | ~1ms |
 
-## iOS-Specific Commands
+## TypeScript/JavaScript-Specific Commands
 
 | Task | Command |
 |------|---------|
-| SwiftUI views | `ast-index swiftui` |
-| Async functions | `ast-index async-funcs` |
-| @MainActor | `ast-index main-actor` |
-| Combine publishers | `ast-index publishers` |
-| Storyboard usages | `ast-index storyboard-usages "Class"` |
-| Asset usages | `ast-index asset-usages "name"` |
+| Find React components | `ast-index class "Component"` |
+| Find React hooks | `ast-index search "use" --kind function` |
+| Find decorators | `ast-index search "@Controller"` |
+| Find interfaces | `ast-index class "Props"` |
+| Find types | `ast-index symbol "DTO"` |
 
 ## Index Management
 
@@ -133,7 +132,7 @@ Run a quick search to verify everything works:
 
 ```bash
 ast-index stats
-ast-index search "ViewController"
+ast-index search "Component"
 ```
 
 ## Output
@@ -143,3 +142,33 @@ After completion, inform user:
 - Rules file created at .claude/rules/ast-index.md
 - Index has been built with X files and Y symbols
 - Ready to use ast-index for code search
+
+## Supported File Types
+
+This initialization supports:
+- `.ts`, `.tsx`, `.mts` - TypeScript (including React TSX and ES modules)
+- `.js`, `.jsx` - JavaScript (including React JSX)
+- `.mjs`, `.cjs` - ES modules and CommonJS
+- `.vue` - Vue Single File Components
+- `.svelte` - Svelte components
+
+## Framework Detection
+
+After indexing, you can detect the framework:
+
+```bash
+# Check for React
+ast-index search "useState" --kind function
+
+# Check for Vue
+ast-index search "defineComponent"
+
+# Check for Svelte
+ast-index search "export let"
+
+# Check for NestJS
+ast-index search "@Controller"
+
+# Check for Angular
+ast-index search "@Component"
+```

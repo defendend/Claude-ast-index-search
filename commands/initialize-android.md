@@ -1,6 +1,6 @@
 ---
 name: initialize-android
-description: Initialize ast-index for Android/Kotlin/Java project - configures .claude/settings.json and CLAUDE.md
+description: "Manual override: initialize ast-index for Android/Kotlin/Java project"
 ---
 
 # Initialize ast-index for Android Project
@@ -35,78 +35,86 @@ Then create or merge into `.claude/settings.json`. If file doesn't exist, create
 
 ```json
 {
+  "extraKnownMarketplaces": {
+    "ast-index": {
+      "source": {
+        "source": "github",
+        "repo": "defendend/Claude-ast-index-search"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "ast-index@ast-index": true
+  },
   "permissions": {
     "allow": [
+      "Bash(ya tool ast-index *)",
       "Bash(ast-index *)"
     ]
-  },
-  "rules": [
-    "When searching for classes, symbols, files, or code patterns - use `ast-index` CLI for fast indexed search instead of grep/find/Glob",
-    "For finding class definitions use `ast-index class \"ClassName\"`",
-    "For finding symbol usages use `ast-index usages \"SymbolName\"`",
-    "For finding implementations of interface/class use `ast-index implementations \"InterfaceName\"`",
-    "For understanding call hierarchy use `ast-index call-tree \"functionName\" --depth 3`",
-    "For exploring class inheritance use `ast-index hierarchy \"ClassName\"`",
-    "For finding Dagger provides/inject points use `ast-index provides/inject \"ModuleName\"`",
-    "For finding Compose functions use `ast-index composables`",
-    "For module dependency analysis use `ast-index deps/dependents \"module-name\"`",
-    "Run `ast-index update` periodically to keep index fresh after code changes"
-  ]
+  }
 }
 ```
 
-**Important**: If `.claude/settings.json` already exists, MERGE the rules array (don't replace). Check for duplicates before adding.
+**Important**: If `.claude/settings.json` already exists, MERGE the keys (don't replace the whole file).
 
-### 3. Update .claude/CLAUDE.md
+### 3. Create .claude/rules/ast-index.md (CRITICAL)
 
-If `.claude/CLAUDE.md` doesn't exist, create it:
+Create the rules directory and ast-index rules file:
 
 ```bash
-touch .claude/CLAUDE.md
+mkdir -p .claude/rules
 ```
 
-Then append this section at the end of the file:
+Create file `.claude/rules/ast-index.md` with this content:
 
 ```markdown
+# ast-index Rules
 
-## ast-index - Code Search Tool
+## Mandatory Search Rules
 
-Fast native CLI for structural code search in Android/Kotlin/Java projects.
+1. **ALWAYS use ast-index FIRST** for any code search task
+2. **NEVER duplicate results** — if ast-index found usages/implementations, that IS the complete answer
+3. **DO NOT run grep "for completeness"** after ast-index returns results
+4. **Use grep/Search ONLY when:**
+   - ast-index returns empty results
+   - Searching for regex patterns (ast-index uses literal match)
+   - Searching for string literals inside code (`"some text"`)
+   - Searching in comments content
 
-### Quick Reference
+## Why ast-index
+
+ast-index is 17-69x faster than grep (1-10ms vs 200ms-3s) and returns structured, accurate results.
+
+## Command Reference
+
+| Task | Command | Time |
+|------|---------|------|
+| Universal search | `ast-index search "query"` | ~10ms |
+| Find class | `ast-index class "ClassName"` | ~1ms |
+| Find usages | `ast-index usages "SymbolName"` | ~8ms |
+| Find implementations | `ast-index implementations "Interface"` | ~5ms |
+| Call hierarchy | `ast-index call-tree "function" --depth 3` | ~1s |
+| Class hierarchy | `ast-index hierarchy "ClassName"` | ~5ms |
+| Find callers | `ast-index callers "functionName"` | ~1s |
+| Module deps | `ast-index deps "module-name"` | ~10ms |
+| File outline | `ast-index outline "File.kt"` | ~1ms |
+
+## Android-Specific Commands
 
 | Task | Command |
 |------|---------|
-| Universal search | `ast-index search "query"` |
-| Find class | `ast-index class "ClassName"` |
-| Find usages | `ast-index usages "SymbolName"` |
-| Find implementations | `ast-index implementations "Interface"` |
-| Call hierarchy | `ast-index call-tree "function" --depth 3` |
-| Class hierarchy | `ast-index hierarchy "ClassName"` |
-| Find callers | `ast-index callers "functionName"` |
-| Module deps | `ast-index deps "module-name"` |
-| File outline | `ast-index outline "File.kt"` |
+| Dagger provides | `ast-index provides "Type"` |
+| Dagger inject | `ast-index inject "Type"` |
+| Composables | `ast-index composables` |
+| Suspend functions | `ast-index suspend` |
+| Flows | `ast-index flows` |
+| XML usages | `ast-index xml-usages "ViewClass"` |
 
-### Android-Specific Commands
+## Index Management
 
-| Task | Command |
-|------|---------|
-| Dagger provides | `ast-index provides "query"` |
-| Dagger inject | `ast-index inject "query"` |
-| Composables | `ast-index composables "query"` |
-| Suspend functions | `ast-index suspend "query"` |
-| Flows | `ast-index flows "query"` |
-| XML usages | `ast-index xml-usages "layout_name"` |
-
-### Index Management
-
-```bash
-ast-index rebuild    # Full reindex (run once after clone)
-ast-index update     # Incremental update (run periodically)
-ast-index stats      # Show index statistics
-```
-
-Performance: search ~10ms, usages ~8ms, class ~1ms (indexed queries).
+- `ast-index rebuild` — Full reindex (run once after clone)
+- `ast-index update` — After git pull/merge
+- `ast-index stats` — Show index statistics
 ```
 
 ### 4. Build the Index
@@ -114,7 +122,6 @@ Performance: search ~10ms, usages ~8ms, class ~1ms (indexed queries).
 Run initial indexing:
 
 ```bash
-cd <project-root>
 ast-index rebuild
 ```
 
@@ -132,7 +139,7 @@ ast-index search "Activity"
 ## Output
 
 After completion, inform user:
-- settings.json has been configured with ast-index rules
-- CLAUDE.md has been updated with ast-index reference
+- settings.json has been configured with ast-index permissions
+- Rules file created at .claude/rules/ast-index.md
 - Index has been built with X files and Y symbols
 - Ready to use ast-index for code search

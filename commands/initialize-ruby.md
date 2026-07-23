@@ -1,11 +1,11 @@
 ---
-name: initialize-ios
-description: "Manual override: initialize ast-index for iOS/Swift/ObjC project"
+name: initialize-ruby
+description: "Manual override: initialize ast-index for Ruby/Rails project"
 ---
 
-# Initialize ast-index for iOS Project
+# Initialize ast-index for Ruby Project
 
-This command sets up ast-index integration for an iOS/Swift/Objective-C project.
+This command sets up ast-index integration for Ruby projects (Rails, RSpec, plain Ruby).
 
 ## Steps to Execute
 
@@ -90,25 +90,25 @@ ast-index is 17-69x faster than grep (1-10ms vs 200ms-3s) and returns structured
 | Task | Command | Time |
 |------|---------|------|
 | Universal search | `ast-index search "query"` | ~10ms |
-| Find class/protocol | `ast-index class "ClassName"` | ~1ms |
+| Find class | `ast-index class "ClassName"` | ~1ms |
+| Find module | `ast-index search "module ModuleName"` | ~1ms |
 | Find usages | `ast-index usages "SymbolName"` | ~8ms |
-| Find conformances | `ast-index implementations "Protocol"` | ~5ms |
-| Call hierarchy | `ast-index call-tree "function" --depth 3` | ~1s |
-| Class hierarchy | `ast-index hierarchy "ClassName"` | ~5ms |
-| Find callers | `ast-index callers "functionName"` | ~1s |
-| Module deps | `ast-index deps "ModuleName"` | ~10ms |
-| File outline | `ast-index outline "File.swift"` | ~1ms |
+| Call hierarchy | `ast-index call-tree "method" --depth 3` | ~1s |
+| Find callers | `ast-index callers "methodName"` | ~1s |
+| File outline | `ast-index outline "model.rb"` | ~1ms |
 
-## iOS-Specific Commands
+## Ruby/Rails-Specific Commands
 
 | Task | Command |
 |------|---------|
-| SwiftUI views | `ast-index swiftui` |
-| Async functions | `ast-index async-funcs` |
-| @MainActor | `ast-index main-actor` |
-| Combine publishers | `ast-index publishers` |
-| Storyboard usages | `ast-index storyboard-usages "Class"` |
-| Asset usages | `ast-index asset-usages "name"` |
+| Find models | `ast-index search "ApplicationRecord"` |
+| Find controllers | `ast-index class "Controller"` |
+| Find services | `ast-index class "Service"` |
+| Find associations | `ast-index search "has_many"` |
+| Find validations | `ast-index search "validates"` |
+| Find scopes | `ast-index search "scope"` |
+| Find callbacks | `ast-index search "before_action"` |
+| Find tests | `ast-index search "describe"` |
 
 ## Index Management
 
@@ -133,7 +133,7 @@ Run a quick search to verify everything works:
 
 ```bash
 ast-index stats
-ast-index search "ViewController"
+ast-index search "class"
 ```
 
 ## Output
@@ -143,3 +143,19 @@ After completion, inform user:
 - Rules file created at .claude/rules/ast-index.md
 - Index has been built with X files and Y symbols
 - Ready to use ast-index for code search
+
+## Rails Project Detection
+
+For Rails projects, you can detect the framework:
+
+```bash
+# Check for Rails
+ast-index search "ApplicationRecord"
+ast-index search "ApplicationController"
+
+# Check for RSpec
+ast-index search "RSpec.describe"
+
+# Check for Minitest
+ast-index search "Minitest::Test"
+```

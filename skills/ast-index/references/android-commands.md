@@ -2,16 +2,17 @@
 
 Commands for Android/Kotlin/Java projects.
 
-## DI Commands (Dagger)
+## DI Commands (Dagger/Spring)
 
 **Find @Provides/@Binds** for a type:
 ```bash
 ast-index provides "UserRepository"
 ```
 
-**Find @Inject** points for a type:
+**Find @Inject/@Autowired** points for a type:
 ```bash
-ast-index inject "UserInteractor"
+ast-index inject "UserInteractor"     # Finds @Inject and @Autowired usages
+ast-index inject "UserService"        # Spring @Autowired constructor injection
 ```
 
 **Find classes with annotation**:

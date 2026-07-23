@@ -1,280 +1,64 @@
 # Perl Commands Reference
 
-ast-index provides comprehensive support for Perl codebases, including indexing and searching.
-
-## Supported File Types
-
-| Extension | Description |
-|-----------|-------------|
-| `.pm` | Perl modules |
-| `.pl` | Perl scripts |
-| `.t` | Perl test files |
-| `.pod` | POD documentation files |
-
-## Indexed Constructs
-
-### Symbols (in `symbols` table)
-
-| Perl Construct | Kind | Example |
-|----------------|------|---------|
-| `package Name;` | package | `package DoCmd;` |
-| `sub name { }` | function | `sub do_direct_cmd { }` |
-| `use constant NAME =>` | constant | `use constant ORDER_ID_OFFSET => 100_000_000;` |
-| `our $VAR` | property | `our $VERSION = '0.01';` |
-| `our @ARRAY` | property | `our @EXPORT = qw(...)` |
-| `our %HASH` | property | `our %cmds = (...)` |
-
-### Inheritance (in `inheritance` table)
-
-| Perl Construct | Parent |
-|----------------|--------|
-| `use base qw/Parent/` | Parent |
-| `use parent qw/Parent/` | Parent |
-| `our @ISA = qw(Parent)` | Parent |
-
-### Modules (in `modules` table)
-
-Perl packages are indexed as modules. Each `package Name;` declaration in `.pm` files creates a module entry.
+Commands for Perl projects (.pm, .pl, .t, .pod files).
 
 ## Perl-Specific Commands
 
-### perl-exports
-
-Find @EXPORT and @EXPORT_OK definitions in Perl modules.
+### Find Exports
 
 ```bash
-ast-index perl-exports                    # Find all exports
-ast-index perl-exports "function_name"    # Filter by function name
-ast-index perl-exports -l 100             # Limit to 100 results
+ast-index perl-exports              # Find all @EXPORT/@EXPORT_OK
+ast-index perl-exports "function"   # Filter by name
 ```
 
-**What it searches:**
-- `our @EXPORT = qw(...)`
-- `our @EXPORT_OK = qw(...)`
-- `@EXPORT = ...`
-- `@EXPORT_OK = ...`
-
-### perl-subs
-
-Find all subroutine definitions in Perl files.
+### Find Subroutines
 
 ```bash
-ast-index perl-subs                       # Find all subroutines
-ast-index perl-subs "validate"            # Find subs containing "validate"
-ast-index perl-subs -l 50                 # Limit to 50 results
+ast-index perl-subs                 # Find all subroutine definitions
+ast-index perl-subs "process"       # Filter by name
 ```
 
-### perl-pod
-
-Find POD documentation sections in Perl files.
+### Find POD Documentation
 
 ```bash
-ast-index perl-pod                        # Find all POD sections
-ast-index perl-pod "SYNOPSIS"             # Find SYNOPSIS sections
-ast-index perl-pod "METHODS"              # Find METHODS sections
+ast-index perl-pod                  # Find =head1, =item, etc.
+ast-index perl-pod "SYNOPSIS"       # Filter by section
 ```
 
-**What it searches:**
-- `=head1`, `=head2`, `=head3`, `=head4` - Section headings
-- `=item` - List items
-- `=over`, `=back` - List delimiters
-- `=pod`, `=cut` - POD block markers
-- `=begin`, `=end` - Format blocks
-- `=for` - Formatter-specific paragraphs
-
-### perl-tests
-
-Find Test::More and Test::Simple assertions.
+### Find Tests
 
 ```bash
-ast-index perl-tests                      # Find all test assertions
-ast-index perl-tests "validate"           # Filter by test description
-ast-index perl-tests -l 100               # Limit results
+ast-index perl-tests                # Find Test::More assertions
+ast-index perl-tests "ok"           # Find specific assertion type
 ```
 
-**What it searches:**
-- `ok()` - Basic test
-- `is()`, `isnt()` - Equality tests
-- `like()`, `unlike()` - Regex tests
-- `cmp_ok()` - Comparison tests
-- `is_deeply()` - Deep comparison
-- `diag()` - Diagnostic output
-- `pass()`, `fail()` - Explicit pass/fail
-- `subtest` - Subtest blocks
-- `plan`, `done_testing` - Test plans
-- `SKIP`, `TODO` - Skip/todo blocks
-
-### perl-imports
-
-Find use/require statements in Perl files.
+### Find Imports
 
 ```bash
-ast-index perl-imports                    # Find all imports
-ast-index perl-imports "DBI"              # Find DBI imports
-ast-index perl-imports "Test"             # Find Test::* imports
+ast-index perl-imports              # Find use/require statements
+ast-index perl-imports "DBI"        # Find specific module usage
 ```
 
-**Note:** Skips pragmas like `use strict`, `use warnings`, `use utf8`, `use base`, `use parent`, `use constant`.
+## Indexed Perl Constructs
 
-## Core Commands with Perl Support
+- `package` declarations
+- `sub` definitions
+- `use constant` constants
+- `our` variables
+- Inheritance: `use base`, `use parent`, `@ISA`
 
-### imports
+## Module Detection
 
-Show imports in a specific file. Works with Perl files.
+Perl packages are indexed as modules for `module` command:
 
 ```bash
-ast-index imports "path/to/Module.pm"     # Show use/require in Perl file
+ast-index module "MyApp::Utils"     # Find Perl module
+ast-index deps "MyApp::Utils"       # Module dependencies
 ```
 
-Extracts `use Module;` and `require Module;` statements (skipping pragmas).
+## Project Detection
 
-### module
-
-Find modules by name. Includes Perl packages.
-
-```bash
-ast-index module "DoCmd"                  # Find DoCmd package
-ast-index module "Direct"                 # Find packages containing "Direct"
-```
-
-### symbol
-
-Find symbols by name (packages, subs, constants, variables).
-
-```bash
-ast-index symbol "DoCmd"                  # Find DoCmd package or sub
-ast-index symbol "VERSION"                # Find $VERSION declarations
-```
-
-### class (package)
-
-Find package definitions.
-
-```bash
-ast-index class "DoCmd"                   # Find DoCmd package
-```
-
-### implementations
-
-Find packages that inherit from a parent.
-
-```bash
-ast-index implementations "Exporter"      # Find packages using Exporter
-ast-index implementations "Base::Class"
-```
-
-### hierarchy
-
-Show inheritance hierarchy.
-
-```bash
-ast-index hierarchy "MyPackage"           # Show parent/child packages
-```
-
-### usages
-
-Find symbol usages.
-
-```bash
-ast-index usages "process_data"           # Find where process_data is used
-```
-
-### outline
-
-Show symbols in a file.
-
-```bash
-ast-index outline "path/to/Module.pm"     # Show packages, subs, constants, variables
-```
-
-### todo
-
-Find TODO/FIXME/HACK comments.
-
-```bash
-ast-index todo                            # Searches Perl comments too
-```
-
-### callers
-
-Find function call sites.
-
-```bash
-ast-index callers "process_data"          # Find calls in Perl files
-```
-
-Patterns: `->func()`, `func()`, `&func()`
-
-### deprecated
-
-Find deprecated markers.
-
-```bash
-ast-index deprecated                      # Find DEPRECATED markers
-```
-
-Searches `# DEPRECATED` comments and `=head DEPRECATED` POD.
-
-### changed
-
-Show symbols changed in git diff.
-
-```bash
-ast-index changed                         # Shows changed .pm/.pl/.t files
-```
-
-## Performance
-
-| Command | Time | Notes |
-|---------|------|-------|
-| perl-exports | ~0.8s | Grep-based |
-| perl-subs | ~0.8s | Grep-based |
-| perl-pod | ~0.8s | Grep-based |
-| perl-tests | ~0.8s | Grep-based |
-| perl-imports | ~0.8s | Grep-based |
-| symbol (indexed) | ~1ms | Index lookup |
-| usages (indexed) | ~8ms | Reference search |
-| module | ~1ms | Index lookup |
-
-## Example Workflow
-
-```bash
-# 1. Initialize index in Perl project
-cd /path/to/perl/project
-ast-index rebuild
-
-# 2. Explore modules
-ast-index module "Controller"
-
-# 3. Find exported functions
-ast-index perl-exports
-
-# 4. Find all subs in specific area
-ast-index perl-subs "validate"
-
-# 5. Read documentation
-ast-index perl-pod "SYNOPSIS"
-
-# 6. Find tests
-ast-index perl-tests
-
-# 7. Check imports in a file
-ast-index imports "lib/MyApp/Controller.pm"
-
-# 8. Find inheritance
-ast-index implementations "Exporter"
-
-# 9. Check for TODOs
-ast-index todo
-```
-
-## Tips
-
-1. **Use `symbol` for indexed search** - much faster than grep-based commands
-2. **Use `perl-subs` for exploring** - grep-based but finds all subs
-3. **Use `module` to find packages** - indexed, instant results
-4. **Check inheritance** - `implementations` works with Perl packages
-5. **Find exports** - `perl-exports` shows module public API
-6. **Read POD** - `perl-pod` finds documentation sections
-7. **Find tests** - `perl-tests` locates Test::More assertions
-8. **Check imports** - `perl-imports` or `imports` for specific file
+Auto-detected by marker files:
+- `Makefile.PL`
+- `Build.PL`
+- `cpanfile`

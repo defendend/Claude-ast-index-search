@@ -1,164 +1,167 @@
 # Protocol Buffers Commands Reference
 
-ast-index supports parsing and indexing Protocol Buffers files (`.proto`), including both proto2 and proto3 syntax.
+ast-index supports parsing and indexing Protocol Buffer files (`.proto`) for both proto2 and proto3 syntax.
 
-## Supported Proto Elements
+## Supported Elements
 
 | Proto Element | Symbol Kind | Example |
-|--------------|-------------|---------|
-| `message` | Class | `message UserRequest` → Class |
-| Nested `message` | Class | `TRequest.TItem` → Class with parent |
-| `service` | Interface | `service UserService` → Interface |
-| `rpc` | Function | `rpc GetUser(...)` → Function |
-| `enum` | Enum | `enum Status` → Enum |
-| `package` | Package | `package api.v1` → Package |
-| `option java_package` | Property | Cross-reference with Java |
+|---------------|-------------|---------|
+| `message Name` | Class | `UserRequest` → Class |
+| `enum Name` | Enum | `Status` → Enum |
+| `service Name` | Interface | `UserService` → Interface |
+| `rpc Method()` | Function | `GetUser` → Function |
+| `import "file.proto"` | Import | `common.proto` → Import |
+| `package name` | Package | `api.v1` → Package |
+| `field type name = N` | Property | `user_id` → Property |
+| `oneof name` | Property | `payload` → Property |
 
-## Core Commands for Proto Files
+## Core Commands
 
 ### Search Messages
 
-Find proto message definitions (indexed as classes):
+Find message definitions:
 
 ```bash
-ast-index class "UserRequest"           # Find message by name
-ast-index class "TChangeAgency"         # Find messages starting with T
+ast-index class "Request"           # Find request messages
+ast-index class "Response"          # Find response messages
+ast-index search "User"             # Find user-related types
 ```
 
 ### Search Services
 
-Find service definitions (indexed as interfaces):
+Find gRPC service definitions:
 
 ```bash
-ast-index search "Service"              # Find all services
-ast-index class "CampaignService"       # Find specific service
+ast-index search "Service"          # Find all services
+ast-index class "UserService"       # Find specific service
 ```
 
 ### Search RPC Methods
 
-Find RPC method definitions (indexed as functions):
-
 ```bash
-ast-index symbol "GetCampaign"          # Find RPC by name
-ast-index callers "GetCampaign"         # Find where RPC is called
+ast-index symbol "Get"              # Find Get* methods
+ast-index symbol "Create"           # Find Create* methods
+ast-index usages "GetUser"          # Find RPC usages
 ```
 
 ### Search Enums
 
-Find enum definitions:
+```bash
+ast-index search "enum"             # Find all enums
+ast-index class "Status"            # Find status enum
+```
+
+### File Analysis
 
 ```bash
-ast-index search "Status"               # Find status enums
-ast-index class "EChangeAgencyResult"   # Find specific enum
-```
-
-### Find Usages
-
-Find all places where a proto message is used:
-
-```bash
-ast-index usages "UserRequest"          # Find message usages
-ast-index usages "CampaignService"      # Find service usages
-```
-
-## Proto2 vs Proto3
-
-ast-index supports both proto2 and proto3 syntax:
-
-**proto2 features:**
-- `optional`, `required`, `repeated` field modifiers
-- `extensions` and `extend` declarations
-- Default values with `default = value`
-
-**proto3 features:**
-- `syntax = "proto3";` declaration
-- Implicit `optional` (no `required`)
-- Built-in JSON mapping annotations
-- Google API annotations (`google.api.http`)
-
-## Nested Messages
-
-Nested messages are indexed with their full path:
-
-```protobuf
-message TRequest {
-    message TItem {       // Indexed as "TRequest.TItem"
-        uint64 id = 1;
-    }
-}
-```
-
-```bash
-# Search for nested message
-ast-index class "TRequest.TItem"
-
-# Or search by short name (will find if unique)
-ast-index class "TItem"
-```
-
-## Java Package Cross-Reference
-
-Proto files often specify Java package for code generation:
-
-```protobuf
-option java_package = "ru.yandex.direct.api";
-```
-
-These are indexed and can be searched:
-
-```bash
-ast-index search "java_package:ru.yandex.direct"
+ast-index outline "user.proto"      # Show messages, services, enums
+ast-index imports "api.proto"       # Show import statements
 ```
 
 ## Example Workflow
 
 ```bash
-# 1. Index proto directory
-cd /path/to/proto/files
+# 1. Index proto files
+cd /path/to/proto/project
 ast-index rebuild
 
-# 2. Find all messages
-ast-index class ""
+# 2. Check index statistics
+ast-index stats
 
-# 3. Find specific message
-ast-index class "TChangeAgencyRequest"
+# 3. Find all messages
+ast-index search "message"
 
-# 4. Find nested messages
-ast-index search "TChangeAgencyRequest"
-
-# 5. Check file structure
-ast-index outline "agency_change_request.proto"
-
-# 6. Find all services
+# 4. Find service definitions
 ast-index search "Service"
+
+# 5. Show proto file structure
+ast-index outline "api/v1/user.proto"
+
+# 6. Find usages of message
+ast-index usages "UserRequest"
+```
+
+## Proto Patterns
+
+### Message Definition (proto3)
+
+```protobuf
+syntax = "proto3";
+
+package api.v1;
+
+message UserRequest {
+    string user_id = 1;
+    repeated string fields = 2;
+
+    oneof filter {
+        string name = 3;
+        int32 age = 4;
+    }
+}
+
+message UserResponse {
+    User user = 1;
+    Status status = 2;
+}
+```
+
+Indexed as:
+- `api.v1` [package]
+- `UserRequest` [class]
+- `user_id` [property]
+- `fields` [property]
+- `filter` [property] (oneof)
+- `UserResponse` [class]
+
+### Service Definition
+
+```protobuf
+service UserService {
+    rpc GetUser(UserRequest) returns (UserResponse);
+    rpc CreateUser(CreateUserRequest) returns (UserResponse);
+    rpc ListUsers(ListUsersRequest) returns (stream UserResponse);
+}
+```
+
+Indexed as:
+- `UserService` [interface]
+- `GetUser` [function] with parent `UserService`
+- `CreateUser` [function] with parent `UserService`
+- `ListUsers` [function] with parent `UserService`
+
+### Enum Definition
+
+```protobuf
+enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_ACTIVE = 1;
+    STATUS_INACTIVE = 2;
+}
+```
+
+Indexed as:
+- `Status` [enum]
+- `STATUS_UNSPECIFIED`, `STATUS_ACTIVE`, `STATUS_INACTIVE` [property]
+
+## Import Handling
+
+```protobuf
+import "google/protobuf/timestamp.proto";
+import "common/types.proto";
+import public "shared.proto";
+```
+
+```bash
+ast-index imports "service.proto"   # Shows all imports
+ast-index usages "common/types.proto"  # Find where proto is imported
 ```
 
 ## Performance
 
 | Operation | Time |
 |-----------|------|
-| Rebuild (100 proto files) | ~200ms |
-| Search message | ~2ms |
-| Find usages | ~10ms |
-
-## Limitations
-
-Current implementation:
-- Does not parse field definitions (only message/service/rpc/enum)
-- Does not resolve imports across files
-- Does not validate proto syntax
-- Does not index comments/documentation
-
-## File Structure
-
-Proto files are detected by `.proto` extension. No special project markers required.
-
-Typical directory structure:
-```
-project/
-├── api/v1/
-│   ├── user.proto
-│   └── campaign.proto
-└── internal/
-    └── types.proto
-```
+| Rebuild (50 proto files) | ~100ms |
+| Search message | ~1ms |
+| Find usages | ~3ms |
+| File outline | ~1ms |

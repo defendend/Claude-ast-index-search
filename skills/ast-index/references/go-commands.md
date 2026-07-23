@@ -1,6 +1,6 @@
 # Go Commands Reference
 
-ast-index supports parsing and indexing Go source files (`.go`), with focus on backend services and microservices patterns.
+ast-index supports parsing and indexing Go source files (`.go`).
 
 ## Supported Elements
 
@@ -47,13 +47,11 @@ ast-index symbol "Do"               # Find Do methods
 ast-index callers "Handle"          # Find Handle callers
 ```
 
-### Search Methods
-
-Methods are indexed with their receiver type as parent:
+### File Analysis
 
 ```bash
-ast-index search "DeleteAction"     # Find DeleteAction and its methods
-ast-index symbol "Do"               # Find Do method (shows receiver)
+ast-index outline "handler.go"      # Show structs, interfaces, functions
+ast-index imports "service.go"      # Show imports (including import blocks)
 ```
 
 ## Example Workflow
@@ -79,7 +77,7 @@ ast-index outline "internal/handler.go"
 ast-index usages "Service"
 ```
 
-## Yandex Go Patterns
+## Go Patterns
 
 ### Action Pattern
 
@@ -90,7 +88,6 @@ type DeleteAction struct {
     filesRepo     FilesRepo
 }
 
-// di:new
 func NewDeleteAction(
     avaSrv *avatarsmds.Service,
     tmpStorageSrv *tmpstorage.FileUploader,
@@ -120,40 +117,6 @@ type AvatarsMDS interface {
 
 Indexed as: `AvatarsMDS` [interface]
 
-### Repository Pattern
-
-```go
-type Storage struct {
-    db *sql.DB
-}
-
-func NewStorage(db *sql.DB) *Storage {
-    return &Storage{db: db}
-}
-
-func (s *Storage) FilesRepo() FilesRepository {
-    return &filesRepository{db: s.db}
-}
-```
-
-Indexed as:
-- `Storage` [class]
-- `NewStorage` [function]
-- `FilesRepo` [function] with parent `Storage`
-
-## File Extensions
-
-Supported extensions:
-- `.go` - Go source
-
-## Performance
-
-| Operation | Time |
-|-----------|------|
-| Rebuild (100 Go files) | ~250ms |
-| Search class | ~1ms |
-| Find usages | ~5ms |
-
 ## Import Handling
 
 Imports are tracked with their full path:
@@ -163,35 +126,19 @@ import (
     "context"
     "fmt"
 
-    "a.yandex-team.ru/taxi/backend-go/services/eats-files-uploads/internal/entities"
+    "github.com/example/backend-go/services/files-uploads/internal/entities"
 )
 ```
 
-Indexed as:
-- `context` [import] from "context"
-- `fmt` [import] from "fmt"
-- `entities` [import] from "a.yandex-team.ru/.../entities"
-
 ```bash
-ast-index search "entities"         # Find entities package usage
+ast-index imports "handler.go"      # Shows all imports with aliases
 ast-index usages "context"          # Find context usage
 ```
 
-## Limitations
+## Performance
 
-**Supported:**
-- Package declarations
-- Struct definitions
-- Interface definitions
-- Functions and methods
-- Import statements (single and block)
-- Constants (exported only)
-- Package-level variables (exported only)
-- Type aliases
-
-**Not supported:**
-- Embedded structs tracking
-- Interface embedding
-- Generic type parameters (Go 1.18+)
-- Build tags detection
-- Test function classification
+| Operation | Time |
+|-----------|------|
+| Rebuild (100 Go files) | ~250ms |
+| Search class | ~1ms |
+| Find usages | ~5ms |

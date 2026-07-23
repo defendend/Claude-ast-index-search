@@ -1,11 +1,11 @@
 ---
-name: initialize-ios
-description: "Manual override: initialize ast-index for iOS/Swift/ObjC project"
+name: initialize-rust
+description: "Manual override: initialize ast-index for Rust project"
 ---
 
-# Initialize ast-index for iOS Project
+# Initialize ast-index for Rust Project
 
-This command sets up ast-index integration for an iOS/Swift/Objective-C project.
+This command sets up ast-index integration for Rust projects (Cargo-based).
 
 ## Steps to Execute
 
@@ -90,25 +90,25 @@ ast-index is 17-69x faster than grep (1-10ms vs 200ms-3s) and returns structured
 | Task | Command | Time |
 |------|---------|------|
 | Universal search | `ast-index search "query"` | ~10ms |
-| Find class/protocol | `ast-index class "ClassName"` | ~1ms |
+| Find struct/trait | `ast-index class "StructName"` | ~1ms |
+| Find symbol | `ast-index symbol "SymbolName"` | ~1ms |
 | Find usages | `ast-index usages "SymbolName"` | ~8ms |
-| Find conformances | `ast-index implementations "Protocol"` | ~5ms |
+| Find implementations | `ast-index implementations "Trait"` | ~5ms |
 | Call hierarchy | `ast-index call-tree "function" --depth 3` | ~1s |
-| Class hierarchy | `ast-index hierarchy "ClassName"` | ~5ms |
 | Find callers | `ast-index callers "functionName"` | ~1s |
-| Module deps | `ast-index deps "ModuleName"` | ~10ms |
-| File outline | `ast-index outline "File.swift"` | ~1ms |
+| Module deps | `ast-index deps "module-name"` | ~10ms |
+| File outline | `ast-index outline "lib.rs"` | ~1ms |
 
-## iOS-Specific Commands
+## Rust-Specific Commands
 
 | Task | Command |
 |------|---------|
-| SwiftUI views | `ast-index swiftui` |
-| Async functions | `ast-index async-funcs` |
-| @MainActor | `ast-index main-actor` |
-| Combine publishers | `ast-index publishers` |
-| Storyboard usages | `ast-index storyboard-usages "Class"` |
-| Asset usages | `ast-index asset-usages "name"` |
+| Find structs | `ast-index class "User"` |
+| Find traits | `ast-index class "Repository"` |
+| Find impl blocks | `ast-index search "impl"` |
+| Find macros | `ast-index search "macro_rules"` |
+| Find derives | `ast-index search "#[derive"` |
+| Find tests | `ast-index search "#[test]"` |
 
 ## Index Management
 
@@ -133,7 +133,7 @@ Run a quick search to verify everything works:
 
 ```bash
 ast-index stats
-ast-index search "ViewController"
+ast-index search "fn"
 ```
 
 ## Output
@@ -143,3 +143,19 @@ After completion, inform user:
 - Rules file created at .claude/rules/ast-index.md
 - Index has been built with X files and Y symbols
 - Ready to use ast-index for code search
+
+## Cargo Workspace Support
+
+For Cargo workspaces with multiple crates:
+
+```bash
+# Index entire workspace from root
+cd /path/to/workspace
+ast-index rebuild
+
+# Or index specific crate
+cd /path/to/workspace/crate-name
+ast-index rebuild
+```
+
+The indexer will automatically detect and index all `.rs` files in the project.

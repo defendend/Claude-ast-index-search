@@ -1,148 +1,127 @@
 # Python Commands Reference
 
-ast-index supports parsing and indexing Python source files (`.py`), with focus on backend services patterns.
+ast-index supports parsing and indexing Python source files (`.py`).
 
 ## Supported Elements
 
 | Python Element | Symbol Kind | Example |
 |----------------|-------------|---------|
-| `class ClassName:` | Class | `Context` → Class |
-| `class Child(Parent):` | Class | `ChildClass` → Class (with parent) |
-| `def function_name():` | Function | `handle` → Function |
-| `async def handler():` | Function | `async_handler` → Function |
-| `import module` | Import | `logging` → Import |
-| `from X import Y` | Import | `db` → Import |
-| `@decorator` | Annotation | `@pytest.fixture` → Annotation |
-| `CONSTANT = value` | Constant | `MAX_SIZE` → Constant |
-| `TypeName = Union[...]` | TypeAlias | `ResponseType` → TypeAlias |
+| `class ClassName` | Class | `UserService` → Class |
+| `def function_name` | Function | `process_data` → Function |
+| `async def function_name` | Function | `fetch_user` → Function |
+| `@decorator` | Decorator | `@dataclass` → Decorator |
+| `import module` | Import | `import os` → Import |
+| `from module import name` | Import | `from typing import List` → Import |
 
 ## Core Commands
 
 ### Search Classes
 
-Find class definitions:
+Find Python class definitions:
 
 ```bash
-ast-index class "Context"           # Find specific class
-ast-index class "Handler"           # Find all handlers
-ast-index search "Service"          # Find services
+ast-index class "Service"           # Find service classes
+ast-index class "Handler"           # Find handler classes
+ast-index search "Repository"       # Find repositories
 ```
 
 ### Search Functions
 
-Find function definitions including async handlers:
+Find functions and async functions:
 
 ```bash
-ast-index symbol "handle"           # Find handle functions
-ast-index search "async"            # Find async functions
-ast-index callers "process"         # Find callers of process
+ast-index symbol "process"          # Find functions containing "process"
+ast-index symbol "fetch"            # Find fetch functions
+ast-index callers "handle_request"  # Find callers of handle_request
 ```
 
-### Search Imports
+### File Analysis
 
-Find imports and module usage:
+Show file structure:
 
 ```bash
-ast-index search "logging"          # Find logging usage
-ast-index usages "db"               # Find db module usages
+ast-index outline "service.py"      # Show classes and functions
+ast-index imports "handler.py"      # Show all imports (including from X import Y)
 ```
 
 ## Example Workflow
 
 ```bash
-# 1. Index Python service
-cd /path/to/python/service
+# 1. Index Python project
+cd /path/to/python/project
 ast-index rebuild
 
 # 2. Check index statistics
 ast-index stats
 
-# 3. Find all handlers
-ast-index symbol "handle"
+# 3. Find all classes
+ast-index search "class"
 
-# 4. Find specific class
-ast-index class "Context"
+# 4. Find async functions
+ast-index symbol "async"
 
 # 5. Show file structure
-ast-index outline "api/handler.py"
+ast-index outline "main.py"
 
 # 6. Find usages
-ast-index usages "Context"
+ast-index usages "UserService"
 ```
 
-## Yandex Python Patterns
+## Indexed Python Patterns
 
-### Taxi Backend Service Handler
+### Class Definition
 
 ```python
-async def handle(
-    request: requests.AdminGet,
-    context: web_context.Context,
-) -> responses.ADMIN_GET_RESPONSES:
-    settings = await db.get_all_settings(context)
-    return responses.AdminGet200(data=settings)
+class UserService:
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def get_user(self, user_id: int) -> User:
+        return await self.db.fetch_user(user_id)
 ```
 
 Indexed as:
-- `handle` [function]
-- `requests.AdminGet` [import usage]
-- `web_context.Context` [import usage]
+- `UserService` [class]
+- `__init__` [function]
+- `get_user` [function]
 
-### Service Configuration
+### Decorators
 
 ```python
-from driver_referrals.common import db
-from driver_referrals.generated.service.swagger import requests
+@dataclass
+class Config:
+    host: str
+    port: int
 
-logger = logging.getLogger(__name__)
+@router.get("/users")
+async def get_users():
+    pass
 ```
 
 Indexed as:
-- `db` [import]
-- `requests` [import]
-- `driver_referrals.common` [import]
+- `@dataclass` [decorator]
+- `Config` [class]
+- `@router.get` [decorator]
+- `get_users` [function]
 
-## File Extensions
+## Import Handling
 
-Supported extensions:
-- `.py` - Python source
+Both import styles are tracked:
+
+```python
+import os
+import sys
+from typing import List, Optional
+from fastapi import FastAPI, Depends
+```
+
+Use `ast-index imports "file.py"` to see all imports with line numbers.
 
 ## Performance
 
 | Operation | Time |
 |-----------|------|
-| Rebuild (300 Python files) | ~2s |
-| Search class | ~3ms |
-| Find usages | ~10ms |
-
-## Decorators
-
-The parser tracks significant decorators:
-
-- `@pytest.fixture` - Test fixtures
-- `@pytest.mark.*` - Test markers
-- `@dataclass` - Data classes
-- `@property` - Properties
-- `@route` / `@handler` - Web handlers
-
-```bash
-ast-index search "@pytest"          # Find test decorators
-ast-index search "@dataclass"       # Find dataclasses
-```
-
-## Limitations
-
-**Supported:**
-- Class definitions with inheritance
-- Functions and async functions
-- Import statements
-- Module-level constants (UPPER_CASE)
-- Type aliases
-- Significant decorators
-
-**Not supported:**
-- Method detection (all `def` indexed as functions)
-- Comprehension expressions
-- Lambda functions
-- Dynamic imports (`__import__`)
-- Conditional imports (`if TYPE_CHECKING:`)
+| Rebuild (500 Python files) | ~500ms |
+| Search class | ~1ms |
+| Find usages | ~5ms |
+| File outline | ~1ms |
