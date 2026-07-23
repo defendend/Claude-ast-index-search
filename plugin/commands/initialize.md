@@ -35,8 +35,9 @@ Stop there until the binary exists.
 ### 2. Detect stack(s) from actual repo markers
 
 Run the built-in detector and parse its JSON output. Do not scan markers by
-hand — `ast-index` already implements the same checks and adds Kotlin
-Multiplatform recognition.
+hand — `ast-index` already implements the same checks and adds
+Kotlin Multiplatform (KMP) recognition.
+Treat detection as a set of stacks, not a single label.
 
 ```bash
 ast-index --format json detect-stacks

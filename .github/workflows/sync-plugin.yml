@@ -4,9 +4,11 @@ on:
   push:
     branches: [main]
     paths:
-      - '.claude-plugin/**'
-      - 'commands/**'
-      - 'skills/**'
+      - 'plugin/.claude-plugin/**'
+      - 'plugin/commands/**'
+      - 'plugin/skills/**'
+      - 'plugin/hooks/**'
+      - '.github/workflows/sync-plugin.yml'
 
 jobs:
   sync:
@@ -25,30 +27,33 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Fetch plugin branch
-          git fetch origin plugin:plugin || true
+          # Fetch plugin branch without creating a local branch named like the
+          # source directory.
+          git fetch origin refs/heads/plugin:refs/remotes/origin/plugin
 
           # Create temporary directory with plugin files
           mkdir -p /tmp/plugin-files
-          cp -r .claude-plugin /tmp/plugin-files/
-          cp -r commands /tmp/plugin-files/
-          cp -r skills /tmp/plugin-files/
+          cp -r plugin/.claude-plugin /tmp/plugin-files/
+          cp -r plugin/commands /tmp/plugin-files/
+          cp -r plugin/skills /tmp/plugin-files/
+          cp -r plugin/hooks /tmp/plugin-files/
 
           # Switch to plugin branch
-          git checkout plugin
+          git switch --detach refs/remotes/origin/plugin
 
           # Remove old files and copy new ones
-          rm -rf .claude-plugin commands skills
+          rm -rf .claude-plugin commands skills hooks
           cp -r /tmp/plugin-files/.claude-plugin .
           cp -r /tmp/plugin-files/commands .
           cp -r /tmp/plugin-files/skills .
+          cp -r /tmp/plugin-files/hooks .
 
           # Commit and push if there are changes
-          git add -A
+          git add -A -- .claude-plugin commands skills hooks
           if git diff --staged --quiet; then
             echo "No changes to sync"
           else
             git commit -m "Sync plugin from main ($(git rev-parse --short main))"
-            git push origin plugin
+            git push origin HEAD:plugin
             echo "Plugin branch synced successfully"
           fi
