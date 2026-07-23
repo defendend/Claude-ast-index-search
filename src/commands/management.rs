@@ -6,10 +6,11 @@
 //! - stats: Show index statistics
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::Colorize;
 
 use crate::db;
@@ -94,10 +95,8 @@ fn snapshot_subtrees(root: &Path, verbose: bool) -> Result<Vec<db::Subtree>> {
     if verbose {
         eprintln!("[verbose] reading subtrees from existing DB...");
     }
-    let old_conn = db::open_db(root)?;
-    // Side-effect: migrates any pre-3.47 `metadata.extra_roots` JSON into
-    // the subtrees table so list_subtrees below sees everything.
-    db::get_extra_roots(&old_conn).ok();
+    let old_conn = db::open_db_leased(root)?;
+    // `open_db` eagerly and transactionally migrates pre-3.47 extra_roots.
     db::list_subtrees(&old_conn)
 }
 
@@ -169,6 +168,11 @@ pub fn cmd_rebuild(
         "AST_INDEX_EXPERIMENTAL_FAST_REBUILD",
         experimental_fast_rebuild,
     );
+    // Rebuild performs potentially long config and sub-project discovery
+    // before acquiring its exclusive rebuild lock. Keep the previous index
+    // leased from the first cache access so GC cannot remove it before the
+    // subtree snapshot/swap sequence begins.
+    let _cache_lease = db::acquire_project_lease(root)?;
     if verbose {
         std::env::set_var("AST_INDEX_VERBOSE", "1");
         eprintln!("[verbose] rebuild started for: {}", root.display());
@@ -366,45 +370,29 @@ pub fn cmd_rebuild(
         eprintln!("[verbose] acquiring rebuild lock...");
     }
     let t = Instant::now();
-    let _lock = db::acquire_rebuild_lock(root)?;
+    let _lock = db::acquire_rebuild_guard(root)?;
     if verbose {
         eprintln!("[verbose] lock acquired in {:?}", t.elapsed());
     }
+    db::recover_interrupted_index_publication(root)?;
 
     // Save subtree triples (name + canonical_path + original_path) before
-    // swapping the old DB aside. Going through `get_extra_roots` (legacy
+    // building the replacement. Going through `get_extra_roots` (legacy
     // shim) would collapse each row to a bare canonical path string and
     // lose the user-chosen name + original (relative) path form on every
     // rebuild — re-importing them as `<basename>` and `original=canonical`.
     let saved_subtrees = snapshot_subtrees(root, verbose)?;
 
-    // Swap the live DB aside instead of deleting it outright. The guard
-    // restores the swap if rebuild fails (walker cap aborted, IO error,
-    // anything that propagates an Err) so the user never loses a working
-    // index because of a failed rebuild attempt.
+    // Build in a private generation beside the live DB. Readers retain the
+    // previous complete generation until the short publication handoff.
     if verbose {
-        eprintln!("[verbose] swapping old DB aside...");
+        eprintln!("[verbose] allocating staged DB generation...");
     }
     let t = Instant::now();
-    let swap_guard = match db::RebuildSwap::begin(root) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!(
-                "{}",
-                format!("Warning: could not move old index aside: {}", e).yellow()
-            );
-            if let Ok(db_path) = db::get_db_path(root) {
-                eprintln!(
-                    "Cache path: {}",
-                    db_path.parent().unwrap_or(db_path.as_path()).display()
-                );
-                eprintln!("Try manually removing the cache directory and re-running rebuild.");
-            }
-            return Err(e);
-        }
-    };
+    let live_db = db::get_db_path(root)?;
+    let staged = IndexStaging::create(&live_db, "rebuild")?;
     if verbose {
-        eprintln!("[verbose] DB swapped in {:?}", t.elapsed());
+        eprintln!("[verbose] staged generation allocated in {:?}", t.elapsed());
     }
 
     // Remove old kotlin-index cache dir entirely
@@ -414,10 +402,13 @@ pub fn cmd_rebuild(
         eprintln!("[verbose] opening new DB...");
     }
     let t = Instant::now();
-    let mut conn = db::open_db(root)?;
+    let mut conn = db::open_staged_db(root, staged.db_path())?;
     init_rebuild_schema(&conn)?;
     if verbose {
-        eprintln!("[verbose] DB opened + schema created in {:?}", t.elapsed());
+        eprintln!(
+            "[verbose] staged DB opened + schema created in {:?}",
+            t.elapsed()
+        );
     }
 
     // Reattach saved subtrees verbatim so user-chosen names and the
@@ -783,14 +774,23 @@ pub fn cmd_rebuild(
         }
     }
 
+    match index_type {
+        "all" => {
+            db::mark_index_updated(&conn)?;
+            db::mark_modules_indexed(&conn)?;
+        }
+        "files" | "symbols" => db::mark_index_updated(&conn)?,
+        "modules" | "deps" => db::mark_modules_indexed(&conn)?,
+        _ => {}
+    }
+
     if verbose {
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
     restore_rebuild_pragmas(&conn, verbose)?;
-    // Drop conn first so WAL/SHM files are quiescent before the swap is
-    // removed.
-    drop(conn);
-    swap_guard.commit()?;
+    db::seal_staged_db(conn, staged.db_path())?;
+    let publication = db::acquire_index_publication_guard(root)?;
+    publication.install_staged(staged.db_path())?;
     Ok(())
 }
 
@@ -817,10 +817,11 @@ fn cmd_rebuild_sub_projects(
         eprintln!("[verbose] sub-projects: acquiring lock...");
     }
     let t = Instant::now();
-    let _lock = db::acquire_rebuild_lock(root)?;
+    let _lock = db::acquire_rebuild_guard(root)?;
     if verbose {
         eprintln!("[verbose] lock acquired in {:?}", t.elapsed());
     }
+    db::recover_interrupted_index_publication(root)?;
 
     let t = Instant::now();
     let sub_projects = indexer::find_sub_projects(root, exclude_matcher, config_include);
@@ -852,25 +853,17 @@ fn cmd_rebuild_sub_projects(
 
     let saved_subtrees = snapshot_subtrees(root, verbose)?;
 
-    // Swap aside instead of delete — see cmd_rebuild for rationale.
+    // Build beside the live generation — see cmd_rebuild for rationale.
     if verbose {
-        eprintln!("[verbose] swapping old DB aside...");
+        eprintln!("[verbose] allocating staged DB generation...");
     }
     let t = Instant::now();
-    let swap_guard = match db::RebuildSwap::begin(root) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!(
-                "{}",
-                format!("Warning: could not move old index aside: {}", e).yellow()
-            );
-            return Err(e);
-        }
-    };
-    let mut conn = db::open_db(root)?;
+    let live_db = db::get_db_path(root)?;
+    let staged = IndexStaging::create(&live_db, "rebuild")?;
+    let mut conn = db::open_staged_db(root, staged.db_path())?;
     init_rebuild_schema(&conn)?;
     if verbose {
-        eprintln!("[verbose] DB swapped in {:?}", t.elapsed());
+        eprintln!("[verbose] staged DB opened in {:?}", t.elapsed());
     }
 
     attach_rebuild_subtrees(
@@ -1121,6 +1114,8 @@ fn cmd_rebuild_sub_projects(
     }
 
     finalize_rebuild_schema(&conn, verbose)?;
+    db::mark_index_updated(&conn)?;
+    db::mark_modules_indexed(&conn)?;
 
     println!();
     println!(
@@ -1134,14 +1129,16 @@ fn cmd_rebuild_sub_projects(
         eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
     }
     restore_rebuild_pragmas(&conn, verbose)?;
-    drop(conn);
-    swap_guard.commit()?;
+    db::seal_staged_db(conn, staged.db_path())?;
+    let publication = db::acquire_index_publication_guard(root)?;
+    publication.install_staged(staged.db_path())?;
     Ok(())
 }
 
 /// Incrementally update the index
 pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
     let start = Instant::now();
+    let _mutation_guard = db::acquire_rebuild_guard(root)?;
 
     if !db::db_exists(root) {
         println!(
@@ -1153,10 +1150,10 @@ pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
 
     let _experimental_fast_rebuild_env = ScopedEnvVar::set_bool(
         "AST_INDEX_EXPERIMENTAL_FAST_REBUILD",
-        crate::commands::is_experimental_fast_rebuild_enabled(root),
+        crate::commands::try_is_experimental_fast_rebuild_enabled(root)?,
     );
 
-    let mut conn = db::open_db(root)?;
+    let mut conn = db::open_db_leased(root)?;
 
     // Load .ast-index.yaml so update honours the same include/exclude as rebuild.
     // Without this, update on a project with `include: [adfox, yabs/adfox]` would
@@ -1209,45 +1206,29 @@ pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
 pub fn cmd_restore(root: &Path, db_file: &str) -> Result<()> {
     let src = std::path::Path::new(db_file);
 
-    if !src.exists() {
-        anyhow::bail!("File not found: {}", db_file);
-    }
-    if !src.is_file() {
-        anyhow::bail!("Not a file: {}", db_file);
-    }
-
+    // Serialize before allocating or populating a staging generation. This
+    // also recovers validated staging directories abandoned by a dead writer.
+    let _mutation_guard = db::acquire_rebuild_guard(root)?;
     let dest = db::get_db_path(root)?;
-    let dest_dir = dest.parent().unwrap();
+    let dest_dir = dest
+        .parent()
+        .context("index database path has no parent directory")?;
     std::fs::create_dir_all(dest_dir)?;
+    ensure_distinct_restore_source(src, &dest)?;
 
-    // Remove existing DB files if present
-    if db::db_exists(root) {
-        db::delete_db(root)?;
-    }
+    let staged = IndexStaging::create(&dest, "restore")?;
+    let normalized_root = db::normalize_root_for_storage(root);
+    let stats = db::stage_restore_snapshot(src, staged.db_path(), &normalized_root)?;
 
-    std::fs::copy(src, &dest)?;
-
-    // Copy WAL/SHM if they exist alongside the source
-    for suffix in ["-wal", "-shm"] {
-        let src_extra = src.with_extension(format!("db{}", suffix));
-        if src_extra.exists() {
-            let dest_extra = dest.with_extension(format!("db{}", suffix));
-            std::fs::copy(&src_extra, &dest_extra)?;
-        }
-    }
-
-    // Update project_root metadata to match current project
-    let conn = db::open_db(root)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('project_root', ?1)",
-        [root.to_string_lossy().as_ref()],
-    )?;
+    // Recheck under the exclusive mutation lock so a concurrently replaced
+    // source can never become the live DB between validation and publication.
+    ensure_distinct_restore_source(src, &dest)?;
+    let publication = db::acquire_index_publication_guard(root)?;
+    publication.install_staged(staged.db_path())?;
 
     println!("{}", format!("Restored index from: {}", db_file).green());
     println!("DB path: {}", dest.display());
 
-    // Show quick stats
-    let stats = db::get_stats(&conn)?;
     println!(
         "{}",
         format!(
@@ -1260,9 +1241,133 @@ pub fn cmd_restore(root: &Path, db_file: &str) -> Result<()> {
     Ok(())
 }
 
+struct IndexStaging {
+    db_path: PathBuf,
+    live_db: PathBuf,
+}
+
+impl IndexStaging {
+    fn create(live_db: &Path, purpose: &str) -> Result<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let dest_dir = live_db
+            .parent()
+            .context("index database path has no parent directory")?;
+
+        for _ in 0..128 {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let dir = dest_dir.join(format!(".{purpose}-{}-{id}", std::process::id()));
+            match create_private_restore_dir(&dir) {
+                Ok(()) => {
+                    let db_path = dir.join("index.db");
+                    if let Err(error) = db::register_index_staging(&db_path, live_db, purpose) {
+                        let _ = std::fs::remove_dir(&dir);
+                        return Err(error);
+                    }
+                    return Ok(Self {
+                        db_path,
+                        live_db: live_db.to_path_buf(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create {purpose} staging directory {}",
+                            dir.display()
+                        )
+                    })
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "failed to allocate a unique {purpose} staging directory in {}",
+            dest_dir.display()
+        )
+    }
+
+    fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+}
+
+impl Drop for IndexStaging {
+    fn drop(&mut self) {
+        let _ = db::discard_index_staging(&self.db_path, &self.live_db);
+    }
+}
+
+#[cfg(unix)]
+fn create_private_restore_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_restore_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+fn ensure_distinct_restore_source(source: &Path, live_db: &Path) -> Result<()> {
+    let source_metadata = std::fs::symlink_metadata(source)
+        .with_context(|| format!("failed to inspect restore source {}", source.display()))?;
+    anyhow::ensure!(
+        source_metadata.file_type().is_file(),
+        "restore source is not a regular file: {}",
+        source.display()
+    );
+
+    let live_metadata = match std::fs::symlink_metadata(live_db) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect live index {}", live_db.display()))
+        }
+    };
+    anyhow::ensure!(
+        live_metadata.file_type().is_file(),
+        "live index is not a regular file: {}",
+        live_db.display()
+    );
+    anyhow::ensure!(
+        !same_file_identity(&source_metadata, &live_metadata),
+        "restore source is the live index database: {}",
+        source.display()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    left.file_attributes() == right.file_attributes()
+        && left.creation_time() == right.creation_time()
+        && left.last_write_time() == right.last_write_time()
+        && left.file_size() == right.file_size()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok().is_some()
+        && left.modified().ok() == right.modified().ok()
+}
+
 /// Clear index database for current project
 pub fn cmd_clear(root: &Path) -> Result<()> {
-    db::delete_db(root)?;
+    let _mutation_guard = db::acquire_rebuild_guard(root)?;
+    db::clear_published_index(root)?;
     println!("Index cleared for {}", root.display());
     Ok(())
 }
@@ -1277,7 +1382,7 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
     let stats = db::get_stats(&conn)?;
     let db_path = db::get_db_path(root)?;
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -1327,6 +1432,7 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
 
 /// Add an extra source root
 pub fn cmd_add_root(root: &Path, path: &str, force: bool) -> Result<()> {
+    let _mutation_guard = db::acquire_rebuild_guard(root)?;
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -1372,7 +1478,7 @@ pub fn cmd_add_root(root: &Path, path: &str, force: bool) -> Result<()> {
         }
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
     db::add_extra_root(&conn, &abs_path)?;
     println!("{}", format!("Added source root: {}", abs_path).green());
     Ok(())
@@ -1380,6 +1486,7 @@ pub fn cmd_add_root(root: &Path, path: &str, force: bool) -> Result<()> {
 
 /// Remove an extra source root
 pub fn cmd_remove_root(root: &Path, path: &str) -> Result<()> {
+    let _mutation_guard = db::acquire_rebuild_guard(root)?;
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -1395,7 +1502,7 @@ pub fn cmd_remove_root(root: &Path, path: &str) -> Result<()> {
         cwd.join(path).to_string_lossy().to_string()
     };
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
     if db::remove_extra_root(&conn, &abs_path)? {
         println!("{}", format!("Removed source root: {}", abs_path).green());
     } else {
@@ -1431,9 +1538,7 @@ fn resolve_subtree_path(path: &str) -> (String, String) {
     let candidate = if std::path::Path::new(path).is_absolute() {
         std::path::PathBuf::from(path)
     } else {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join(path)
+        std::env::current_dir().unwrap_or_default().join(path)
     };
     let canonical = db::safe_canonicalize(&candidate)
         .to_string_lossy()
@@ -1442,17 +1547,11 @@ fn resolve_subtree_path(path: &str) -> (String, String) {
 }
 
 /// Reject obvious overlaps with the primary project root unless --force.
-fn reject_overlap_with_root(
-    root: &Path,
-    canonical_new: &str,
-    force: bool,
-) -> Result<bool> {
+fn reject_overlap_with_root(root: &Path, canonical_new: &str, force: bool) -> Result<bool> {
     if force {
         return Ok(true);
     }
-    let canonical_root = db::safe_canonicalize(root)
-        .to_string_lossy()
-        .into_owned();
+    let canonical_root = db::safe_canonicalize(root).to_string_lossy().into_owned();
     let canonical_new_pb = std::path::Path::new(canonical_new);
     let canonical_root_pb = std::path::Path::new(&canonical_root);
 
@@ -1493,6 +1592,7 @@ pub fn cmd_subtree_add(
     force: bool,
     format: &str,
 ) -> Result<()> {
+    let _mutation_guard = db::acquire_rebuild_guard(root)?;
     if !ensure_index_exists(root) {
         return Ok(());
     }
@@ -1501,7 +1601,7 @@ pub fn cmd_subtree_add(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
     if let Some(existing) = db::find_subtree_by_name(&conn, name)? {
         println!(
             "{}",
@@ -1547,10 +1647,11 @@ pub fn cmd_subtree_add(
 }
 
 pub fn cmd_subtree_remove(root: &Path, name: &str, format: &str) -> Result<()> {
+    let _mutation_guard = db::acquire_rebuild_guard(root)?;
     if !ensure_index_exists(root) {
         return Ok(());
     }
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
     let existing = db::find_subtree_by_name(&conn, name)?;
     let removed = db::remove_subtree_by_name(&conn, name)?;
 
@@ -1573,10 +1674,7 @@ pub fn cmd_subtree_remove(root: &Path, name: &str, format: &str) -> Result<()> {
         }
         println!("Run `ast-index rebuild` to drop its files from the index.");
     } else {
-        println!(
-            "{}",
-            format!("Subtree '{}' not found.", name).yellow()
-        );
+        println!("{}", format!("Subtree '{}' not found.", name).yellow());
     }
     Ok(())
 }
@@ -1585,7 +1683,7 @@ pub fn cmd_subtree_list(root: &Path, format: &str) -> Result<()> {
     if !ensure_index_exists(root) {
         return Ok(());
     }
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
     let subtrees = db::list_subtrees(&conn)?;
 
     if format == "json" {
@@ -1634,7 +1732,7 @@ pub fn cmd_query(root: &Path, sql: &str, limit: usize) -> Result<()> {
         }
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // Apply LIMIT if not already in query
     let query = if !upper.contains("LIMIT") {
@@ -1690,7 +1788,7 @@ pub fn cmd_db_path(root: &Path) -> Result<()> {
 
 /// Show database schema (tables and columns)
 pub fn cmd_schema(root: &Path) -> Result<()> {
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     let mut stmt = conn.prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%' ORDER BY name"

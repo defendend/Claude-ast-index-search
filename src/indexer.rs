@@ -665,7 +665,15 @@ fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
         "jvmMain",
         "nativeMain",
     ];
-    'sources: for top in ["src", "shared", "common", "core", "kmp", "composeApp", "androidApp"] {
+    'sources: for top in [
+        "src",
+        "shared",
+        "common",
+        "core",
+        "kmp",
+        "composeApp",
+        "androidApp",
+    ] {
         let top_path = root.join(top);
         if !top_path.is_dir() {
             continue;
@@ -1438,9 +1446,7 @@ fn emit_soft_warning(seen: usize, walk_start: std::time::Instant) {
 impl ignore::ParallelVisitor for ParallelWalkCollector {
     fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
         // Cooperative early-stop when another worker has tripped the cap.
-        if self.max_files > 0
-            && self.aborted.load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.max_files > 0 && self.aborted.load(std::sync::atomic::Ordering::Relaxed) {
             return ignore::WalkState::Quit;
         }
         match entry {
@@ -1455,9 +1461,7 @@ impl ignore::ParallelVisitor for ParallelWalkCollector {
                 }
                 if self.warn_threshold > 0
                     && seen > self.warn_threshold
-                    && !self
-                        .warned
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    && !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed)
                 {
                     emit_soft_warning(seen, self.walk_start);
                 }
@@ -1997,21 +2001,22 @@ pub fn update_directory_incremental(
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // 1. Load existing files from DB with their mtime
-    let mut existing_files: HashMap<(String, String), (i64, i64)> = HashMap::new(); // (root_path, path) -> (file_id, mtime)
+    // 1. Load existing files from DB with their mtime and size.
+    let mut existing_files: HashMap<(String, String), (i64, i64, i64)> = HashMap::new(); // (root_path, path) -> (file_id, mtime, size)
     {
-        let mut stmt = conn.prepare("SELECT id, root_path, path, mtime FROM files")?;
+        let mut stmt = conn.prepare("SELECT id, root_path, path, mtime, size FROM files")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
         for row in rows {
-            let (id, root_path, path, mtime) = row?;
-            existing_files.insert((root_path, path), (id, mtime));
+            let (id, root_path, path, mtime, size) = row?;
+            existing_files.insert((root_path, path), (id, mtime, size));
         }
     }
 
@@ -2040,14 +2045,12 @@ pub fn update_directory_incremental(
             walk_specs.push((root.to_path_buf(), root.to_path_buf()));
         }
     }
-    if let Ok(extra) = db::get_extra_roots(conn) {
-        for e in extra {
-            let p = PathBuf::from(&e);
-            if p.exists() {
-                walk_specs.push((p.clone(), p));
-            } else if progress {
-                eprintln!("Skipping missing extra root: {}", e);
-            }
+    for e in db::get_extra_roots(conn)? {
+        let p = PathBuf::from(&e);
+        if p.exists() {
+            walk_specs.push((p.clone(), p));
+        } else if progress {
+            eprintln!("Skipping missing extra root: {}", e);
         }
     }
 
@@ -2106,15 +2109,21 @@ pub fn update_directory_incremental(
                 .to_string();
             let root_key = db::normalize_root_for_storage(anchor);
 
-            let file_mtime = fs::metadata(&file_path)
-                .and_then(|m| m.modified())
+            let (file_mtime, file_size) = fs::metadata(&file_path)
                 .ok()
-                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+                .map(|metadata| {
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    (mtime, metadata.len() as i64)
+                })
+                .unwrap_or((0, 0));
 
             let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
-                Some((_, db_mtime)) => file_mtime > *db_mtime,
+                Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
                 None => true,
             };
 
@@ -2130,15 +2139,21 @@ pub fn update_directory_incremental(
 
     let root_key = db::normalize_root_for_storage(root);
     for (file_path, rel_path) in collect_node_modules_dts_files(root) {
-        let file_mtime = fs::metadata(&file_path)
-            .and_then(|m| m.modified())
+        let (file_mtime, file_size) = fs::metadata(&file_path)
             .ok()
-            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            .map(|metadata| {
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                (mtime, metadata.len() as i64)
+            })
+            .unwrap_or((0, 0));
 
         let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
-            Some((_, db_mtime)) => file_mtime > *db_mtime,
+            Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
             None => true,
         };
 
@@ -2165,6 +2180,12 @@ pub fn update_directory_incremental(
             files_to_parse.len(),
             deleted_paths.len()
         );
+    }
+
+    let was_dirty = db::has_index_update_dirty(conn)?;
+    let has_planned_mutations = !files_to_parse.is_empty() || !deleted_paths.is_empty();
+    if has_planned_mutations {
+        db::mark_index_update_dirty(conn)?;
     }
 
     // 5. Delete removed files from DB
@@ -2235,6 +2256,11 @@ pub fn update_directory_incremental(
     } else {
         0
     };
+
+    let all_planned_files_written = updated_count == files_to_parse.len();
+    if all_planned_files_written && (has_planned_mutations || was_dirty) {
+        db::complete_index_update(conn)?;
+    }
 
     Ok((updated_count, files_to_parse.len(), deleted_paths.len()))
 }
@@ -2782,7 +2808,7 @@ pub fn index_module_dependencies(
         });
         let maven_dep_re = &*MAVEN_DEP_RE;
 
-        let edges: Vec<(i64, i64, String)> = {
+        let mut edges: Vec<(i64, i64, String)> = {
             let num_threads = effective_num_threads();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(num_threads)
@@ -2992,12 +3018,16 @@ pub fn index_module_dependencies(
             })
         };
 
+        edges.sort_unstable();
+        edges.dedup();
+
         for (module_id, dep_id, dep_kind) in edges {
             dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
             dep_count += 1;
         }
     }
 
+    db::mark_modules_indexed(&tx)?;
     tx.commit()?;
 
     Ok(dep_count)

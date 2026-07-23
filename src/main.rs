@@ -783,10 +783,7 @@ fn main() -> Result<()> {
     // Conflict guard: --subtree and --local both narrow the workspace, but
     // they narrow it differently, so combining them is meaningless.
     if cli.subtree.is_some() && cli.local {
-        eprintln!(
-            "{}",
-            "Error: --subtree and --local are mutually exclusive."
-        );
+        eprintln!("{}", "Error: --subtree and --local are mutually exclusive.");
         std::process::exit(2);
     }
     if let Some(name) = &cli.subtree {
@@ -803,14 +800,45 @@ fn main() -> Result<()> {
                 !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
             })
             .unwrap_or(false);
-    let root = match &cli.command {
-        Commands::Rebuild { .. } | Commands::Clear => find_project_root_for_write()?,
-        _ => find_project_root_for_read(walk_up)?,
+    let cache_independent = matches!(
+        &cli.command,
+        Commands::Version
+            | Commands::InstallClaudePlugin
+            | Commands::InstallCodexMcp { .. }
+            | Commands::DetectStacks
+            | Commands::InstallGitHooks { .. }
+            | Commands::Agrep { .. }
+    );
+    let release_command_publication = matches!(&cli.command, Commands::Watch);
+    let (root, mut command_cache_lease) = if cache_independent {
+        // These commands use only the working tree or executable metadata.
+        // Keep root detection best-effort so a broken cache path cannot make
+        // `version`, stack detection, installers, hooks, or ast-grep fail.
+        (find_project_root_without_cache()?, None)
+    } else {
+        match &cli.command {
+            Commands::Rebuild { .. } | Commands::Restore { .. } | Commands::Clear => {
+                let root = find_project_root_for_write()?;
+                (root, None)
+            }
+            _ => {
+                let (root, lease) = find_project_root_for_read_with_lease(walk_up)?;
+                (root, lease)
+            }
+        }
     };
     let format = cli.format.as_str();
 
     // Migrate project DB from old kotlin-index to ast-index
-    db::migrate_legacy_project(&root);
+    if !cache_independent && command_cache_lease.is_none() {
+        command_cache_lease = Some(db::migrate_legacy_project_with_lease(&root)?);
+    }
+    if release_command_publication {
+        if let Some(lease) = command_cache_lease.as_mut() {
+            lease.release_publication();
+        }
+    }
+    let _command_cache_lease = command_cache_lease;
 
     // Compute directory scope: if cwd is inside project root, limit search to cwd subtree
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -902,11 +930,9 @@ fn main() -> Result<()> {
             if remember && force {
                 std::env::set_var("AST_INDEX_REMEMBER_BYPASS", "1");
             } else if remember && !force {
-                eprintln!(
-                    "[ast-index] --remember has no effect without --force; ignoring"
-                );
+                eprintln!("[ast-index] --remember has no effect without --force; ignoring");
             }
-            commands::management::cmd_rebuild(
+            let result = commands::management::cmd_rebuild(
                 &root,
                 &r#type,
                 !no_deps,
@@ -917,9 +943,20 @@ fn main() -> Result<()> {
                 &include,
                 &exclude,
                 &paths,
-            )
+            );
+            if result.is_ok() {
+                gc_stale_index_caches(&root);
+            }
+            result
         }
-        Commands::Update { verbose } => commands::management::cmd_update(&root, verbose),
+        Commands::Update { verbose } => {
+            let had_index = db::db_exists(&root);
+            let result = commands::management::cmd_update(&root, verbose);
+            if result.is_ok() && had_index {
+                gc_stale_index_caches(&root);
+            }
+            result
+        }
         Commands::Restore { path } => commands::management::cmd_restore(&root, &path),
         Commands::Stats => commands::management::cmd_stats(&root, format),
         // Index commands
@@ -1379,7 +1416,10 @@ fn cmd_detect_stacks(root: &Path, format: &str) -> Result<()> {
     }
 
     if detection.stacks.is_empty() {
-        println!("{}", "No known project stacks detected at this root.".yellow());
+        println!(
+            "{}",
+            "No known project stacks detected at this root.".yellow()
+        );
         println!(
             "Markers checked: settings.gradle*, package.json, Cargo.toml, Package.swift, \
              go.mod, pyproject.toml, Gemfile, composer.json, *.csproj, build.sbt, build.zig, \
@@ -1412,7 +1452,10 @@ fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool) -> Result<()> 
     let script_body = git_hook_script();
 
     if dry_run {
-        println!("Would write the following hooks under {}:", git_dir.display());
+        println!(
+            "Would write the following hooks under {}:",
+            git_dir.display()
+        );
         for event in events {
             println!("\n=== {} ===", event);
             println!("{}", script_body);
@@ -1451,21 +1494,12 @@ fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool) -> Result<()> 
 
     println!(
         "{}",
-        format!(
-            "Installed {} hook(s) into {}.",
-            wrote,
-            git_dir.display()
-        )
-        .green()
+        format!("Installed {} hook(s) into {}.", wrote, git_dir.display()).green()
     );
     if !skipped.is_empty() {
         println!(
             "{}",
-            format!(
-                "Already installed (skipped): {}",
-                skipped.join(", ")
-            )
-            .dimmed()
+            format!("Already installed (skipped): {}", skipped.join(", ")).dimmed()
         );
     }
     println!("Each hook runs `ast-index update` in the background after the git operation.");
@@ -1650,10 +1684,100 @@ fn find_project_root_for_write() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
 }
 
-fn find_project_root_for_read(walk_up: bool) -> Result<PathBuf> {
+/// After a successful rebuild/update, sweep index caches for other projects
+/// that have not been touched past the configured retention period.
+/// Best-effort and quiet: a summary line is printed to stderr only when
+/// something was removed, and cleanup errors never fail the command.
+fn gc_stale_index_caches(root: &Path) {
+    if let Ok(removed) = db::gc_stale_caches(root) {
+        if removed > 0 {
+            eprintln!(
+                "{}",
+                format!(
+                    "[ast-index] removed {} stale index cache(s) not touched in over {} days",
+                    removed,
+                    db::STALE_CACHE_MAX_AGE_DAYS
+                )
+                .dimmed()
+            );
+        }
+    }
+}
+
+fn find_project_root_without_cache() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     let home = dirs::home_dir();
-    find_project_root_for_read_at_with_db(&cwd, home.as_deref(), walk_up, db::db_exists)
+    find_project_root_for_read_at_with_db(&cwd, home.as_deref(), false, |_| false)
+}
+
+/// Runtime root discovery for commands that access the index cache.
+///
+/// An initialized DB is selected only while its shared lease is already
+/// held. Marker and cwd fallbacks return no lease so legacy-cache migration
+/// can take the target lock exclusively; the caller acquires a shared lease
+/// immediately after that migration step.
+fn find_project_root_for_read_with_lease(
+    walk_up: bool,
+) -> Result<(PathBuf, Option<db::ProjectLease>)> {
+    let cwd = std::env::current_dir()?;
+    let home = dirs::home_dir();
+
+    if walk_up {
+        for ancestor in cwd.ancestors() {
+            if home.as_deref() == Some(ancestor) {
+                break;
+            }
+            if let Some(lease) = db::acquire_project_lease_if_initialized(ancestor)? {
+                return Ok((ancestor.to_path_buf(), Some(lease)));
+            }
+        }
+    }
+
+    for ancestor in cwd.ancestors() {
+        if home.as_deref() == Some(ancestor) {
+            break;
+        }
+        if let Some(lease) = db::acquire_project_lease_if_initialized(ancestor)? {
+            return Ok((ancestor.to_path_buf(), Some(lease)));
+        }
+        if has_project_root_marker(ancestor) {
+            return Ok((ancestor.to_path_buf(), None));
+        }
+    }
+
+    Ok((cwd, None))
+}
+
+fn has_project_root_marker(path: &Path) -> bool {
+    if path.join(".git").exists()
+        || path.join(".arc").join("HEAD").exists()
+        || path.join("settings.gradle").exists()
+        || path.join("settings.gradle.kts").exists()
+        || path.join("Package.swift").exists()
+        || path.join("pubspec.yaml").exists()
+        || path.join("Cargo.toml").exists()
+        || path.join("package.json").exists()
+        || path.join("go.mod").exists()
+        || path.join("pyproject.toml").exists()
+        || path.join("setup.py").exists()
+        || path.join("WORKSPACE").exists()
+        || path.join("WORKSPACE.bazel").exists()
+        || path.join("MODULE.bazel").exists()
+    {
+        return true;
+    }
+
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .map(|extension| extension == "xcodeproj" || extension == "sln")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Test-friendly wrapper for `find_project_root_for_read` that uses the
@@ -1712,70 +1836,7 @@ fn find_project_root_for_read_at_with_db(
         if db_exists(ancestor) {
             return Ok(ancestor.to_path_buf());
         }
-        // VCS markers
-        if ancestor.join(".git").exists() || ancestor.join(".arc").join("HEAD").exists() {
-            return Ok(ancestor.to_path_buf());
-        }
-        // Android/Gradle markers
-        if ancestor.join("settings.gradle").exists()
-            || ancestor.join("settings.gradle.kts").exists()
-        {
-            return Ok(ancestor.to_path_buf());
-        }
-        // iOS/Swift markers
-        if ancestor.join("Package.swift").exists() {
-            return Ok(ancestor.to_path_buf());
-        }
-        // Check for .xcodeproj
-        if let Ok(entries) = std::fs::read_dir(ancestor) {
-            for entry in entries.flatten() {
-                if entry
-                    .path()
-                    .extension()
-                    .map(|e| e == "xcodeproj")
-                    .unwrap_or(false)
-                {
-                    return Ok(ancestor.to_path_buf());
-                }
-            }
-        }
-        // Dart/Flutter markers
-        if ancestor.join("pubspec.yaml").exists() {
-            return Ok(ancestor.to_path_buf());
-        }
-        // Rust markers
-        if ancestor.join("Cargo.toml").exists() {
-            return Ok(ancestor.to_path_buf());
-        }
-        // Node.js markers
-        if ancestor.join("package.json").exists() {
-            return Ok(ancestor.to_path_buf());
-        }
-        // Go markers
-        if ancestor.join("go.mod").exists() {
-            return Ok(ancestor.to_path_buf());
-        }
-        // Python markers
-        if ancestor.join("pyproject.toml").exists() || ancestor.join("setup.py").exists() {
-            return Ok(ancestor.to_path_buf());
-        }
-        // C#/.NET markers
-        if let Ok(entries) = std::fs::read_dir(ancestor) {
-            let has_sln = entries.flatten().any(|e| {
-                e.path()
-                    .extension()
-                    .map(|ext| ext == "sln")
-                    .unwrap_or(false)
-            });
-            if has_sln {
-                return Ok(ancestor.to_path_buf());
-            }
-        }
-        // Bazel markers
-        if ancestor.join("WORKSPACE").exists()
-            || ancestor.join("WORKSPACE.bazel").exists()
-            || ancestor.join("MODULE.bazel").exists()
-        {
+        if has_project_root_marker(ancestor) {
             return Ok(ancestor.to_path_buf());
         }
     }

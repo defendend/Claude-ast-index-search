@@ -77,6 +77,12 @@ not committed and does not modify source files. To see the exact SQLite path:
 ast-index db-path
 ```
 
+After a successful `rebuild` or `update`, `ast-index` removes caches for other
+projects only when they have not been touched for more than 14 days. Open
+commands and a running `watch` hold an external lease, so an active index is
+never selected by this cleanup. A removed cache is recreated by the next
+`ast-index rebuild` in that project.
+
 ## Connect It To A Project
 
 For a small or medium project, the default setup is enough:

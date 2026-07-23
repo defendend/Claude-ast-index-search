@@ -22,6 +22,13 @@ fn run(cwd: &Path, args: &[&str]) -> std::process::Output {
     Command::new(binary())
         .current_dir(cwd)
         .args(args)
+        .env(
+            "AST_INDEX_CACHE_DIR",
+            cwd.parent().unwrap_or(cwd).join("ast-index-test-cache"),
+        )
+        .env("AST_INDEX_DISABLE_GC", "1")
+        .env_remove("AST_INDEX_DB_PATH")
+        .env_remove("KOTLIN_INDEX_DB_PATH")
         .env_remove("AST_INDEX_MAX_FILES")
         .output()
         .unwrap()
@@ -31,13 +38,21 @@ fn make_workspace() -> (TempDir, std::path::PathBuf) {
     let tmp = TempDir::new().unwrap();
     let main = tmp.path().join("main");
     let extra = tmp.path().join("extra");
-    write(&main.join("Cargo.toml"), "[package]\nname=\"m\"\nversion=\"0\"\n");
+    write(
+        &main.join("Cargo.toml"),
+        "[package]\nname=\"m\"\nversion=\"0\"\n",
+    );
     write(&main.join("src/lib.rs"), "pub fn shared_fn() {}\n");
-    write(&extra.join("Cargo.toml"), "[package]\nname=\"e\"\nversion=\"0\"\n");
+    write(
+        &extra.join("Cargo.toml"),
+        "[package]\nname=\"e\"\nversion=\"0\"\n",
+    );
     write(&extra.join("src/lib.rs"), "pub fn shared_fn() {}\n");
 
     assert!(run(&main, &["rebuild"]).status.success());
-    assert!(run(&main, &["subtree", "add", "extra", "../extra"]).status.success());
+    assert!(run(&main, &["subtree", "add", "extra", "../extra"])
+        .status
+        .success());
     assert!(run(&main, &["rebuild"]).status.success());
 
     let main_path = main.clone();
@@ -84,7 +99,12 @@ fn subtree_flag_keeps_only_named_subtree() {
     let out = run(
         &main,
         &[
-            "--subtree", "extra", "--format", "json", "symbol", "shared_fn",
+            "--subtree",
+            "extra",
+            "--format",
+            "json",
+            "symbol",
+            "shared_fn",
         ],
     );
     assert!(out.status.success());
@@ -92,7 +112,10 @@ fn subtree_flag_keeps_only_named_subtree() {
     let arr = parsed.as_array().unwrap();
     assert_eq!(arr.len(), 1, "--subtree extra must keep only extra rows");
     let path = arr[0]["path"].as_str().unwrap();
-    assert!(path.contains("/extra/"), "expected subtree path, got {path}");
+    assert!(
+        path.contains("/extra/"),
+        "expected subtree path, got {path}"
+    );
 }
 
 #[test]
@@ -101,7 +124,12 @@ fn subtree_flag_with_unknown_name_returns_empty() {
     let out = run(
         &main,
         &[
-            "--subtree", "ghost", "--format", "json", "symbol", "shared_fn",
+            "--subtree",
+            "ghost",
+            "--format",
+            "json",
+            "symbol",
+            "shared_fn",
         ],
     );
     assert!(out.status.success());

@@ -113,7 +113,7 @@ pub fn cmd_map(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
     let stats = db::get_stats(&conn)?;
 
     let depth = if stats.file_count > 5000 { 3 } else { 2 };
@@ -620,7 +620,7 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // A. Naming patterns — suffix counts from symbols
     let mut naming: Vec<NamingPattern> = Vec::new();

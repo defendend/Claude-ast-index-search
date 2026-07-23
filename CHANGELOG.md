@@ -1,5 +1,27 @@
 # Changelog
 
+## 3.49.2
+
+- **Preserve complete legacy indexes during cache migration** — migrations now
+  carry the whole cache generation, including named subtree registrations and
+  subtree-owned file rows, instead of losing that data while moving an older
+  cache layout.
+- **Garbage-collect only genuinely stale caches** — automatic cleanup removes
+  caches strictly older than 14 days while protecting the current project,
+  active leased caches, recent database/WAL activity, and interrupted
+  publication state.
+- **Publish rebuilds and restores crash-safely** — replacement databases are
+  assembled and validated in staging, installed as a complete generation, and
+  recovered after interruption; concurrent readers no longer observe a
+  half-published index.
+- **Keep incremental freshness conservative** — interrupted updates remain
+  marked stale until completion is published, and a file whose size changes at
+  the same mtime is re-indexed instead of being skipped.
+- **Reduce fresh database size by about 12% in measured databases** — redundant
+  reference and uniqueness indexes are no longer stored, while the existing
+  tables and raw columns remain available to `query` and `schema` for
+  compatibility.
+
 ## 3.49.1
 - **Publish the multi-root rebuild fix from the current mainline** — re-release
   the 3.49.0 changes on top of 3.48.1 so the release tag points at the current

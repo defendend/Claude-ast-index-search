@@ -28,7 +28,7 @@ pub fn cmd_storyboard_usages(root: &Path, class_name: &str, module: Option<&str>
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     let class_like = format!("%{}%", class_name);
 
@@ -134,7 +134,7 @@ pub fn cmd_asset_usages(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     if unused {
         // Find unused assets

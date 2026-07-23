@@ -101,6 +101,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "libc",
  "libtest-mimic",
  "notify",
  "notify-debouncer-mini",

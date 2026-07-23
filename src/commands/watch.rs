@@ -41,13 +41,18 @@ fn try_acquire_watch_lock(root: &Path) -> Option<std::fs::File> {
 
 /// Watch for file changes and incrementally update the index
 pub fn cmd_watch(root: &Path) -> Result<()> {
-    if !db::db_exists(root) {
+    // Held for the complete watch loop. The lease file lives outside the
+    // project cache directory, so stale-cache GC cannot unlink this index
+    // while the watcher is idle between SQLite connections.
+    let _cache_lease = db::acquire_project_lease(root)?;
+    let Some(initial) = db::open_existing_db_leased(root)? else {
         println!(
             "{}",
             "Index not found. Run 'ast-index rebuild' first.".red()
         );
         return Ok(());
-    }
+    };
+    drop(initial);
 
     // Ensure only one watch process runs at a time
     let _lock = match try_acquire_watch_lock(root) {
@@ -152,12 +157,16 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
 }
 
 fn update_index(root: &Path) -> Result<(usize, usize)> {
+    // Watch is long-lived, so take the common mutation lock only for one
+    // coalesced update batch. Readers remain concurrent through SQLite WAL.
+    let _mutation_guard = db::acquire_rebuild_guard(root)?;
     let _experimental_fast_rebuild_env = ScopedEnvVar::set_bool(
         "AST_INDEX_EXPERIMENTAL_FAST_REBUILD",
-        commands::is_experimental_fast_rebuild_enabled(root),
+        commands::try_is_experimental_fast_rebuild_enabled(root)?,
     );
 
-    let mut conn = db::open_db(root)?;
+    let mut conn = db::open_existing_db_leased(root)?
+        .ok_or_else(|| anyhow::anyhow!("Index was cleared; run 'ast-index rebuild' first."))?;
 
     // Honour .ast-index.yaml so watch stays scoped to the same paths as rebuild/update.
     let config = indexer::load_config(root).unwrap_or_default();

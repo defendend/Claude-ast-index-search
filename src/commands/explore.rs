@@ -52,8 +52,8 @@ pub fn cmd_explore(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
-    let resolver = PathResolver::from_conn(root, &conn);
+    let conn = db::open_db_leased(root)?;
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
 
     let raw = query.join(" ");
     let terms = tokenize(&raw);
@@ -135,7 +135,15 @@ pub fn cmd_explore(
         return emit_json(root, &raw, dom_lang.as_deref(), &cands, &file_order, &tests);
     }
 
-    emit_text(root, &raw, dom_lang.as_deref(), &cands, &file_order, &tests, &resolver);
+    emit_text(
+        root,
+        &raw,
+        dom_lang.as_deref(),
+        &cands,
+        &file_order,
+        &tests,
+        &resolver,
+    );
     Ok(())
 }
 
@@ -145,12 +153,7 @@ pub fn cmd_explore(
 
 fn score(c: &Cand, terms: &[String], dom_lang: Option<&str>) -> f64 {
     let name_lc = c.sym.name.to_lowercase();
-    let qual_lc = c
-        .sym
-        .qualified_name
-        .as_deref()
-        .unwrap_or("")
-        .to_lowercase();
+    let qual_lc = c.sym.qualified_name.as_deref().unwrap_or("").to_lowercase();
     let stem = path_stem(&c.sym.path).to_lowercase();
     let path_lc = c.sym.path.to_lowercase();
 
@@ -192,7 +195,12 @@ fn score(c: &Cand, terms: &[String], dom_lang: Option<&str>) -> f64 {
 
     // A lone match on a single term, when the symbol is a trivial member
     // (getter/field/local), is almost always noise — damp it hard.
-    if term_hits <= 1 && matches!(c.sym.kind.as_str(), "method" | "function" | "property" | "variable") {
+    if term_hits <= 1
+        && matches!(
+            c.sym.kind.as_str(),
+            "method" | "function" | "property" | "variable"
+        )
+    {
         s *= 0.45;
     }
 
@@ -311,7 +319,9 @@ fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>>
         }
         "rs" => {
             // Rust tests are usually inline (#[cfg(test)]) — not path-detectable.
-            return Ok(vec!["(rust: inline #[cfg(test)] — not path-detected)".to_string()]);
+            return Ok(vec![
+                "(rust: inline #[cfg(test)] — not path-detected)".to_string()
+            ]);
         }
         _ => {}
     }
@@ -348,19 +358,23 @@ fn emit_text(
     resolver: &PathResolver,
 ) {
     let n_files = file_order.len();
-    println!(
-        "{} {}",
-        "Exploration:".bold(),
-        raw.bold()
-    );
+    println!("{} {}", "Exploration:".bold(), raw.bold());
     if let Some(d) = dom_lang {
-        println!("  dominant language: .{}  ·  {} symbols matched", d, cands.len());
+        println!(
+            "  dominant language: .{}  ·  {} symbols matched",
+            d,
+            cands.len()
+        );
     }
 
     println!("\n{}", "Relevant symbols:".cyan());
     for c in cands.iter().take(MAX_SYMBOLS_LISTED) {
         let disp = resolver.resolve_with_root(&c.sym.path, c.sym.root_path.as_deref());
-        let tag = if c.vendor { " (vendor)".dimmed().to_string() } else { String::new() };
+        let tag = if c.vendor {
+            " (vendor)".dimmed().to_string()
+        } else {
+            String::new()
+        };
         println!(
             "  {} [{}]  {}:{}  {}{}",
             c.sym.display_name().cyan(),
@@ -890,7 +904,9 @@ mod tests {
 
     #[test]
     fn test_path_detection() {
-        assert!(is_test_path("spec/services/applicant/merge_service_spec.rb"));
+        assert!(is_test_path(
+            "spec/services/applicant/merge_service_spec.rb"
+        ));
         assert!(is_test_path("src/foo.test.ts"));
         assert!(is_test_path("pkg/foo_test.go"));
         assert!(is_test_path("Tests/SessionTests.swift"));
@@ -899,9 +915,17 @@ mod tests {
 
     #[test]
     fn penalties_downrank_noise_not_real_code() {
-        let real = penalty_mult(&sym("MergeService", "class", "app/x.rb", 1), false, Some("rb"));
+        let real = penalty_mult(
+            &sym("MergeService", "class", "app/x.rb", 1),
+            false,
+            Some("rb"),
+        );
         let imp = penalty_mult(&sym("foo", "import", "app/x.rb", 1), false, Some("rb"));
-        let vendor = penalty_mult(&sym("X", "interface", "node_modules/x.d.ts", 1), true, Some("rb"));
+        let vendor = penalty_mult(
+            &sym("X", "interface", "node_modules/x.d.ts", 1),
+            true,
+            Some("rb"),
+        );
         let test = penalty_mult(&sym("X", "class", "spec/x_spec.rb", 1), false, Some("rb"));
         let cross = penalty_mult(&sym("X", "class", "bench/x.java", 1), false, Some("kt"));
         assert_eq!(real, 1.0);
@@ -921,13 +945,21 @@ mod tests {
         let dom = Some("rb");
         // Matches all three terms (name + path).
         let strong = score(
-            &cand("MergeService", "class", "app/services/applicant/merge_service.rb"),
+            &cand(
+                "MergeService",
+                "class",
+                "app/services/applicant/merge_service.rb",
+            ),
             &terms,
             dom,
         );
         // A trivial getter matching only "applicant".
         let weak = score(
-            &cand("applicant", "method", "app/contexts/security_form_context.rb"),
+            &cand(
+                "applicant",
+                "method",
+                "app/contexts/security_form_context.rb",
+            ),
             &terms,
             dom,
         );

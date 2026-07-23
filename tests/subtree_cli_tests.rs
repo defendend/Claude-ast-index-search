@@ -23,6 +23,13 @@ fn rebuild(root: &Path) {
     let out = Command::new(binary())
         .current_dir(root)
         .args(["rebuild"])
+        .env(
+            "AST_INDEX_CACHE_DIR",
+            root.parent().unwrap_or(root).join("ast-index-test-cache"),
+        )
+        .env("AST_INDEX_DISABLE_GC", "1")
+        .env_remove("AST_INDEX_DB_PATH")
+        .env_remove("KOTLIN_INDEX_DB_PATH")
         .env_remove("AST_INDEX_MAX_FILES")
         .output()
         .unwrap();
@@ -37,6 +44,13 @@ fn run(root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(binary())
         .current_dir(root)
         .args(args)
+        .env(
+            "AST_INDEX_CACHE_DIR",
+            root.parent().unwrap_or(root).join("ast-index-test-cache"),
+        )
+        .env("AST_INDEX_DISABLE_GC", "1")
+        .env_remove("AST_INDEX_DB_PATH")
+        .env_remove("KOTLIN_INDEX_DB_PATH")
         .env_remove("AST_INDEX_MAX_FILES")
         .output()
         .unwrap()
@@ -47,9 +61,15 @@ fn add_list_remove_round_trip() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("project");
     let extra = tmp.path().join("extra");
-    write(&project.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    write(
+        &project.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0\"\n",
+    );
     write(&project.join("src/lib.rs"), "pub fn a() {}\n");
-    write(&extra.join("Cargo.toml"), "[package]\nname=\"y\"\nversion=\"0\"\n");
+    write(
+        &extra.join("Cargo.toml"),
+        "[package]\nname=\"y\"\nversion=\"0\"\n",
+    );
     write(&extra.join("src/lib.rs"), "pub fn b() {}\n");
 
     rebuild(&project);
@@ -70,7 +90,10 @@ fn add_list_remove_round_trip() {
     );
     let stdout = String::from_utf8_lossy(&add.stdout);
     assert!(stdout.contains("Attached subtree extra"));
-    assert!(stdout.contains("source: ../extra"), "original path should appear");
+    assert!(
+        stdout.contains("source: ../extra"),
+        "original path should appear"
+    );
 
     // List shows it now.
     let list = run(&project, &["subtree", "list"]);
@@ -101,7 +124,10 @@ fn add_with_duplicate_name_rejects() {
     let project = tmp.path().join("project");
     let extra1 = tmp.path().join("extra1");
     let extra2 = tmp.path().join("extra2");
-    write(&project.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    write(
+        &project.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0\"\n",
+    );
     write(&project.join("src/lib.rs"), "pub fn a() {}\n");
     write(&extra1.join("a.rs"), "fn x() {}\n");
     write(&extra2.join("b.rs"), "fn y() {}\n");
@@ -130,7 +156,10 @@ fn add_with_duplicate_name_rejects() {
 fn add_overlapping_with_root_rejects_without_force() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("project");
-    write(&project.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    write(
+        &project.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0\"\n",
+    );
     write(&project.join("src/lib.rs"), "pub fn a() {}\n");
     write(&project.join("sub/a.rs"), "fn x() {}\n");
 
@@ -146,10 +175,7 @@ fn add_overlapping_with_root_rejects_without_force() {
     );
 
     // With --force the attach goes through.
-    let forced = run(
-        &project,
-        &["subtree", "add", "inner", "./sub", "--force"],
-    );
+    let forced = run(&project, &["subtree", "add", "inner", "./sub", "--force"]);
     assert!(forced.status.success());
     let stdout = String::from_utf8_lossy(&forced.stdout);
     assert!(stdout.contains("Attached subtree inner"));
@@ -160,7 +186,10 @@ fn legacy_add_root_still_works_and_auto_names() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("project");
     let extra = tmp.path().join("legacy");
-    write(&project.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    write(
+        &project.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0\"\n",
+    );
     write(&project.join("src/lib.rs"), "pub fn a() {}\n");
     write(&extra.join("a.rs"), "fn x() {}\n");
 

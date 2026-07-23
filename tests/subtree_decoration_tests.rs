@@ -23,6 +23,13 @@ fn run(cwd: &Path, args: &[&str]) -> std::process::Output {
     Command::new(binary())
         .current_dir(cwd)
         .args(args)
+        .env(
+            "AST_INDEX_CACHE_DIR",
+            cwd.parent().unwrap_or(cwd).join("ast-index-test-cache"),
+        )
+        .env("AST_INDEX_DISABLE_GC", "1")
+        .env_remove("AST_INDEX_DB_PATH")
+        .env_remove("KOTLIN_INDEX_DB_PATH")
         .env_remove("AST_INDEX_MAX_FILES")
         .output()
         .unwrap()
@@ -32,9 +39,15 @@ fn make_workspace() -> (TempDir, std::path::PathBuf) {
     let tmp = TempDir::new().unwrap();
     let main = tmp.path().join("main");
     let extra = tmp.path().join("extra");
-    write(&main.join("Cargo.toml"), "[package]\nname=\"m\"\nversion=\"0\"\n");
+    write(
+        &main.join("Cargo.toml"),
+        "[package]\nname=\"m\"\nversion=\"0\"\n",
+    );
     write(&main.join("src/lib.rs"), "pub fn main_only_fn() {}\n");
-    write(&extra.join("Cargo.toml"), "[package]\nname=\"e\"\nversion=\"0\"\n");
+    write(
+        &extra.join("Cargo.toml"),
+        "[package]\nname=\"e\"\nversion=\"0\"\n",
+    );
     write(&extra.join("src/lib.rs"), "pub fn extra_only_fn() {}\n");
 
     let out = run(&main, &["rebuild"]);
@@ -89,9 +102,6 @@ fn json_mode_keeps_raw_path_without_prefix() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let path = parsed[0]["path"].as_str().unwrap();
-    assert!(
-        !path.starts_with("["),
-        "JSON path must be raw, got: {path}"
-    );
+    assert!(!path.starts_with("["), "JSON path must be raw, got: {path}");
     assert!(path.contains("/extra/src/lib.rs"));
 }

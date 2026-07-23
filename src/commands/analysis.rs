@@ -26,7 +26,7 @@ pub fn cmd_unused_symbols(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // Build query based on filters
     let (sql, filter_param) = if let Some(mod_path) = module {

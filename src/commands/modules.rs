@@ -30,7 +30,7 @@ pub fn cmd_module(root: &Path, pattern: &str, limit: usize) -> Result<()> {
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     let mut stmt = conn.prepare("SELECT name, path FROM modules WHERE name LIKE ?1 LIMIT ?2")?;
     let pattern = format!("%{}%", pattern);
@@ -63,7 +63,7 @@ pub fn cmd_deps(root: &Path, module: &str) -> Result<()> {
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // Check if module deps are indexed
     if db::count_module_deps(&conn)? == 0 {
@@ -130,7 +130,7 @@ pub fn cmd_dependents(root: &Path, module: &str) -> Result<()> {
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // Check if module deps are indexed
     if db::count_module_deps(&conn)? == 0 {
@@ -204,7 +204,7 @@ pub fn cmd_unused_deps(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // Check if module deps are indexed
     if db::count_module_deps(&conn)? == 0 {
@@ -1396,7 +1396,7 @@ pub fn cmd_module_route(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // Check module_deps populated.
     if db::count_module_deps(&conn)? == 0 {

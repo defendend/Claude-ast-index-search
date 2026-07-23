@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 
 use super::{relative_path, search_files, PathResolver};
 use crate::db::{self, SearchScope};
@@ -54,7 +54,7 @@ pub fn cmd_search(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // Split query by comma for OR semantics: "email,mail" searches both terms
     let terms: Vec<&str> = query
@@ -174,7 +174,7 @@ pub fn cmd_search(
         },
     )?;
 
-    let resolver = PathResolver::from_conn(root, &conn);
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
     // Apply --subtree / --local filters before resolving paths so we don't
     // do extra work on rows the user will throw away.
     let files: Vec<String> = files
@@ -286,7 +286,7 @@ pub fn cmd_symbol(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
     let mut symbols = if let Some(pat) = pattern {
         let like_pattern = db::glob_to_like(pat);
         db::find_symbols_by_pattern(&conn, &like_pattern, kind, limit, scope)?
@@ -299,7 +299,7 @@ pub fn cmd_symbol(
         }
     };
 
-    let resolver = PathResolver::from_conn(root, &conn);
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
     symbols.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
     for s in &mut symbols {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
@@ -363,7 +363,7 @@ pub fn cmd_class(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     let mut results: Vec<db::SearchResult> = if let Some(pat) = pattern {
         let like_pattern = db::glob_to_like(pat);
@@ -393,7 +393,7 @@ pub fn cmd_class(
         }
     };
 
-    let resolver = PathResolver::from_conn(root, &conn);
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
     results.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
     for s in &mut results {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
@@ -473,10 +473,10 @@ pub fn cmd_implementations(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
     let mut impls = db::find_implementations_scoped(&conn, parent, limit, scope)?;
 
-    let resolver = PathResolver::from_conn(root, &conn);
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
     impls.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
     for s in &mut impls {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
@@ -516,11 +516,11 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
     let (mut definitions, mut imports, mut usages) =
         db::find_cross_references(&conn, symbol, limit)?;
 
-    let resolver = PathResolver::from_conn(root, &conn);
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
     definitions.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
     imports.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
     usages.retain(|r| resolver.matches_filter(r.root_path.as_deref()));
@@ -597,7 +597,7 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // Find the class/interface/package
     let classes = db::find_symbols_by_name(&conn, name, Some("class"), 1)?;
@@ -664,7 +664,7 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
             .take(limit)
             .collect()
     };
-    let resolver = PathResolver::from_conn(root, &conn);
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
     children.retain(|c| resolver.matches_filter(c.root_path.as_deref()));
     for c in &mut children {
         c.path = resolver.resolve_with_root(&c.path, c.root_path.as_deref());
@@ -706,9 +706,10 @@ pub fn cmd_usages(
     scope: &SearchScope,
 ) -> Result<()> {
     // Try to use index first
+    let _cache_lease = db::acquire_project_lease(root)?;
     let db_path = db::get_db_path(root)?;
     if db_path.exists() {
-        let conn = Connection::open(&db_path)?;
+        let conn = db::open_db_leased(root)?;
 
         // Check if refs table has data
         let refs_count: i64 = conn
@@ -722,7 +723,7 @@ pub fn cmd_usages(
         if refs_count > 0 {
             // Use indexed references with scope filtering
             let mut refs = db::find_references_scoped(&conn, symbol, limit, scope)?;
-            let resolver = PathResolver::from_conn(root, &conn);
+            let resolver = PathResolver::try_from_conn(root, &conn)?;
             refs.retain(|r| resolver.matches_filter(r.root_path.as_deref()));
             for r in &mut refs {
                 r.path = resolver.resolve_with_root(&r.path, r.root_path.as_deref());

@@ -23,7 +23,7 @@ pub fn cmd_xml_usages(root: &Path, class_name: &str, module_filter: Option<&str>
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // Check if XML usages are indexed
     let xml_count: i64 = conn.query_row("SELECT COUNT(*) FROM xml_usages", [], |row| row.get(0))?;
@@ -127,7 +127,7 @@ pub fn cmd_resource_usages(
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     // Check if resources are indexed
     let res_count: i64 = conn.query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))?;

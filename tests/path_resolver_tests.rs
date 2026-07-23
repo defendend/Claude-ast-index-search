@@ -12,13 +12,14 @@ use std::fs;
 
 use ast_index::commands::PathResolver;
 use ast_index::db;
+use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
-fn open_fresh_db(project_root: &std::path::Path) -> rusqlite::Connection {
-    if db::db_exists(project_root) {
-        db::delete_db(project_root).unwrap();
-    }
-    let conn = db::open_db(project_root).unwrap();
+fn open_fresh_db(_project_root: &std::path::Path) -> rusqlite::Connection {
+    // PathResolver only needs the schema. Keeping these connections in-memory
+    // avoids making parallel tests contend through the process-wide cache
+    // namespace now that unreadable cache candidates deliberately fail closed.
+    let conn = Connection::open_in_memory().unwrap();
     db::init_db(&conn).unwrap();
     conn
 }
@@ -54,9 +55,39 @@ fn resolve_returns_absolute_path_in_extra_root() {
 
     assert_eq!(
         resolved,
-        file.to_string_lossy(),
+        std::path::Path::new(&db::normalize_root_for_storage(extra.path()))
+            .join(rel)
+            .to_string_lossy(),
         "file present only under extra root must resolve to its absolute path"
     );
+}
+
+#[test]
+fn strict_resolver_migrates_legacy_direct_connection() {
+    let primary = TempDir::new().unwrap();
+    let extra = TempDir::new().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        .unwrap();
+    let raw_extra = extra.path().to_string_lossy().into_owned();
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('extra_roots', ?1)",
+        params![serde_json::to_string(&vec![raw_extra]).unwrap()],
+    )
+    .unwrap();
+
+    let rel = "src/Legacy.kt";
+    fs::create_dir_all(extra.path().join("src")).unwrap();
+    fs::write(extra.path().join(rel), "class Legacy").unwrap();
+
+    let resolver = PathResolver::try_from_conn(primary.path(), &conn).unwrap();
+    assert_eq!(
+        resolver.resolve(rel),
+        std::path::Path::new(&db::normalize_root_for_storage(extra.path()))
+            .join(rel)
+            .to_string_lossy()
+    );
+    assert_eq!(db::list_subtrees(&conn).unwrap().len(), 1);
 }
 
 #[test]
@@ -111,13 +142,15 @@ fn resolve_with_root_disambiguates_colliding_paths() {
     fs::write(primary.path().join(rel), "primary").unwrap();
     fs::write(extra.path().join(rel), "extra").unwrap();
 
-    let resolver = PathResolver::from_conn(primary.path(), &conn);
+    let resolver = PathResolver::from_conn(primary.path(), &conn).with_decoration(false);
     let resolved =
         resolver.resolve_with_root(rel, Some(&db::normalize_root_for_storage(extra.path())));
 
     assert_eq!(
         resolved,
-        extra.path().join(rel).to_string_lossy(),
+        std::path::Path::new(&db::normalize_root_for_storage(extra.path()))
+            .join(rel)
+            .to_string_lossy(),
         "owning root hint must point to the extra-root copy, not the primary one"
     );
 }

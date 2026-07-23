@@ -1,328 +1,233 @@
 # Index database schema
 
-The ast-index stores every project's code graph in a SQLite database under
-`~/Library/Caches/ast-index/<hash>/index.db` (macOS) or
-`$XDG_CACHE_HOME/ast-index/<hash>/index.db` (Linux). Where `<hash>` is a
-stable hash of the canonicalised project root.
+ast-index stores each project's code graph in a SQLite database under
+`~/Library/Caches/ast-index/<hash>/index.db` on macOS or
+`$XDG_CACHE_HOME/ast-index/<hash>/index.db` on Linux. `<hash>` is derived from
+the normalized project root.
 
-Schema lives in `src/db.rs` (`init_db`). 14 tables, adjacency-list shape.
+The authoritative DDL lives in `src/db.rs`. The current schema has 15 base
+tables plus the `symbols_fts` FTS5 virtual table. Fresh rebuilds create the
+base tables first, bulk-load data, and add secondary indexes and FTS only
+afterward.
 
-## ER overview
+## Logical overview
 
-```
-CORE — always populated
-═══════════════════════════════════════════════════════════════════════════
+```text
+subtrees.canonical_path ── value match ── files.root_path
+                                              │
+                                  ┌───────────┴───────────┐
+                                  ▼                       ▼
+                               symbols                   refs
+                                  │
+                                  ▼
+                             inheritance
 
- ┌─────────────────────┐
- │ files               │◄─────────┬─────────────────────────────────┐
- ├─────────────────────┤          │                                 │
- │ id        PK        │          │                                 │
- │ path      TEXT NN   │          │                                 │
- │ mtime     INT  NN   │          │                                 │
- │ size      INT  NN   │          │                                 │
- └─────────────────────┘          │                                 │
-                                  │ file_id                         │ file_id
-                                  │                                 │
- ┌─────────────────────┐          │      ┌──────────────────────┐   │
- │ symbols             │          │      │ refs                 │   │
- ├─────────────────────┤          │      ├──────────────────────┤   │
- │ id          PK      │──────────┘      │ id           PK      │   │
- │ file_id     FK→fil. │                 │ file_id      FK→fil. │───┘
- │ name        TEXT NN │                 │ name         TEXT NN │
- │ kind        TEXT NN │                 │ line         INT  NN │
- │ line        INT  NN │                 │ context      TEXT    │
- │ parent_id   FK→sym. │◄───┐            │                      │
- │ signature   TEXT    │    │            │ (import / usage site)│
- └─────────────────────┘    │            └──────────────────────┘
-                            │ containment
-                            │ (self-ref: method → enclosing class)
-                            │
- ┌─────────────────────┐    │
- │ inheritance         │    │
- ├─────────────────────┤    │
- │ id          PK      │    │
- │ child_id    FK→sym. │────┼── extends / implements (plural)
- │ parent_name TEXT    │    │    ← TEXT by design, NOT a FK —
- │ kind        TEXT    │    │      supertype may be outside index
- └─────────────────────┘    │
+modules ── module_deps
+   │    └─ transitive_deps
+   ├────── resources ── resource_usages
+   ├────── xml_usages
+   ├────── ios_assets ── ios_asset_usages
+   └────── storyboard_usages
 
-       *** Two distinct "parent" concepts — do not conflate ***
-       symbols.parent_id   = CONTAINMENT   (enclosing scope)
-       inheritance.*       = SUPERTYPE     (extends / implements)
+metadata                         symbols ── external content ── symbols_fts
 ```
 
-```
-MODULE-LEVEL — populated for projects with a module system
-═══════════════════════════════════════════════════════════════════════════
+The line between `subtrees.canonical_path` and `files.root_path` is a value
+relationship, not a foreign key.
 
- ┌─────────────────┐         ┌─────────────────────┐
- │ modules         │◄────────│ module_deps         │
- ├─────────────────┤  m_id   ├─────────────────────┤
- │ id       PK     │◄────────│ module_id     FK    │
- │ name     TEXT NN│  dep_id │ dep_module_id FK    │
- │ path     TEXT NN│◄────────│ dep_kind      TEXT  │  ← impl / api / test
- │ kind     TEXT   │         └─────────────────────┘
- └─────────────────┘
-        ▲
-        │ module_id / dep_id
-        │
- ┌─────────────────────┐
- │ transitive_deps     │       ← precomputed reachability:
- ├─────────────────────┤         module → every transitive dep
- │ id          PK      │         with depth and full path chain
- │ module_id   FK      │
- │ dependency_id FK    │
- │ depth       INT  NN │
- │ path        TEXT    │
- └─────────────────────┘
-```
+## Base tables
 
-```
-ANDROID — populated when ProjectType == Android
-═══════════════════════════════════════════════════════════════════════════
+`PK` means primary key, `NN` means `NOT NULL`, and `UQ` means `UNIQUE`.
+Every declared foreign key below uses `ON DELETE CASCADE`.
 
- modules ◄── resources ◄── resource_usages
-              ├ type, name, file_path, line
-              └ (@drawable/ic_foo, R.string.x, etc.)
+| Table | Columns | Declared foreign keys and constraints |
+|---|---|---|
+| `files` | `id INTEGER PK`, `path TEXT NN`, `root_path TEXT NN DEFAULT ''`, `mtime INTEGER NN`, `size INTEGER NN` | `UNIQUE(root_path, path)` |
+| `symbols` | `id INTEGER PK`, `file_id INTEGER NN`, `name TEXT NN`, `qualified_name TEXT`, `kind TEXT NN`, `line INTEGER NN`, `parent_id INTEGER`, `signature TEXT` | `file_id → files.id` |
+| `modules` | `id INTEGER PK`, `name TEXT NN UQ`, `path TEXT NN`, `kind TEXT` | — |
+| `module_deps` | `id INTEGER PK`, `module_id INTEGER NN`, `dep_module_id INTEGER NN`, `dep_kind TEXT` | `module_id → modules.id`, `dep_module_id → modules.id` |
+| `inheritance` | `id INTEGER PK`, `child_id INTEGER NN`, `parent_name TEXT NN`, `kind TEXT NN` | `child_id → symbols.id` |
+| `refs` | `id INTEGER PK`, `file_id INTEGER NN`, `name TEXT NN`, `line INTEGER NN`, `context TEXT` | `file_id → files.id` |
+| `xml_usages` | `id INTEGER PK`, `module_id INTEGER`, `file_path TEXT NN`, `line INTEGER NN`, `class_name TEXT NN`, `usage_type TEXT`, `element_id TEXT` | `module_id → modules.id` |
+| `resources` | `id INTEGER PK`, `module_id INTEGER`, `type TEXT NN`, `name TEXT NN`, `file_path TEXT NN`, `line INTEGER` | `module_id → modules.id` |
+| `resource_usages` | `id INTEGER PK`, `resource_id INTEGER`, `usage_file TEXT NN`, `usage_line INTEGER NN`, `usage_type TEXT` | `resource_id → resources.id` |
+| `transitive_deps` | `id INTEGER PK`, `module_id INTEGER NN`, `dependency_id INTEGER NN`, `depth INTEGER NN`, `path TEXT` | `module_id → modules.id`, `dependency_id → modules.id` |
+| `storyboard_usages` | `id INTEGER PK`, `module_id INTEGER`, `file_path TEXT NN`, `line INTEGER NN`, `class_name TEXT NN`, `usage_type TEXT`, `storyboard_id TEXT` | `module_id → modules.id` |
+| `ios_assets` | `id INTEGER PK`, `module_id INTEGER`, `type TEXT NN`, `name TEXT NN`, `file_path TEXT NN` | `module_id → modules.id` |
+| `ios_asset_usages` | `id INTEGER PK`, `asset_id INTEGER`, `usage_file TEXT NN`, `usage_line INTEGER NN`, `usage_type TEXT` | `asset_id → ios_assets.id` |
+| `metadata` | `key TEXT PK`, `value TEXT NN` | — |
+| `subtrees` | `id INTEGER PK`, `name TEXT NN UQ`, `canonical_path TEXT NN UQ`, `original_path TEXT NN` | — |
 
- xml_usages
- ├ module_id, file_path, line
- └ class_name, usage_type, element_id
-   (class mentions in XML layouts)
-```
+### File identity and roots
 
-```
-IOS — populated when ProjectType == iOS
-═══════════════════════════════════════════════════════════════════════════
+`files.path` is relative to the source root that owns the file.
+`files.root_path` records that root's normalized absolute path. A primary
+project and an attached subtree may contain the same relative path, so file
+identity is the pair `(root_path, path)`, enforced by
+`UNIQUE(root_path, path)`.
 
- modules ◄── ios_assets ◄── ios_asset_usages
-              ├ type, name, file_path
-              └ (UIImage(named:), SwiftUI Image, …)
+`mtime` and `size` are the incremental freshness inputs. A file is considered
+unchanged only when both values still match.
 
- storyboard_usages
- ├ module_id, file_path, line
- └ class_name, usage_type, storyboard_id
-   (ViewController classes in .storyboard / .xib)
-```
+The empty-string default on `root_path` remains for compatibility with older
+databases and direct compatibility helpers. Current indexing writes an owning
+root. Attached roots are registered in `subtrees`; `original_path` preserves
+what the user entered, while `canonical_path` is the normalized value used in
+`files.root_path`.
 
-```
-META
-═══════════════════════════════════════════════════════════════════════════
+### Symbols, references, and inheritance
 
- metadata  ← KV-store
- ├ key   TEXT PK
- └ value TEXT NN
-   project_root, no_ignore, extra_roots, schema_version, …
-```
+`symbols.qualified_name` stores the parser-provided qualified name when one is
+available. `signature` is nullable because not every language or declaration
+has a useful signature.
 
-## Table-by-table
+`symbols.parent_id` is a reserved, nullable compatibility column. It has no
+foreign-key constraint, and current indexing code does not populate it.
+Consumers must not treat it as a containment hierarchy.
 
-### `files` (the file registry)
+`refs.name` and `inheritance.parent_name` are intentionally string-based:
+neither points to a specific `symbols` row. References therefore remain
+language-agnostic, and an inheritance parent may live outside the index.
+`inheritance.child_id` is the resolved side of an inheritance edge.
 
-Every source file discovered during `rebuild` / `update`. `path` is
-relative to the root that owns the file — primary root or an extra root
-added via `add-root`. `mtime` and `size` are cached so `update` can skip
-unchanged files without re-parsing.
+### Platform-specific data
 
-### `symbols`
+The Android tables are `resources`, `resource_usages`, and `xml_usages`.
+The iOS tables are `ios_assets`, `ios_asset_usages`, and
+`storyboard_usages`. Their nullable `module_id` or asset/resource IDs allow
+data to be recorded even when the corresponding owning row cannot be
+resolved.
 
-The main symbol table. One row per named declaration (class, function,
-method, struct, interface, enum, constant, variable, type alias, etc.).
+## Metadata keys
 
-- `kind` is a short string tag (`class`, `function`, `method`, `import`,
-  `constant`, …). The full vocabulary is `SymbolKind` in `src/db.rs`.
-- `parent_id` references another row in the same table — this is
-  **containment** (method inside class, inner class inside outer class,
-  function inside module scope). Nullable because top-level declarations
-  have no enclosing symbol.
-- `signature` is the full type signature as a string for display
-  (`fn foo(x: i32) -> String`). Nullable because not every parser
-  produces signatures.
+`metadata` is a string-to-string store. Production code currently uses these
+keys:
 
-### `refs` (references / usages)
+| Key | Meaning |
+|---|---|
+| `project_root` | Normalized project root used to validate cache ownership and migrations. |
+| `no_ignore` | `1` when indexing was configured to include ignored files. |
+| `bypass_size_check` | Persistent opt-in created by `rebuild --force --remember` to bypass the candidate-file cap. |
+| `experimental_fast_rebuild` | `1` or `0`, recording the experimental rebuild mode for later commands. |
+| `last_update_at` | Unix timestamp in milliseconds for the last completed file-index update. |
+| `index_update_dirty_at` | Unix timestamp in milliseconds marking an incremental update that may be partial; removed when completion is published. |
+| `last_modules_indexed_at` | Unix timestamp in milliseconds for completed module indexing. |
 
-Every non-definition mention of a name — imports, function-call sites,
-type references. Stored loosely:
+`extra_roots` is a legacy migration input only. On open, its JSON array is
+moved into `subtrees` and the metadata row is deleted. There is no
+`schema_version` metadata key in the current implementation.
 
-- `name` is a free-form identifier string, **not** an FK to `symbols`.
-- `context` is the line of source where the reference appears, for
-  grep-like preview.
+## Secondary indexes
 
-The "loose" design means refs aren't resolved to specific symbol IDs —
-just "this name appears at this file:line". This keeps indexing fast
-and language-agnostic, at the cost of not supporting semantic
-jump-to-definition. Commands that need resolution (`refs`, `usages`)
-join on `name` and accept that multiple symbols with the same name
-will all match.
+The current explicit secondary indexes are:
 
-### `inheritance`
+- Files and symbols:
+  `idx_files_path`,
+  `idx_symbols_name`,
+  `idx_symbols_qualified_name` (partial, only where `qualified_name IS NOT NULL`),
+  `idx_symbols_kind`, and
+  `idx_symbols_file`.
+- Modules and dependency edges:
+  `idx_module_deps_module`,
+  `idx_module_deps_dep`,
+  `idx_transitive_deps_module`, and
+  `idx_transitive_deps_dep`.
+- Inheritance and references:
+  `idx_inheritance_child`,
+  `idx_inheritance_parent`,
+  `idx_refs_file`, and
+  `idx_refs_name_file_line` on `(name, file_id, line)`.
+- Android data:
+  `idx_xml_usages_class`,
+  `idx_xml_usages_module`,
+  `idx_resources_name`,
+  `idx_resources_type`,
+  `idx_resources_module`, and
+  `idx_resource_usages_resource`.
+- iOS data:
+  `idx_storyboard_usages_class`,
+  `idx_storyboard_usages_module`,
+  `idx_ios_assets_name`,
+  `idx_ios_assets_type`, and
+  `idx_ios_asset_usages_asset`.
 
-One row per `extends` / `implements` / `mixin` relation.
+SQLite also creates indexes for the schema's `PRIMARY KEY` and `UNIQUE`
+constraints where needed, including `files(root_path, path)`, `modules(name)`,
+`subtrees(name)`, and `subtrees(canonical_path)`.
 
-- `child_id` FK → `symbols.id` — the subclass / implementor.
-- `parent_name` — name of the supertype as **TEXT, not an FK**. A
-  supertype frequently lives outside the indexed code (stdlib,
-  third-party, generated code) so we can't always resolve it to an ID.
-  Queries do fuzzy suffix matching: `parent_name = "Foo"` OR
-  `parent_name LIKE "%.Foo"` to catch both short names and fully
-  qualified ones.
-- `kind` distinguishes direct extension, interface implementation,
-  mixin, trait impl, etc.
+Fresh databases intentionally do not create these redundant historical
+indexes:
 
-### `modules`, `module_deps`, `transitive_deps`
+- `idx_files_root_path_path`: duplicates `UNIQUE(root_path, path)`.
+- `idx_modules_name`: duplicates `UNIQUE(name)`.
+- `idx_refs_name`: the leftmost `name` prefix is already covered by
+  `idx_refs_name_file_line`.
 
-Project-specific module concept — Gradle subproject, Cargo crate,
-Python package, Go module, etc. `module_deps` is direct edges;
-`transitive_deps` is precomputed closure with `depth` and `path`
-string for quick "all indirect deps of X" queries.
+Older databases drop those indexes when opened. The qualified-name index is
+also migrated to its current partial definition. This optimization changes
+index structures only: all 15 base tables and their raw columns remain
+available to `ast-index query` and `ast-index schema` for compatibility.
 
-### Android (`resources`, `resource_usages`, `xml_usages`)
+## Full-text search
 
-Populated only for Android projects. `resources` catalogues
-`R.string.*`, `R.drawable.*` etc. declarations; `resource_usages` is
-where they're referenced; `xml_usages` tracks fully-qualified class
-names mentioned in layout XML.
-
-### iOS (`ios_assets`, `ios_asset_usages`, `storyboard_usages`)
-
-Analogues for Swift/ObjC projects. `ios_assets` enumerates
-`.xcassets` entries; `ios_asset_usages` catches `UIImage(named:)` /
-SwiftUI `Image` references; `storyboard_usages` pins ViewController
-classes to `.storyboard` / `.xib` files.
-
-### `metadata`
-
-Plain KV table for DB-level config that shouldn't live in a schema
-column: `project_root` (canonical path for cache-lookup validation),
-`no_ignore` (whether `.gitignore` was bypassed at last rebuild),
-`extra_roots` (JSON list of additional source roots added via
-`add-root`), `schema_version` (for future migrations).
-
-## Design decisions worth knowing
-
-### Adjacency list, not materialized path
-
-Both hierarchies (containment via `parent_id`, inheritance via
-`inheritance.*`) store **only the immediate parent**, not the full
-chain. To walk ancestors, use a recursive CTE:
+`symbols_fts` is an FTS5 external-content virtual table:
 
 ```sql
-WITH RECURSIVE ancestors AS (
-    SELECT id, name, kind, parent_id, 0 AS depth
-    FROM symbols WHERE id = ?1
-  UNION ALL
-    SELECT s.id, s.name, s.kind, s.parent_id, a.depth + 1
-    FROM symbols s
-    JOIN ancestors a ON s.id = a.parent_id
-)
-SELECT * FROM ancestors ORDER BY depth;
+CREATE VIRTUAL TABLE symbols_fts USING fts5(
+    name,
+    signature,
+    content=symbols,
+    content_rowid=id
+);
 ```
 
-SQLite recursive CTEs are fast on realistic depths (5–10 levels) —
-milliseconds. The trade-off is cheap writes (insert one edge, no
-cascade on rename) at the cost of recursive reads.
-
-### `refs` is string-based, not ID-based
-
-`refs.name` is TEXT, not a FK to `symbols`. Consequence: commands
-searching references (`usages`, `refs`, `callers`) match purely by
-name. This:
-- avoids brittle name-resolution during indexing (tree-sitter doesn't
-  do scope resolution);
-- keeps indexing fast and language-agnostic;
-- means multiple definitions with the same name all match a single
-  query — use `--in-file` / `--module` scope filters to narrow.
-
-### Extra roots
-
-When `add-root` is used, additional source trees are indexed alongside
-the primary. Paths in `files.path` and `symbols.*` stay relative to
-**the root that owns the file**. Query output is resolved to absolute
-paths through `commands::PathResolver` when extra roots are present,
-so output is never ambiguous about which root a result came from.
-
-### Indexes
-
-Indexes are created in `init_db` but not shown by `ast-index schema`
-(which lists only table schemas). To see them:
-
-```bash
-sqlite3 $(ast-index db-path) ".indexes"
-sqlite3 $(ast-index db-path) ".schema"      # full DDL including indexes
-```
-
-Notable ones:
-- `idx_symbols_name`, `idx_symbols_name_lower` — fast symbol lookup
-- `idx_symbols_file`, `idx_symbols_parent` — join paths
-- `idx_refs_file_name`, `idx_refs_name` — reference queries
-- `idx_inheritance_parent` — `implementations` / `hierarchy` lookups
-- `symbols_fts` (FTS5 virtual table) — fuzzy full-text search
+It indexes `symbols.name` and `symbols.signature`, using `symbols.id` as the
+row ID. The `symbols_ai`, `symbols_ad`, and `symbols_au` triggers synchronize
+inserts, deletes, and updates. FTS is rebuilt after a fresh bulk load.
 
 ## Common query patterns
 
-Full qualified name (walk containment chain):
+Find a symbol by qualified name:
 
 ```sql
-WITH RECURSIVE ancestors AS (
-    SELECT id, name, parent_id, 0 AS depth FROM symbols WHERE id = ?1
-  UNION ALL
-    SELECT s.id, s.name, s.parent_id, a.depth + 1
-    FROM symbols s JOIN ancestors a ON s.id = a.parent_id
-)
-SELECT GROUP_CONCAT(name, '.') FROM (
-    SELECT name FROM ancestors ORDER BY depth DESC
-);
--- → "MyApp.billing.PaymentService.processPayment"
+SELECT s.name, s.qualified_name, s.kind, f.root_path, f.path, s.line
+FROM symbols AS s
+JOIN files AS f ON f.id = s.file_id
+WHERE s.qualified_name = ?1;
 ```
 
-All supertypes of a class (walk inheritance chain):
+Find implementations or subclasses by parent name:
 
 ```sql
-WITH RECURSIVE supers AS (
-    SELECT parent_name AS name, 1 AS depth FROM inheritance WHERE child_id = ?1
-  UNION ALL
-    SELECT i.parent_name, s.depth + 1
-    FROM inheritance i
-    JOIN symbols ss ON ss.name = s.name
-    JOIN supers   s ON 1 = 1
-    WHERE i.child_id = ss.id
-)
-SELECT DISTINCT name, depth FROM supers ORDER BY depth;
-```
-
-Implementations of an interface:
-
-```sql
-SELECT s.name, f.path, s.line
-FROM inheritance i
-JOIN symbols s ON s.id = i.child_id
-JOIN files f ON f.id = s.file_id
+SELECT s.name, f.root_path, f.path, s.line
+FROM inheritance AS i
+JOIN symbols AS s ON s.id = i.child_id
+JOIN files AS f ON f.id = s.file_id
 WHERE i.parent_name = ?1
    OR i.parent_name LIKE '%.' || ?1;
 ```
 
-Symbols inside a specific file:
+Address one file unambiguously:
 
 ```sql
 SELECT s.name, s.kind, s.line
-FROM symbols s
-JOIN files f ON f.id = s.file_id
-WHERE f.path = ?1
+FROM symbols AS s
+JOIN files AS f ON f.id = s.file_id
+WHERE f.root_path = ?1 AND f.path = ?2
 ORDER BY s.line;
 ```
 
 ## Inspecting the live database
 
 ```bash
-ast-index db-path       # path to the .db file
-ast-index schema        # JSON dump of all tables + row counts
+ast-index db-path
+ast-index schema
 ast-index query "SELECT * FROM symbols WHERE name = ?1 LIMIT 20" foo
 
-# Raw SQLite
-sqlite3 $(ast-index db-path) ".tables"
-sqlite3 $(ast-index db-path) "SELECT kind, COUNT(*) FROM symbols GROUP BY kind ORDER BY 2 DESC"
+sqlite3 "$(ast-index db-path)" ".indexes"
+sqlite3 "$(ast-index db-path)" ".schema"
 ```
 
-The `query` command has an allowlist — only `SELECT`/`WITH`/`EXPLAIN`
-are permitted; `INSERT`/`UPDATE`/`DELETE`/`DROP`/`PRAGMA` are rejected
-to prevent accidental damage. Use raw `sqlite3` for mutations.
+`ast-index query` accepts read-only `SELECT`, `WITH`, and `EXPLAIN`
+statements. Use the SQLite CLI only when the complete raw schema, including
+indexes, virtual tables, and triggers, is needed.

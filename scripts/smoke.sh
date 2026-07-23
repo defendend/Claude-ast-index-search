@@ -4,7 +4,7 @@
 # ============================================================================
 #
 # WHAT
-#   The CLI equivalent of a Playwright suite. Five independent scenarios
+#   The CLI equivalent of a Playwright suite. Six independent scenarios
 #   exercise the real release binary against synthetic Rust projects, then
 #   assert on stdout / stderr / exit code / SQLite state.
 #
@@ -27,11 +27,14 @@
 #   5. mcp-stdio          Spawn ast-index-mcp with AST_INDEX_ROOT, send a
 #                         JSON-RPC `initialize` then a `tools/call stats`,
 #                         verify well-formed JSON-RPC responses.
+#   6. perf-budget        Index a copy of this repo's `src/`, then verify
+#                         rebuild, search, and no-op update stay within loose
+#                         latency budgets.
 #
 # OUTPUT
 #   On failure, the offending command + output is printed and a per-scenario
 #   log is written under $WORKDIR/logs/<scenario>.log. Final line is
-#   "N/5 scenarios passed". Exit 0 iff N == 5.
+#   "N/6 scenarios passed". Exit 0 iff N == 6.
 #
 # USAGE
 #   bash scripts/smoke.sh                 # run all scenarios
@@ -224,8 +227,10 @@ pub fn library_marker() -> i32 { 42 }
 EOF
 
     run_in "$dir" "$AST_INDEX" rebuild || { fail "rebuild exited non-zero"; return 1; }
-    assert_contains "$LAST_OUTPUT" "Detected project type: Rust" "rebuild output" || return 1
     assert_contains "$LAST_OUTPUT" "Indexed 2 files" "rebuild file count" || return 1
+
+    run_in "$dir" "$AST_INDEX" detect-stacks || { fail "detect-stacks exited non-zero"; return 1; }
+    assert_contains "$LAST_OUTPUT" "Rust (rust)" "detected project stack" || return 1
 
     run_in "$dir" "$AST_INDEX" search smoke_fresh_marker || { fail "search exited non-zero"; return 1; }
     assert_contains "$LAST_OUTPUT" "smoke_fresh_marker" "search result" || return 1
@@ -233,9 +238,6 @@ EOF
 
     run_in "$dir" "$AST_INDEX" stats --format json || { fail "stats --format json exited non-zero"; return 1; }
     assert_json_valid "$LAST_OUTPUT" "stats json" || return 1
-    local proj
-    proj=$(printf '%s' "$LAST_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['project'])")
-    assert_eq "$proj" "Rust" "stats.project" || return 1
     local files
     files=$(printf '%s' "$LAST_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['stats']['file_count'])")
     assert_eq "$files" "2" "stats.file_count" || return 1
@@ -305,6 +307,8 @@ scenario_extra_roots() {
     local primary="$1/primary"
     local extra="$1/extra"
     mkdir -p "$primary/src" "$extra/src"
+    local extra_canonical
+    extra_canonical=$(cd "$extra" && pwd -P)
 
     cat > "$primary/Cargo.toml" <<'EOF'
 [package]
@@ -338,7 +342,7 @@ EOF
     assert_contains "$LAST_OUTPUT" "extra_root_unique_marker" "extra-root symbol present" || return 1
     # Regression: the path MUST be absolute (resolved against extra root),
     # not a bare 'src/lib.rs' which would be ambiguous.
-    assert_contains "$LAST_OUTPUT" "$extra/src/lib.rs" "extra-root path is absolute" || return 1
+    assert_contains "$LAST_OUTPUT" "$extra_canonical/src/lib.rs" "extra-root path is absolute" || return 1
 
     # The primary symbol should still be searchable.
     run_in "$primary" "$AST_INDEX" search primary_marker || { fail "search primary symbol"; return 1; }
@@ -383,7 +387,7 @@ print('YES' if any(s.get('name') == 'json_marker' for s in syms) else 'NO')
 
     run_in "$dir" "$AST_INDEX" stats --format json || { fail "stats --format json"; return 1; }
     assert_json_valid "$LAST_OUTPUT" "stats json output" || return 1
-    for key in project stats db_path db_size_bytes; do
+    for key in stats db_path db_size_bytes; do
         assert_json_key "$LAST_OUTPUT" "$key" "stats json" || return 1
     done
 

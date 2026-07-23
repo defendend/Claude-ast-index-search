@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
+use rusqlite::OptionalExtension;
 
 use crate::db::SymbolKind;
 
@@ -52,7 +53,7 @@ pub fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize, format: &
         return Ok(());
     }
 
-    let conn = db::open_db(root)?;
+    let conn = db::open_db_leased(root)?;
 
     let search_pattern = if exact {
         pattern.to_string()
@@ -60,7 +61,7 @@ pub fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize, format: &
         pattern.to_string()
     };
     let files = db::find_files_with_roots(&conn, &search_pattern, limit)?;
-    let resolver = super::PathResolver::from_conn(root, &conn);
+    let resolver = super::PathResolver::try_from_conn(root, &conn)?;
     let files: Vec<String> = files
         .into_iter()
         .filter(|f| resolver.matches_filter(f.root_path.as_deref()))
@@ -365,14 +366,15 @@ pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
 
     // Also try looking up module path from DB
     if !module_dir.exists() {
-        if let Ok(conn) = crate::db::open_db(root) {
+        if let Some(_cache_lease) = crate::db::acquire_project_lease_if_initialized(root)? {
+            let conn = crate::db::open_db_leased(root)?;
             let db_path: Option<String> = conn
                 .query_row(
                     "SELECT path FROM modules WHERE name = ?1",
                     rusqlite::params![module_path],
                     |row| row.get(0),
                 )
-                .ok();
+                .optional()?;
             if let Some(p) = db_path {
                 let alt = root.join(&p);
                 if alt.exists() {

@@ -34,7 +34,7 @@ use grep_regex::RegexMatcher;
 use grep_searcher::MmapChoice;
 use grep_searcher::{sinks::UTF8, SearcherBuilder};
 use ignore::WalkBuilder;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::db;
 
@@ -64,18 +64,32 @@ pub struct PathResolver {
 }
 
 impl PathResolver {
+    /// Build a resolver with the historical best-effort behaviour. Database
+    /// errors fall back to a primary-only resolver.
     pub fn from_conn(primary: &Path, conn: &Connection) -> Self {
+        Self::try_from_conn(primary, conn)
+            .unwrap_or_else(|_| Self::from_subtrees(primary, Vec::new()))
+    }
+
+    /// Build a resolver while propagating subtree metadata errors.
+    pub fn try_from_conn(primary: &Path, conn: &Connection) -> Result<Self> {
+        // Direct pre-3.47 connections have not gone through open_db's eager
+        // migration. The compatibility shim upgrades metadata.extra_roots
+        // transactionally before we read the named subtree rows.
+        db::get_extra_roots(conn)?;
+        Ok(Self::from_subtrees(primary, db::list_subtrees(conn)?))
+    }
+
+    fn from_subtrees(primary: &Path, subtrees: Vec<db::Subtree>) -> Self {
         let primary_key = db::normalize_root_for_storage(primary);
-        let extra = db::get_extra_roots(conn)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|root| {
-                let path = PathBuf::from(&root);
+        let extra = subtrees
+            .iter()
+            .map(|subtree| {
+                let path = PathBuf::from(&subtree.canonical_path);
                 (db::normalize_root_for_storage(&path), path)
             })
             .collect();
-        let subtree_names = db::list_subtrees(conn)
-            .unwrap_or_default()
+        let subtree_names = subtrees
             .into_iter()
             .map(|s| (s.canonical_path, s.name))
             .collect();
@@ -219,23 +233,46 @@ impl PathResolver {
 
 /// Check if no_ignore mode is enabled for this project
 pub fn is_no_ignore_enabled(root: &Path) -> bool {
-    if let Ok(conn) = db::open_db(root) {
-        let result: Result<String, _> = conn.query_row(
+    try_is_no_ignore_enabled(root).unwrap_or(false)
+}
+
+/// Strict variant of [`is_no_ignore_enabled`] for production command paths.
+pub fn try_is_no_ignore_enabled(root: &Path) -> Result<bool> {
+    let Some(_cache_lease) = db::acquire_project_lease_if_initialized(root)? else {
+        return Ok(false);
+    };
+    let conn = db::open_db_leased(root)?;
+    let value: Option<String> = conn
+        .query_row(
             "SELECT value FROM metadata WHERE key = 'no_ignore'",
             [],
             |row| row.get(0),
-        );
-        return result.map(|v| v == "1").unwrap_or(false);
-    }
-    false
+        )
+        .optional()
+        .context("failed to read metadata.no_ignore")?;
+    Ok(value.as_deref() == Some("1"))
 }
 
 /// Check if the last rebuild for this project used experimental fast rebuild mode.
 pub fn is_experimental_fast_rebuild_enabled(root: &Path) -> bool {
-    if let Ok(conn) = db::open_db(root) {
-        return db::is_experimental_fast_rebuild_enabled_in_db(&conn);
-    }
-    false
+    try_is_experimental_fast_rebuild_enabled(root).unwrap_or(false)
+}
+
+/// Strict variant of [`is_experimental_fast_rebuild_enabled`] for production commands.
+pub fn try_is_experimental_fast_rebuild_enabled(root: &Path) -> Result<bool> {
+    let Some(_cache_lease) = db::acquire_project_lease_if_initialized(root)? else {
+        return Ok(false);
+    };
+    let conn = db::open_db_leased(root)?;
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'experimental_fast_rebuild'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read metadata.experimental_fast_rebuild")?;
+    Ok(value.as_deref() == Some("1"))
 }
 
 /// Get number of available CPU cores
@@ -264,7 +301,7 @@ where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
-    let no_ignore = is_no_ignore_enabled(root);
+    let no_ignore = try_is_no_ignore_enabled(root)?;
     let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
     let arc_root = if no_ignore {
         None
@@ -355,7 +392,7 @@ where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
-    let no_ignore = is_no_ignore_enabled(root);
+    let no_ignore = try_is_no_ignore_enabled(root)?;
     let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
     let arc_root = if no_ignore {
         None
