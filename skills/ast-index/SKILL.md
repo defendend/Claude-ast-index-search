@@ -235,13 +235,59 @@ ast-index unused-symbols --export-only             # Only exported (public) symb
 
 ### Git/Arc Integration
 
-**`changed`** - Show symbols changed in git/arc diff. Auto-detects VCS and base branch.
+**`changed`** - Fast branch-level file summary from the detected Git/Arc
+repository. It compares `merge-base(base, HEAD)` to `HEAD` and reports
+repository-relative paths with `A` (added), `M` (modified), `D` (deleted), or
+`R` (renamed) status. Without `--base`, Git resolves `origin/HEAD`, then tries
+`origin/main`, `origin/master`, `main`, `master`, and `trunk`; Arc uses
+`trunk`. For renames, JSON includes `old_path`.
 
 ```bash
-ast-index changed                        # Auto: trunk (arc) or origin/main (git)
-ast-index changed --base main            # Explicit base branch
-ast-index changed --base trunk           # For arc projects
+ast-index changed                              # Auto-detect Git base; Arc uses trunk
+ast-index changed --base main                  # Explicit base branch
+ast-index --format json changed --base trunk   # Stable JSON schema v1
+ast-index changed --timeout-ms 30000           # Bound VCS execution time
+ast-index changed --verbose                    # Exact VCS argv and timing on stderr
 ```
+
+Example text output:
+
+```text
+Changed files against main (5):
+  A  src/new.rs
+  M  src/lib.rs
+  D  src/obsolete.rs
+  R  src/old.rs -> src/current.rs
+  M  src/generated\nname.rs
+```
+
+Text mode escapes control characters and backslashes so each result stays on
+one line. Scripts should request JSON instead of parsing the text summary.
+
+Example JSON output:
+
+```json
+{
+  "schema_version": 1,
+  "vcs": "git",
+  "base": "main",
+  "head": "HEAD",
+  "scope": null,
+  "changes": [
+    { "status": "M", "path": "src/lib.rs" },
+    { "status": "R", "path": "src/current.rs", "old_path": "src/old.rs" }
+  ]
+}
+```
+
+At repository root `scope` is `null`; in a nested working directory it is the
+repository-relative directory path.
+
+`changed` reads VCS state directly and does not depend on the ast-index
+database/cache. Its scope is the current working directory, but output paths
+remain relative to the repository root. Use it to inventory branch files
+before review; use raw `git diff` / `arc diff` for patch hunks. It does not
+report changed symbols or include staged/unstaged working-tree-only edits.
 
 ### Public API
 
@@ -615,7 +661,7 @@ Consult: `references/module-commands.md`
 5. Use `ast-index class` for precise class/interface lookup
 6. Use `ast-index usages` to find all references before refactoring
 7. Use `ast-index implementations` to understand inheritance
-8. Use `ast-index changed --base main` before code review
+8. Use `ast-index changed --base main` to inventory branch files before code review
 9. Run `ast-index update` periodically to keep index fresh
 
 ## JSON Output (Optional)
@@ -624,10 +670,10 @@ Consult: `references/module-commands.md`
 
 Add `--format json` only when:
 - Parsing output programmatically (pipelines, scripts)
-- Need exact field values (file paths, line numbers, symbol kinds)
+- Need exact field values (file paths, statuses, line numbers, symbol kinds)
 - Integrating with another tool
 
-Supported commands: `search`, `symbol`, `class`, `usages`, `implementations`, `refs`, `stats`, `unused-symbols`, `map`, `conventions`.
+Supported commands: `search`, `symbol`, `class`, `usages`, `implementations`, `refs`, `stats`, `changed`, `unused-symbols`, `map`, `conventions`.
 
 ```bash
 ast-index search "Query" --format json | jq '.results[].path'
