@@ -242,10 +242,66 @@ ast-index usages <SYMBOL>          # Symbol usages
 ast-index callers <FUNCTION>       # Function call sites
 ast-index implementations <PARENT> # Find implementations
 ast-index hierarchy <CLASS>        # Class hierarchy tree
-ast-index changed [--base BRANCH]  # Changed symbols
+ast-index changed [--base BRANCH]  # Branch-level changed files (A/M/D/R)
 ast-index todo [PATTERN]           # TODO/FIXME/HACK comments
 ast-index deprecated [QUERY]       # Deprecated items
 ```
+
+### Changed files on the current branch
+
+`changed` asks the detected Git or Arc repository for the files changed from
+`merge-base(base, HEAD)` to `HEAD`. Without `--base`, Git resolves
+`origin/HEAD`, then tries `origin/main`, `origin/master`, `main`, `master`, and
+`trunk`; Arc uses `trunk`. It reads VCS state directly, so it works without an
+ast-index database and does not require `rebuild` or `update`. Results are
+scoped to the current working directory, while paths remain
+repository-relative. Staged and unstaged working-tree edits are not included.
+
+```bash
+# Compact text summary
+ast-index changed
+
+# Stable schema v1; the VCS timeout defaults to 30000 ms
+ast-index --format json changed --base origin/main --timeout-ms 30000
+
+# Print the detected root, scope, exact VCS argv, and timing to stderr
+ast-index changed --verbose
+```
+
+Text output uses `A` (added), `M` (modified), `D` (deleted), and `R` (renamed):
+
+```text
+Changed files against origin/main (3):
+  M  README.md
+  R  docs/old-guide.md -> docs/setup-guide.md
+  M  docs/generated\nname.md
+```
+
+Control characters and backslashes in text paths are escaped, so every change
+stays on one output line. Use JSON instead of parsing this human-readable
+summary in scripts.
+
+JSON output preserves rename metadata:
+
+```json
+{
+  "schema_version": 1,
+  "vcs": "git",
+  "base": "origin/main",
+  "head": "HEAD",
+  "scope": null,
+  "changes": [
+    { "status": "M", "path": "README.md" },
+    { "status": "R", "path": "docs/setup-guide.md", "old_path": "docs/old-guide.md" }
+  ]
+}
+```
+
+At the repository root, `scope` is `null`; from a nested working directory it
+is that repository-relative directory path.
+
+This is a fast file summary for branch review, not a changed-symbol report and
+not a replacement for `git diff` / `arc diff` when patch hunks are needed.
 
 ### Module analysis
 
@@ -474,3 +530,21 @@ exclude:
   - "generated"
   - "proto/gen"
 ```
+
+## Changelog
+
+### 3.50.0
+
+- **Review branch changes quickly without building an index** — use `changed`
+  from the CLI or MCP to read cache-independent Git/Arc branch changes with
+  added, modified, deleted, and renamed files, rename metadata,
+  working-directory scope, a bounded VCS timeout, Git base auto-detection, and
+  stable JSON schema v1.
+- **Migrate `changed` consumers to the file-level contract** — text output now
+  prints an A/M/D/R file summary instead of regex-derived declaration
+  pseudo-symbols. Scripts should request `--format json` and read
+  `changes[].status`, `changes[].path`, and `changes[].old_path` for renames.
+  Library callers can use the deprecated Rust compatibility wrappers while
+  migrating to the new API.
+
+See [CHANGELOG.md](CHANGELOG.md) for earlier releases.

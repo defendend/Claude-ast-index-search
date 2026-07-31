@@ -1,14 +1,11 @@
 //! Integration tests for `commands::files` public APIs.
 //!
-//! Covers VCS detection, branch detection helpers, and the file-oriented
-//! commands (`cmd_file`, `cmd_outline`, `cmd_imports`, `cmd_changed`)
-//! that are user-facing entry points but had zero integration coverage.
+//! Covers the file-oriented commands (`cmd_file`, `cmd_outline`,
+//! `cmd_imports`) that are user-facing entry points.
 
 use std::{fs, process::Command};
 
-use ast_index::commands::files::{
-    cmd_changed, cmd_file, cmd_imports, cmd_outline, detect_git_default_branch, detect_vcs,
-};
+use ast_index::commands::files::{cmd_file, cmd_imports, cmd_outline};
 use ast_index::db;
 use tempfile::TempDir;
 
@@ -19,73 +16,6 @@ fn open_fresh_db(project_root: &std::path::Path) -> rusqlite::Connection {
     let conn = db::open_db(project_root).unwrap();
     db::init_db(&conn).unwrap();
     conn
-}
-
-// ----------------------------------------------------------------------
-// detect_vcs
-// ----------------------------------------------------------------------
-
-#[test]
-fn detect_vcs_returns_git_for_git_repo() {
-    let dir = TempDir::new().unwrap();
-    fs::create_dir(dir.path().join(".git")).unwrap();
-
-    assert_eq!(detect_vcs(dir.path()), "git");
-}
-
-#[test]
-fn detect_vcs_returns_arc_when_arc_head_present() {
-    let dir = TempDir::new().unwrap();
-    fs::create_dir(dir.path().join(".arc")).unwrap();
-    fs::write(dir.path().join(".arc").join("HEAD"), "trunk\n").unwrap();
-
-    assert_eq!(
-        detect_vcs(dir.path()),
-        "arc",
-        ".arc/HEAD must mark this as an arc repo"
-    );
-}
-
-#[test]
-fn detect_vcs_arc_wins_over_git_when_both_present() {
-    // Real-world: a fork with both .git and .arc directories.
-    let dir = TempDir::new().unwrap();
-    fs::create_dir(dir.path().join(".git")).unwrap();
-    fs::create_dir(dir.path().join(".arc")).unwrap();
-    fs::write(dir.path().join(".arc").join("HEAD"), "trunk\n").unwrap();
-
-    assert_eq!(
-        detect_vcs(dir.path()),
-        "arc",
-        "ancestor walk hits .arc first; ancestors are checked in order"
-    );
-}
-
-#[test]
-fn detect_vcs_defaults_to_git_when_nothing_found() {
-    let dir = TempDir::new().unwrap();
-    // No VCS markers at all.
-    assert_eq!(
-        detect_vcs(dir.path()),
-        "git",
-        "fallback must be git for the common case"
-    );
-}
-
-// ----------------------------------------------------------------------
-// detect_git_default_branch
-// ----------------------------------------------------------------------
-
-#[test]
-fn detect_git_default_branch_falls_back_when_not_a_git_repo() {
-    // No .git here — git commands fail, so the helper must fall back
-    // to the documented default ("origin/main") rather than panic.
-    let dir = TempDir::new().unwrap();
-    let branch = detect_git_default_branch(dir.path());
-    assert_eq!(
-        branch, "origin/main",
-        "documented fallback must be origin/main"
-    );
 }
 
 // ----------------------------------------------------------------------
@@ -220,18 +150,4 @@ fn cmd_imports_handles_file_with_no_imports() {
     fs::write(&src, "package demo\n\nclass Bare\n").unwrap();
 
     cmd_imports(dir.path(), "Bare.kt").expect("file with no imports must succeed");
-}
-
-// ----------------------------------------------------------------------
-// cmd_changed
-// ----------------------------------------------------------------------
-
-#[test]
-fn cmd_changed_handles_no_vcs_gracefully() {
-    // No git/arc here — vcs commands fail, but the helper must
-    // surface a friendly message and return Ok rather than bubbling up
-    // a process-spawn error.
-    let dir = TempDir::new().unwrap();
-    cmd_changed(dir.path(), "origin/main")
-        .expect("missing VCS must print a friendly hint, not error");
 }

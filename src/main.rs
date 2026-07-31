@@ -37,7 +37,7 @@ Search & Navigation:
   usages                 Find usages of a symbol
   outline                Show symbols in a file
   imports                Show imports in a file
-  changed                Show changed symbols (git/arc diff)
+  changed                Show changed files (git/arc branch diff)
 
 Module Commands:
   module                 Find modules
@@ -552,11 +552,17 @@ enum Commands {
         #[arg(short, long, default_value = "100")]
         limit: usize,
     },
-    /// Show changed symbols (git/arc diff)
+    /// Show changed files in the current branch (git/arc)
     Changed {
-        /// Base branch (auto-detected: trunk for arc, origin/main for git)
+        /// Base branch (default: trunk for arc; auto-detected for git)
         #[arg(long)]
         base: Option<String>,
+        /// VCS subprocess wall-clock timeout in milliseconds
+        #[arg(long, default_value = "30000")]
+        timeout_ms: u64,
+        /// Print VCS/root/timing diagnostics to stderr
+        #[arg(long)]
+        verbose: bool,
     },
     // === iOS Commands ===
     /// Find class usages in storyboards/xibs (iOS)
@@ -780,6 +786,11 @@ fn main() -> Result<()> {
     // formatters in subagents) can branch on text vs JSON without us
     // threading `format` through every signature.
     std::env::set_var("AST_INDEX_FORMAT", cli.format.as_str());
+    if matches!(&cli.command, Commands::Changed { .. }) && cli.subtree.is_some() {
+        return Err(anyhow::anyhow!(
+            "--subtree is not supported by 'changed'; invoke it from the desired directory"
+        ));
+    }
     // Conflict guard: --subtree and --local both narrow the workspace, but
     // they narrow it differently, so combining them is meaningless.
     if cli.subtree.is_some() && cli.local {
@@ -808,9 +819,15 @@ fn main() -> Result<()> {
             | Commands::DetectStacks
             | Commands::InstallGitHooks { .. }
             | Commands::Agrep { .. }
+            | Commands::Changed { .. }
     );
+    let changed_command = matches!(&cli.command, Commands::Changed { .. });
     let release_command_publication = matches!(&cli.command, Commands::Watch);
-    let (root, mut command_cache_lease) = if cache_independent {
+    let (root, mut command_cache_lease) = if changed_command {
+        // `changed` discovers only VCS markers from the invocation directory.
+        // It must never probe or create the ast-index cache.
+        (std::env::current_dir()?, None)
+    } else if cache_independent {
         // These commands use only the working tree or executable metadata.
         // Keep root detection best-effort so a broken cache path cannot make
         // `version`, stack detection, installers, hooks, or ast-grep fail.
@@ -1126,16 +1143,11 @@ fn main() -> Result<()> {
         Commands::Api { module_path, limit } => {
             commands::files::cmd_api(&root, &module_path, limit)
         }
-        Commands::Changed { base } => {
-            let vcs = commands::files::detect_vcs(&root);
-            let default_base = if vcs == "arc" {
-                "trunk"
-            } else {
-                commands::files::detect_git_default_branch(&root)
-            };
-            let base = base.as_deref().unwrap_or(default_base);
-            commands::files::cmd_changed(&root, base)
-        }
+        Commands::Changed {
+            base,
+            timeout_ms,
+            verbose,
+        } => commands::changed::cmd_changed(&root, base.as_deref(), timeout_ms, verbose, format),
         // Android commands
         Commands::XmlUsages { class_name, module } => {
             commands::android::cmd_xml_usages(&root, &class_name, module.as_deref())

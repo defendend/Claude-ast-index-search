@@ -400,12 +400,14 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "changed",
-            "description": "List symbols that changed since a base git/arc branch — additions, modifications, deletions. Essential for code-review prep, changelog generation, 'what did I actually change' questions. Default base is `origin/main` for git repos, `trunk` for arc repos.",
+            "description": "Summarize files changed on the current Git/Arc branch from merge-base(base, HEAD) to HEAD; staged and unstaged working-tree edits are not included. Returns repo-relative current paths with A/M/D/R statuses and `old_path` for renames. This is branch-level file metadata, not changed symbols or a replacement for a raw VCS diff. It is independent of the ast-index database/cache; `project_root` sets the working-directory scope.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "base":         { "type": "string", "description": "Base branch name. Defaults to 'origin/main' (git) or 'trunk' (arc)." },
-                    "project_root": { "type": "string", "description": "Absolute path to project root. Optional." }
+                    "base":         { "type": "string",  "description": "Base branch or revision. The comparison is merge-base(base, HEAD) to HEAD. Omit to resolve Git origin/HEAD, then try origin/main, origin/master, main, master, and trunk; Arc uses trunk." },
+                    "timeout_ms":   { "type": "integer", "description": "VCS command timeout in milliseconds (default 30000)." },
+                    "project_root": { "type": "string",  "description": "Working directory used as the scope. Results are limited to this subtree but paths remain repository-relative. Optional." },
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact A/M/D/R summary); pass 'json' for schema v1." }
                 }
             }
         }),
@@ -501,11 +503,14 @@ fn call_tool(params: Value, ast_index_bin: &str, default_root: &PathBuf) -> Resu
 
     let stdout = String::from_utf8(output.stdout).context("ast-index produced non-UTF8 output")?;
 
-    let rendered = match output_format {
-        "json" => stdout, // caller asked for raw JSON — pass through
-        _ => format::to_compact(name, &stdout),
-    };
-    Ok(rendered)
+    Ok(render_tool_output(name, output_format, stdout))
+}
+
+fn render_tool_output(tool: &str, output_format: &str, stdout: String) -> String {
+    match output_format {
+        "json" => stdout,
+        _ => format::to_compact(tool, &stdout),
+    }
 }
 
 /// Whether the underlying ast-index command honours `--format json`.
@@ -522,6 +527,7 @@ fn supports_json_format(tool: &str) -> bool {
             | "stats"
             | "symbol"
             | "class"
+            | "changed"
     )
 }
 
@@ -660,7 +666,8 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         }
         "changed" => {
             argv.push("changed".into());
-            push_if_str(&mut argv, &arguments, "base", "--base");
+            push_if_str(&mut argv, arguments, "base", "--base");
+            push_if_num(&mut argv, arguments, "timeout_ms", "--timeout-ms");
         }
         "module" => {
             argv.push("module".into());
@@ -912,13 +919,88 @@ mod tests {
     #[test]
     fn changed_no_args_omits_base() {
         let argv = build_argv("changed", &json!({})).unwrap();
-        assert_eq!(argv, vec!["changed"]);
+        assert_eq!(argv, vec!["changed", "--format", "json"]);
     }
 
     #[test]
-    fn changed_with_base() {
-        let argv = build_argv("changed", &json!({"base": "develop"})).unwrap();
-        assert_eq!(argv, vec!["changed", "--base", "develop"]);
+    fn changed_forwards_base_timeout_and_internal_json_format() {
+        let argv = build_argv(
+            "changed",
+            &json!({"base": "develop", "timeout_ms": 45000, "format": "text"}),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "changed",
+                "--base",
+                "develop",
+                "--timeout-ms",
+                "45000",
+                "--format",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn changed_descriptor_documents_file_level_contract() {
+        let descriptor = tool_descriptors()
+            .into_iter()
+            .find(|tool| tool["name"] == "changed")
+            .unwrap();
+        let description = descriptor["description"].as_str().unwrap();
+        assert!(description.contains("A/M/D/R"));
+        assert!(description.contains("old_path"));
+        assert!(description.contains("independent"));
+        assert!(!description.contains("List symbols"));
+        let base_description = descriptor["inputSchema"]["properties"]["base"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(base_description.contains("origin/HEAD"));
+        assert!(base_description.contains("Arc uses trunk"));
+        assert_eq!(
+            descriptor["inputSchema"]["properties"]["format"]["enum"],
+            json!(["text", "json"])
+        );
+        assert_eq!(
+            descriptor["inputSchema"]["properties"]["timeout_ms"]["type"],
+            "integer"
+        );
+    }
+
+    #[test]
+    fn changed_raw_json_is_opt_in_and_preserved_verbatim() {
+        let raw = concat!(
+            "{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"vcs\": \"git\",\n",
+            "  \"base\": \"origin/main\",\n",
+            "  \"head\": \"HEAD\",\n",
+            "  \"scope\": null,\n",
+            "  \"changes\": []\n",
+            "}\n"
+        )
+        .to_string();
+        assert_eq!(render_tool_output("changed", "json", raw.clone()), raw);
+        assert_ne!(render_tool_output("changed", "text", raw.clone()), raw);
+    }
+
+    #[test]
+    fn nonzero_child_exit_remains_an_mcp_tool_error() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({"name": "changed", "arguments": {}}),
+        };
+        let response = handle_request(request, "false", &PathBuf::from(".")).unwrap();
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ast-index exited with"));
     }
 
     #[test]
@@ -947,6 +1029,7 @@ mod tests {
             "stats",
             "symbol",
             "class",
+            "changed",
         ];
         let no = [
             "outline",
@@ -957,7 +1040,6 @@ mod tests {
             "hierarchy",
             "imports",
             "api",
-            "changed",
             "module",
             "deps",
             "dependents",

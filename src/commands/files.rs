@@ -5,7 +5,7 @@
 //! - outline: Show file symbols outline
 //! - imports: Show file imports
 //! - api: Show module public API
-//! - changed: Show changed symbols in git diff
+//! - changed: See [`super::changed`]
 
 use std::path::{Path, PathBuf};
 
@@ -431,185 +431,20 @@ pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-/// Detect which VCS is used in the project directory
-pub fn detect_vcs(root: &Path) -> &'static str {
-    let home = std::env::var("HOME").ok().map(PathBuf::from);
-
-    for ancestor in root.ancestors() {
-        // Stop at home directory to avoid false positives from ~/.arc
-        if let Some(ref h) = home {
-            if ancestor == h.as_path() {
-                break;
-            }
-        }
-
-        // .arc/HEAD distinguishes real arc repo from ~/.arc (client storage)
-        if ancestor.join(".arc").join("HEAD").exists() || ancestor.join(".arcconfig").exists() {
-            return "arc";
-        }
-        if ancestor.join(".git").exists() {
-            return "git";
-        }
-    }
-    "git"
-}
-
-/// Get merge-base between HEAD and the given base branch
-fn get_merge_base(root: &Path, vcs: &str, base: &str) -> Result<String> {
-    let output = std::process::Command::new(vcs)
-        .args(["merge-base", "HEAD", base])
-        .current_dir(root)
-        .output()?;
-
-    if !output.status.success() {
-        // Fallback to direct base if merge-base fails
-        return Ok(base.to_string());
-    }
-
-    Ok(std::str::from_utf8(&output.stdout)?.trim().to_string())
-}
-
-/// Detect default git remote branch (origin/main or origin/master)
-pub fn detect_git_default_branch(root: &Path) -> &'static str {
-    // Try symbolic-ref to get remote HEAD (e.g. "refs/remotes/origin/main")
-    if let Ok(output) = std::process::Command::new("git")
-        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
-        .current_dir(root)
-        .output()
-    {
-        if output.status.success() {
-            let refname = String::from_utf8_lossy(&output.stdout);
-            let refname = refname.trim();
-            // Extract branch name after "refs/remotes/origin/"
-            if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
-                return match branch {
-                    "main" => "origin/main",
-                    "master" => "origin/master",
-                    "trunk" => "origin/trunk",
-                    "develop" => "origin/develop",
-                    _ => "origin/main",
-                };
-            }
-        }
-    }
-
-    // Fallback: check common branch names
-    for branch in &["origin/main", "origin/master", "origin/trunk"] {
-        if let Ok(output) = std::process::Command::new("git")
-            .args(["rev-parse", "--verify", branch])
-            .current_dir(root)
-            .output()
-        {
-            if output.status.success() {
-                return branch;
-            }
-        }
-    }
-
-    "origin/main"
-}
-
-/// Normalize base branch for the given VCS
-fn normalize_base_for_vcs(vcs: &str, base: &str) -> String {
-    if vcs == "arc" {
-        // Arc doesn't use origin/ prefix
-        base.strip_prefix("origin/").unwrap_or(base).to_string()
-    } else {
-        base.to_string()
-    }
-}
-
-/// Show changed symbols in git/arc diff
+/// Compatibility entry point for the legacy changed command API.
+#[deprecated(note = "use commands::changed::cmd_changed for structured changed-file output")]
 pub fn cmd_changed(root: &Path, base: &str) -> Result<()> {
-    let vcs = detect_vcs(root);
-    let base = normalize_base_for_vcs(vcs, base);
+    super::changed::cmd_changed(root, Some(base), 30_000, false, "text")
+}
 
-    // Find merge-base to only show changes from the current branch
-    let merge_base = get_merge_base(root, vcs, &base)?;
+/// Compatibility entry point for callers that detect the repository VCS.
+#[deprecated(note = "the changed command now detects its VCS internally")]
+pub fn detect_vcs(root: &Path) -> &'static str {
+    super::changed::detect_vcs_compat(root)
+}
 
-    // Get list of changed files
-    let output = std::process::Command::new(vcs)
-        .args(["diff", "--name-only", &merge_base])
-        .current_dir(root)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = std::str::from_utf8(&output.stderr).unwrap_or("");
-        println!(
-            "{}",
-            format!("Failed to get {} diff: {}", vcs, stderr.trim()).red()
-        );
-        return Ok(());
-    }
-
-    let changed_files: Vec<&str> = std::str::from_utf8(&output.stdout)?
-        .lines()
-        .filter(|f| {
-            f.ends_with(".kt")
-                || f.ends_with(".java")
-                || f.ends_with(".swift")
-                || f.ends_with(".m")
-                || f.ends_with(".h")
-                || f.ends_with(".pm")
-                || f.ends_with(".pl")
-                || f.ends_with(".t")
-        })
-        .collect();
-
-    if changed_files.is_empty() {
-        println!("No supported files changed since {}", base);
-        return Ok(());
-    }
-
-    println!(
-        "{}",
-        format!(
-            "Changed symbols since '{}' ({} files):",
-            base,
-            changed_files.len()
-        )
-        .bold()
-    );
-
-    // Parse changed files for symbols
-    let class_re = Regex::new(r"(?m)^\s*(class|interface|object|enum\s+class)\s+(\w+)")?;
-    let fun_re = Regex::new(r"(?m)^\s*(?:override\s+)?(?:suspend\s+)?fun\s+(\w+)")?;
-
-    for file in &changed_files {
-        let file_path = root.join(file);
-        if !file_path.exists() {
-            continue;
-        }
-
-        let content = match std::fs::read_to_string(&file_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let mut symbols: Vec<String> = vec![];
-
-        for line in content.lines() {
-            if let Some(caps) = class_re.captures(line) {
-                let kind = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                let name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                symbols.push(format!("{} {}", kind, name));
-            }
-            if let Some(caps) = fun_re.captures(line) {
-                let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                symbols.push(format!("fun {}", name));
-            }
-        }
-
-        if !symbols.is_empty() {
-            println!("\n  {}:", file.cyan());
-            for sym in symbols.iter().take(10) {
-                println!("    {}", sym);
-            }
-            if symbols.len() > 10 {
-                println!("    ... and {} more", symbols.len() - 10);
-            }
-        }
-    }
-
-    Ok(())
+/// Compatibility entry point for callers that detect the default Git base.
+#[deprecated(note = "omit --base to let commands::changed::cmd_changed detect the Git base")]
+pub fn detect_git_default_branch(root: &Path) -> &'static str {
+    super::changed::detect_git_default_branch_compat(root)
 }

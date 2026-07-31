@@ -119,15 +119,65 @@ ast-index annotations "RestController"
 ast-index deprecated
 ```
 
-### Changed Code (Git/Arc diff)
+### Changed files on a branch (Git/Arc)
 
 ```bash
-# Show symbols changed vs main branch
+# Auto-detect the Git base; Arc uses trunk
 ast-index changed
 
-# Changed symbols in a specific branch
+# Compare merge-base(origin/develop, HEAD) to HEAD
 ast-index changed --base origin/develop
+
+# Structured output; VCS timeout defaults to 30000 ms
+ast-index --format json changed --base origin/develop --timeout-ms 30000
+
+# Print the detected root, scope, exact VCS argv, and timing to stderr
+ast-index changed --verbose
 ```
+
+`changed` is a cache-independent branch summary: it does not read the
+ast-index database, so no `rebuild` or `update` is required. The current
+working directory defines the scope; returned paths remain relative to the
+repository root. Staged and unstaged working-tree edits are not included.
+Without `--base`, Git resolves `origin/HEAD`, then tries `origin/main`,
+`origin/master`, `main`, `master`, and `trunk`; Arc uses `trunk`.
+
+Text output reports added, modified, deleted, and renamed files:
+
+```text
+Changed files against origin/develop (5):
+  A  docs/new-guide.md
+  M  README.md
+  D  docs/obsolete.md
+  R  docs/old-name.md -> docs/new-name.md
+  M  docs/generated\nname.md
+```
+
+Control characters and backslashes in text paths are escaped, keeping each
+change on one output line. Scripts should consume JSON rather than parse this
+human-readable summary.
+
+JSON uses schema v1 and keeps the old path for renames:
+
+```json
+{
+  "schema_version": 1,
+  "vcs": "git",
+  "base": "origin/develop",
+  "head": "HEAD",
+  "scope": null,
+  "changes": [
+    { "status": "M", "path": "README.md" },
+    { "status": "R", "path": "docs/new-name.md", "old_path": "docs/old-name.md" }
+  ]
+}
+```
+
+At repository root `scope` is `null`; in a nested working directory it is the
+repository-relative directory path.
+
+Use raw `git diff` / `arc diff` when you need patch hunks. `changed` reports
+files and statuses, not changed declarations or symbols.
 
 ### Structural Search (ast-grep)
 
@@ -249,6 +299,7 @@ Add `--format json` for structured output (useful for AI agents):
 ast-index --format json search "UserRepository"
 ast-index --format json symbol "fetchUser" --kind function
 ast-index --format json refs "UserRepository"
+ast-index --format json changed --base origin/main
 ```
 
 ## Supported Languages

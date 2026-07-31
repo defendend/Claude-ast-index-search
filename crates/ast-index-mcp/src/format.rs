@@ -39,6 +39,7 @@ pub fn to_compact(tool: &str, raw_json: &str) -> String {
         "symbol" | "class" | "implementations" => render_symbol_list(&value, &mut out),
         "file" | "find_file" => render_file_list(&value, &mut out),
         "stats" => render_stats(&value, &mut out),
+        "changed" => render_changed(&value, &mut out),
         _ => false,
     };
 
@@ -243,6 +244,88 @@ fn render_stats(v: &Value, out: &mut String) -> bool {
     true
 }
 
+fn render_changed(v: &Value, out: &mut String) -> bool {
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    if obj.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return false;
+    }
+
+    let (Some(vcs), Some(base), Some(head), Some(scope_value), Some(changes)) = (
+        obj.get("vcs").and_then(Value::as_str),
+        obj.get("base").and_then(Value::as_str),
+        obj.get("head").and_then(Value::as_str),
+        obj.get("scope"),
+        obj.get("changes").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    let scope = match scope_value {
+        Value::Null => ".",
+        Value::String(scope) => scope,
+        _ => return false,
+    };
+
+    let mut lines = Vec::with_capacity(changes.len());
+    for change in changes {
+        let (Some(status), Some(path)) = (
+            change.get("status").and_then(Value::as_str),
+            change.get("path").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+        let line = match status {
+            "A" | "M" | "D" => format!("{status} {}", escape_path(path)),
+            "R" => {
+                let Some(old_path) = change.get("old_path").and_then(Value::as_str) else {
+                    return false;
+                };
+                format!("R {} -> {}", escape_path(old_path), escape_path(path))
+            }
+            _ => return false,
+        };
+        lines.push(line);
+    }
+
+    let vcs = escape_path(vcs);
+    let base = escape_path(base);
+    let head = escape_path(head);
+    let scope = escape_path(scope);
+    writeln!(
+        out,
+        "Changed files from merge-base({base}, {head}) to {head} ({vcs}, scope={scope})"
+    )
+    .ok();
+    if lines.is_empty() {
+        writeln!(out, "(no changes)").ok();
+    } else {
+        for line in lines {
+            writeln!(out, "{line}").ok();
+        }
+    }
+    true
+}
+
+fn escape_path(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\0' => escaped.push_str("\\0"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{1b}' => escaped.push_str("\\x1b"),
+            value if value.is_control() => {
+                write!(escaped, "\\u{{{:x}}}", value as u32).ok();
+            }
+            value => escaped.push(value),
+        }
+    }
+    escaped
+}
+
 fn write_symbol_line(s: &Value, indent: &str, out: &mut String) {
     let name = s
         .get("qualified_name")
@@ -440,6 +523,91 @@ mod tests {
         assert!(!out.contains("xml_usages_count"));
         assert!(out.contains("db_size_mb: 1.00"));
         assert!(out.contains("db_path: /tmp/index.db"));
+    }
+
+    // --- changed ---
+
+    #[test]
+    fn changed_renders_schema_v1_with_all_statuses_and_rename_paths() {
+        let json = r#"{
+            "schema_version": 1,
+            "vcs": "git",
+            "base": "origin/main",
+            "head": "HEAD",
+            "scope": "crates/ast-index-mcp",
+            "changes": [
+                {"status": "A", "path": "src/new.rs"},
+                {"status": "M", "path": "src/lib.rs"},
+                {"status": "D", "path": "src/old.rs"},
+                {"status": "R", "path": "src/current.rs", "old_path": "src/former.rs"}
+            ]
+        }"#;
+        assert_eq!(
+            to_compact("changed", json),
+            concat!(
+                "Changed files from merge-base(origin/main, HEAD) to HEAD ",
+                "(git, scope=crates/ast-index-mcp)\n",
+                "A src/new.rs\n",
+                "M src/lib.rs\n",
+                "D src/old.rs\n",
+                "R src/former.rs -> src/current.rs"
+            )
+        );
+    }
+
+    #[test]
+    fn changed_empty_branch_is_explicit() {
+        let json = r#"{
+            "schema_version": 1,
+            "vcs": "arc",
+            "base": "trunk",
+            "head": "HEAD",
+            "scope": null,
+            "changes": []
+        }"#;
+        assert_eq!(
+            to_compact("changed", json),
+            concat!(
+                "Changed files from merge-base(trunk, HEAD) to HEAD (arc, scope=.)\n",
+                "(no changes)"
+            )
+        );
+    }
+
+    #[test]
+    fn changed_escapes_path_controls_but_preserves_unicode() {
+        let json = r#"{
+            "schema_version": 1,
+            "vcs": "git\rcli",
+            "base": "main\nbranch",
+            "head": "HEAD\tref",
+            "scope": "nested\t雪",
+            "changes": [
+                {"status": "M", "path": "src/tab\t雪.rs"},
+                {
+                    "status": "R",
+                    "path": "src/new\u001b雪.rs",
+                    "old_path": "src/old\nname.rs"
+                }
+            ]
+        }"#;
+        assert_eq!(
+            to_compact("changed", json),
+            concat!(
+                "Changed files from merge-base(main\\nbranch, HEAD\\tref) to ",
+                "HEAD\\tref (git\\rcli, scope=nested\\t雪)\n",
+                "M src/tab\\t雪.rs\n",
+                "R src/old\\nname.rs -> src/new\\x1b雪.rs"
+            )
+        );
+    }
+
+    #[test]
+    fn changed_unknown_schema_falls_back_without_losing_json() {
+        let json = r#"{"schema_version":2,"changes":[]}"#;
+        let rendered: Value = serde_json::from_str(&to_compact("changed", json)).unwrap();
+        let original: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(rendered, original);
     }
 
     // --- fall-through behaviour ---
