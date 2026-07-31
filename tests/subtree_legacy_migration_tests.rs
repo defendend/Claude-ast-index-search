@@ -436,4 +436,81 @@ fn open_db_migrates_legacy_schemas_atomically_and_idempotently() {
             }
         ])
     );
+
+    let auto_project = tmp.path().join("auto-sub-projects");
+    let auto_cache = tmp.path().join("auto-cache");
+    std::fs::create_dir(&auto_project).unwrap();
+    std::fs::create_dir(&auto_cache).unwrap();
+    for index in 0..20 {
+        let sub_project = auto_project.join(format!("project-{index:02}"));
+        std::fs::create_dir_all(sub_project.join("src")).unwrap();
+        std::fs::write(
+            sub_project.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"project-{index:02}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sub_project.join("src/lib.rs"),
+            format!("pub fn indexed_project_{index:02}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let auto_db = tmp.path().join("auto-sub-projects.sqlite");
+    db_path_override.set(&auto_db);
+    {
+        let conn = db::open_db(&auto_project).unwrap();
+        db::init_db(&conn).unwrap();
+        assert_eq!(metadata_value(&conn, "extra_roots"), None);
+        conn.execute("DROP TABLE subtrees", []).unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ast-index"))
+        .current_dir(&auto_project)
+        .env("AST_INDEX_DB_PATH", &auto_db)
+        .env("AST_INDEX_CACHE_DIR", &auto_cache)
+        .env("AST_INDEX_DISABLE_GC", "1")
+        .env_remove("KOTLIN_INDEX_DB_PATH")
+        .env_remove("AST_INDEX_MAX_FILES")
+        .arg("rebuild")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "auto sub-project rebuild failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Detected 20 sub-projects"),
+        "rebuild did not take the auto sub-project shortcut: {stderr}"
+    );
+    assert!(
+        !stdout.contains("no such table: subtrees") && !stderr.contains("no such table: subtrees"),
+        "legacy schema error escaped migration\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let conn = Connection::open(&auto_db).unwrap();
+    assert!(schema_object_exists(&conn, "table", "subtrees"));
+    assert_eq!(metadata_value(&conn, "extra_roots"), None);
+    let indexed_sub_projects: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE path GLOB 'project-*/src/lib.rs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed_sub_projects, 20);
+    for path in ["project-00/src/lib.rs", "project-19/src/lib.rs"] {
+        let indexed: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)",
+                [path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(indexed, "missing indexed sub-project source: {path}");
+    }
 }
