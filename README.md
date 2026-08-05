@@ -72,6 +72,16 @@ brew tap defendend/ast-index
 brew install ast-index
 ```
 
+### Cargo (from Git)
+
+Requires a Rust toolchain.
+
+```bash
+cargo install --locked --git https://github.com/defendend/Claude-ast-index-search ast-index
+```
+
+This builds and installs the latest version from the default branch. For prebuilt release binaries, use Homebrew or Winget.
+
 ### Winget (Windows)
 
 ```shell
