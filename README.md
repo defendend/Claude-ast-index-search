@@ -45,7 +45,8 @@ ast-index deps app
 
 Use `ast-index update` after edits or branch switches. In monorepos with nested
 project markers, add `--walk-up` or `AST_INDEX_WALK_UP=1` to reuse the root
-index.
+index. Use `--root /path/to/project` (or `-C`) when the project root must not
+depend on the current directory.
 
 **Guides:** [User guide](USER_GUIDE.md) for everyday workflow;
 [Command setup guide](docs/setup-guide.md) for install/options/examples.
@@ -503,6 +504,11 @@ roots:
   - "../shared-lib"
   - "../common-modules"
 
+# Limit the primary root to these directories
+include:
+  - "app"
+  - "packages/shared"
+
 # Directories to exclude from indexing
 exclude:
   - "vendor"
@@ -514,6 +520,10 @@ no_ignore: false
 ```
 
 All fields are optional. CLI flags override config file values.
+
+Universal `search` scans the primary `include` scope and every configured root.
+Use `--local` to search only the primary scope or `--subtree NAME` to search one
+named additional root.
 
 ### Examples
 

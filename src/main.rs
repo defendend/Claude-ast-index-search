@@ -118,6 +118,17 @@ struct Cli {
     #[arg(long, global = true)]
     walk_up: bool,
 
+    /// Use this directory as the primary project root instead of discovering
+    /// it from the current directory. Also selects its config and index cache.
+    #[arg(
+        short = 'C',
+        long = "root",
+        global = true,
+        value_name = "PATH",
+        conflicts_with = "walk_up"
+    )]
+    root: Option<PathBuf>,
+
     /// Restrict search/listing commands to a single named subtree.
     /// Use `subtree list` to discover names. Conflicts with `--local`.
     /// May trim the result below `--limit` because the cap is applied to
@@ -811,6 +822,8 @@ fn main() -> Result<()> {
                 !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
             })
             .unwrap_or(false);
+    let explicit_root = cli.root.as_deref().map(resolve_explicit_root).transpose()?;
+    let has_explicit_root = explicit_root.is_some();
     let cache_independent = matches!(
         &cli.command,
         Commands::Version
@@ -823,7 +836,18 @@ fn main() -> Result<()> {
     );
     let changed_command = matches!(&cli.command, Commands::Changed { .. });
     let release_command_publication = matches!(&cli.command, Commands::Watch);
-    let (root, mut command_cache_lease) = if changed_command {
+    let (root, mut command_cache_lease) = if let Some(root) = explicit_root {
+        let lease = if cache_independent
+            || matches!(
+                &cli.command,
+                Commands::Rebuild { .. } | Commands::Restore { .. } | Commands::Clear
+            ) {
+            None
+        } else {
+            db::acquire_project_lease_if_initialized(&root)?
+        };
+        (root, lease)
+    } else if changed_command {
         // `changed` discovers only VCS markers from the invocation directory.
         // It must never probe or create the ast-index cache.
         (std::env::current_dir()?, None)
@@ -859,7 +883,7 @@ fn main() -> Result<()> {
 
     // Compute directory scope: if cwd is inside project root, limit search to cwd subtree
     let cwd = std::env::current_dir().unwrap_or_default();
-    let dir_prefix = if cwd != root {
+    let dir_prefix = if !has_explicit_root && cwd != root {
         cwd.strip_prefix(&root).ok().map(|rel| {
             let mut s = rel.to_string_lossy().to_string();
             if !s.ends_with('/') {
@@ -1694,6 +1718,25 @@ fn shell_quote(arg: &str) -> String {
 
 fn find_project_root_for_write() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
+}
+
+fn resolve_explicit_root(path: &Path) -> Result<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    anyhow::ensure!(
+        candidate.exists(),
+        "project root does not exist: {}",
+        candidate.display()
+    );
+    anyhow::ensure!(
+        candidate.is_dir(),
+        "project root is not a directory: {}",
+        candidate.display()
+    );
+    Ok(db::safe_canonicalize(&candidate))
 }
 
 /// After a successful rebuild/update, sweep index caches for other projects

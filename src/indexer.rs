@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::Connection;
@@ -217,6 +217,18 @@ pub struct ProjectConfig {
 /// Load project config from `.ast-index.yaml` or `.ast-index.yml` in the given root.
 /// Returns `None` if no config file found or on parse error (with warning).
 pub fn load_config(root: &Path) -> Option<ProjectConfig> {
+    match load_config_strict(root) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Warning: {error:#}");
+            None
+        }
+    }
+}
+
+/// Load project config while preserving parse and read errors for commands
+/// that cannot safely fall back to scanning the whole project root.
+pub fn load_config_strict(root: &Path) -> Result<Option<ProjectConfig>> {
     let yaml_path = root.join(".ast-index.yaml");
     let yml_path = root.join(".ast-index.yml");
     let config_path = if yaml_path.exists() {
@@ -224,25 +236,15 @@ pub fn load_config(root: &Path) -> Option<ProjectConfig> {
     } else if yml_path.exists() {
         yml_path
     } else {
-        return None;
+        return Ok(None);
     };
 
-    match fs::read_to_string(&config_path) {
-        Ok(content) => match serde_yaml::from_str::<ProjectConfig>(&content) {
-            Ok(config) => {
-                eprintln!("Loaded config from {}", config_path.display());
-                Some(config)
-            }
-            Err(e) => {
-                eprintln!("Warning: failed to parse {}: {}", config_path.display(), e);
-                None
-            }
-        },
-        Err(e) => {
-            eprintln!("Warning: failed to read {}: {}", config_path.display(), e);
-            None
-        }
-    }
+    let content = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config = serde_yaml::from_str::<ProjectConfig>(&content)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    eprintln!("Loaded config from {}", config_path.display());
+    Ok(Some(config))
 }
 
 /// Check if project has build system markers (Gradle/Maven build files)
