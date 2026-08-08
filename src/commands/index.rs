@@ -8,9 +8,9 @@
 //! - hierarchy: Show class hierarchy
 //! - usages: Find symbol usages (indexed or grep-based)
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use colored::Colorize;
 use regex::Regex;
 use rusqlite::params;
@@ -34,6 +34,138 @@ fn auto_pattern_from_name<'a>(
         Some(n) if n.contains('*') || n.contains('?') => (None, Some(n)),
         _ => (name, pattern),
     }
+}
+
+#[derive(Debug)]
+struct ContentSearchRoot {
+    walk_root: PathBuf,
+    path_anchor: PathBuf,
+    root_key: String,
+}
+
+fn configured_path(primary: &Path, value: &str, label: &str) -> Result<PathBuf> {
+    ensure!(!value.trim().is_empty(), "{label} path must not be empty");
+    let raw = Path::new(value);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        primary.join(raw)
+    };
+    ensure!(
+        candidate.exists(),
+        "{label} path does not exist: {}",
+        candidate.display()
+    );
+    ensure!(
+        candidate.is_dir(),
+        "{label} path is not a directory: {}",
+        candidate.display()
+    );
+    Ok(db::safe_canonicalize(&candidate))
+}
+
+fn push_search_root(roots: &mut Vec<ContentSearchRoot>, candidate: ContentSearchRoot) {
+    if roots.iter().any(|existing| {
+        existing.root_key == candidate.root_key
+            && candidate.walk_root.starts_with(&existing.walk_root)
+    }) {
+        return;
+    }
+    roots.retain(|existing| {
+        existing.root_key != candidate.root_key
+            || !existing.walk_root.starts_with(&candidate.walk_root)
+    });
+    if !roots
+        .iter()
+        .any(|existing| existing.walk_root == candidate.walk_root)
+    {
+        roots.push(candidate);
+    }
+}
+
+fn content_search_roots(
+    root: &Path,
+    conn: &rusqlite::Connection,
+) -> Result<Vec<ContentSearchRoot>> {
+    let config = crate::indexer::load_config_strict(root)?.unwrap_or_default();
+    let primary = db::safe_canonicalize(root);
+    let primary_key = db::normalize_root_for_storage(&primary);
+    let local_only = std::env::var("AST_INDEX_LOCAL_SCOPE").is_ok();
+    let selected_subtree = std::env::var("AST_INDEX_SUBTREE").ok();
+    let mut roots = Vec::new();
+
+    let mut include_roots = Vec::new();
+    for include in config.include.unwrap_or_default() {
+        let path = configured_path(&primary, &include, "include")?;
+        ensure!(
+            path.starts_with(&primary),
+            "include path escapes the project root: {}",
+            include
+        );
+        include_roots.push(path);
+    }
+    if include_roots.is_empty() {
+        include_roots.push(primary.clone());
+    }
+    if selected_subtree.is_none() {
+        for walk_root in include_roots {
+            push_search_root(
+                &mut roots,
+                ContentSearchRoot {
+                    walk_root,
+                    path_anchor: primary.clone(),
+                    root_key: primary_key.clone(),
+                },
+            );
+        }
+    }
+
+    let subtrees = db::list_subtrees(conn)?;
+    let mut configured_extra_roots = Vec::new();
+    for configured_root in config.roots.unwrap_or_default() {
+        configured_extra_roots.push(configured_path(&primary, &configured_root, "extra root")?);
+    }
+
+    for subtree in &subtrees {
+        let path = configured_path(&primary, &subtree.canonical_path, "extra root")?;
+        let enabled = !local_only
+            && selected_subtree
+                .as_deref()
+                .map(|name| name == subtree.name)
+                .unwrap_or(true);
+        if enabled {
+            push_search_root(
+                &mut roots,
+                ContentSearchRoot {
+                    walk_root: path.clone(),
+                    path_anchor: path,
+                    root_key: subtree.canonical_path.clone(),
+                },
+            );
+        }
+    }
+
+    if !local_only && selected_subtree.is_none() {
+        for path in configured_extra_roots {
+            let root_key = db::normalize_root_for_storage(&path);
+            push_search_root(
+                &mut roots,
+                ContentSearchRoot {
+                    walk_root: path.clone(),
+                    path_anchor: path,
+                    root_key,
+                },
+            );
+        }
+    }
+
+    if let Some(name) = selected_subtree {
+        if !subtrees.iter().any(|subtree| subtree.name == name) {
+            return Ok(Vec::new());
+        }
+    }
+
+    Ok(roots)
 }
 
 /// Full-text search across files, symbols, and file contents
@@ -143,38 +275,41 @@ pub fn cmd_search(
         regex::escape(query)
     };
 
-    super::search_files_limited(
-        root,
-        &pattern,
-        &super::grep::ALL_SOURCE_EXTENSIONS,
-        limit,
-        |path, line_num, line| {
-            let rel_path = super::relative_path(root, path);
-            // Apply scope filter for grep results
-            if let Some(prefix) = scope.dir_prefix {
-                if !rel_path.starts_with(prefix) {
-                    return;
-                }
-            }
-            if let Some(in_file) = scope.in_file {
-                if !rel_path.contains(in_file) {
-                    return;
-                }
-            }
-            if let Some(module) = scope.module {
-                if !rel_path.starts_with(module) {
-                    return;
-                }
-            }
-            let content: String = line.trim().chars().take(100).collect();
-            let key = format!("{}:{}", rel_path, line_num);
-            if seen_content.insert(key) {
-                content_matches.push((rel_path, line_num, content));
-            }
-        },
-    )?;
-
     let resolver = PathResolver::try_from_conn(root, &conn)?;
+    for search_root in content_search_roots(root, &conn)? {
+        let remaining = limit.saturating_sub(content_matches.len());
+        if remaining == 0 {
+            break;
+        }
+        super::search_files_limited(
+            &search_root.walk_root,
+            &pattern,
+            &super::grep::ALL_SOURCE_EXTENSIONS,
+            remaining,
+            |path, line_num, line| {
+                let rel_path = super::relative_path(&search_root.path_anchor, path);
+                if scope
+                    .dir_prefix
+                    .is_some_and(|prefix| !rel_path.starts_with(prefix))
+                    || scope
+                        .in_file
+                        .is_some_and(|in_file| !rel_path.contains(in_file))
+                    || scope
+                        .module
+                        .is_some_and(|module| !rel_path.starts_with(module))
+                {
+                    return;
+                }
+                let resolved = resolver.resolve_with_root(&rel_path, Some(&search_root.root_key));
+                let content: String = line.trim().chars().take(100).collect();
+                let key = format!("{}:{}", path.display(), line_num);
+                if seen_content.insert(key) {
+                    content_matches.push((resolved, line_num, content));
+                }
+            },
+        )?;
+    }
+
     // Apply --subtree / --local filters before resolving paths so we don't
     // do extra work on rows the user will throw away.
     let files: Vec<String> = files
@@ -185,9 +320,6 @@ pub fn cmd_search(
     symbols.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
     for s in &mut symbols {
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
-    }
-    for m in &mut content_matches {
-        m.0 = resolver.resolve(&m.0);
     }
 
     if format == "json" {

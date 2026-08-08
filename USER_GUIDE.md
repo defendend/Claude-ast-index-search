@@ -93,13 +93,15 @@ ast-index rebuild
 ```
 
 For a large repository, add a project config so `rebuild`, `update`, and
-`watch` all scan the same intended paths:
+`watch`, and content search all scan the same intended paths:
 
 ```yaml
 # .ast-index.yaml
 include:
   - app
   - packages/shared
+roots:
+  - ../shared-library
 exclude:
   - vendor
   - generated
@@ -112,7 +114,11 @@ ast-index rebuild
 ```
 
 Use `include` when you only want selected directories from a larger tree. Use
-`exclude` for generated or vendored folders that should never enter the index.
+`roots` for additional source trees outside the primary root. Use `exclude` for
+generated or vendored folders that should never enter the index. Universal
+`search` scans the configured `include` paths and all additional roots by
+default; pass `--local` for the primary root only or `--subtree NAME` for one
+named additional root.
 
 ## Keeping The Index Fresh
 
@@ -227,6 +233,18 @@ ast-index --walk-up search "Payment"
 # or
 AST_INDEX_WALK_UP=1 ast-index search "Payment"
 ```
+
+To select one project root independently of the current directory, pass it
+explicitly. `--root` and `-C` also select that root's `.ast-index.yaml` and
+index cache:
+
+```bash
+ast-index --root /path/to/project search "Payment"
+ast-index -C /path/to/project update
+```
+
+An explicit root is mutually exclusive with `--walk-up` and disables automatic
+current-subdirectory result scoping.
 
 ## AI Agent Instructions
 
