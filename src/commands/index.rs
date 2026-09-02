@@ -13,9 +13,11 @@ use std::path::Path;
 use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
-use rusqlite::params;
 
-use super::{relative_path, search_files, PathResolver};
+use super::{
+    print_truncation_notice, relative_path, search_files_page, Page, Pagination, PathResolver,
+    PAGINATED_JSON_SCHEMA_VERSION,
+};
 use crate::db::{self, SearchScope};
 
 fn symbol_display_name(symbol: &db::SearchResult) -> &str {
@@ -62,75 +64,22 @@ pub fn cmd_search(
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
         .collect();
-    let per_term_limit = if terms.len() > 1 { limit } else { limit };
-
     // Collect results from all terms, deduplicating
-    let mut files: Vec<db::FileResult> = vec![];
-    let mut symbols: Vec<db::SearchResult> = vec![];
-    let mut ref_matches: Vec<(String, i64)> = vec![];
     let mut content_matches: Vec<(String, usize, String)> = vec![];
 
-    let mut seen_files = std::collections::HashSet::new();
-    let mut seen_symbols = std::collections::HashSet::new();
-    let mut seen_refs = std::collections::HashSet::new();
     let mut seen_content = std::collections::HashSet::new();
+    let files_total = db::count_files_with_roots_terms_scoped(&conn, &terms, scope)?;
+    let symbols_total =
+        db::count_search_symbol_terms_scoped(&conn, &terms, kind_filter, scope, fuzzy)?;
+    let refs_total = db::count_search_ref_terms_scoped(&conn, &terms, scope)?;
 
-    // 1. Search in file paths (index)
-    for term in &terms {
-        let mut term_files = db::find_files_with_roots(&conn, term, per_term_limit)?;
-        if let Some(prefix) = scope.dir_prefix {
-            term_files.retain(|f| f.path.starts_with(prefix));
-        }
-        for f in term_files {
-            if seen_files.insert(format!(
-                "{}\u{1f}|{}",
-                f.root_path.as_deref().unwrap_or(""),
-                f.path
-            )) {
-                files.push(f);
-            }
-        }
-    }
-
-    // 2. Search in symbols using FTS or fuzzy (index)
-    let fetch_limit = per_term_limit * if kind_filter.is_some() { 5 } else { 1 };
-    for term in &terms {
-        let raw = if fuzzy {
-            db::search_symbols_fuzzy(&conn, term, fetch_limit)?
-        } else {
-            let fts_query = format!("{}*", term);
-            db::search_symbols_scoped(&conn, &fts_query, fetch_limit, scope)?
-        };
-        for s in raw {
-            let key = format!(
-                "{}\u{1f}|{}:{}:{}",
-                s.root_path.as_deref().unwrap_or(""),
-                s.path,
-                s.line,
-                s.name
-            );
-            if seen_symbols.insert(key) {
-                if let Some(kf) = kind_filter {
-                    if s.kind == kf {
-                        symbols.push(s);
-                    }
-                } else {
-                    symbols.push(s);
-                }
-            }
-        }
-    }
-    symbols.truncate(limit);
-
-    // 3. Search in references (imports and usages from index)
-    for term in &terms {
-        let term_refs = db::search_refs(&conn, term, per_term_limit)?;
-        for (name, count) in term_refs {
-            if seen_refs.insert(name.clone()) {
-                ref_matches.push((name, count));
-            }
-        }
-    }
+    let probe_limit = limit.saturating_add(1);
+    // One OR query per indexed category fills the page with unique rows while
+    // keeping memory bounded to the requested page plus one probe row.
+    let files = db::find_files_with_roots_terms_scoped(&conn, &terms, probe_limit, scope)?;
+    let mut symbols =
+        db::search_symbol_terms_scoped(&conn, &terms, kind_filter, probe_limit, scope, fuzzy)?;
+    let ref_matches = db::search_ref_terms_scoped(&conn, &terms, probe_limit, scope)?;
 
     // 4. Search in file contents (grep)
     let pattern = if terms.len() > 1 {
@@ -143,7 +92,7 @@ pub fn cmd_search(
         regex::escape(query)
     };
 
-    super::search_files_limited(
+    let content_page = search_files_page(
         root,
         &pattern,
         &super::grep::ALL_SOURCE_EXTENSIONS,
@@ -153,26 +102,29 @@ pub fn cmd_search(
             // Apply scope filter for grep results
             if let Some(prefix) = scope.dir_prefix {
                 if !rel_path.starts_with(prefix) {
-                    return;
+                    return None;
                 }
             }
             if let Some(in_file) = scope.in_file {
                 if !rel_path.contains(in_file) {
-                    return;
+                    return None;
                 }
             }
             if let Some(module) = scope.module {
                 if !rel_path.starts_with(module) {
-                    return;
+                    return None;
                 }
             }
             let content: String = line.trim().chars().take(100).collect();
             let key = format!("{}:{}", rel_path, line_num);
             if seen_content.insert(key) {
-                content_matches.push((rel_path, line_num, content));
+                Some((rel_path, line_num, content))
+            } else {
+                None
             }
         },
     )?;
+    content_matches = content_page.items;
 
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     // Apply --subtree / --local filters before resolving paths so we don't
@@ -190,16 +142,29 @@ pub fn cmd_search(
         m.0 = resolver.resolve(&m.0);
     }
 
+    let files_page = Page::new(files, files_total, limit);
+    let symbols_page = Page::new(symbols, symbols_total, limit);
+    let refs_page = Page::new(ref_matches, refs_total, limit);
+    let content_pagination =
+        Pagination::new(content_page.pagination.total, content_matches.len(), limit);
+
     if format == "json" {
         let result = serde_json::json!({
-            "files": files,
-            "symbols": symbols,
-            "references": ref_matches.iter().map(|(name, count)| {
+            "schema_version": PAGINATED_JSON_SCHEMA_VERSION,
+            "files": files_page.items,
+            "symbols": symbols_page.items,
+            "references": refs_page.items.iter().map(|(name, count)| {
                 serde_json::json!({"name": name, "usage_count": count})
             }).collect::<Vec<_>>(),
             "content_matches": content_matches.iter().map(|(p, l, c)| {
                 serde_json::json!({"path": p, "line": l, "content": c})
-            }).collect::<Vec<_>>()
+            }).collect::<Vec<_>>(),
+            "pagination": {
+                "files": files_page.pagination,
+                "symbols": symbols_page.pagination,
+                "references": refs_page.pagination,
+                "content_matches": content_pagination,
+            }
         });
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
@@ -208,19 +173,31 @@ pub fn cmd_search(
     // Output results
     println!("{}", format!("Search results for '{}':", query).bold());
 
-    if !files.is_empty() {
-        println!("\n{}", "Files (by path):".cyan());
-        for path in files.iter().take(limit) {
+    if !files_page.items.is_empty() {
+        println!(
+            "\n{}",
+            format!(
+                "Files by path (showing {} of {}):",
+                files_page.pagination.returned, files_page.pagination.total
+            )
+            .cyan()
+        );
+        for path in &files_page.items {
             println!("  {}", path);
         }
-        if files.len() > limit {
-            println!("  ... and {} more", files.len() - limit);
-        }
+        print_truncation_notice(files_page.pagination);
     }
 
-    if !symbols.is_empty() {
-        println!("\n{}", "Symbols (definitions):".cyan());
-        for s in symbols.iter().take(limit) {
+    if !symbols_page.items.is_empty() {
+        println!(
+            "\n{}",
+            format!(
+                "Symbols (showing {} of {}):",
+                symbols_page.pagination.returned, symbols_page.pagination.total
+            )
+            .cyan()
+        );
+        for s in &symbols_page.items {
             println!(
                 "  {} [{}]: {}:{}",
                 symbol_display_name(s).cyan(),
@@ -229,29 +206,43 @@ pub fn cmd_search(
                 s.line
             );
         }
+        print_truncation_notice(symbols_page.pagination);
     }
 
-    if !ref_matches.is_empty() {
-        println!("\n{}", "References (imports & usages):".cyan());
-        for (name, count) in ref_matches.iter().take(limit) {
+    if !refs_page.items.is_empty() {
+        println!(
+            "\n{}",
+            format!(
+                "References (showing {} of {}):",
+                refs_page.pagination.returned, refs_page.pagination.total
+            )
+            .cyan()
+        );
+        for (name, count) in &refs_page.items {
             println!("  {} — used in {} places", name.cyan(), count);
         }
+        print_truncation_notice(refs_page.pagination);
     }
 
     if !content_matches.is_empty() {
-        println!("\n{}", "Content matches:".cyan());
-        for (path, line_num, content) in content_matches.iter().take(limit) {
+        println!(
+            "\n{}",
+            format!(
+                "Content matches (showing {} of {}):",
+                content_pagination.returned, content_pagination.total
+            )
+            .cyan()
+        );
+        for (path, line_num, content) in &content_matches {
             println!("  {}:{}", path.cyan(), line_num);
             println!("    {}", content.dimmed());
         }
-        if content_matches.len() > limit {
-            println!("  ... and {} more", content_matches.len() - limit);
-        }
+        print_truncation_notice(content_pagination);
     }
 
-    if files.is_empty()
-        && symbols.is_empty()
-        && ref_matches.is_empty()
+    if files_page.items.is_empty()
+        && symbols_page.items.is_empty()
+        && refs_page.items.is_empty()
         && content_matches.is_empty()
     {
         println!("  No results found.");
@@ -287,15 +278,26 @@ pub fn cmd_symbol(
     }
 
     let conn = db::open_db_leased(root)?;
-    let mut symbols = if let Some(pat) = pattern {
+    let (mut symbols, total) = if let Some(pat) = pattern {
         let like_pattern = db::glob_to_like(pat);
-        db::find_symbols_by_pattern(&conn, &like_pattern, kind, limit, scope)?
+        let total = db::count_symbols_by_pattern_scoped(&conn, &like_pattern, kind, scope, false)?;
+        (
+            db::find_symbols_by_pattern(&conn, &like_pattern, kind, limit, scope)?,
+            total,
+        )
     } else {
         let name = name.unwrap();
         if fuzzy && kind.is_none() {
-            db::search_symbols_fuzzy(&conn, name, limit)?
+            let total = db::count_symbols_fuzzy_scoped(&conn, name, None, scope, false)?;
+            let matches =
+                db::search_symbols_for_command(&conn, name, None, limit, scope, true, false)?;
+            (matches, total)
         } else {
-            db::find_symbols_by_name_scoped(&conn, name, kind, limit, scope)?
+            let total = db::count_symbols_by_name_scoped(&conn, name, kind, scope, false)?;
+            (
+                db::find_symbols_by_name_scoped(&conn, name, kind, limit, scope)?,
+                total,
+            )
         }
     };
 
@@ -305,8 +307,9 @@ pub fn cmd_symbol(
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
 
+    let page = Page::new(symbols, total, limit);
     if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&symbols)?);
+        println!("{}", serde_json::to_string_pretty(&page)?);
         return Ok(());
     }
 
@@ -314,10 +317,14 @@ pub fn cmd_symbol(
     let kind_str = kind.map(|k| format!(" ({})", k)).unwrap_or_default();
     println!(
         "{}",
-        format!("Symbols matching '{}'{}:", query_str, kind_str).bold()
+        format!(
+            "Symbols matching '{}'{} (showing {} of {}):",
+            query_str, kind_str, page.pagination.returned, page.pagination.total
+        )
+        .bold()
     );
 
-    for s in &symbols {
+    for s in &page.items {
         println!(
             "  {} [{}]: {}:{}",
             symbol_display_name(s).cyan(),
@@ -331,9 +338,10 @@ pub fn cmd_symbol(
         }
     }
 
-    if symbols.is_empty() {
+    if page.items.is_empty() {
         println!("  No symbols found.");
     }
+    print_truncation_notice(page.pagination);
 
     Ok(())
 }
@@ -365,31 +373,26 @@ pub fn cmd_class(
 
     let conn = db::open_db_leased(root)?;
 
-    let mut results: Vec<db::SearchResult> = if let Some(pat) = pattern {
+    let (mut results, total): (Vec<db::SearchResult>, usize) = if let Some(pat) = pattern {
         let like_pattern = db::glob_to_like(pat);
-        db::find_class_like_pattern(&conn, &like_pattern, limit, scope)?
+        let total = db::count_symbols_by_pattern_scoped(&conn, &like_pattern, None, scope, true)?;
+        (
+            db::find_class_like_pattern(&conn, &like_pattern, limit, scope)?,
+            total,
+        )
     } else {
         let name = name.unwrap();
         if fuzzy {
-            let all = db::search_symbols_fuzzy(&conn, name, limit * 5)?;
-            all.into_iter()
-                .filter(|s| {
-                    matches!(
-                        s.kind.as_str(),
-                        "class"
-                            | "interface"
-                            | "object"
-                            | "enum"
-                            | "protocol"
-                            | "struct"
-                            | "actor"
-                            | "package"
-                    )
-                })
-                .take(limit)
-                .collect()
+            let total = db::count_symbols_fuzzy_scoped(&conn, name, None, scope, true)?;
+            let results =
+                db::search_symbols_for_command(&conn, name, None, limit, scope, true, true)?;
+            (results, total)
         } else {
-            db::find_class_like_scoped(&conn, name, limit, scope)?
+            let total = db::count_class_like_scoped(&conn, name, scope)?;
+            (
+                db::find_class_like_scoped(&conn, name, limit, scope)?,
+                total,
+            )
         }
     };
 
@@ -399,15 +402,23 @@ pub fn cmd_class(
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
 
+    let page = Page::new(results, total, limit);
     if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        println!("{}", serde_json::to_string_pretty(&page)?);
         return Ok(());
     }
 
     let query_str = pattern.unwrap_or(name.unwrap_or(""));
-    println!("{}", format!("Classes matching '{}':", query_str).bold());
+    println!(
+        "{}",
+        format!(
+            "Classes matching '{}' (showing {} of {}):",
+            query_str, page.pagination.returned, page.pagination.total
+        )
+        .bold()
+    );
 
-    for s in &results {
+    for s in &page.items {
         println!(
             "  {} [{}]: {}:{}",
             symbol_display_name(s).cyan(),
@@ -417,9 +428,10 @@ pub fn cmd_class(
         );
     }
 
-    if results.is_empty() {
+    if page.items.is_empty() {
         println!("  No classes found.");
     }
+    print_truncation_notice(page.pagination);
 
     Ok(())
 }
@@ -474,6 +486,7 @@ pub fn cmd_implementations(
     }
 
     let conn = db::open_db_leased(root)?;
+    let total = db::count_implementations_scoped(&conn, parent, scope)?;
     let mut impls = db::find_implementations_scoped(&conn, parent, limit, scope)?;
 
     let resolver = PathResolver::try_from_conn(root, &conn)?;
@@ -482,14 +495,22 @@ pub fn cmd_implementations(
         s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
 
+    let page = Page::new(impls, total, limit);
     if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&impls)?);
+        println!("{}", serde_json::to_string_pretty(&page)?);
         return Ok(());
     }
 
-    println!("{}", format!("Implementations of '{}':", parent).bold());
+    println!(
+        "{}",
+        format!(
+            "Implementations of '{}' (showing {} of {}):",
+            parent, page.pagination.returned, page.pagination.total
+        )
+        .bold()
+    );
 
-    for s in &impls {
+    for s in &page.items {
         println!(
             "  {} [{}]: {}:{}",
             symbol_display_name(s).cyan(),
@@ -499,9 +520,10 @@ pub fn cmd_implementations(
         );
     }
 
-    if impls.is_empty() {
+    if page.items.is_empty() {
         println!("  No implementations found.");
     }
+    print_truncation_notice(page.pagination);
 
     Ok(())
 }
@@ -517,8 +539,13 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
     }
 
     let conn = db::open_db_leased(root)?;
-    let (mut definitions, mut imports, mut usages) =
-        db::find_cross_references(&conn, symbol, limit)?;
+    let no_scope = SearchScope::none();
+    let definitions_total = db::count_symbols_by_name_scoped(&conn, symbol, None, &no_scope, true)?;
+    let imports_total = db::count_imports_scoped(&conn, symbol, &no_scope)?;
+    let usages_total = db::count_references_scoped(&conn, symbol, &no_scope)?;
+    let mut definitions = db::find_definitions_scoped(&conn, symbol, limit, &no_scope)?;
+    let mut imports = db::find_imports_scoped(&conn, symbol, limit, &no_scope)?;
+    let mut usages = db::find_references_scoped(&conn, symbol, limit, &no_scope)?;
 
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     definitions.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
@@ -534,11 +561,21 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
         r.path = resolver.resolve_with_root(&r.path, r.root_path.as_deref());
     }
 
+    let definitions_page = Page::new(definitions, definitions_total, limit);
+    let imports_page = Page::new(imports, imports_total, limit);
+    let usages_page = Page::new(usages, usages_total, limit);
+
     if format == "json" {
         let result = serde_json::json!({
-            "definitions": definitions,
-            "imports": imports,
-            "usages": usages,
+            "schema_version": PAGINATED_JSON_SCHEMA_VERSION,
+            "definitions": definitions_page.items,
+            "imports": imports_page.items,
+            "usages": usages_page.items,
+            "pagination": {
+                "definitions": definitions_page.pagination,
+                "imports": imports_page.pagination,
+                "usages": usages_page.pagination,
+            },
         });
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
@@ -546,9 +583,16 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
 
     println!("{}", format!("Cross-references for '{}':", symbol).bold());
 
-    if !definitions.is_empty() {
-        println!("\n  {}", "Definitions:".cyan());
-        for s in &definitions {
+    if !definitions_page.items.is_empty() {
+        println!(
+            "\n  {}",
+            format!(
+                "Definitions (showing {} of {}):",
+                definitions_page.pagination.returned, definitions_page.pagination.total
+            )
+            .cyan()
+        );
+        for s in &definitions_page.items {
             println!(
                 "    {} [{}]: {}:{}",
                 symbol_display_name(s).cyan(),
@@ -557,30 +601,50 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
                 s.line
             );
         }
+        print_truncation_notice(definitions_page.pagination);
     }
 
-    if !imports.is_empty() {
-        println!("\n  {}", "Imports:".cyan());
-        for s in &imports {
+    if !imports_page.items.is_empty() {
+        println!(
+            "\n  {}",
+            format!(
+                "Imports (showing {} of {}):",
+                imports_page.pagination.returned, imports_page.pagination.total
+            )
+            .cyan()
+        );
+        for s in &imports_page.items {
             println!("    {}:{}", s.path.cyan(), s.line);
             if let Some(sig) = &s.signature {
                 println!("      {}", sig.dimmed());
             }
         }
+        print_truncation_notice(imports_page.pagination);
     }
 
-    if !usages.is_empty() {
-        println!("\n  {}", "Usages:".cyan());
-        for r in &usages {
+    if !usages_page.items.is_empty() {
+        println!(
+            "\n  {}",
+            format!(
+                "Usages (showing {} of {}):",
+                usages_page.pagination.returned, usages_page.pagination.total
+            )
+            .cyan()
+        );
+        for r in &usages_page.items {
             println!("    {}:{}", r.path.cyan(), r.line);
             if let Some(ctx) = &r.context {
                 let truncated: String = ctx.chars().take(80).collect();
                 println!("      {}", truncated.dimmed());
             }
         }
+        print_truncation_notice(usages_page.pagination);
     }
 
-    if definitions.is_empty() && imports.is_empty() && usages.is_empty() {
+    if definitions_page.items.is_empty()
+        && imports_page.items.is_empty()
+        && usages_page.items.is_empty()
+    {
         println!("  No references found.");
     }
 
@@ -712,16 +776,11 @@ pub fn cmd_usages(
         let conn = db::open_db_leased(root)?;
 
         // Check if refs table has data
-        let refs_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM refs WHERE name = ?1 LIMIT 1",
-                params![symbol],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        let refs_count = db::count_references_scoped(&conn, symbol, scope)?;
 
         if refs_count > 0 {
             // Use indexed references with scope filtering
+            let total = db::count_references_scoped(&conn, symbol, scope)?;
             let mut refs = db::find_references_scoped(&conn, symbol, limit, scope)?;
             let resolver = PathResolver::try_from_conn(root, &conn)?;
             refs.retain(|r| resolver.matches_filter(r.root_path.as_deref()));
@@ -729,17 +788,22 @@ pub fn cmd_usages(
                 r.path = resolver.resolve_with_root(&r.path, r.root_path.as_deref());
             }
 
+            let page = Page::new(refs, total, limit);
             if format == "json" {
-                println!("{}", serde_json::to_string_pretty(&refs)?);
+                println!("{}", serde_json::to_string_pretty(&page)?);
                 return Ok(());
             }
 
             println!(
                 "{}",
-                format!("Usages of '{}' ({}):", symbol, refs.len()).bold()
+                format!(
+                    "Usages of '{}' (showing {} of {}):",
+                    symbol, page.pagination.returned, page.pagination.total
+                )
+                .bold()
             );
 
-            for r in &refs {
+            for r in &page.items {
                 println!("  {}:{}", r.path.cyan(), r.line);
                 if let Some(ctx) = &r.context {
                     let truncated: String = ctx.chars().take(80).collect();
@@ -747,9 +811,10 @@ pub fn cmd_usages(
                 }
             }
 
-            if refs.is_empty() {
+            if page.items.is_empty() {
                 println!("  No usages found in index.");
             }
+            print_truncation_notice(page.pagination);
 
             return Ok(());
         }
@@ -762,56 +827,72 @@ pub fn cmd_usages(
         regex::escape(symbol)
     ))?;
 
-    let mut usages: Vec<(String, usize, String)> = vec![];
-
-    search_files(root, &pattern, &["kt", "java"], |path, line_num, line| {
-        if usages.len() >= limit {
-            return;
-        }
-
-        // Skip definitions
-        if def_pattern.is_match(line) {
-            return;
-        }
-
-        let rel_path = relative_path(root, path);
-        // Apply scope filter for grep results
-        if let Some(in_file) = scope.in_file {
-            if !rel_path.contains(in_file) {
-                return;
+    let page = search_files_page(
+        root,
+        &pattern,
+        &["kt", "java"],
+        limit,
+        |path, line_num, line| {
+            // Skip definitions
+            if def_pattern.is_match(line) {
+                return None;
             }
-        }
-        if let Some(module) = scope.module {
-            if !rel_path.starts_with(module) {
-                return;
+
+            let rel_path = relative_path(root, path);
+            // Apply scope filter for grep results
+            if let Some(in_file) = scope.in_file {
+                if !rel_path.contains(in_file) {
+                    return None;
+                }
             }
-        }
-        let content: String = line.trim().chars().take(80).collect();
-        usages.push((rel_path, line_num, content));
-    })?;
+            if let Some(module) = scope.module {
+                if !rel_path.starts_with(module) {
+                    return None;
+                }
+            }
+            if let Some(prefix) = scope.dir_prefix {
+                if !rel_path.starts_with(prefix) {
+                    return None;
+                }
+            }
+            let content: String = line.trim().chars().take(80).collect();
+            Some((rel_path, line_num, content))
+        },
+    )?;
 
     if format == "json" {
-        let result: Vec<_> = usages
+        let items: Vec<_> = page
+            .items
             .iter()
             .map(|(p, l, c)| serde_json::json!({"path": p, "line": l, "content": c}))
             .collect();
+        let result = serde_json::json!({
+            "schema_version": PAGINATED_JSON_SCHEMA_VERSION,
+            "items": items,
+            "pagination": page.pagination,
+        });
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
 
     println!(
         "{}",
-        format!("Usages of '{}' ({}):", symbol, usages.len()).bold()
+        format!(
+            "Usages of '{}' (showing {} of {}):",
+            symbol, page.pagination.returned, page.pagination.total
+        )
+        .bold()
     );
 
-    for (path, line_num, content) in &usages {
+    for (path, line_num, content) in &page.items {
         println!("  {}:{}", path.cyan(), line_num);
         println!("    {}", content);
     }
 
-    if usages.is_empty() {
+    if page.items.is_empty() {
         println!("  No usages found.");
     }
+    print_truncation_notice(page.pagination);
 
     Ok(())
 }

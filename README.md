@@ -43,12 +43,24 @@ ast-index implementations Presenter
 ast-index deps app
 ```
 
-Use `ast-index update` after edits or branch switches. In monorepos with nested
+Use `ast-index update` after edits or branch switches. Hooks can queue a
+trailing-debounced refresh without losing edits that arrive during an update:
+
+```bash
+ast-index update --background --debounce-ms 500
+```
+
+Index-reading commands wait (with a bounded timeout) for an already queued
+generation, so they do not observe stale results. In monorepos with nested
 project markers, add `--walk-up` or `AST_INDEX_WALK_UP=1` to reuse the root
 index.
 
-**Guides:** [User guide](USER_GUIDE.md) for everyday workflow;
-[Command setup guide](docs/setup-guide.md) for install/options/examples.
+**Guides:** [User guide](https://github.com/defendend/Claude-ast-index-search/blob/main/USER_GUIDE.md)
+for everyday workflow;
+[command setup guide](https://github.com/defendend/Claude-ast-index-search/blob/main/docs/setup-guide.md)
+for install/options/examples;
+[CodeGraph comparison](https://github.com/defendend/Claude-ast-index-search/blob/main/docs/comparison.md)
+for a dated, source-backed feature comparison.
 
 ## Performance
 
@@ -77,6 +89,18 @@ brew install ast-index
 ```shell
 winget install --id defendend.ast-index
 ```
+
+### Cargo (pending first crates.io release)
+
+The package and release automation are prepared, but this channel is not
+available until the first ast-index version appears on crates.io. Starting
+with that release, install with a Rust toolchain:
+
+```bash
+cargo install ast-index --locked
+```
+
+Until then, use Homebrew, npm, Winget, a release archive, or a source build.
 
 ### Migration from kotlin-index
 
@@ -130,6 +154,27 @@ ast-index --walk-up search ViewModel
 This is opt-in by design: silently preferring a far-away parent DB could
 surface a stale or misconfigured index from an earlier accidental
 `rebuild` higher up. With the flag you explicitly say "trust the parent".
+
+## Worktrees And Intentional Cross-Root Workspaces
+
+Independent git worktrees get independent indexes because their canonical
+root paths differ. Rebuild once inside each worktree; do not attach worktrees
+to one another.
+
+For source trees that intentionally form one workspace, create the primary
+index first, attach a named subtree, then index the attached files:
+
+```bash
+cd /path/to/application
+ast-index rebuild
+ast-index subtree add shared ../shared-library
+ast-index update                 # or: ast-index rebuild
+ast-index subtree list
+```
+
+Use `--subtree shared` to query only that attachment and `--local` to query
+only the primary project. The legacy root commands remain compatibility
+aliases; new automation should use `subtree add/remove/list`.
 
 ## AI Agent Integration
 
@@ -247,12 +292,40 @@ ast-index todo [PATTERN]           # TODO/FIXME/HACK comments
 ast-index deprecated [QUERY]       # Deprecated items
 ```
 
+### Paginated JSON schema v2
+
+Limited search commands now report completeness explicitly. `symbol`, `class`,
+`implementations`, `usages`, and `callers` use this shape:
+
+```json
+{
+  "schema_version": 2,
+  "items": [],
+  "pagination": {
+    "total": 0,
+    "returned": 0,
+    "truncated": false,
+    "limit": 50
+  }
+}
+```
+
+`search` and `refs` keep their named result arrays and provide one pagination
+object per array under `pagination`. Consumers migrating from bare arrays must
+read `items` for single-result-set commands and must check `truncated` before
+treating a response as complete. This is limit-based pagination, not a cursor:
+rerun with a larger `--limit` when more results are required.
+
+The cache-independent `changed` command retains its separate JSON schema v1;
+its schema version did not change with this pagination migration.
+
 ### Changed files on the current branch
 
-`changed` asks the detected Git or Arc repository for the files changed from
+`changed` asks the detected version-control repository for the files changed from
 `merge-base(base, HEAD)` to `HEAD`. Without `--base`, Git resolves
 `origin/HEAD`, then tries `origin/main`, `origin/master`, `main`, `master`, and
-`trunk`; Arc uses `trunk`. It reads VCS state directly, so it works without an
+`trunk`; other supported backends select their conventional mainline. It reads
+version-control state directly, so it works without an
 ast-index database and does not require `rebuild` or `update`. Results are
 scoped to the current working directory, while paths remain
 repository-relative. Staged and unstaged working-tree edits are not included.
@@ -301,7 +374,8 @@ At the repository root, `scope` is `null`; from a nested working directory it
 is that repository-relative directory path.
 
 This is a fast file summary for branch review, not a changed-symbol report and
-not a replacement for `git diff` / `arc diff` when patch hunks are needed.
+not a replacement for your version-control system's diff command when patch
+hunks are needed.
 
 ### Module analysis
 
@@ -533,10 +607,48 @@ exclude:
 
 ## Changelog
 
+### 3.51.0
+
+- **Report truncated search results instead of hiding them** — `search`,
+  `symbol`, `class`, `implementations`, `refs`, `usages`, and `callers` now
+  print `showing N of M` with a `--limit` hint, and emit paginated JSON
+  schema v2 with `total`, `returned`, `truncated`, and `limit`.
+- **Keep the index fresh without blocking edits** — `update --background
+  --debounce-ms <ms>` queues a coordinated, trailing-debounced generation and
+  returns immediately; index-reading commands wait for a queued generation
+  instead of answering from a stale index.
+- **Scope watcher detection to the project** — the new `watch-status` command
+  reports whether this project has an active watcher, so a watcher in one
+  repository no longer suppresses updates in another. Session-start and
+  post-edit hooks and the generated Git hooks use it, and the session-start
+  hook now runs asynchronously with a visible status message.
+- **Index Kotlin files containing `suspend { }` lambdas** — a suspend-lambda
+  syntax error no longer drops the enclosing interface, nested classes, and
+  later declarations from the index, and local `val` bindings are no longer
+  published as properties.
+- **Count Kotlin references accurately** — references in a symbol's own
+  declaring file are kept when external references exist, and matches inside
+  string literals, comments, and KDoc are excluded while executable string
+  interpolation is still indexed.
+- **Resolve kebab-case Gradle type-safe project accessors** — `deps`,
+  `dependents`, `unused-deps`, and `module-route` now link
+  `projects.core.designIcon` to `:core:design-icon`, and report ambiguity
+  instead of picking an arbitrary module.
+- **Rebuild on Windows** — the staged index is synced through a
+  write-capable handle, fixing `failed to sync index file … (os error 5)`.
+- **Detect nested project stacks** — `detect-stacks` performs a bounded
+  recursive marker scan and recognizes standard nested Kotlin Multiplatform
+  layouts such as `composeApp/src/commonMain`.
+- **Document worktrees and cross-root workspaces** — independent git
+  worktrees keep independent indexes; intentional workspaces are attached
+  with `rebuild`, then `subtree add`, then `update`.
+- **Compare ast-index and CodeGraph** — `docs/comparison.md` adds a dated,
+  source-backed feature comparison with pinned snapshots of both projects.
+
 ### 3.50.0
 
 - **Review branch changes quickly without building an index** — use `changed`
-  from the CLI or MCP to read cache-independent Git/Arc branch changes with
+  from the CLI or MCP to read cache-independent branch changes with
   added, modified, deleted, and renamed files, rename metadata,
   working-directory scope, a bounded VCS timeout, Git base auto-detection, and
   stable JSON schema v1.

@@ -93,6 +93,7 @@ dependencies = [
  "cc",
  "clap",
  "colored",
+ "cortexkit-tree-sitter-scss",
  "criterion",
  "crossbeam-channel",
  "dirs",
@@ -138,7 +139,6 @@ dependencies = [
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-scala",
- "tree-sitter-scss",
  "tree-sitter-sequel",
  "tree-sitter-swift",
  "tree-sitter-typescript",
@@ -308,6 +308,16 @@ checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "cortexkit-tree-sitter-scss"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e1ab239ee763e587b6213bde9320d0ffb7013808b827ef36c115bfd265799a1"
+dependencies = [
+ "cc",
+ "tree-sitter",
 ]
 
 [[package]]
@@ -1625,15 +1635,6 @@ checksum = "7516aeb3d1f40ede8e3045b163e86993b3434514dd06c34c0b75e782d9a0b251"
 dependencies = [
  "cc",
  "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-scss"
-version = "1.0.0"
-source = "git+https://github.com/tree-sitter-grammars/tree-sitter-scss?rev=2ef6d42e3ad7a8208900f9346f4529806ae0f9f9#2ef6d42e3ad7a8208900f9346f4529806ae0f9f9"
-dependencies = [
- "cc",
- "tree-sitter",
 ]
 
 [[package]]

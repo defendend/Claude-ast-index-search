@@ -1,6 +1,7 @@
 # ast-index Setup Guide
 
-Fast code search CLI for AI coding agents and developers. Single binary, zero dependencies.
+Fast code search CLI for AI coding agents and developers. Single binary with
+no external runtime dependencies.
 
 ## Install
 
@@ -11,11 +12,15 @@ brew tap defendend/ast-index
 brew install ast-index
 ```
 
-### Yandex (ya tool)
+### Cargo (pending first crates.io release)
+
+After the first ast-index version is published on crates.io:
 
 ```bash
-ya tool ast-index version
+cargo install ast-index --locked
 ```
+
+Until that rollout, use Homebrew or a release archive.
 
 ### Manual
 
@@ -119,10 +124,10 @@ ast-index annotations "RestController"
 ast-index deprecated
 ```
 
-### Changed files on a branch (Git/Arc)
+### Changed files on a branch
 
 ```bash
-# Auto-detect the Git base; Arc uses trunk
+# Auto-detect the branch base
 ast-index changed
 
 # Compare merge-base(origin/develop, HEAD) to HEAD
@@ -140,7 +145,8 @@ ast-index database, so no `rebuild` or `update` is required. The current
 working directory defines the scope; returned paths remain relative to the
 repository root. Staged and unstaged working-tree edits are not included.
 Without `--base`, Git resolves `origin/HEAD`, then tries `origin/main`,
-`origin/master`, `main`, `master`, and `trunk`; Arc uses `trunk`.
+`origin/master`, `main`, `master`, and `trunk`. Other supported version-control
+backends select their conventional mainline automatically.
 
 Text output reports added, modified, deleted, and renamed files:
 
@@ -176,8 +182,8 @@ JSON uses schema v1 and keeps the old path for renames:
 At repository root `scope` is `null`; in a nested working directory it is the
 repository-relative directory path.
 
-Use raw `git diff` / `arc diff` when you need patch hunks. `changed` reports
-files and statuses, not changed declarations or symbols.
+Use your version-control system's diff command when you need patch hunks.
+`changed` reports files and statuses, not changed declarations or symbols.
 
 ### Structural Search (ast-grep)
 
@@ -280,16 +286,32 @@ ast-index perl-imports
 
 ## Multi-Root Projects
 
+Independent worktrees should each have their own index. Use a named subtree
+only when separate directories intentionally form one logical workspace.
+
 ```bash
-# Add additional source root (e.g., shared library)
-ast-index add-root /path/to/shared-lib
+# 1. Create the primary index; subtree commands require it.
+ast-index rebuild
 
-# List configured roots
-ast-index list-roots
+# 2. Attach a stable, human-readable name.
+ast-index subtree add shared /path/to/shared-lib
 
-# Remove a root
-ast-index remove-root /path/to/shared-lib
+# 3. Index the newly attached files and inspect the workspace.
+ast-index update
+ast-index subtree list
+
+# Scope a query, or restrict it to the primary project.
+ast-index --subtree shared search "Repository"
+ast-index --local search "Repository"
+
+# Detach by name, then drop its indexed files.
+ast-index subtree remove shared
+ast-index rebuild
 ```
+
+A full `rebuild` after `subtree add` is also valid and preserves the named
+attachment. The older `add-root`, `remove-root`, and `list-roots` forms remain
+compatibility aliases; prefer `subtree add/remove/list` in new automation.
 
 ## JSON Output
 
@@ -301,6 +323,14 @@ ast-index --format json symbol "fetchUser" --kind function
 ast-index --format json refs "UserRepository"
 ast-index --format json changed --base origin/main
 ```
+
+Paginated search commands use schema v2. Most return
+`{ schema_version, items, pagination }`, where `pagination` contains `total`,
+`returned`, `truncated`, and `limit`. `search` and `refs` retain their named
+arrays and expose pagination metadata for each array. Migrate consumers that
+expect a bare array to read `items`, and check `truncated` before assuming the
+response is complete. Increase `--limit` when necessary. `changed` remains on
+its separate schema v1.
 
 ## Supported Languages
 

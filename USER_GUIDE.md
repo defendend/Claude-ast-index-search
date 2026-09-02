@@ -46,6 +46,18 @@ npx @ast-index/cli search MyClass
 winget install --id defendend.ast-index
 ```
 
+### Cargo (pending first crates.io release)
+
+This channel becomes available with the first ast-index release on crates.io.
+After that rollout, install with a Rust toolchain:
+
+```bash
+cargo install ast-index --locked
+```
+
+Before the first crates.io release, use one of the binary channels above or
+build from source.
+
 ### GitHub Releases
 
 Download the archive for your platform from
@@ -183,7 +195,7 @@ Use `rebuild` instead of `update` when:
 - the index looks inconsistent after a very large branch switch;
 - you want a clean baseline before sharing results with an agent.
 
-## Git Worktrees
+## Independent Git Worktrees
 
 Each git worktree has its own directory, and `ast-index` keys the default cache
 by the canonical project-root path. That means each worktree gets its own index.
@@ -203,6 +215,50 @@ ast-index rebuild
 
 After the first rebuild in each worktree, use `ast-index update` or
 `ast-index watch` inside that worktree as usual.
+
+Do not attach one worktree to another with `subtree add`. Worktrees can contain
+different revisions of the same files; combining them would mix branch states
+in one result set.
+
+## Intentional Cross-Root Workspaces
+
+Named subtrees solve a different problem: one logical workspace that
+intentionally spans sibling source trees, such as an application and a local
+shared library. All attached subtrees share the primary project's index.
+
+The command order matters. `subtree add` stores its configuration in an
+existing index, so create the primary index first, attach the subtree second,
+then run an update or rebuild to index its files:
+
+```bash
+cd /path/to/application
+ast-index rebuild
+ast-index subtree add shared ../shared-library
+ast-index update
+ast-index subtree list
+```
+
+`update` incrementally indexes the newly attached subtree. A later `rebuild`
+also preserves named subtree configuration and rebuilds every attached root.
+
+Use a name to narrow results to one attached tree, or `--local` to keep only
+the primary project:
+
+```bash
+ast-index --subtree shared search "Payment"
+ast-index --local search "Payment"
+```
+
+Detach by name, then rebuild to remove that subtree's indexed files:
+
+```bash
+ast-index subtree remove shared
+ast-index rebuild
+```
+
+The legacy `add-root`, `remove-root`, and `list-roots` commands remain
+compatibility aliases. New scripts and documentation should use the named
+`subtree` commands.
 
 ## Running From Subdirectories
 
@@ -371,7 +427,7 @@ ast-index implementations "Repository"  # find implementations
 ast-index hierarchy "BaseController"    # inheritance tree
 ast-index outline src/main.rs           # file structure
 ast-index imports src/main.rs           # imports/includes
-ast-index changed                       # symbols changed in VCS diff
+ast-index changed                       # files changed on the current branch
 ast-index map                           # compact project map
 ast-index conventions                   # detected frameworks and patterns
 ```
@@ -381,6 +437,13 @@ Use JSON for scripts or agents:
 ```bash
 ast-index --format json search "Payment"
 ```
+
+Paginated search commands use JSON schema v2. Single-result-set commands return
+`items` plus `pagination { total, returned, truncated, limit }`; `search` and
+`refs` keep named arrays with per-array pagination metadata. Clients written
+for bare arrays must unwrap `items`, and every client should check `truncated`
+before treating results as complete. Increase `--limit` to request more rows.
+The `changed` command remains on its independent schema v1.
 
 ## Advanced
 
@@ -402,12 +465,14 @@ Use structural search through ast-grep when `sg` is installed:
 ast-index agrep 'if ($COND) { return $RET; }' --lang typescript
 ```
 
-Add external source roots when a project depends on local sibling code:
+Attach a named subtree when a project intentionally depends on local sibling
+code. The primary index must already exist:
 
 ```bash
-ast-index add-root /path/to/shared-library
-ast-index list-roots
+ast-index rebuild
+ast-index subtree add shared /path/to/shared-library
 ast-index update
+ast-index subtree list
 ```
 
 ## Troubleshooting

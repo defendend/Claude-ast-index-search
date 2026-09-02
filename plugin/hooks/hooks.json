@@ -32,7 +32,9 @@
           {
             "type": "command",
             "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session-start-refresh.sh",
-            "timeout": 90
+            "timeout": 90,
+            "statusMessage": "Queuing the ast-index project refresh...",
+            "async": true
           }
         ]
       }

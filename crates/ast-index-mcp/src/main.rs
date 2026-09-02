@@ -522,6 +522,7 @@ fn supports_json_format(tool: &str) -> bool {
         "explore"
             | "search"
             | "usages"
+            | "callers"
             | "implementations"
             | "refs"
             | "stats"
@@ -1024,6 +1025,7 @@ mod tests {
         let yes = [
             "search",
             "usages",
+            "callers",
             "implementations",
             "refs",
             "stats",
@@ -1033,7 +1035,6 @@ mod tests {
         ];
         let no = [
             "outline",
-            "callers",
             "rebuild",
             "find_file",
             "update",

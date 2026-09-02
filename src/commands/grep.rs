@@ -22,7 +22,7 @@ use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 
-use super::{relative_path, search_files_limited};
+use super::{print_truncation_notice, relative_path, search_files_limited, search_files_page};
 
 /// All source code extensions (for grep-based commands: todo, search, callers, etc.)
 pub const ALL_SOURCE_EXTENSIONS: [&str; 58] = [
@@ -163,46 +163,68 @@ pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 }
 
 /// Find function callers
-pub fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()> {
+pub fn cmd_callers(root: &Path, function_name: &str, limit: usize, format: &str) -> Result<()> {
     let pattern = build_caller_pattern(function_name);
     let def_pattern = build_def_skip_pattern(function_name);
 
-    let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
-    let mut count = 0;
-
-    search_files_limited(
+    let page = search_files_page(
         root,
         &pattern,
         &ALL_SOURCE_EXTENSIONS,
         limit,
         |path, line_num, line| {
             if def_pattern.is_match(line) {
-                return;
+                return None;
             } // Skip definitions
 
             let rel_path = relative_path(root, path);
             let content: String = line.chars().take(70).collect();
-
-            by_file
-                .entry(rel_path)
-                .or_default()
-                .push((line_num, content));
-            count += 1;
+            Some((rel_path, line_num, content))
         },
     )?;
 
-    let total: usize = by_file.values().map(|v| v.len()).sum();
+    if format == "json" {
+        let items: Vec<_> = page
+            .items
+            .iter()
+            .map(|(path, line, content)| {
+                serde_json::json!({"path": path, "line": line, "content": content})
+            })
+            .collect();
+        let result = serde_json::json!({
+            "schema_version": super::PAGINATED_JSON_SCHEMA_VERSION,
+            "items": items,
+            "pagination": page.pagination,
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
     println!(
         "{}",
-        format!("Callers of '{}' ({}):", function_name, total).bold()
+        format!(
+            "Callers of '{}' (showing {} of {}):",
+            function_name, page.pagination.returned, page.pagination.total
+        )
+        .bold()
     );
 
-    for (path, items) in by_file.iter() {
+    let mut by_file: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
+    for (path, line, content) in &page.items {
+        by_file
+            .entry(path)
+            .or_default()
+            .push((*line, content.as_str()));
+    }
+    let mut paths: Vec<_> = by_file.into_iter().collect();
+    paths.sort_by(|left, right| left.0.cmp(right.0));
+    for (path, items) in paths {
         println!("\n  {}:", path.cyan());
         for (line_num, content) in items {
             println!("    :{} {}", line_num, content);
         }
     }
+    print_truncation_notice(page.pagination);
 
     Ok(())
 }

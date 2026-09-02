@@ -605,44 +605,204 @@ pub struct StackDetection {
     pub is_kmp: bool,
     /// True when more than one independent stack is present and it is not a KMP repo.
     pub is_polyglot: bool,
+    /// True when filesystem or Gradle-file inspection reached a resource limit.
+    /// Detected stacks are still valid, but the list may be incomplete.
+    pub scan_truncated: bool,
 }
 
-fn collect_markers(root: &Path, candidates: &[&str]) -> Vec<String> {
-    candidates
+const STACK_SCAN_MAX_DEPTH: usize = 8;
+const STACK_SCAN_MAX_ENTRIES: usize = 20_000;
+const STACK_MARKERS_PER_KIND: usize = 32;
+const STACK_GRADLE_MAX_FILES: usize = 64;
+const STACK_GRADLE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const ROOT_STACK_MARKER_NAMES: &[&str] = &[
+    "settings.gradle.kts",
+    "settings.gradle",
+    "build.gradle.kts",
+    "build.gradle",
+    "libs.versions.toml",
+    "pom.xml",
+    "Package.swift",
+    "Podfile",
+    "package.json",
+    "tsconfig.json",
+    "vite.config.ts",
+    "vite.config.js",
+    "next.config.js",
+    "next.config.mjs",
+    "nuxt.config.ts",
+    "angular.json",
+    "Cargo.toml",
+    "Directory.Build.props",
+    "Gemfile",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "go.mod",
+    "pubspec.yaml",
+    "composer.json",
+    "build.sbt",
+    "build.zig",
+    "build.zig.zon",
+    "CMakeLists.txt",
+    "Makefile.PL",
+    "Build.PL",
+    "cpanfile",
+];
+
+#[derive(Debug)]
+struct StackScanEntry {
+    path: PathBuf,
+    relative: String,
+    is_dir: bool,
+}
+
+#[derive(Debug)]
+struct StackMarkerScan {
+    entries: Vec<StackScanEntry>,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StackScanLimits {
+    max_depth: usize,
+    max_entries: usize,
+    max_gradle_files: usize,
+    max_gradle_bytes: usize,
+}
+
+impl Default for StackScanLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: STACK_SCAN_MAX_DEPTH,
+            max_entries: STACK_SCAN_MAX_ENTRIES,
+            max_gradle_files: STACK_GRADLE_MAX_FILES,
+            max_gradle_bytes: STACK_GRADLE_MAX_BYTES,
+        }
+    }
+}
+
+/// Collect the small amount of filesystem metadata needed by stack detection
+/// in one bounded traversal. Sorting the walk makes both the entry budget and
+/// the reported marker order deterministic across filesystems.
+fn scan_stack_markers(root: &Path, limits: StackScanLimits) -> StackMarkerScan {
+    use ignore::WalkBuilder;
+
+    // Preserve root-only detection even when a very large, lexically earlier
+    // subtree consumes the recursive entry budget.
+    let mut entries: Vec<StackScanEntry> = ROOT_STACK_MARKER_NAMES
         .iter()
-        .filter(|name| root.join(name).exists())
-        .map(|s| s.to_string())
+        .filter_map(|name| {
+            let path = root.join(name);
+            path.is_file().then(|| StackScanEntry {
+                path,
+                relative: (*name).to_string(),
+                is_dir: false,
+            })
+        })
+        .collect();
+    let mut seen: std::collections::HashSet<String> =
+        entries.iter().map(|entry| entry.relative.clone()).collect();
+
+    let use_git_ignore = has_git_repo(root);
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .follow_links(false)
+        .max_depth(Some(limits.max_depth))
+        .git_ignore(use_git_ignore)
+        .git_global(use_git_ignore)
+        .git_exclude(use_git_ignore)
+        .filter_entry(|entry| !is_excluded_dir(entry));
+
+    // Do not sort the walker itself: ignore's sorted walk must enumerate and
+    // buffer a whole directory before yielding its first child. Take at most
+    // `cap + 1` raw results, then sort only that bounded sample.
+    let mut raw_items = 0usize;
+    let mut walked: Vec<(StackScanEntry, usize)> = builder
+        .build()
+        .skip(1)
+        .take(limits.max_entries.saturating_add(1))
+        .filter_map(|entry| {
+            raw_items += 1;
+            let entry = entry.ok()?;
+            let depth = entry.depth();
+            let is_dir = entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false);
+            let path = entry.into_path();
+            let relative = path
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            Some((
+                StackScanEntry {
+                    path,
+                    relative,
+                    is_dir,
+                },
+                depth,
+            ))
+        })
+        .collect();
+    let entry_limit_reached = raw_items > limits.max_entries;
+    walked.truncate(limits.max_entries);
+    let depth_limit_reached = walked
+        .iter()
+        .any(|(entry, depth)| entry.is_dir && *depth == limits.max_depth);
+    walked.sort_unstable_by(|left, right| left.0.relative.cmp(&right.0.relative));
+    entries.extend(
+        walked
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .filter(|entry| seen.insert(entry.relative.clone())),
+    );
+
+    StackMarkerScan {
+        entries,
+        truncated: entry_limit_reached || depth_limit_reached,
+    }
+}
+
+fn collect_markers(scan: &[StackScanEntry], candidates: &[&str]) -> Vec<String> {
+    let mut markers = Vec::new();
+    for candidate in candidates {
+        markers.extend(
+            scan.iter()
+                .filter(|entry| {
+                    !entry.is_dir
+                        && entry.path.file_name().and_then(|name| name.to_str()) == Some(*candidate)
+                })
+                .map(|entry| entry.relative.clone())
+                .take(STACK_MARKERS_PER_KIND.saturating_sub(markers.len())),
+        );
+        if markers.len() == STACK_MARKERS_PER_KIND {
+            break;
+        }
+    }
+    markers
+}
+
+fn collect_ext_markers(scan: &[StackScanEntry], ext: &str, limit: usize) -> Vec<String> {
+    scan.iter()
+        .filter(|entry| {
+            entry.path.extension().and_then(|value| value.to_str()) == Some(ext)
+                && (entry.is_dir || entry.path.is_file())
+        })
+        .map(|entry| entry.relative.clone())
+        .take(limit)
         .collect()
 }
 
-fn any_ext_in_root(root: &Path, ext: &str) -> bool {
-    fs::read_dir(root)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .any(|e| e.path().extension().map(|x| x == ext).unwrap_or(false))
-        })
-        .unwrap_or(false)
-}
+fn has_kmp_markers(
+    root: &Path,
+    scan: &[StackScanEntry],
+    limits: StackScanLimits,
+) -> (bool, Vec<String>, bool) {
+    use std::io::Read;
 
-fn collect_ext_markers(root: &Path, ext: &str, limit: usize) -> Vec<String> {
-    fs::read_dir(root)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|x| x == ext).unwrap_or(false))
-                .take(limit)
-                .filter_map(|e| {
-                    e.path()
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
     // KMP requires two independent signals:
     //   * a Kotlin multiplatform source set directory (commonMain / *Main),
     //   * a Gradle plugin reference (`kotlin("multiplatform")` or
@@ -650,8 +810,6 @@ fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
     // Either alone is too weak — non-KMP Android repos sometimes have stray
     // `commonMain` folders, and some Gradle catalogs declare the plugin without
     // applying it.
-    let mut markers = Vec::new();
-
     let kmp_source_sets = [
         "commonMain",
         "commonTest",
@@ -665,70 +823,90 @@ fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
         "jvmMain",
         "nativeMain",
     ];
-    'sources: for top in [
-        "src",
-        "shared",
-        "common",
-        "core",
-        "kmp",
-        "composeApp",
-        "androidApp",
-    ] {
-        let top_path = root.join(top);
-        if !top_path.is_dir() {
+
+    let mut files_read = 0usize;
+    let mut bytes_read = 0usize;
+    let mut budget_truncated = false;
+    for plugin in scan.iter().filter(|entry| {
+        !entry.is_dir
+            && matches!(
+                entry.path.file_name().and_then(|name| name.to_str()),
+                Some("build.gradle.kts" | "build.gradle")
+            )
+    }) {
+        if files_read == limits.max_gradle_files {
+            budget_truncated = true;
+            break;
+        }
+        let Ok(metadata) = fs::metadata(&plugin.path) else {
+            continue;
+        };
+        if metadata.len() > max_file_size_bytes() {
+            budget_truncated = true;
             continue;
         }
-        if let Ok(entries) = fs::read_dir(&top_path) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if kmp_source_sets.contains(&name.as_str()) {
-                    markers.push(format!("{}/{}", top, name));
-                    break 'sources;
-                }
+        let Ok(file_size) = usize::try_from(metadata.len()) else {
+            budget_truncated = true;
+            continue;
+        };
+        if file_size > limits.max_gradle_bytes.saturating_sub(bytes_read) {
+            budget_truncated = true;
+            break;
+        }
+
+        let Ok(file) = fs::File::open(&plugin.path) else {
+            continue;
+        };
+        let mut content = Vec::with_capacity(file_size);
+        let Ok(read) = file.take(file_size as u64).read_to_end(&mut content) else {
+            continue;
+        };
+        files_read += 1;
+        bytes_read = bytes_read.saturating_add(read);
+        let content = String::from_utf8_lossy(&content);
+        if !content.contains("kotlin(\"multiplatform\")")
+            && !content.contains("org.jetbrains.kotlin.multiplatform")
+        {
+            continue;
+        }
+
+        let Some(module_dir) = plugin.path.parent() else {
+            continue;
+        };
+        let source_marker = scan.iter().find(|entry| {
+            if !entry.is_dir {
+                return false;
             }
+            let Ok(relative_to_module) = entry.path.strip_prefix(module_dir) else {
+                return false;
+            };
+            let components: Vec<&str> = relative_to_module
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .collect();
+            match components.as_slice() {
+                [source_set] => kmp_source_sets.contains(source_set),
+                ["src", source_set] => kmp_source_sets.contains(source_set),
+                _ => false,
+            }
+        });
+
+        if let Some(source_marker) = source_marker {
+            let plugin_marker = plugin
+                .path
+                .strip_prefix(root)
+                .unwrap_or(&plugin.path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            return (
+                true,
+                vec![source_marker.relative.clone(), plugin_marker],
+                budget_truncated,
+            );
         }
     }
-    let has_source_set = !markers.is_empty();
 
-    let plugin_files = [
-        "build.gradle.kts",
-        "build.gradle",
-        "settings.gradle.kts",
-        "settings.gradle",
-    ];
-    let mut has_plugin = false;
-    'gradle: for file in plugin_files {
-        let subdirs: Vec<PathBuf> = fs::read_dir(root)
-            .map(|it| {
-                it.filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| p.is_dir())
-                    .collect()
-            })
-            .unwrap_or_default();
-        for base in std::iter::once(root.to_path_buf()).chain(subdirs) {
-            let path = base.join(file);
-            if !path.is_file() {
-                continue;
-            }
-            if let Ok(content) = fs::read_to_string(&path) {
-                if content.contains("kotlin(\"multiplatform\")")
-                    || content.contains("org.jetbrains.kotlin.multiplatform")
-                {
-                    let rel = path
-                        .strip_prefix(root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .into_owned();
-                    markers.push(rel);
-                    has_plugin = true;
-                    break 'gradle;
-                }
-            }
-        }
-    }
-
-    (has_source_set && has_plugin, markers)
+    (false, Vec::new(), budget_truncated)
 }
 
 /// Detect every stack present in `root` by inspecting marker files.
@@ -739,10 +917,20 @@ fn has_kmp_markers(root: &Path) -> (bool, Vec<String>) {
 /// command consumes this to compose Android+iOS rules for KMP repos and
 /// per-stack rules for polyglot monorepos.
 pub fn detect_stacks(root: &Path) -> StackDetection {
+    detect_stacks_with_limits(root, StackScanLimits::default(), true)
+}
+
+fn detect_stacks_with_limits(
+    root: &Path,
+    limits: StackScanLimits,
+    emit_diagnostic: bool,
+) -> StackDetection {
     let mut stacks: Vec<DetectedStack> = Vec::new();
+    let scan = scan_stack_markers(root, limits);
+    let entries = &scan.entries;
 
     let android_markers = collect_markers(
-        root,
+        entries,
         &[
             "settings.gradle.kts",
             "settings.gradle",
@@ -760,9 +948,9 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let mut ios_markers = collect_markers(root, &["Package.swift", "Podfile"]);
-    ios_markers.extend(collect_ext_markers(root, "xcodeproj", 3));
-    ios_markers.extend(collect_ext_markers(root, "xcworkspace", 3));
+    let mut ios_markers = collect_markers(entries, &["Package.swift", "Podfile"]);
+    ios_markers.extend(collect_ext_markers(entries, "xcodeproj", 3));
+    ios_markers.extend(collect_ext_markers(entries, "xcworkspace", 3));
     if !ios_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "ios".to_string(),
@@ -771,7 +959,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let (kmp_found, kmp_markers) = has_kmp_markers(root);
+    let (kmp_found, kmp_markers, gradle_scan_truncated) = has_kmp_markers(root, entries, limits);
     if kmp_found {
         stacks.push(DetectedStack {
             kind: "kmp".to_string(),
@@ -781,7 +969,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
     }
 
     let web_markers = collect_markers(
-        root,
+        entries,
         &[
             "package.json",
             "tsconfig.json",
@@ -801,7 +989,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let rust_markers = collect_markers(root, &["Cargo.toml"]);
+    let rust_markers = collect_markers(entries, &["Cargo.toml"]);
     if !rust_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "rust".to_string(),
@@ -810,9 +998,9 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let mut csharp_markers = collect_markers(root, &["Directory.Build.props"]);
-    csharp_markers.extend(collect_ext_markers(root, "sln", 3));
-    csharp_markers.extend(collect_ext_markers(root, "csproj", 3));
+    let mut csharp_markers = collect_markers(entries, &["Directory.Build.props"]);
+    csharp_markers.extend(collect_ext_markers(entries, "sln", 3));
+    csharp_markers.extend(collect_ext_markers(entries, "csproj", 3));
     if !csharp_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "csharp".to_string(),
@@ -821,8 +1009,8 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let mut ruby_markers = collect_markers(root, &["Gemfile"]);
-    ruby_markers.extend(collect_ext_markers(root, "gemspec", 3));
+    let mut ruby_markers = collect_markers(entries, &["Gemfile"]);
+    ruby_markers.extend(collect_ext_markers(entries, "gemspec", 3));
     if !ruby_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "ruby".to_string(),
@@ -831,7 +1019,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let python_markers = collect_markers(root, &["pyproject.toml", "setup.py", "setup.cfg"]);
+    let python_markers = collect_markers(entries, &["pyproject.toml", "setup.py", "setup.cfg"]);
     if !python_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "python".to_string(),
@@ -840,7 +1028,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let go_markers = collect_markers(root, &["go.mod"]);
+    let go_markers = collect_markers(entries, &["go.mod"]);
     if !go_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "go".to_string(),
@@ -849,7 +1037,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let dart_markers = collect_markers(root, &["pubspec.yaml"]);
+    let dart_markers = collect_markers(entries, &["pubspec.yaml"]);
     if !dart_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "dart".to_string(),
@@ -858,7 +1046,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let php_markers = collect_markers(root, &["composer.json"]);
+    let php_markers = collect_markers(entries, &["composer.json"]);
     if !php_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "php".to_string(),
@@ -867,7 +1055,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let scala_markers = collect_markers(root, &["build.sbt"]);
+    let scala_markers = collect_markers(entries, &["build.sbt"]);
     if !scala_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "scala".to_string(),
@@ -876,7 +1064,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let zig_markers = collect_markers(root, &["build.zig", "build.zig.zon"]);
+    let zig_markers = collect_markers(entries, &["build.zig", "build.zig.zon"]);
     if !zig_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "zig".to_string(),
@@ -885,7 +1073,7 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let cpp_markers = collect_markers(root, &["CMakeLists.txt"]);
+    let cpp_markers = collect_markers(entries, &["CMakeLists.txt"]);
     if !cpp_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "cpp".to_string(),
@@ -894,8 +1082,8 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         });
     }
 
-    let mut perl_markers = collect_markers(root, &["Makefile.PL", "Build.PL", "cpanfile"]);
-    if any_ext_in_root(root, "pm") {
+    let mut perl_markers = collect_markers(entries, &["Makefile.PL", "Build.PL", "cpanfile"]);
+    if !collect_ext_markers(entries, "pm", 1).is_empty() {
         perl_markers.push("*.pm".to_string());
     }
     if !perl_markers.is_empty() {
@@ -926,10 +1114,18 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
         stacks.len() >= 2
     };
 
+    let scan_truncated = scan.truncated || gradle_scan_truncated;
+    if scan_truncated && emit_diagnostic {
+        eprintln!(
+            "Warning: stack detection reached its scan budget; detected stacks may be incomplete"
+        );
+    }
+
     StackDetection {
         stacks,
         is_kmp,
         is_polyglot,
+        scan_truncated,
     }
 }
 
@@ -2712,6 +2908,57 @@ fn strip_kt_line_comments(s: &str) -> String {
     out
 }
 
+/// Convert a stored Gradle module path to the accessor emitted by Gradle's
+/// type-safe project accessors feature. Filesystem path components retain the
+/// project hierarchy, while punctuation inside each component is a word
+/// boundary (`design-icon`, `design_icon`, and `design.icon` all become
+/// `designIcon`).
+fn gradle_project_accessor(module_path: &str) -> Option<String> {
+    let components: Vec<String> = module_path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .map(|component| {
+            let mut accessor = String::with_capacity(component.len());
+            let mut capitalize_next = false;
+            for ch in component.chars() {
+                if matches!(ch, '-' | '_' | '.') {
+                    capitalize_next = true;
+                } else if capitalize_next {
+                    accessor.extend(ch.to_uppercase());
+                    capitalize_next = false;
+                } else {
+                    accessor.push(ch);
+                }
+            }
+            accessor
+        })
+        .filter(|component| !component.is_empty())
+        .collect();
+
+    (!components.is_empty()).then(|| components.join("."))
+}
+
+/// Resolve an accessor without guessing when two real Gradle project paths
+/// normalize to the same generated accessor. Exact module-name lookups stay
+/// first for backwards compatibility with already-supported declarations.
+fn resolve_gradle_module_id(
+    accessor: &str,
+    module_ids: &HashMap<String, i64>,
+    accessor_candidates: &HashMap<String, Vec<(String, i64)>>,
+) -> std::result::Result<Option<i64>, Vec<String>> {
+    match accessor_candidates.get(accessor).map(Vec::as_slice) {
+        // Some module names are already written exactly as an accessor. Keep
+        // that compatibility only when normalization does not reveal another
+        // real project path with the same generated accessor.
+        None => Ok(module_ids.get(accessor).copied()),
+        Some([(_, module_id)]) => Ok(Some(*module_id)),
+        Some(candidates) => Err(candidates
+            .iter()
+            .map(|(module_name, _)| module_name.clone())
+            .collect()),
+    }
+}
+
 /// Parse module dependencies from collected build files (Gradle, Maven, ya.make, Python)
 pub fn index_module_dependencies(
     conn: &mut Connection,
@@ -2770,19 +3017,38 @@ pub fn index_module_dependencies(
 
     let mono_root = find_arc_root(root);
 
-    // First, ensure all modules are indexed and get their IDs
-    let module_ids: std::collections::HashMap<String, i64> = {
-        let mut stmt = conn.prepare("SELECT id, name FROM modules")?;
+    // First, ensure all modules are indexed and get their IDs. Gradle's
+    // generated accessors must be derived from the stored filesystem path:
+    // dots in a directory name are word boundaries, while path separators are
+    // hierarchy boundaries.
+    let module_rows: Vec<(String, String, i64)> = {
+        let mut stmt = conn.prepare("SELECT name, path, id FROM modules ORDER BY name")?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
-        let mut map = std::collections::HashMap::new();
-        for row in rows {
-            let (name, id) = row?;
-            map.insert(name, id);
-        }
-        map
+        rows.collect::<Result<Vec<_>, _>>()?
     };
+    let module_ids: HashMap<String, i64> = module_rows
+        .iter()
+        .map(|(name, _, id)| (name.clone(), *id))
+        .collect();
+    let mut gradle_accessor_candidates: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+    for (module_name, module_path, module_id) in &module_rows {
+        if let Some(accessor) = gradle_project_accessor(module_path) {
+            gradle_accessor_candidates
+                .entry(accessor)
+                .or_default()
+                .push((module_name.clone(), *module_id));
+        }
+    }
+    for candidates in gradle_accessor_candidates.values_mut() {
+        candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        candidates.dedup_by_key(|(_, module_id)| *module_id);
+    }
 
     if progress {
         eprintln!("Found {} modules in index", module_ids.len());
@@ -2818,8 +3084,13 @@ pub fn index_module_dependencies(
             let root_buf = root.to_path_buf();
             let mono_root = mono_root.clone();
             let module_ids = Arc::new(module_ids.clone());
+            let gradle_accessor_candidates = Arc::new(gradle_accessor_candidates);
+            let ambiguous_gradle_refs = Arc::new(Mutex::new(std::collections::BTreeMap::<
+                String,
+                Vec<String>,
+            >::new()));
 
-            pool.install(|| {
+            let edges = pool.install(|| {
                 gradle_files
                     .par_iter()
                     .flat_map_iter(|path| {
@@ -2970,11 +3241,27 @@ pub fn index_module_dependencies(
                             _ => {
                                 let mut inserted: std::collections::HashSet<(i64, i64)> =
                                     std::collections::HashSet::new();
+                                let resolve_accessor =
+                                    |accessor: &str| match resolve_gradle_module_id(
+                                        accessor,
+                                        &module_ids,
+                                        &gradle_accessor_candidates,
+                                    ) {
+                                        Ok(module_id) => module_id,
+                                        Err(candidates) => {
+                                            ambiguous_gradle_refs
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                .entry(accessor.to_string())
+                                                .or_insert(candidates);
+                                            None
+                                        }
+                                    };
                                 for caps in projects_dep_re.captures_iter(&content) {
                                     let dep_kind =
                                         caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
                                     let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                                    if let Some(&dep_id) = module_ids.get(dep_name) {
+                                    if let Some(dep_id) = resolve_accessor(dep_name) {
                                         if inserted.insert((module_id, dep_id)) {
                                             edges.push((module_id, dep_id, dep_kind.to_string()));
                                         }
@@ -3015,7 +3302,20 @@ pub fn index_module_dependencies(
                         edges
                     })
                     .collect()
-            })
+            });
+
+            let ambiguous_gradle_refs = ambiguous_gradle_refs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (accessor, candidates) in ambiguous_gradle_refs.iter() {
+                eprintln!(
+                    "Warning: ambiguous Gradle project accessor `projects.{}` matches modules {}; dependency skipped",
+                    accessor,
+                    candidates.join(", ")
+                );
+            }
+
+            edges
         };
 
         edges.sort_unstable();
@@ -4542,6 +4842,48 @@ no_ignore: true
         assert_eq!(strip_py_version("foo[extra]==1.0"), "foo");
         assert_eq!(strip_py_version("foo ~= 2.0"), "foo");
         assert_eq!(strip_py_version("foo ; python_version>='3.8'"), "foo");
+    }
+
+    #[test]
+    fn stack_marker_scan_stops_at_entry_budget() {
+        let dir = TempDir::new().unwrap();
+        for index in 0..12 {
+            fs::write(dir.path().join(format!("file-{index}.txt")), "x").unwrap();
+        }
+        let limits = StackScanLimits {
+            max_entries: 3,
+            ..StackScanLimits::default()
+        };
+
+        let scan = scan_stack_markers(dir.path(), limits);
+
+        assert!(scan.truncated);
+        assert_eq!(scan.entries.len(), 3);
+    }
+
+    #[test]
+    fn stack_detection_reports_exhausted_gradle_read_budget() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("shared/src/commonMain/kotlin")).unwrap();
+        fs::write(
+            root.join("shared/build.gradle.kts"),
+            "plugins { kotlin(\"multiplatform\") }",
+        )
+        .unwrap();
+        let limits = StackScanLimits {
+            max_gradle_bytes: 8,
+            ..StackScanLimits::default()
+        };
+
+        let detection = detect_stacks_with_limits(root, limits, false);
+
+        assert!(detection.scan_truncated);
+        assert!(!detection.is_kmp);
+        assert_eq!(
+            serde_json::to_value(&detection).unwrap()["scan_truncated"],
+            true
+        );
     }
 
     #[test]

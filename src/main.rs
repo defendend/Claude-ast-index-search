@@ -24,6 +24,7 @@ Index Management:
   clear                  Clear index database
   version                Show version
   watch                  Watch for file changes and auto-update
+  watch-status           Report whether this project has an active watcher
 
 Search & Navigation:
   explore                Ranked relevant symbols' source + neighbours + tests (one-shot; --rwr for graph)
@@ -120,8 +121,7 @@ struct Cli {
 
     /// Restrict search/listing commands to a single named subtree.
     /// Use `subtree list` to discover names. Conflicts with `--local`.
-    /// May trim the result below `--limit` because the cap is applied to
-    /// the unfiltered SQL query.
+    /// Filtering is applied before pagination and `--limit`.
     #[arg(long, global = true)]
     subtree: Option<String>,
 
@@ -305,6 +305,18 @@ enum Commands {
         /// Verbose logging with timing
         #[arg(long, short)]
         verbose: bool,
+        /// Queue the update through the project freshness coordinator
+        #[arg(long)]
+        background: bool,
+        /// Trailing debounce window for background update requests
+        #[arg(long, default_value_t = 500)]
+        debounce_ms: u64,
+        #[arg(long, hide = true)]
+        coordinator_launch: bool,
+        #[arg(long, hide = true)]
+        coordinator_worker: bool,
+        #[arg(long, hide = true)]
+        coordinator_claim: Option<u64>,
     },
     /// Restore index from a .db file
     Restore {
@@ -710,6 +722,12 @@ enum Commands {
     },
     /// Watch for file changes and auto-update index
     Watch,
+    /// Report whether this project has an active watcher
+    WatchStatus {
+        /// Suppress output and communicate status only through the exit code
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Clear index database for current project
     Clear,
     /// Show version
@@ -857,6 +875,38 @@ fn main() -> Result<()> {
     }
     let _command_cache_lease = command_cache_lease;
 
+    let reads_index = !matches!(
+        &cli.command,
+        Commands::Rebuild { .. }
+            | Commands::Update { .. }
+            | Commands::Restore { .. }
+            | Commands::Clear
+            | Commands::Watch
+            | Commands::WatchStatus { .. }
+            | Commands::AddRoot { .. }
+            | Commands::RemoveRoot { .. }
+            | Commands::Subtree {
+                action: SubtreeAction::Add { .. } | SubtreeAction::Remove { .. }
+            }
+            | Commands::Version
+            | Commands::InstallClaudePlugin
+            | Commands::InstallCodexMcp { .. }
+            | Commands::DetectStacks
+            | Commands::InstallGitHooks { .. }
+            | Commands::Agrep { .. }
+            | Commands::Changed { .. }
+            | Commands::DbPath
+    );
+    if reads_index && db::db_exists(&root) {
+        let timeout = std::time::Duration::from_millis(
+            std::env::var("AST_INDEX_UPDATE_WAIT_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30_000),
+        );
+        db::wait_for_pending_update(&root, timeout)?;
+    }
+
     // Compute directory scope: if cwd is inside project root, limit search to cwd subtree
     let cwd = std::env::current_dir().unwrap_or_default();
     let dir_prefix = if cwd != root {
@@ -878,7 +928,7 @@ fn main() -> Result<()> {
         Commands::Callers {
             function_name,
             limit,
-        } => commands::grep::cmd_callers(&root, &function_name, limit),
+        } => commands::grep::cmd_callers(&root, &function_name, limit, format),
         Commands::CallTree {
             function_name,
             depth,
@@ -934,6 +984,7 @@ fn main() -> Result<()> {
             remember,
             max_files,
         } => {
+            let refresh_generation = db::snapshot_requested_update_generation(&root)?;
             if let Some(t) = threads {
                 std::env::set_var("AST_INDEX_THREADS", t.to_string());
             }
@@ -962,19 +1013,54 @@ fn main() -> Result<()> {
                 &paths,
             );
             if result.is_ok() {
+                db::acknowledge_full_refresh(&root, refresh_generation)?;
+                commands::management::ensure_pending_update_worker(&root, 0)?;
                 gc_stale_index_caches(&root);
             }
             result
         }
-        Commands::Update { verbose } => {
+        Commands::Update {
+            verbose,
+            background,
+            debounce_ms,
+            coordinator_launch,
+            coordinator_worker,
+            coordinator_claim,
+        } => {
             let had_index = db::db_exists(&root);
-            let result = commands::management::cmd_update(&root, verbose);
+            let result = if coordinator_worker {
+                commands::management::cmd_update_coordinator_worker(
+                    &root,
+                    debounce_ms,
+                    verbose,
+                    coordinator_claim.context("coordinator worker is missing its claim token")?,
+                )
+            } else if coordinator_launch {
+                commands::management::cmd_update_coordinator_launch(
+                    &root,
+                    debounce_ms,
+                    verbose,
+                    coordinator_claim.context("coordinator launcher is missing its claim token")?,
+                )
+            } else if background {
+                commands::management::cmd_update_background(&root, debounce_ms, verbose)
+            } else {
+                commands::management::cmd_update(&root, verbose)
+            };
             if result.is_ok() && had_index {
                 gc_stale_index_caches(&root);
             }
             result
         }
-        Commands::Restore { path } => commands::management::cmd_restore(&root, &path),
+        Commands::Restore { path } => {
+            let refresh_generation = db::snapshot_requested_update_generation(&root)?;
+            let result = commands::management::cmd_restore(&root, &path);
+            if result.is_ok() {
+                db::acknowledge_full_refresh(&root, refresh_generation)?;
+                commands::management::ensure_pending_update_worker(&root, 0)?;
+            }
+            result
+        }
         Commands::Stats => commands::management::cmd_stats(&root, format),
         // Index commands
         Commands::Search {
@@ -1241,6 +1327,13 @@ fn main() -> Result<()> {
             SubtreeAction::List => commands::management::cmd_subtree_list(&root, format),
         },
         Commands::Watch => commands::watch::cmd_watch(&root),
+        Commands::WatchStatus { quiet } => {
+            if commands::watch::cmd_watch_status(&root, quiet, format)? {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
         Commands::Clear => commands::management::cmd_clear(&root),
         Commands::Version => {
             println!("ast-index v{}", env!("CARGO_PKG_VERSION"));
@@ -1514,7 +1607,7 @@ fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool) -> Result<()> 
             format!("Already installed (skipped): {}", skipped.join(", ")).dimmed()
         );
     }
-    println!("Each hook runs `ast-index update` in the background after the git operation.");
+    println!("Each hook queues a coordinated, trailing-debounced index update.");
     Ok(())
 }
 
@@ -1530,14 +1623,30 @@ fn git_hook_script() -> String {
          if ! command -v ast-index >/dev/null 2>&1; then\n\
            exit 0\n\
          fi\n\
-         # Skip if a watcher is already running for this tree.\n\
-         if pgrep -f \"ast-index watch\" >/dev/null 2>&1; then\n\
+         # Skip only if this tree's watcher owns its project-scoped lock.\n\
+         if ast-index watch-status --quiet >/dev/null 2>&1; then\n\
            exit 0\n\
          fi\n\
-         (ast-index update >/dev/null 2>&1 &) >/dev/null 2>&1\n\
+         if ! ast-index update --background --debounce-ms 500 >/dev/null; then\n\
+           echo \"ast-index: failed to queue background index update\" >&2\n\
+         fi\n\
          exit 0\n",
         GIT_HOOK_MARKER
     )
+}
+
+#[cfg(test)]
+mod git_hook_tests {
+    use super::git_hook_script;
+
+    #[test]
+    fn generated_hook_checks_the_current_projects_watch_lock() {
+        let script = git_hook_script();
+        assert!(script.contains("ast-index watch-status --quiet"));
+        assert!(script.contains("ast-index update --background --debounce-ms 500"));
+        assert!(!script.contains("update >/dev/null 2>&1 &"));
+        assert!(!script.contains("pgrep"));
+    }
 }
 
 fn resolve_git_hooks_dir(root: &Path) -> Result<PathBuf> {

@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 /// Canonicalize a path with a hard timeout.
 ///
@@ -199,7 +200,7 @@ fn publication_lock_path(db_path: &Path, lease: &ProjectLease) -> Result<PathBuf
     Ok(leases_dir(cache_base).join(format!("{cache_key}.publish.lock")))
 }
 
-fn lock_is_contended(error: &std::io::Error) -> bool {
+pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock
         || matches!(
             error.raw_os_error(),
@@ -2116,6 +2117,395 @@ pub fn acquire_rebuild_guard(project_root: &Path) -> Result<RebuildLock> {
     })
 }
 
+const UPDATE_COORDINATOR_STATE_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateCoordinatorState {
+    #[serde(default = "update_coordinator_state_version")]
+    pub version: u8,
+    pub requested_generation: u64,
+    pub completed_generation: u64,
+    #[serde(default)]
+    pub successful_cycles: u64,
+    #[serde(default)]
+    pub worker_scheduled: bool,
+    #[serde(default)]
+    pub worker_launches: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_claim: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_started_claim: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_claimed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_generation: Option<u64>,
+}
+
+fn update_coordinator_state_version() -> u8 {
+    UPDATE_COORDINATOR_STATE_VERSION
+}
+
+fn update_coordinator_paths(
+    project_root: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf, ProjectLease)> {
+    let (db_path, lease, _normalized) = resolve_db_path_and_lease(project_root)?;
+    Ok((
+        db_path.with_extension("db.update-state-v1.json"),
+        db_path.with_extension("db.update-state-v1.lock"),
+        db_path.with_extension("db.update-worker-v1.lock"),
+        lease,
+    ))
+}
+
+pub fn create_update_worker_log(project_root: &Path) -> Result<(File, ProjectLease)> {
+    let (db_path, lease, _normalized) = resolve_db_path_and_lease(project_root)?;
+    let directory = db_path
+        .parent()
+        .context("update worker log has no parent directory")?;
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".ast-index-update-worker-") && name.ends_with(".log") {
+                if entry
+                    .file_type()
+                    .map(|kind| kind.is_file())
+                    .unwrap_or(false)
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for sequence in 0..100_u32 {
+        let path = directory.join(format!(
+            ".ast-index-update-worker-{}-{}.log",
+            std::process::id(),
+            nonce + u128::from(sequence)
+        ));
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(file) => return Ok((file, lease)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("failed to create update worker log"),
+        }
+    }
+    anyhow::bail!("could not allocate a unique update worker log")
+}
+
+fn read_update_state_file(path: &Path) -> Result<UpdateCoordinatorState> {
+    match read_bounded_json_file(path)? {
+        Some(state) => {
+            let state: UpdateCoordinatorState = state;
+            anyhow::ensure!(
+                state.version == UPDATE_COORDINATOR_STATE_VERSION,
+                "unsupported update coordinator state version {} in {}",
+                state.version,
+                path.display()
+            );
+            anyhow::ensure!(
+                state.completed_generation <= state.requested_generation,
+                "invalid update coordinator generations in {}",
+                path.display()
+            );
+            Ok(state)
+        }
+        None => Ok(UpdateCoordinatorState {
+            version: UPDATE_COORDINATOR_STATE_VERSION,
+            ..UpdateCoordinatorState::default()
+        }),
+    }
+}
+
+fn write_update_state_file(path: &Path, state: &UpdateCoordinatorState) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("update coordinator state has no parent directory")?;
+    write_bounded_json_file(path, parent, state, true)
+}
+
+fn with_locked_update_state<T>(
+    project_root: &Path,
+    update: impl FnOnce(&mut UpdateCoordinatorState) -> Result<T>,
+) -> Result<T> {
+    let (state_path, lock_path, _, _lease) = update_coordinator_paths(project_root)?;
+    let lock = open_lock_file(&lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("failed to lock update state {}", lock_path.display()))?;
+    let mut state = read_update_state_file(&state_path)?;
+    let result = update(&mut state)?;
+    write_update_state_file(&state_path, &state)?;
+    Ok(result)
+}
+
+pub fn read_update_coordinator_state(project_root: &Path) -> Result<UpdateCoordinatorState> {
+    let (state_path, lock_path, _, _lease) = update_coordinator_paths(project_root)?;
+    let lock = open_lock_file(&lock_path)?;
+    fs2::FileExt::lock_shared(&lock)
+        .with_context(|| format!("failed to lock update state {}", lock_path.display()))?;
+    read_update_state_file(&state_path)
+}
+
+pub struct UpdateRequest {
+    pub generation: u64,
+    pub claim_token: Option<u64>,
+}
+
+pub fn request_update_generation(project_root: &Path) -> Result<UpdateRequest> {
+    let worker_active = is_update_worker_active(project_root)?;
+    with_locked_update_state(project_root, |state| {
+        state.requested_generation = state
+            .requested_generation
+            .checked_add(1)
+            .context("update generation counter overflow")?;
+        let now = unix_time_millis();
+        let claim_is_live = state.worker_claim.is_some()
+            && (worker_active
+                || state
+                    .worker_claimed_at_ms
+                    .map(|claimed| now.saturating_sub(claimed) < 1_000)
+                    .unwrap_or(false));
+        let claim_token = if claim_is_live {
+            None
+        } else {
+            let token = state.worker_launches.saturating_add(1);
+            state.worker_scheduled = true;
+            state.worker_launches = token;
+            state.worker_claim = Some(token);
+            state.worker_started_claim = None;
+            state.worker_claimed_at_ms = Some(now);
+            Some(token)
+        };
+        Ok(UpdateRequest {
+            generation: state.requested_generation,
+            claim_token,
+        })
+    })
+}
+
+fn unix_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+pub fn claim_pending_update_worker(project_root: &Path) -> Result<Option<u64>> {
+    let worker_active = is_update_worker_active(project_root)?;
+    with_locked_update_state(project_root, |state| {
+        if state.requested_generation <= state.completed_generation {
+            return Ok(None);
+        }
+        let now = unix_time_millis();
+        let claim_is_live = state.worker_claim.is_some()
+            && (worker_active
+                || state
+                    .worker_claimed_at_ms
+                    .map(|claimed| now.saturating_sub(claimed) < 1_000)
+                    .unwrap_or(false));
+        if claim_is_live {
+            return Ok(None);
+        }
+        let token = state.worker_launches.saturating_add(1);
+        state.worker_scheduled = true;
+        state.worker_launches = token;
+        state.worker_claim = Some(token);
+        state.worker_started_claim = None;
+        state.worker_claimed_at_ms = Some(now);
+        Ok(Some(token))
+    })
+}
+
+pub fn acknowledge_update_worker_start(project_root: &Path, token: u64) -> Result<bool> {
+    with_locked_update_state(project_root, |state| {
+        if state.worker_claim != Some(token) {
+            return Ok(false);
+        }
+        state.worker_started_claim = Some(token);
+        Ok(true)
+    })
+}
+
+pub fn finish_update_worker_if_idle(project_root: &Path, token: u64) -> Result<bool> {
+    with_locked_update_state(project_root, |state| {
+        if state.requested_generation > state.completed_generation {
+            return Ok(false);
+        }
+        if state.worker_claim == Some(token) {
+            clear_worker_claim(state);
+        }
+        Ok(true)
+    })
+}
+
+pub fn clear_update_worker_schedule(project_root: &Path, token: u64) -> Result<()> {
+    with_locked_update_state(project_root, |state| {
+        if state.worker_claim == Some(token) {
+            clear_worker_claim(state);
+        }
+        Ok(())
+    })
+}
+
+fn clear_worker_claim(state: &mut UpdateCoordinatorState) {
+    state.worker_scheduled = false;
+    state.worker_claim = None;
+    state.worker_started_claim = None;
+    state.worker_claimed_at_ms = None;
+}
+
+pub fn record_update_failure_and_finish(
+    project_root: &Path,
+    token: u64,
+    generation: u64,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    with_locked_update_state(project_root, |state| {
+        state.last_error = Some(format!("{error:#}"));
+        state.last_failure_generation = Some(generation);
+        if state.requested_generation > generation {
+            return Ok(false);
+        }
+        if state.worker_claim == Some(token) {
+            clear_worker_claim(state);
+        }
+        Ok(true)
+    })
+}
+
+pub fn complete_update_generation(project_root: &Path, generation: u64) -> Result<()> {
+    with_locked_update_state(project_root, |state| {
+        state.completed_generation = state
+            .completed_generation
+            .max(generation.min(state.requested_generation));
+        state.successful_cycles = state.successful_cycles.saturating_add(1);
+        state.last_error = None;
+        state.last_failure_generation = None;
+        Ok(())
+    })
+}
+
+pub fn acknowledge_full_refresh(project_root: &Path, generation: u64) -> Result<()> {
+    with_locked_update_state(project_root, |state| {
+        state.completed_generation = state
+            .completed_generation
+            .max(generation.min(state.requested_generation));
+        if state.last_failure_generation.unwrap_or(0) <= state.completed_generation {
+            state.last_error = None;
+            state.last_failure_generation = None;
+        }
+        Ok(())
+    })
+}
+
+pub fn snapshot_requested_update_generation(project_root: &Path) -> Result<u64> {
+    Ok(read_update_coordinator_state(project_root)?.requested_generation)
+}
+
+pub fn has_pending_update(project_root: &Path) -> Result<bool> {
+    let state = read_update_coordinator_state(project_root)?;
+    Ok(state.requested_generation > state.completed_generation)
+}
+
+pub fn fail_update_generation(
+    project_root: &Path,
+    generation: u64,
+    error: &anyhow::Error,
+) -> Result<()> {
+    with_locked_update_state(project_root, |state| {
+        if generation <= state.completed_generation {
+            return Ok(());
+        }
+        state.last_error = Some(format!("{error:#}"));
+        state.last_failure_generation = Some(generation);
+        Ok(())
+    })
+}
+
+pub struct UpdateWorkerLock {
+    _file: File,
+    _lease: ProjectLease,
+}
+
+pub fn try_acquire_update_worker(project_root: &Path) -> Result<Option<UpdateWorkerLock>> {
+    let (_state_path, _state_lock_path, worker_lock_path, lease) =
+        update_coordinator_paths(project_root)?;
+    let file = open_lock_file(&worker_lock_path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(UpdateWorkerLock {
+            _file: file,
+            _lease: lease,
+        })),
+        Err(error) if lock_is_contended(&error) => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to acquire update worker lock {}",
+                worker_lock_path.display()
+            )
+        }),
+    }
+}
+
+pub fn is_update_worker_active(project_root: &Path) -> Result<bool> {
+    Ok(try_acquire_update_worker(project_root)?.is_none())
+}
+
+pub fn wait_for_update_generation(
+    project_root: &Path,
+    generation: u64,
+    timeout: Duration,
+) -> Result<()> {
+    if generation == 0 {
+        return Ok(());
+    }
+    let started = Instant::now();
+    loop {
+        let state = read_update_coordinator_state(project_root)?;
+        if state.completed_generation >= generation {
+            return Ok(());
+        }
+        if state.last_failure_generation.unwrap_or(0) >= generation
+            && state.worker_claim.is_none()
+            && !is_update_worker_active(project_root)?
+        {
+            anyhow::bail!(
+                "background index update generation {} failed and remains pending: {}",
+                generation,
+                state
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("unknown update failure")
+            );
+        }
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "timed out after {} ms waiting for background index update generation {} (completed {}, requested {})",
+                timeout.as_millis(),
+                generation,
+                state.completed_generation,
+                state.requested_generation
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+pub fn wait_for_pending_update(project_root: &Path, timeout: Duration) -> Result<()> {
+    let state = read_update_coordinator_state(project_root)?;
+    if state.requested_generation <= state.completed_generation {
+        return Ok(());
+    }
+    wait_for_update_generation(project_root, state.requested_generation, timeout)
+}
+
 /// How long a cached index may sit untouched before `gc_stale_caches`
 /// removes it. Activity is measured from the newest regular DB, WAL, SHM,
 /// journal, rebuild-swap artifact, or external activity marker, so reads and
@@ -2141,6 +2531,7 @@ const CACHE_ACTIVITY_FILES: &[&str] = &[
     "index.db.swap-pending",
     "index.db.publish-state-v1",
     "index.db.publish-commit-v1",
+    "index.db.update-state-v1.json",
     CACHE_ACTIVITY_MARKER_NAME,
 ];
 
@@ -3008,8 +3399,11 @@ fn sync_regular_file(path: &Path) -> Result<()> {
         "index file is not regular: {}",
         path.display()
     );
-    OpenOptions::new()
-        .read(true)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    options
         .open(path)
         .and_then(|file| file.sync_all())
         .with_context(|| format!("failed to sync index file {}", path.display()))
@@ -5185,6 +5579,112 @@ pub fn find_files_with_roots(
     Ok(results)
 }
 
+pub fn count_files_with_roots_scoped(
+    conn: &Connection,
+    pattern: &str,
+    scope: &SearchScope,
+) -> Result<usize> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!("SELECT COUNT(*) FROM files f WHERE f.path LIKE ?{scope_clause}");
+    let mut values = vec![format!("%{pattern}%")];
+    values.extend(scope_params);
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+pub fn count_files_with_roots_terms_scoped(
+    conn: &Connection,
+    terms: &[&str],
+    scope: &SearchScope,
+) -> Result<usize> {
+    if terms.is_empty() {
+        return Ok(0);
+    }
+    let predicates = (0..terms.len())
+        .map(|_| "f.path LIKE ?")
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!("SELECT COUNT(*) FROM files f WHERE ({predicates}){scope_clause}");
+    let mut values: Vec<String> = terms.iter().map(|term| format!("%{term}%")).collect();
+    values.extend(scope_params);
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+pub fn find_files_with_roots_terms_scoped(
+    conn: &Connection,
+    terms: &[&str],
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<FileResult>> {
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let predicates = (0..terms.len())
+        .map(|_| "f.path LIKE ?")
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        "SELECT f.path, f.root_path FROM files f WHERE ({predicates}){scope_clause} ORDER BY f.path LIMIT ?"
+    );
+    let mut values: Vec<String> = terms.iter().map(|term| format!("%{term}%")).collect();
+    values.extend(scope_params);
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok(FileResult {
+                path: row.get(0)?,
+                root_path: row.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty()),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
+pub fn find_files_with_roots_scoped(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<FileResult>> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        "SELECT f.path, f.root_path FROM files f WHERE f.path LIKE ?{scope_clause} LIMIT ?"
+    );
+    let mut values = vec![format!("%{pattern}%")];
+    values.extend(scope_params);
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok(FileResult {
+                path: row.get(0)?,
+                root_path: row.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty()),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 /// Find symbols by name (exact match first, then prefix/contains if no results)
 pub fn find_symbols_by_name(
     conn: &Connection,
@@ -5710,6 +6210,40 @@ pub fn count_implementations(conn: &Connection, parent_name: &str) -> Result<usi
     Ok(count as usize)
 }
 
+pub fn count_implementations_scoped(
+    conn: &Connection,
+    parent_name: &str,
+    scope: &SearchScope,
+) -> Result<usize> {
+    if scope.is_empty() {
+        return count_implementations(conn, parent_name);
+    }
+    let suffix_pattern = format!("%.{parent_name}");
+    let namespace_suffix_pattern = format!("%::{parent_name}");
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        r#"
+        SELECT COUNT(*)
+        FROM inheritance i
+        JOIN symbols s ON i.child_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE (i.parent_name = ? OR i.parent_name LIKE ? OR i.parent_name LIKE ?){scope_clause}
+        "#
+    );
+    let mut values = vec![
+        parent_name.to_string(),
+        suffix_pattern,
+        namespace_suffix_pattern,
+    ];
+    values.extend(scope_params);
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
 pub fn find_implementations_scoped(
     conn: &Connection,
     parent_name: &str,
@@ -5887,6 +6421,25 @@ pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     Ok(results)
 }
 
+pub fn count_references_scoped(
+    conn: &Connection,
+    name: &str,
+    scope: &SearchScope,
+) -> Result<usize> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        "SELECT COUNT(*) FROM refs r JOIN files f ON r.file_id = f.id WHERE r.name = ?{scope_clause}"
+    );
+    let mut values = vec![name.to_string()];
+    values.extend(scope_params);
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
 /// All symbols defined in a file, ordered by line. Used by `explore --rwr`
 /// to attribute a reference (file + line) to its owning symbol — the last
 /// symbol whose start line is <= the reference line. Approximate without
@@ -5933,6 +6486,130 @@ pub fn search_refs(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(
     Ok(results)
 }
 
+pub fn count_search_refs(conn: &Connection, query: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT name) FROM refs WHERE name LIKE ?1",
+        params![format!("{query}%")],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+pub fn count_search_ref_terms(conn: &Connection, terms: &[&str]) -> Result<usize> {
+    if terms.is_empty() {
+        return Ok(0);
+    }
+    let predicates = (0..terms.len())
+        .map(|_| "name LIKE ?")
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let sql = format!("SELECT COUNT(DISTINCT name) FROM refs WHERE {predicates}");
+    let values: Vec<String> = terms.iter().map(|term| format!("{term}%")).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+pub fn count_search_ref_terms_scoped(
+    conn: &Connection,
+    terms: &[&str],
+    scope: &SearchScope,
+) -> Result<usize> {
+    if terms.is_empty() {
+        return Ok(0);
+    }
+    let predicates = (0..terms.len())
+        .map(|_| "r.name LIKE ?")
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        "SELECT COUNT(DISTINCT r.name) FROM refs r JOIN files f ON r.file_id = f.id WHERE ({predicates}){scope_clause}"
+    );
+    let mut values: Vec<String> = terms.iter().map(|term| format!("{term}%")).collect();
+    values.extend(scope_params);
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+pub fn search_ref_terms_scoped(
+    conn: &Connection,
+    terms: &[&str],
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<(String, i64)>> {
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let predicates = (0..terms.len())
+        .map(|_| "r.name LIKE ?")
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        "SELECT r.name, COUNT(*) AS usage_count FROM refs r JOIN files f ON r.file_id = f.id WHERE ({predicates}){scope_clause} GROUP BY r.name ORDER BY usage_count DESC, r.name LIMIT ?"
+    );
+    let mut values: Vec<String> = terms.iter().map(|term| format!("{term}%")).collect();
+    values.extend(scope_params);
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
+pub fn search_refs_scoped(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<(String, i64)>> {
+    if scope.is_empty() {
+        return search_refs(conn, query, limit);
+    }
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        r#"
+        SELECT r.name, COUNT(*) AS usage_count
+        FROM refs r
+        JOIN files f ON r.file_id = f.id
+        WHERE r.name LIKE ?{scope_clause}
+        GROUP BY r.name
+        ORDER BY CASE WHEN r.name = ? THEN 0 ELSE 1 END, usage_count DESC
+        LIMIT ?
+        "#
+    );
+    let mut values = vec![format!("{query}%")];
+    values.extend(scope_params);
+    values.push(query.to_string());
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 /// Count references in the database
 pub fn count_refs(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM refs", [], |row| row.get(0))?)
@@ -5955,6 +6632,142 @@ pub fn find_imports(conn: &Connection, name: &str, limit: usize) -> Result<Vec<S
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(results)
+}
+
+pub fn count_imports(conn: &Connection, name: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM symbols WHERE kind = 'import' AND name = ?1",
+        params![name],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+pub fn count_imports_scoped(conn: &Connection, name: &str, scope: &SearchScope) -> Result<usize> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        "SELECT COUNT(*) FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.kind = 'import' AND s.name = ?{scope_clause}"
+    );
+    let mut values = vec![name.to_string()];
+    values.extend(scope_params);
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+pub fn find_imports_scoped(
+    conn: &Connection,
+    name: &str,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.kind = 'import' AND s.name = ?{scope_clause} LIMIT ?"
+    );
+    let mut values = vec![name.to_string()];
+    values.extend(scope_params);
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params.as_slice(), row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
+pub fn find_definitions(conn: &Connection, name: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    let find = |predicate: &str, value: String| -> Result<Vec<SearchResult>> {
+        let sql = format!(
+            r#"
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE {predicate} AND s.kind != 'import'
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
+            LIMIT ?
+            "#
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let results = stmt
+            .query_map(params![value, limit as i64], row_to_search_result)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(results)
+    };
+
+    if name.starts_with("::") {
+        return find("s.qualified_name LIKE ?", format!("%{name}"));
+    }
+    if name.contains("::") {
+        let exact = find("s.qualified_name = ?", name.to_string())?;
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        let suffix = find("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        if !suffix.is_empty() {
+            return Ok(suffix);
+        }
+        return find("s.qualified_name LIKE ?", format!("{name}%"));
+    }
+    let exact = find("s.name = ?", name.to_string())?;
+    if !exact.is_empty() {
+        Ok(exact)
+    } else {
+        find("s.name LIKE ?", format!("{name}%"))
+    }
+}
+
+pub fn find_definitions_scoped(
+    conn: &Connection,
+    name: &str,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
+    let find = |predicate: &str, value: String| -> Result<Vec<SearchResult>> {
+        let (scope_clause, scope_params) = scope.path_condition();
+        let sql = format!(
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE {predicate} AND s.kind != 'import'{scope_clause} ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name) LIMIT ?"
+        );
+        let mut values = vec![value];
+        values.extend(scope_params);
+        values.push(limit.to_string());
+        let params: Vec<&dyn rusqlite::types::ToSql> = values
+            .iter()
+            .map(|value| value as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let results = stmt
+            .query_map(params.as_slice(), row_to_search_result)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(results)
+    };
+
+    if name.starts_with("::") {
+        return find("s.qualified_name LIKE ?", format!("%{name}"));
+    }
+    if name.contains("::") {
+        let exact = find("s.qualified_name = ?", name.to_string())?;
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        let suffix = find("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        if !suffix.is_empty() {
+            return Ok(suffix);
+        }
+        return find("s.qualified_name LIKE ?", format!("{name}%"));
+    }
+    let exact = find("s.name = ?", name.to_string())?;
+    if !exact.is_empty() {
+        Ok(exact)
+    } else {
+        find("s.name LIKE ?", format!("{name}%"))
+    }
 }
 
 /// Find all cross-references for a symbol: definitions, imports, and usages
@@ -6068,7 +6881,22 @@ impl<'a> SearchScope<'a> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.in_file.is_none() && self.module.is_none() && self.dir_prefix.is_none()
+        self.in_file.is_none()
+            && self.module.is_none()
+            && self.dir_prefix.is_none()
+            && std::env::var_os("AST_INDEX_LOCAL_SCOPE").is_none()
+            && std::env::var_os("AST_INDEX_SUBTREE").is_none()
+    }
+
+    pub fn matches_path(&self, path: &str) -> bool {
+        self.dir_prefix
+            .map(|prefix| path.starts_with(prefix))
+            .unwrap_or(true)
+            && self.in_file.map(|file| path.contains(file)).unwrap_or(true)
+            && self
+                .module
+                .map(|module| path.starts_with(module))
+                .unwrap_or(true)
     }
 
     /// Build WHERE clause fragment and collect params
@@ -6087,12 +6915,472 @@ impl<'a> SearchScope<'a> {
             conditions.push("f.path LIKE ?".to_string());
             params.push(format!("{}%", module));
         }
+        if std::env::var_os("AST_INDEX_LOCAL_SCOPE").is_some() {
+            conditions.push(
+                "NOT EXISTS (SELECT 1 FROM subtrees st WHERE st.canonical_path = f.root_path)"
+                    .to_string(),
+            );
+        } else if let Ok(name) = std::env::var("AST_INDEX_SUBTREE") {
+            conditions.push(
+                "EXISTS (SELECT 1 FROM subtrees st WHERE st.canonical_path = f.root_path AND st.name = ?)"
+                    .to_string(),
+            );
+            params.push(name);
+        }
         if conditions.is_empty() {
             (String::new(), params)
         } else {
             (format!(" AND {}", conditions.join(" AND ")), params)
         }
     }
+}
+
+fn count_symbol_matches(
+    conn: &Connection,
+    predicate: &str,
+    predicate_params: Vec<String>,
+    kind: Option<&str>,
+    scope: &SearchScope,
+    class_only: bool,
+    exclude_imports: bool,
+) -> Result<usize> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let mut sql = format!(
+        "SELECT COUNT(*) FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicate}){scope_clause}"
+    );
+    if class_only {
+        sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+    }
+    if exclude_imports {
+        sql.push_str(" AND s.kind != 'import'");
+    }
+    if kind.is_some() {
+        sql.push_str(" AND s.kind = ?");
+    }
+
+    let mut values = predicate_params;
+    values.extend(scope_params);
+    if let Some(kind) = kind {
+        values.push(kind.to_string());
+    }
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+pub fn count_symbols_by_name_scoped(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    scope: &SearchScope,
+    exclude_imports: bool,
+) -> Result<usize> {
+    let count = |predicate: &str, value: String| {
+        count_symbol_matches(
+            conn,
+            predicate,
+            vec![value],
+            kind,
+            scope,
+            false,
+            exclude_imports,
+        )
+    };
+    if name.starts_with("::") {
+        return count("s.qualified_name LIKE ?", format!("%{name}"));
+    }
+    if name.contains("::") {
+        let exact = count("s.qualified_name = ?", name.to_string())?;
+        if exact > 0 {
+            return Ok(exact);
+        }
+        let suffix = count("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        if suffix > 0 {
+            return Ok(suffix);
+        }
+        return count("s.qualified_name LIKE ?", format!("{name}%"));
+    }
+
+    let exact = count("s.name = ?", name.to_string())?;
+    if exact > 0 {
+        Ok(exact)
+    } else {
+        count("s.name LIKE ?", format!("{name}%"))
+    }
+}
+
+pub fn count_symbols_by_pattern_scoped(
+    conn: &Connection,
+    like_pattern: &str,
+    kind: Option<&str>,
+    scope: &SearchScope,
+    class_only: bool,
+) -> Result<usize> {
+    let qualified = like_pattern.contains("::");
+    let search_pattern = if qualified && like_pattern.starts_with("::") {
+        format!("%{like_pattern}")
+    } else {
+        like_pattern.to_string()
+    };
+    let name_expr = if qualified {
+        "COALESCE(s.qualified_name, s.name)"
+    } else {
+        "s.name"
+    };
+    if qualified && !like_pattern.starts_with('%') && !like_pattern.starts_with("::") {
+        count_symbol_matches(
+            conn,
+            &format!("{name_expr} LIKE ? ESCAPE '\\' OR {name_expr} LIKE ? ESCAPE '\\'"),
+            vec![search_pattern, format!("%::{like_pattern}")],
+            kind,
+            scope,
+            class_only,
+            false,
+        )
+    } else {
+        count_symbol_matches(
+            conn,
+            &format!("{name_expr} LIKE ? ESCAPE '\\'"),
+            vec![search_pattern],
+            kind,
+            scope,
+            class_only,
+            false,
+        )
+    }
+}
+
+pub fn count_class_like_scoped(
+    conn: &Connection,
+    name: &str,
+    scope: &SearchScope,
+) -> Result<usize> {
+    let count = |predicate: &str, value: String| {
+        count_symbol_matches(conn, predicate, vec![value], None, scope, true, false)
+    };
+    if name.starts_with("::") {
+        return count("s.qualified_name LIKE ?", format!("%{name}"));
+    }
+    if name.contains("::") {
+        let exact = count("s.qualified_name = ?", name.to_string())?;
+        if exact > 0 {
+            return Ok(exact);
+        }
+        let suffix = count("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        if suffix > 0 {
+            return Ok(suffix);
+        }
+        return count("s.qualified_name LIKE ?", format!("{name}%"));
+    }
+    count("s.name = ?", name.to_string())
+}
+
+pub fn count_symbols_fuzzy_scoped(
+    conn: &Connection,
+    query: &str,
+    kind: Option<&str>,
+    scope: &SearchScope,
+    class_only: bool,
+) -> Result<usize> {
+    let (predicate, value) = if query.contains("::") {
+        ("s.qualified_name LIKE ?", format!("%{query}%"))
+    } else {
+        ("s.name LIKE ?", format!("%{query}%"))
+    };
+    count_symbol_matches(conn, predicate, vec![value], kind, scope, class_only, false)
+}
+
+pub fn count_search_symbols_scoped(
+    conn: &Connection,
+    query: &str,
+    kind: Option<&str>,
+    scope: &SearchScope,
+) -> Result<usize> {
+    if query.trim().is_empty() {
+        return Ok(0);
+    }
+    if query.contains("::") {
+        let raw = query.trim_end_matches('*');
+        let (predicate, value) = if query.starts_with("::") {
+            ("s.qualified_name LIKE ?", format!("%{raw}"))
+        } else if query.ends_with('*') {
+            ("s.qualified_name LIKE ?", format!("{raw}%"))
+        } else {
+            ("s.qualified_name = ?", raw.to_string())
+        };
+        return count_symbol_matches(conn, predicate, vec![value], kind, scope, false, false);
+    }
+
+    let escaped_query = escape_fts5_query(query);
+    let (scope_clause, scope_params) = scope.path_condition();
+    let mut sql = format!(
+        r#"
+        SELECT COUNT(*)
+        FROM symbols_fts fts
+        JOIN symbols s ON fts.rowid = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE symbols_fts MATCH ?{scope_clause}
+        "#
+    );
+    if kind.is_some() {
+        sql.push_str(" AND s.kind = ?");
+    }
+    let mut values = vec![escaped_query];
+    values.extend(scope_params);
+    if let Some(kind) = kind {
+        values.push(kind.to_string());
+    }
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+pub fn count_search_symbol_terms_scoped(
+    conn: &Connection,
+    terms: &[&str],
+    kind: Option<&str>,
+    scope: &SearchScope,
+    fuzzy: bool,
+) -> Result<usize> {
+    if terms.is_empty() {
+        return Ok(0);
+    }
+    let (scope_clause, scope_params) = scope.path_condition();
+    let mut values = Vec::new();
+    let mut sql = if fuzzy {
+        let predicates = terms
+            .iter()
+            .map(|term| {
+                values.push(format!("%{term}%"));
+                if term.contains("::") {
+                    "s.qualified_name LIKE ?"
+                } else {
+                    "s.name LIKE ?"
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!(
+            "SELECT COUNT(*) FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicates}){scope_clause}"
+        )
+    } else {
+        let query = terms
+            .iter()
+            .map(|term| escape_fts5_query(&format!("{term}*")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        values.push(query);
+        format!(
+            "SELECT COUNT(*) FROM symbols_fts fts JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id WHERE symbols_fts MATCH ?{scope_clause}"
+        )
+    };
+    values.extend(scope_params);
+    if let Some(kind) = kind {
+        sql.push_str(" AND s.kind = ?");
+        values.push(kind.to_string());
+    }
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+pub fn search_symbol_terms_scoped(
+    conn: &Connection,
+    terms: &[&str],
+    kind: Option<&str>,
+    limit: usize,
+    scope: &SearchScope,
+    fuzzy: bool,
+) -> Result<Vec<SearchResult>> {
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (scope_clause, scope_params) = scope.path_condition();
+    let mut values = Vec::new();
+    let mut sql = if fuzzy {
+        let predicates = terms
+            .iter()
+            .map(|term| {
+                values.push(format!("%{term}%"));
+                if term.contains("::") {
+                    "s.qualified_name LIKE ?"
+                } else {
+                    "s.name LIKE ?"
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!(
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicates}){scope_clause}"
+        )
+    } else {
+        values.push(
+            terms
+                .iter()
+                .map(|term| escape_fts5_query(&format!("{term}*")))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        );
+        format!(
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols_fts fts JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id WHERE symbols_fts MATCH ?{scope_clause}"
+        )
+    };
+    values.extend(scope_params);
+    if let Some(kind) = kind {
+        sql.push_str(" AND s.kind = ?");
+        values.push(kind.to_string());
+    }
+    sql.push_str(" ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), f.path, s.line LIMIT ?");
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params.as_slice(), row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
+pub fn search_symbols_for_command(
+    conn: &Connection,
+    query: &str,
+    kind: Option<&str>,
+    limit: usize,
+    scope: &SearchScope,
+    fuzzy: bool,
+    class_only: bool,
+) -> Result<Vec<SearchResult>> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let (scope_clause, scope_params) = scope.path_condition();
+    let mut values = Vec::new();
+    let mut sql;
+
+    if fuzzy {
+        let (column, contains, exact, prefix) = if query.contains("::") {
+            (
+                "s.qualified_name",
+                format!("%{query}%"),
+                if query.starts_with("::") {
+                    format!("%{query}")
+                } else {
+                    query.to_string()
+                },
+                if query.starts_with("::") {
+                    format!("%{query}")
+                } else {
+                    format!("{query}%")
+                },
+            )
+        } else {
+            (
+                "s.name",
+                format!("%{query}%"),
+                query.to_string(),
+                format!("{query}%"),
+            )
+        };
+        sql = format!(
+            r#"
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE {column} LIKE ?{scope_clause}
+            "#
+        );
+        values.push(contains);
+        values.extend(scope_params);
+        if kind.is_some() {
+            sql.push_str(" AND s.kind = ?");
+        }
+        if class_only {
+            sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+        }
+        sql.push_str(&format!(
+            " ORDER BY CASE WHEN {column} = ? THEN 0 WHEN {column} LIKE ? THEN 1 ELSE 2 END, length({column}) LIMIT ?"
+        ));
+        if let Some(kind) = kind {
+            values.push(kind.to_string());
+        }
+        values.push(exact);
+        values.push(prefix);
+        values.push(limit.to_string());
+    } else if query.contains("::") {
+        let raw = query.trim_end_matches('*');
+        let (predicate, value) = if query.starts_with("::") {
+            ("s.qualified_name LIKE ?", format!("%{raw}"))
+        } else if query.ends_with('*') {
+            ("s.qualified_name LIKE ?", format!("{raw}%"))
+        } else {
+            ("s.qualified_name = ?", raw.to_string())
+        };
+        sql = format!(
+            r#"
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE {predicate}{scope_clause}
+            "#
+        );
+        values.push(value);
+        values.extend(scope_params);
+        if kind.is_some() {
+            sql.push_str(" AND s.kind = ?");
+        }
+        if class_only {
+            sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+        }
+        sql.push_str(" ORDER BY length(s.qualified_name), s.qualified_name LIMIT ?");
+        if let Some(kind) = kind {
+            values.push(kind.to_string());
+        }
+        values.push(limit.to_string());
+    } else {
+        sql = format!(
+            r#"
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+            FROM symbols_fts fts
+            JOIN symbols s ON fts.rowid = s.id
+            JOIN files f ON s.file_id = f.id
+            WHERE symbols_fts MATCH ?{scope_clause}
+            "#
+        );
+        values.push(escape_fts5_query(query));
+        values.extend(scope_params);
+        if kind.is_some() {
+            sql.push_str(" AND s.kind = ?");
+        }
+        if class_only {
+            sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+        }
+        sql.push_str(" LIMIT ?");
+        if let Some(kind) = kind {
+            values.push(kind.to_string());
+        }
+        values.push(limit.to_string());
+    }
+
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params.as_slice(), row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
 }
 
 /// Search symbols with scope filtering (file/module)
@@ -6431,7 +7719,7 @@ pub fn find_references_scoped(
     // Scope filter is applied at files table (small, ~tens of thousands),
     // producing a small file_id set, then refs are filtered by both name
     // AND file_id — both covered by idx_refs_name_file_line.
-    let scope_subquery = if scope_params.is_empty() {
+    let scope_subquery = if scope_clause.is_empty() {
         String::new()
     } else {
         // Strip leading " AND " and wrap in file_id IN subselect

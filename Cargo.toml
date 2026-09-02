@@ -2,9 +2,8 @@
 members = [".", "crates/ast-index-mcp"]
 # Only build the root `ast-index` binary with `cargo build` by default.
 # MCP crate is opt-in: `cargo build -p ast-index-mcp`.
-# This keeps existing release pipelines (release.yml, Arcadia IX, homebrew,
-# npm, ya tool upload) unchanged — they all run plain `cargo build --release`
-# and produce a single `ast-index` binary as before.
+# This keeps existing binary distribution workflows unchanged: they run plain
+# `cargo build --release` and produce a single `ast-index` binary as before.
 default-members = ["."]
 
 [package]
@@ -13,6 +12,21 @@ version = "3.50.0"
 edition = "2021"
 description = "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, Scala, PHP, Perl, Python, Go, C++, and Protocol Buffers projects"
 license = "MIT"
+repository = "https://github.com/defendend/Claude-ast-index-search"
+homepage = "https://github.com/defendend/Claude-ast-index-search"
+readme = "README.md"
+keywords = ["code-search", "static-analysis", "tree-sitter", "sqlite", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+publish = ["crates-io"]
+include = [
+    "/src/**",
+    "/tree-sitter-bsl/src/**",
+    "/build.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+]
 
 [dependencies]
 # CLI
@@ -72,7 +86,7 @@ tree-sitter-commonlisp = "0.4.1"
 tree-sitter-gdscript = "6.1"
 tree-sitter-zig = "1.1"
 tree-sitter-css = "0.25"
-tree-sitter-scss = "1.0"
+tree-sitter-scss = { package = "cortexkit-tree-sitter-scss", version = "1.0.1" }
 tree-sitter-less = "1.0"
 
 [build-dependencies]
@@ -111,13 +125,6 @@ harness = false
 [[bench]]
 name = "index_build"
 harness = false
-
-[patch.crates-io]
-# Published tree-sitter-scss 1.0.0 (2024-04-09) hardcodes `-Wno-unused-parameter`
-# in build.rs, which MSVC `cl.exe` rejects (`error D8021`). Upstream master has
-# the platform-conditional fix (2024-04-26 commit 9ab738d) but never cut a
-# 1.0.1. Pin to a recent master SHA so Windows release builds compile.
-tree-sitter-scss = { git = "https://github.com/tree-sitter-grammars/tree-sitter-scss", rev = "2ef6d42e3ad7a8208900f9346f4529806ae0f9f9" }
 
 [profile.release]
 lto = true

@@ -1,5 +1,6 @@
 //! Watch mode — automatically update index on file changes
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -12,31 +13,64 @@ use notify_debouncer_mini::new_debouncer;
 use crate::commands::{self, management::ScopedEnvVar};
 use crate::{db, indexer, parsers};
 
-/// Acquire an exclusive lock for watch mode, scoped to project root.
-/// Returns the lock file handle (lock held while handle is alive).
-/// Returns None if another watch is already running for this project.
-fn try_acquire_watch_lock(root: &Path) -> Option<std::fs::File> {
-    use fs2::FileExt;
-    let lock_path = db::get_db_path(root).ok()?.with_extension("watch.lock");
+fn open_watch_lock(root: &Path) -> Result<std::fs::File> {
+    let lock_path = db::get_db_path(root)?.with_extension("watch.lock");
     if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .write(true)
-        .open(&lock_path)
-        .ok()?;
-    // Try non-blocking exclusive lock
+        .open(lock_path)
+        .map_err(Into::into)
+}
+
+/// Acquire an exclusive lock for watch mode, scoped to the resolved project
+/// database. The lock remains held until the returned file is dropped.
+fn try_acquire_watch_lock(root: &Path) -> Result<Option<std::fs::File>> {
+    use fs2::FileExt;
+    let file = open_watch_lock(root)?;
     match file.try_lock_exclusive() {
         Ok(()) => {
-            // Write PID for debugging
-            use std::io::Write;
+            file.set_len(0)?;
             let mut f = &file;
-            let _ = write!(f, "{}", std::process::id());
-            Some(file)
+            write!(f, "{}", std::process::id())?;
+            Ok(Some(file))
         }
-        Err(_) => None, // another watch is running
+        Err(error) if db::lock_is_contended(&error) => Ok(None),
+        Err(error) => Err(error.into()),
     }
+}
+
+/// Report whether this project's watch lock is currently held. This probes
+/// the same lock as [`cmd_watch`], so another project's watcher cannot affect
+/// the result.
+fn is_watch_running(root: &Path) -> Result<bool> {
+    use fs2::FileExt;
+    let file = open_watch_lock(root)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(false),
+        Err(error) if db::lock_is_contended(&error) => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Print a stable watcher status. Callers that only need the exit status use
+/// `--quiet`; the CLI exits successfully only while this project is watched.
+pub fn cmd_watch_status(root: &Path, quiet: bool, format: &str) -> Result<bool> {
+    let watching = is_watch_running(root)?;
+    if !quiet {
+        if format == "json" {
+            println!(r#"{{"watching":{watching}}}"#);
+        } else if watching {
+            println!("watching");
+        } else {
+            println!("not-watching");
+        }
+        std::io::stdout().flush()?;
+    }
+    Ok(watching)
 }
 
 /// Watch for file changes and incrementally update the index
@@ -55,7 +89,7 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
     drop(initial);
 
     // Ensure only one watch process runs at a time
-    let _lock = match try_acquire_watch_lock(root) {
+    let _lock = match try_acquire_watch_lock(root)? {
         Some(lock) => lock,
         None => {
             eprintln!("{}", "Another ast-index watch is already running.".yellow());

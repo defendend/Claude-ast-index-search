@@ -71,6 +71,7 @@ fn render_search(v: &Value, out: &mut String) -> bool {
                     writeln!(out, "  {s}").ok();
                 }
             }
+            write_named_pagination_notice(obj, "files", out);
         }
     }
 
@@ -81,6 +82,7 @@ fn render_search(v: &Value, out: &mut String) -> bool {
             for s in symbols {
                 write_symbol_line(s, "  ", out);
             }
+            write_named_pagination_notice(obj, "symbols", out);
         }
     }
 
@@ -96,6 +98,7 @@ fn render_search(v: &Value, out: &mut String) -> bool {
                     writeln!(out, "  {name} ×{count}").ok();
                 }
             }
+            write_named_pagination_notice(obj, "references", out);
         }
     }
 
@@ -112,6 +115,7 @@ fn render_search(v: &Value, out: &mut String) -> bool {
                     writeln!(out, "  {path}:{line}  {}", truncate(snippet, 100)).ok();
                 }
             }
+            write_named_pagination_notice(obj, "content_matches", out);
         }
     }
 
@@ -132,6 +136,7 @@ fn render_refs(v: &Value, out: &mut String) -> bool {
             for d in defs {
                 write_symbol_line(d, "  ", out);
             }
+            write_named_pagination_notice(obj, "definitions", out);
         }
     }
 
@@ -152,6 +157,7 @@ fn render_refs(v: &Value, out: &mut String) -> bool {
                     }
                 }
             }
+            write_named_pagination_notice(obj, "imports", out);
         }
     }
 
@@ -162,6 +168,7 @@ fn render_refs(v: &Value, out: &mut String) -> bool {
             for u in usages {
                 write_ref_line(u, "  ", out);
             }
+            write_named_pagination_notice(obj, "usages", out);
         }
     }
 
@@ -169,25 +176,71 @@ fn render_refs(v: &Value, out: &mut String) -> bool {
 }
 
 fn render_ref_list(v: &Value, out: &mut String) -> bool {
-    // usages / callers: array of {name, line, context, path}
-    let Some(arr) = v.as_array() else {
+    // Legacy responses are arrays; schema v2 wraps them in {items,pagination}.
+    let Some(arr) = page_items(v) else {
         return false;
     };
     for r in arr {
         write_ref_line(r, "", out);
     }
+    write_page_pagination_notice(v, out);
     true
 }
 
 fn render_symbol_list(v: &Value, out: &mut String) -> bool {
-    // symbol / class / implementations: array of SearchResult
-    let Some(arr) = v.as_array() else {
+    let Some(arr) = page_items(v) else {
         return false;
     };
     for s in arr {
         write_symbol_line(s, "", out);
     }
+    write_page_pagination_notice(v, out);
     true
+}
+
+fn page_items(value: &Value) -> Option<&Vec<Value>> {
+    value
+        .as_array()
+        .or_else(|| value.as_object()?.get("items").and_then(Value::as_array))
+}
+
+fn write_page_pagination_notice(value: &Value, out: &mut String) {
+    if let Some(pagination) = value.get("pagination") {
+        write_pagination_notice(pagination, out);
+    }
+}
+
+fn write_named_pagination_notice(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+    out: &mut String,
+) {
+    if let Some(pagination) = object
+        .get("pagination")
+        .and_then(Value::as_object)
+        .and_then(|pages| pages.get(name))
+    {
+        write_pagination_notice(pagination, out);
+    }
+}
+
+fn write_pagination_notice(pagination: &Value, out: &mut String) {
+    if pagination.get("truncated").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let returned = pagination
+        .get("returned")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = pagination
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or(returned);
+    writeln!(
+        out,
+        "  … truncated: showing {returned} of {total}; raise limit to {total}"
+    )
+    .ok();
 }
 
 fn render_file_list(v: &Value, out: &mut String) -> bool {
@@ -349,7 +402,11 @@ fn write_ref_line(r: &Value, indent: &str, out: &mut String) {
     let line = r.get("line").and_then(Value::as_i64).unwrap_or(0);
     writeln!(out, "{indent}{path}:{line}").ok();
 
-    if let Some(ctx) = r.get("context").and_then(Value::as_str) {
+    if let Some(ctx) = r
+        .get("context")
+        .and_then(Value::as_str)
+        .or_else(|| r.get("content").and_then(Value::as_str))
+    {
         if !ctx.is_empty() {
             writeln!(out, "{indent}  {}", truncate(ctx, 80)).ok();
         }
@@ -457,9 +514,35 @@ mod tests {
     }
 
     #[test]
+    fn usages_renders_page_v2_and_truncation_notice() {
+        let json = r#"{
+            "schema_version":2,
+            "items":[{"path":"src/a.rs","line":10,"context":"foo();"}],
+            "pagination":{"total":4,"returned":1,"truncated":true,"limit":1}
+        }"#;
+        let out = to_compact("usages", json);
+        assert!(out.contains("src/a.rs:10"));
+        assert!(out.contains("showing 1 of 4"));
+        assert!(out.contains("raise limit to 4"));
+    }
+
+    #[test]
     fn callers_uses_same_shaper_as_usages() {
         let json = r#"[{"path":"a.rs","line":1,"context":"foo()"}]"#;
         assert_eq!(to_compact("usages", json), to_compact("callers", json));
+    }
+
+    #[test]
+    fn callers_page_v2_renders_content_field() {
+        let json = r#"{
+            "schema_version":2,
+            "items":[{"path":"a.rs","line":1,"content":"foo()"}],
+            "pagination":{"total":2,"returned":1,"truncated":true,"limit":1}
+        }"#;
+        let out = to_compact("callers", json);
+        assert!(out.contains("a.rs:1"));
+        assert!(out.contains("foo()"));
+        assert!(out.contains("showing 1 of 2"));
     }
 
     // --- symbol / class / implementations (symbol list) ---
@@ -475,6 +558,18 @@ mod tests {
         assert!(out.contains("Foo [class] a.rs:5"));
         assert!(out.contains("struct Foo<T>"));
         assert!(out.contains("bar [function] b.rs:10"));
+    }
+
+    #[test]
+    fn symbol_renders_page_v2_without_losing_pagination() {
+        let json = r#"{
+            "schema_version":2,
+            "items":[{"name":"Foo","kind":"class","path":"a.rs","line":5}],
+            "pagination":{"total":3,"returned":1,"truncated":true,"limit":1}
+        }"#;
+        let out = to_compact("symbol", json);
+        assert!(out.contains("Foo [class] a.rs:5"));
+        assert!(out.contains("showing 1 of 3"));
     }
 
     #[test]

@@ -7,8 +7,9 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -86,6 +87,18 @@ fn build_exclude_matcher(
         gb.add_line(None, p).ok();
     }
     gb.build().ok()
+}
+
+fn test_full_refresh_pause() -> Result<()> {
+    if let Some(path) = std::env::var_os("AST_INDEX_TEST_REFRESH_STARTED_FILE") {
+        std::fs::write(path, b"started")?;
+    }
+    if let Ok(delay) = std::env::var("AST_INDEX_TEST_REFRESH_DELAY_MS") {
+        if let Ok(delay) = delay.parse::<u64>() {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+    }
+    Ok(())
 }
 
 fn snapshot_subtrees(root: &Path, verbose: bool) -> Result<Vec<db::Subtree>> {
@@ -371,6 +384,7 @@ pub fn cmd_rebuild(
     }
     let t = Instant::now();
     let _lock = db::acquire_rebuild_guard(root)?;
+    test_full_refresh_pause()?;
     if verbose {
         eprintln!("[verbose] lock acquired in {:?}", t.elapsed());
     }
@@ -818,6 +832,7 @@ fn cmd_rebuild_sub_projects(
     }
     let t = Instant::now();
     let _lock = db::acquire_rebuild_guard(root)?;
+    test_full_refresh_pause()?;
     if verbose {
         eprintln!("[verbose] lock acquired in {:?}", t.elapsed());
     }
@@ -1136,7 +1151,7 @@ fn cmd_rebuild_sub_projects(
 }
 
 /// Incrementally update the index
-pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
+fn run_update_once(root: &Path, verbose: bool) -> Result<()> {
     let start = Instant::now();
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
 
@@ -1202,6 +1217,236 @@ pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+fn test_update_fault_injection() -> Result<()> {
+    if let Some(path) = std::env::var_os("AST_INDEX_TEST_UPDATE_STARTED_FILE") {
+        std::fs::write(path, b"started")?;
+    }
+    if let Ok(delay) = std::env::var("AST_INDEX_TEST_UPDATE_DELAY_MS") {
+        if let Ok(delay) = delay.parse::<u64>() {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+    }
+    if let Some(path) = std::env::var_os("AST_INDEX_TEST_UPDATE_FAIL_ONCE_FILE") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            anyhow::bail!("injected update failure");
+        }
+    }
+    Ok(())
+}
+
+fn run_update_worker(root: &Path, debounce_ms: u64, verbose: bool, token: u64) -> Result<bool> {
+    if let Some(path) = std::env::var_os("AST_INDEX_TEST_WORKER_BEFORE_LOCK_FILE") {
+        std::fs::write(path, b"before-lock")?;
+    }
+    if std::env::var_os("AST_INDEX_TEST_WORKER_EXIT_BEFORE_LOCK").is_some() {
+        anyhow::bail!("injected worker exit before lock acquisition");
+    }
+
+    // Exactly one process owns the current claim. It may wait through the
+    // tiny old-leader lock handoff, while superseded stale-token processes
+    // exit without joining a process herd.
+    let _worker = loop {
+        if db::read_update_coordinator_state(root)?.worker_claim != Some(token) {
+            return Ok(false);
+        }
+        if let Some(worker) = db::try_acquire_update_worker(root)? {
+            break worker;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if !db::acknowledge_update_worker_start(root, token)? {
+        return Ok(false);
+    }
+
+    loop {
+        let state = db::read_update_coordinator_state(root)?;
+        if state.requested_generation <= state.completed_generation {
+            if !db::finish_update_worker_if_idle(root, token)? {
+                continue;
+            }
+            if let Some(path) = std::env::var_os("AST_INDEX_TEST_UPDATE_BEFORE_EXIT_FILE") {
+                std::fs::write(path, b"before-exit")?;
+            }
+            if let Ok(delay) = std::env::var("AST_INDEX_TEST_UPDATE_EXIT_DELAY_MS") {
+                if let Ok(delay) = delay.parse::<u64>() {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+            }
+            return Ok(true);
+        }
+
+        let mut target = state.requested_generation;
+        if debounce_ms > 0 {
+            loop {
+                std::thread::sleep(Duration::from_millis(debounce_ms));
+                let latest = db::read_update_coordinator_state(root)?;
+                if latest.requested_generation == target {
+                    break;
+                }
+                target = latest.requested_generation;
+            }
+        }
+
+        let result = (|| -> Result<()> {
+            anyhow::ensure!(
+                db::db_exists(root),
+                "index not found; run 'ast-index rebuild' before requesting background updates"
+            );
+            test_update_fault_injection()?;
+            run_update_once(root, verbose)
+        })();
+        match result {
+            Ok(()) => db::complete_update_generation(root, target)?,
+            Err(error) => {
+                if !db::record_update_failure_and_finish(root, token, target, &error)? {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn default_update_wait_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("AST_INDEX_UPDATE_WAIT_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30_000),
+    )
+}
+
+fn spawn_update_launcher(root: &Path, debounce_ms: u64, verbose: bool, token: u64) -> Result<()> {
+    if let Some(path) = std::env::var_os("AST_INDEX_TEST_LAUNCH_STARTED_FILE") {
+        std::fs::write(path, b"launch-started")?;
+    }
+    if let Ok(delay) = std::env::var("AST_INDEX_TEST_LAUNCH_FAIL_DELAY_MS") {
+        if let Ok(delay) = delay.parse::<u64>() {
+            std::thread::sleep(Duration::from_millis(delay));
+            anyhow::bail!("injected launcher failure");
+        }
+    }
+    let executable = std::env::current_exe().context("failed to resolve ast-index executable")?;
+    let mut command = Command::new(executable);
+    command
+        .current_dir(root)
+        .arg("update")
+        .arg("--coordinator-launch")
+        .arg("--coordinator-claim")
+        .arg(token.to_string())
+        .arg("--debounce-ms")
+        .arg(debounce_ms.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if verbose {
+        command.arg("--verbose");
+    }
+    let output = command.output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to launch background update worker: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+pub fn cmd_update_background(root: &Path, debounce_ms: u64, verbose: bool) -> Result<()> {
+    anyhow::ensure!(
+        db::db_exists(root),
+        "index not found; run 'ast-index rebuild' before requesting background updates"
+    );
+    let request = db::request_update_generation(root)?;
+    if let Some(token) = request.claim_token {
+        if let Err(error) = spawn_update_launcher(root, debounce_ms, verbose, token) {
+            db::clear_update_worker_schedule(root, token)?;
+            db::fail_update_generation(root, request.generation, &error)?;
+            return Err(error);
+        }
+    }
+    println!(
+        "Queued background index update generation {}.",
+        request.generation
+    );
+    Ok(())
+}
+
+pub fn ensure_pending_update_worker(root: &Path, debounce_ms: u64) -> Result<()> {
+    let Some(token) = db::claim_pending_update_worker(root)? else {
+        return Ok(());
+    };
+    if let Err(error) = spawn_update_launcher(root, debounce_ms, false, token) {
+        db::clear_update_worker_schedule(root, token)?;
+        let generation = db::snapshot_requested_update_generation(root)?;
+        db::fail_update_generation(root, generation, &error)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn cmd_update_coordinator_launch(
+    root: &Path,
+    debounce_ms: u64,
+    verbose: bool,
+    token: u64,
+) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to resolve ast-index executable")?;
+    let (log, _log_lease) = db::create_update_worker_log(root)?;
+    let stderr = log.try_clone()?;
+    let mut command = Command::new(executable);
+    command
+        .current_dir(root)
+        .arg("update")
+        .arg("--coordinator-worker")
+        .arg("--coordinator-claim")
+        .arg(token.to_string())
+        .arg("--debounce-ms")
+        .arg(debounce_ms.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+    if verbose {
+        command.arg("--verbose");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+    command.spawn().context("failed to spawn update worker")?;
+    Ok(())
+}
+
+pub fn cmd_update_coordinator_worker(
+    root: &Path,
+    debounce_ms: u64,
+    verbose: bool,
+    token: u64,
+) -> Result<()> {
+    run_update_worker(root, debounce_ms, verbose, token).map(|_| ())
+}
+
+pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
+    if !db::db_exists(root) {
+        println!(
+            "{}",
+            "Index not found. Run 'ast-index rebuild' first.".red()
+        );
+        return Ok(());
+    }
+    let request = db::request_update_generation(root)?;
+    if let Some(token) = request.claim_token {
+        // Foreground update is the claimed leader; no launcher is needed.
+        run_update_worker(root, 0, verbose, token)?;
+    }
+    db::wait_for_update_generation(root, request.generation, default_update_wait_timeout())?;
+    Ok(())
+}
+
 /// Restore index from a .db file
 pub fn cmd_restore(root: &Path, db_file: &str) -> Result<()> {
     let src = std::path::Path::new(db_file);
@@ -1209,6 +1454,7 @@ pub fn cmd_restore(root: &Path, db_file: &str) -> Result<()> {
     // Serialize before allocating or populating a staging generation. This
     // also recovers validated staging directories abandoned by a dead writer.
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
+    test_full_refresh_pause()?;
     let dest = db::get_db_path(root)?;
     let dest_dir = dest
         .parent()

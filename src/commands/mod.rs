@@ -30,14 +30,69 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use colored::Colorize;
 use crossbeam_channel as channel;
 use grep_regex::RegexMatcher;
 use grep_searcher::MmapChoice;
 use grep_searcher::{sinks::UTF8, SearcherBuilder};
 use ignore::WalkBuilder;
 use rusqlite::{Connection, OptionalExtension};
+use serde::Serialize;
 
 use crate::db;
+
+pub const PAGINATED_JSON_SCHEMA_VERSION: u8 = 2;
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Pagination {
+    pub total: usize,
+    pub returned: usize,
+    pub truncated: bool,
+    pub limit: usize,
+}
+
+impl Pagination {
+    pub fn new(total: usize, returned: usize, limit: usize) -> Self {
+        Self {
+            total,
+            returned,
+            truncated: total > returned,
+            limit,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Page<T> {
+    pub schema_version: u8,
+    pub items: Vec<T>,
+    pub pagination: Pagination,
+}
+
+impl<T> Page<T> {
+    pub fn new(mut items: Vec<T>, total: usize, limit: usize) -> Self {
+        items.truncate(limit);
+        let pagination = Pagination::new(total, items.len(), limit);
+        Self {
+            schema_version: PAGINATED_JSON_SCHEMA_VERSION,
+            items,
+            pagination,
+        }
+    }
+}
+
+pub fn print_truncation_notice(pagination: Pagination) {
+    if pagination.truncated {
+        println!(
+            "  {}",
+            format!(
+                "Truncated: showing {} of {} results; use --limit {} to see all.",
+                pagination.returned, pagination.total, pagination.total
+            )
+            .yellow()
+        );
+    }
+}
 
 /// Resolves stored relative paths to absolute paths when extra roots are configured.
 ///
@@ -333,52 +388,90 @@ where
     let extensions: Arc<HashSet<String>> =
         Arc::new(extensions.iter().map(|s| s.to_string()).collect());
 
-    walker.run(|| {
-        let tx = tx.clone();
-        let matcher = matcher.clone();
-        let extensions = Arc::clone(&extensions);
+    std::thread::scope(|scope| -> Result<()> {
+        let worker = scope.spawn(move || {
+            walker.run(|| {
+                let tx = tx.clone();
+                let matcher = matcher.clone();
+                let extensions = Arc::clone(&extensions);
 
-        // Create optimized searcher ONCE per thread (not per file!)
-        // SAFETY: memory-mapped files are safe when files aren't modified during search
-        let mut searcher = SearcherBuilder::new()
-            .memory_map(unsafe { MmapChoice::auto() })
-            .line_number(true)
-            .build();
+                // Create optimized searcher ONCE per thread (not per file!)
+                // SAFETY: memory-mapped files are safe when files aren't modified during search
+                let mut searcher = SearcherBuilder::new()
+                    .memory_map(unsafe { MmapChoice::auto() })
+                    .line_number(true)
+                    .build();
 
-        Box::new(move |entry| {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    // Fast O(1) HashSet lookup
-                    if extensions.contains(ext.to_str().unwrap_or("")) {
-                        let path_arc: Arc<Path> = Arc::from(path);
+                Box::new(move |entry| {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if let Some(ext) = path.extension() {
+                            // Fast O(1) HashSet lookup
+                            if extensions.contains(ext.to_str().unwrap_or("")) {
+                                let path_arc: Arc<Path> = Arc::from(path);
 
-                        let _ = searcher.search_path(
-                            &matcher,
-                            path,
-                            UTF8(|line_num, line| {
-                                let _ = tx.send((
-                                    Arc::clone(&path_arc),
-                                    line_num as usize,
-                                    line.trim_end().to_string(),
-                                ));
-                                Ok(true)
-                            }),
-                        );
+                                let _ = searcher.search_path(
+                                    &matcher,
+                                    path,
+                                    UTF8(|line_num, line| {
+                                        if tx
+                                            .send((
+                                                Arc::clone(&path_arc),
+                                                line_num as usize,
+                                                line.trim_end().to_string(),
+                                            ))
+                                            .is_err()
+                                        {
+                                            return Ok(false);
+                                        }
+                                        Ok(true)
+                                    }),
+                                );
+                            }
+                        }
                     }
-                }
-            }
-            ignore::WalkState::Continue
-        })
-    });
+                    ignore::WalkState::Continue
+                })
+            });
+        });
 
-    drop(tx);
-
-    for (path, line_num, line) in rx {
-        handler(&path, line_num, &line);
-    }
+        for (path, line_num, line) in rx {
+            handler(&path, line_num, &line);
+        }
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("parallel file search worker panicked"))?;
+        Ok(())
+    })?;
 
     Ok(())
+}
+
+/// Scan file matches, apply caller-side filtering before pagination, and
+/// retain an exact total without storing every accepted result. This is used
+/// by commands whose validity checks (for example, excluding definitions)
+/// cannot safely be applied by the regex scanner itself.
+pub fn search_files_page<T, F>(
+    root: &Path,
+    pattern: &str,
+    extensions: &[&str],
+    limit: usize,
+    mut filter_map: F,
+) -> Result<Page<T>>
+where
+    F: FnMut(&Path, usize, &str) -> Option<T>,
+{
+    let mut items = Vec::with_capacity(limit.min(1024));
+    let mut total = 0usize;
+    search_files(root, pattern, extensions, |path, line_num, line| {
+        if let Some(item) = filter_map(path, line_num, line) {
+            total = total.saturating_add(1);
+            if items.len() < limit {
+                items.push(item);
+            }
+        }
+    })?;
+    Ok(Page::new(items, total, limit))
 }
 
 /// Fast parallel file search with early termination support
