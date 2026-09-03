@@ -636,6 +636,8 @@ exclude:
   instead of picking an arbitrary module.
 - **Rebuild on Windows** — the staged index is synced through a
   write-capable handle, fixing `failed to sync index file … (os error 5)`.
+  Concurrent runs are also recognized as ordinary lock contention instead of
+  failing with `failed to acquire index publication lock … (os error 33)`.
 - **Detect nested project stacks** — `detect-stacks` performs a bounded
   recursive marker scan and recognizes standard nested Kotlin Multiplatform
   layouts such as `composeApp/src/commonMain`.

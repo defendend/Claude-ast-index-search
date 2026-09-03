@@ -201,11 +201,17 @@ fn publication_lock_path(db_path: &Path, lease: &ProjectLease) -> Result<PathBuf
 }
 
 pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
+    // fs2 signals contention with a platform-specific raw error and no common
+    // ErrorKind: EWOULDBLOCK/EAGAIN on Unix, ERROR_LOCK_VIOLATION on Windows.
+    // Matching only the Unix codes turns ordinary Windows contention into a
+    // hard "failed to acquire lock" failure.
     error.kind() == std::io::ErrorKind::WouldBlock
         || matches!(
             error.raw_os_error(),
             Some(libc::EAGAIN) | Some(libc::EACCES)
         )
+        || (error.raw_os_error().is_some()
+            && error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
 }
 
 fn try_acquire_shared_publication(
@@ -8331,6 +8337,30 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn lock_contention_is_recognized_on_every_platform() {
+        assert!(lock_is_contended(&fs2::lock_contended_error()));
+        assert!(!lock_is_contended(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+    }
+
+    #[test]
+    fn concurrent_exclusive_lock_reports_contention_not_failure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let lock_path = temp.path().join("index.publish.lock");
+        let holder = open_lock_file(&lock_path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&holder).unwrap();
+
+        let contender = open_lock_file(&lock_path).unwrap();
+        let error = fs2::FileExt::try_lock_exclusive(&contender).unwrap_err();
+        assert!(
+            lock_is_contended(&error),
+            "contended lock reported as a hard error: {error:?} (raw {:?})",
+            error.raw_os_error()
+        );
     }
 
     #[test]
