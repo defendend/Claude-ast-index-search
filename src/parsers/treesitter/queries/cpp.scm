@@ -100,3 +100,71 @@
 ; #include <path> or #include "path"
 (preproc_include
   path: (_) @include_path)
+
+; === Functions whose return type is a pointer or a reference (added 2026-09-04) ===
+; tree-sitter-cpp wraps the function_declarator of `T* f()` in a pointer_declarator and of
+; `T& f()` in a reference_declarator, so the patterns above never matched them: every
+; Creature*/GameObject*/GridMap*-returning function of a TrinityCore checkout was missing from
+; the index (measured six for six). Same captures as above. No template_declaration variants:
+; the plain function_definition patterns already match a definition inside a template, and a
+; second pattern would only duplicate it (Codex, 2026-09-04). scope: (_) so that
+; Outer::Inner::f and Class<X>::f (template_type scope) are caught as well.
+
+; T* f(...)
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @func_name)))
+
+; T** f(...)
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator
+        declarator: (identifier) @func_name))))
+
+; T& f(...)
+(function_definition
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (identifier) @func_name)))
+
+; T* Class::Method(...)
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (qualified_identifier
+        scope: (_) @method_class
+        name: (identifier) @method_name))))
+
+; T** Class::Method(...)
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator
+        declarator: (qualified_identifier
+          scope: (_) @method_class
+          name: (identifier) @method_name)))))
+
+; T& Class::Method(...)
+(function_definition
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (qualified_identifier
+        scope: (_) @method_class
+        name: (identifier) @method_name))))
+
+; T* Class::operator...(...) and T& Class::operator...(...)
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (qualified_identifier
+        scope: (_) @method_class
+        name: (operator_name) @method_name))))
+
+(function_definition
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (qualified_identifier
+        scope: (_) @method_class
+        name: (operator_name) @method_name))))
