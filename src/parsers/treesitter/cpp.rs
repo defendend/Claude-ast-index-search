@@ -908,6 +908,73 @@ fn find_capture<'a>(
 mod tests {
     use super::*;
 
+    // --- Functions returning a pointer or a reference ---
+
+    #[test]
+    fn test_parse_pointer_and_reference_return_functions() {
+        let content = r#"
+GridMap* TerrainInfo::GetGrid(uint32 mapId, float x, float y, bool loadIfMissing /*= true*/)
+{
+    return nullptr;
+}
+
+Creature* Player::GetNPCIfCanInteractWith(ObjectGuid const& guid, NPCFlags npcFlags) const
+{
+    return nullptr;
+}
+
+PhaseShift const& PhasingHandler::GetEmptyPhaseShift()
+{
+    static PhaseShift const empty;
+    return empty;
+}
+
+Player* FindPlayer(ObjectGuid const& guid)
+{
+    return nullptr;
+}
+
+char** SplitArgs(char const* line)
+{
+    return nullptr;
+}
+
+Color4& Color4::operator=(Color4 const& other)
+{
+    return *this;
+}
+
+template <class T>
+T* MakeOne()
+{
+    return nullptr;
+}
+
+uint32 Plain()
+{
+    return 0;
+}
+"#;
+        let symbols = CPP_PARSER.parse_symbols(content).unwrap();
+        for name in ["GetGrid", "GetNPCIfCanInteractWith", "GetEmptyPhaseShift", "FindPlayer", "SplitArgs", "operator=", "MakeOne", "Plain"] {
+            let found: Vec<_> = symbols.iter().filter(|s| s.name == name).collect();
+            assert_eq!(found.len(), 1, "Expected exactly one symbol named {}, got: {:?}", name, symbols);
+            assert_eq!(found[0].kind, SymbolKind::Function, "{} should be a function", name);
+        }
+        let get_grid = symbols.iter().find(|s| s.name == "GetGrid").unwrap();
+        assert!(
+            get_grid.parents.iter().any(|(p, _)| p == "TerrainInfo"),
+            "Expected GetGrid to belong to TerrainInfo, got: {:?}",
+            get_grid.parents
+        );
+        let assign = symbols.iter().find(|s| s.name == "operator=").unwrap();
+        assert!(
+            assign.parents.iter().any(|(p, _)| p == "Color4"),
+            "Expected operator= to belong to Color4, got: {:?}",
+            assign.parents
+        );
+    }
+
     // --- Classes ---
 
     #[test]
