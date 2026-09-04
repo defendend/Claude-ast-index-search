@@ -77,7 +77,7 @@ fn truncate_to_len(s: &str, max: usize) -> String {
 
 use anyhow::Result;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// Strip // line comments only (no block comments). Used for BSL.
@@ -751,8 +751,19 @@ pub fn extract_references_for_lang(
 ) -> Result<Vec<ParsedRef>> {
     let mut refs = Vec::new();
 
-    // Build set of locally defined symbol names (to skip them)
-    let defined_names: HashSet<&str> = defined_symbols.iter().map(|s| s.name.as_str()).collect();
+    // Map every locally defined symbol to the line it is declared on. Only that
+    // line is skipped: a symbol used further down its own file (a constant fed
+    // into the next constant, a local interface passed to defineProps) is a real
+    // usage, and skipping the whole name hid it from `usages` entirely.
+    let mut declared_at: HashMap<&str, HashSet<usize>> = HashMap::new();
+    for symbol in defined_symbols {
+        declared_at
+            .entry(symbol.name.as_str())
+            .or_default()
+            .insert(symbol.line);
+    }
+    let is_declaration_line =
+        |name: &str, line: usize| declared_at.get(name).is_some_and(|l| l.contains(&line));
 
     // Regex for identifiers that might be references:
     // - CamelCase identifiers (types, classes) like PaymentRepository, String
@@ -979,7 +990,7 @@ pub fn extract_references_for_lang(
             if !name.is_empty()
                 && !base_keywords.contains(name)
                 && !extra_keywords.contains(name)
-                && !defined_names.contains(name)
+                && !is_declaration_line(name, line_num)
             {
                 refs.push(ParsedRef {
                     name: name.to_string(),
@@ -995,7 +1006,7 @@ pub fn extract_references_for_lang(
             if !name.is_empty()
                 && !base_keywords.contains(name)
                 && !extra_keywords.contains(name)
-                && !defined_names.contains(name)
+                && !is_declaration_line(name, line_num)
             {
                 // Only add if name length > 2 to avoid noise
                 if name.len() > 2 {
@@ -1085,6 +1096,28 @@ mod tests {
         let refs = extract_references(content, &symbols).unwrap();
         assert!(refs.iter().any(|r| r.name == "PaymentRepository"));
         assert!(refs.iter().any(|r| r.name == "PaymentRepositoryImpl"));
+    }
+
+    #[test]
+    fn test_extract_references_finds_usage_in_declaring_file() {
+        // A symbol used further down its own file is a real usage; skipping the
+        // whole name (instead of just the declaration line) hid it from `usages`.
+        let content = "export const ICONS = {}\nexport const ORDER = Object.keys(ICONS)\n";
+        let symbols = vec![ParsedSymbol {
+            name: "ICONS".to_string(),
+            kind: SymbolKind::Constant,
+            line: 1,
+            signature: "export const ICONS".to_string(),
+            parents: vec![],
+        }];
+        let refs = extract_references(content, &symbols).unwrap();
+        assert!(
+            refs.iter().any(|r| r.name == "ICONS" && r.line == 2),
+            "expected ICONS usage on line 2; got {:?}",
+            refs.iter().map(|r| (&r.name, r.line)).collect::<Vec<_>>()
+        );
+        // The declaration itself is still not a reference.
+        assert!(!refs.iter().any(|r| r.name == "ICONS" && r.line == 1));
     }
 
     #[test]
