@@ -700,6 +700,41 @@ pub fn parse_file_symbols(
     Ok((symbols, refs))
 }
 
+/// Parse only the symbols of a file, skipping reference extraction.
+///
+/// Used for inputs indexed purely for their definitions — `node_modules` type
+/// declarations — where references would describe a library's own internals.
+pub fn parse_file_symbols_only(content: &str, file_type: FileType) -> Result<Vec<ParsedSymbol>> {
+    let effective_type = if file_type == FileType::Cpp && detect_h_file_objc(content) {
+        FileType::ObjC
+    } else {
+        file_type
+    };
+
+    if let Some(ts_parser) = treesitter::get_treesitter_parser(effective_type) {
+        return ts_parser.parse_symbols(content);
+    }
+
+    let stripped = strip_comments(content, file_type);
+    let content = &stripped;
+
+    match file_type {
+        FileType::Perl => parse_perl_symbols(content),
+        FileType::Wsdl => parse_wsdl_symbols(content),
+        FileType::Vue => {
+            let script = extract_vue_script(content);
+            let script_stripped = strip_c_comments(&script, false);
+            parse_typescript_symbols(&script_stripped)
+        }
+        FileType::Svelte => {
+            let script = extract_svelte_script(content);
+            let script_stripped = strip_c_comments(&script, false);
+            parse_typescript_symbols(&script_stripped)
+        }
+        _ => Err(anyhow::anyhow!("No parser for {:?}", file_type)),
+    }
+}
+
 /// Extract references/usages from file content
 pub fn extract_references(
     content: &str,
@@ -1050,6 +1085,18 @@ mod tests {
         let refs = extract_references(content, &symbols).unwrap();
         assert!(refs.iter().any(|r| r.name == "PaymentRepository"));
         assert!(refs.iter().any(|r| r.name == "PaymentRepositoryImpl"));
+    }
+
+    #[test]
+    fn test_parse_file_symbols_only_skips_refs() {
+        let content = "export declare const RESULT_TONE: Record<string, string>;\nexport declare function helper(): void;\n";
+        let symbols = parse_file_symbols_only(content, FileType::TypeScript).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "RESULT_TONE"));
+        // Same input through the full entry point still yields references, so the
+        // difference is the skipped extraction, not a parser change.
+        let (full_symbols, refs) = parse_file_symbols(content, FileType::TypeScript).unwrap();
+        assert_eq!(symbols.len(), full_symbols.len());
+        assert!(!refs.is_empty());
     }
 
     #[test]
