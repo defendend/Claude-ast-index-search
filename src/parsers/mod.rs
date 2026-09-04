@@ -721,9 +721,14 @@ pub fn extract_references_for_lang(
 
     // Regex for identifiers that might be references:
     // - CamelCase identifiers (types, classes) like PaymentRepository, String
+    // - SCREAMING_SNAKE_CASE constants like DEAL_KIND_ICONS, MAX_RETRIES
     // - Function calls like getCards(, process(
+    //
+    // `_` is a word character, so `\b` never fires inside DEAL_KIND_ICONS: without
+    // `_` in the class the name matches neither whole nor in parts, and every
+    // reference to an upper-snake constant is silently dropped.
     static IDENTIFIER_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b([A-Z][a-zA-Z0-9]*)\b").unwrap());
+        LazyLock::new(|| Regex::new(r"\b([A-Z][A-Za-z0-9_]*)\b").unwrap());
 
     let identifier_re = &*IDENTIFIER_RE; // CamelCase types
     static FUNC_CALL_RE: LazyLock<Regex> =
@@ -1045,6 +1050,28 @@ mod tests {
         let refs = extract_references(content, &symbols).unwrap();
         assert!(refs.iter().any(|r| r.name == "PaymentRepository"));
         assert!(refs.iter().any(|r| r.name == "PaymentRepositoryImpl"));
+    }
+
+    #[test]
+    fn test_extract_references_finds_upper_snake_case_constants() {
+        // `_` is a word character, so a `[A-Z][a-zA-Z0-9]*` class matches an
+        // upper-snake name neither whole nor in parts (issue: `usages` returned
+        // zero for every SCREAMING_SNAKE constant).
+        let content = "const icon = DEAL_KIND_ICONS[kind]\nuseMediaQuery(COARSE_POINTER_MQ)\n";
+        let symbols = vec![];
+        let refs = extract_references(content, &symbols).unwrap();
+        assert!(
+            refs.iter().any(|r| r.name == "DEAL_KIND_ICONS"),
+            "expected DEAL_KIND_ICONS; got {:?}",
+            refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            refs.iter().any(|r| r.name == "COARSE_POINTER_MQ"),
+            "expected COARSE_POINTER_MQ; got {:?}",
+            refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        // The name must not be split into fragments.
+        assert!(!refs.iter().any(|r| r.name == "DEAL" || r.name == "ICONS"));
     }
 
     #[test]
