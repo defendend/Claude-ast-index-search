@@ -956,10 +956,30 @@ uint32 Plain()
 }
 "#;
         let symbols = CPP_PARSER.parse_symbols(content).unwrap();
-        for name in ["GetGrid", "GetNPCIfCanInteractWith", "GetEmptyPhaseShift", "FindPlayer", "SplitArgs", "operator=", "MakeOne", "Plain"] {
+        for name in [
+            "GetGrid",
+            "GetNPCIfCanInteractWith",
+            "GetEmptyPhaseShift",
+            "FindPlayer",
+            "SplitArgs",
+            "operator=",
+            "MakeOne",
+            "Plain",
+        ] {
             let found: Vec<_> = symbols.iter().filter(|s| s.name == name).collect();
-            assert_eq!(found.len(), 1, "Expected exactly one symbol named {}, got: {:?}", name, symbols);
-            assert_eq!(found[0].kind, SymbolKind::Function, "{} should be a function", name);
+            assert_eq!(
+                found.len(),
+                1,
+                "Expected exactly one symbol named {}, got: {:?}",
+                name,
+                symbols
+            );
+            assert_eq!(
+                found[0].kind,
+                SymbolKind::Function,
+                "{} should be a function",
+                name
+            );
         }
         let get_grid = symbols.iter().find(|s| s.name == "GetGrid").unwrap();
         assert!(
