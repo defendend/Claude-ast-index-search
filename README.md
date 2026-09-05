@@ -84,33 +84,27 @@ brew tap defendend/ast-index
 brew install ast-index
 ```
 
-### Cargo (from Git)
+### Cargo (crates.io)
 
 Requires a Rust toolchain.
+
+```bash
+cargo install ast-index --locked
+```
+
+To build the unreleased default branch instead:
 
 ```bash
 cargo install --locked --git https://github.com/defendend/Claude-ast-index-search ast-index
 ```
 
-This builds and installs the latest version from the default branch. For prebuilt release binaries, use Homebrew or Winget.
+Both build from source. For prebuilt release binaries, use Homebrew, npm, or Winget.
 
 ### Winget (Windows)
 
 ```shell
 winget install --id defendend.ast-index
 ```
-
-### Cargo (pending first crates.io release)
-
-The package and release automation are prepared, but this channel is not
-available until the first ast-index version appears on crates.io. Starting
-with that release, install with a Rust toolchain:
-
-```bash
-cargo install ast-index --locked
-```
-
-Until then, use Homebrew, npm, Winget, a release archive, or a source build.
 
 ### Migration from kotlin-index
 
@@ -616,6 +610,16 @@ exclude:
 ```
 
 ## Changelog
+
+### 3.52.0
+
+- **Index C++ functions that return a pointer or a reference** — declarations
+  such as `Grid* GetGrid()`, `Player& FindPlayer()`, and
+  `const Grid* const GetEmptyPhaseShift()` are now indexed instead of being
+  skipped.
+- **Install from crates.io** — the installation guide now documents
+  `cargo install ast-index --locked` as the released channel, with the Git
+  build kept as the way to install the unreleased default branch.
 
 ### 3.51.0
 
