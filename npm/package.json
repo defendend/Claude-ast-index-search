@@ -1,6 +1,6 @@
 {
   "name": "@ast-index/cli",
-  "version": "3.51.0",
+  "version": "3.52.0",
   "description": "Fast AST-based code search CLI for 30 programming languages. Native Rust binary distributed via npm.",
   "keywords": [
     "ast",
@@ -22,11 +22,11 @@
     "ast-index": "./bin/ast-index"
   },
   "optionalDependencies": {
-    "@ast-index/cli-darwin-arm64": "3.51.0",
-    "@ast-index/cli-darwin-x64": "3.51.0",
-    "@ast-index/cli-linux-x64": "3.51.0",
-    "@ast-index/cli-linux-arm64": "3.51.0",
-    "@ast-index/cli-win32-x64": "3.51.0"
+    "@ast-index/cli-darwin-arm64": "3.52.0",
+    "@ast-index/cli-darwin-x64": "3.52.0",
+    "@ast-index/cli-linux-x64": "3.52.0",
+    "@ast-index/cli-linux-arm64": "3.52.0",
+    "@ast-index/cli-win32-x64": "3.52.0"
   },
   "repository": {
     "type": "git",
