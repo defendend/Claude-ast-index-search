@@ -611,6 +611,25 @@ exclude:
 
 ## Changelog
 
+### 3.53.0
+
+- **`search` no longer returns nothing for a multi-word query** — when a
+  query with two or more terms has no literal match, `search` now hands it to
+  the `explore` ranking engine and prints relevance-ranked symbols with their
+  source, honouring `--module` / `--in-file`. Text output is labelled
+  `No literal matches …`; JSON stays a single document and carries
+  `"fallback": "explore"` plus a `reason`. Single-term queries keep exact
+  literal semantics.
+- **`callers` walks attached subtrees** — call sites inside a subtree added
+  with `subtree add` are found and shown as `[name] /abs/path`, matching
+  `usages` and `refs`. `--subtree NAME` restricts to that subtree, `--local`
+  to the primary root. Previously both flags were accepted and ignored.
+- **`explore` accepts scope** — `--module` / `--in-file` narrow the candidate
+  set before ranking.
+- **Agent guidance points intent queries at `explore`** — the skill and the
+  MCP `search` description now say to use `explore` for a question or a
+  description and `search` for a known identifier.
+
 ### 3.52.0
 
 - **Index C++ functions that return a pointer or a reference** — declarations
