@@ -189,7 +189,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "search",
-            "description": "Universal code search across file paths, symbol definitions, imports/usages, and file contents. Use this FIRST for any 'find X in the codebase' question — it returns files, matching symbols (classes, functions, etc.), and content matches in one call. Prefer this over grep.",
+            "description": "Literal code search across file paths, symbol definitions, imports/usages, and file contents. Use it when you already know an identifier or path fragment (`UserService`, `parseConfig`, `auth/`). For a question or a description of what you are looking for, call `explore` instead — it ranks by relevance. If a multi-word query has no literal match, `search` automatically returns `explore` results with a `fallback: \"explore\"` marker in JSON. Prefer this over grep.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

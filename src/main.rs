@@ -1154,7 +1154,14 @@ fn main() -> Result<()> {
             query,
             max_files,
             rwr,
-        } => commands::explore::cmd_explore(&root, &query, max_files, rwr, format),
+        } => {
+            let scope = db::SearchScope {
+                in_file: None,
+                module: None,
+                dir_prefix: dir_prefix_ref,
+            };
+            commands::explore::cmd_explore(&root, &query, max_files, rwr, format, &scope)
+        }
         Commands::Hierarchy {
             name,
             in_file,

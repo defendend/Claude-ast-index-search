@@ -19,12 +19,15 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use super::PathResolver;
-use crate::db::{self, SearchResult};
+use crate::db::{self, SearchResult, SearchScope};
 
 /// Candidates pulled per query term from FTS before ranking.
 const SEED_PER_TERM: usize = 40;
 /// Max symbols listed in the ranked "Relevant symbols" section.
 const MAX_SYMBOLS_LISTED: usize = 15;
+/// Source files shown when `explore` runs as the `search` fallback; matches
+/// the CLI default so both paths return the same amount of context.
+const DEFAULT_MAX_FILES: usize = 6;
 /// Hard cap on lines per source snippet (god-file / minified protection).
 const SNIPPET_CAP_LINES: usize = 60;
 
@@ -43,6 +46,19 @@ pub fn cmd_explore(
     max_files: usize,
     use_rwr: bool,
     format: &str,
+    scope: &SearchScope,
+) -> Result<()> {
+    run_explore(root, query, max_files, use_rwr, format, scope, None)
+}
+
+fn run_explore(
+    root: &Path,
+    query: &[String],
+    max_files: usize,
+    use_rwr: bool,
+    format: &str,
+    scope: &SearchScope,
+    fallback_reason: Option<&str>,
 ) -> Result<()> {
     if !db::db_exists(root) {
         println!(
@@ -72,6 +88,9 @@ pub fn cmd_explore(
         }
         for s in hits {
             if !resolver.matches_filter(s.root_path.as_deref()) {
+                continue;
+            }
+            if !scope.matches_path(&s.path) {
                 continue;
             }
             if !seen.insert((s.path.clone(), s.line)) {
@@ -132,7 +151,15 @@ pub fn cmd_explore(
     }
 
     if format == "json" {
-        return emit_json(root, &raw, dom_lang.as_deref(), &cands, &file_order, &tests);
+        return emit_json(
+            root,
+            &raw,
+            dom_lang.as_deref(),
+            &cands,
+            &file_order,
+            &tests,
+            fallback_reason,
+        );
     }
 
     emit_text(
@@ -145,6 +172,39 @@ pub fn cmd_explore(
         &resolver,
     );
     Ok(())
+}
+
+/// Entry point used by `search` when literal matching finds nothing for a
+/// multi-word query. Runs the ranking engine on the same query and labels the
+/// output so the caller knows it did not get a literal match.
+pub fn cmd_search_fallback(
+    root: &Path,
+    query: &str,
+    format: &str,
+    scope: &SearchScope,
+) -> Result<()> {
+    const REASON: &str =
+        "no literal matches for a multi-word query; results are ranked by relevance";
+    if format != "json" {
+        println!(
+            "{}",
+            format!(
+                "No literal matches for '{}'. Showing relevance-ranked results (same as `ast-index explore`):",
+                query
+            )
+            .yellow()
+        );
+        println!();
+    }
+    run_explore(
+        root,
+        &[query.to_string()],
+        DEFAULT_MAX_FILES,
+        false,
+        format,
+        scope,
+        Some(REASON),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +497,7 @@ fn emit_json(
     cands: &[Cand],
     file_order: &[usize],
     tests: &[(String, Vec<String>)],
+    fallback_reason: Option<&str>,
 ) -> Result<()> {
     let symbols: Vec<_> = cands
         .iter()
@@ -482,7 +543,7 @@ fn emit_json(
             })
         })
         .collect();
-    let out = json!({
+    let mut out = json!({
         "query": raw,
         "dominant_language": dom_lang,
         "symbols": symbols,
@@ -490,6 +551,12 @@ fn emit_json(
         "files": files,
         "tests": tests_json,
     });
+    if let Some(reason) = fallback_reason {
+        // Same document, not a second one: a `search` caller parsing the
+        // response must see one valid JSON object with an explicit marker.
+        out["fallback"] = json!("explore");
+        out["reason"] = json!(reason);
+    }
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }

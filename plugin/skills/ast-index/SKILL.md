@@ -13,9 +13,13 @@ Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swif
 **ALWAYS use ast-index FIRST for any code search task.** These rules are mandatory:
 
 1. **ast-index is the PRIMARY search tool** — use it before grep, ripgrep, or Search tool
-2. **DO NOT duplicate results** — if ast-index found usages/implementations, that IS the complete answer
-3. **DO NOT run grep "for completeness"** after ast-index returns results
-4. **Use grep/Search ONLY when:**
+2. **Pick the command by what you know:**
+   - You have an intent or a description ("how is auth handled", "processing update admin") → `ast-index explore "<query>"`. It ranks by relevance and prints the source.
+   - You have an exact identifier (`UserService`, `parseConfig`) → `ast-index search` / `symbol` / `class`.
+   - `search` itself falls back to `explore` ranking when a multi-word query has no literal match, so a wrong pick is not fatal — but `explore` is the right first call for questions.
+3. **DO NOT duplicate results** — if ast-index found usages/implementations, that IS the complete answer
+4. **DO NOT run grep "for completeness"** after ast-index returns results
+5. **Use grep/Search ONLY when:**
    - ast-index returns empty results
    - Searching for regex patterns (ast-index uses literal match)
    - Searching for string literals inside code (`"some text"`)
@@ -655,9 +659,9 @@ Consult: `references/module-commands.md`
 ## Workflow Recommendations
 
 1. Run `ast-index rebuild` once in project root to build the index
-2. **Start a session** with `ast-index conventions` + `ast-index map` to understand project structure (~80 lines, ~500 tokens)
-3. Use `ast-index map --module <path>` to drill down into specific areas
-4. Use `ast-index search` for quick universal search when exploring
+3. **Start a session** with `ast-index conventions` + `ast-index map` to understand project structure (~80 lines, ~500 tokens)
+4. Use `ast-index map --module <path>` to drill down into specific areas
+5. Use `ast-index search` for quick universal search when exploring
 5. Use `ast-index class` for precise class/interface lookup
 6. Use `ast-index usages` to find all references before refactoring
 7. Use `ast-index implementations` to understand inheritance

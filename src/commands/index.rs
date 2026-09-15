@@ -148,6 +148,19 @@ pub fn cmd_search(
     let content_pagination =
         Pagination::new(content_page.pagination.total, content_matches.len(), limit);
 
+    let nothing_found = files_page.items.is_empty()
+        && symbols_page.items.is_empty()
+        && refs_page.items.is_empty()
+        && content_matches.is_empty();
+
+    // A multi-word query is almost always an intent ("how is auth handled"),
+    // not an identifier. Literal matching returns nothing for it, and an agent
+    // then falls back to grep. Hand the same query to the ranking engine
+    // instead of reporting an empty page.
+    if nothing_found && is_multi_term_query(query) {
+        return super::explore::cmd_search_fallback(root, query, format, scope);
+    }
+
     if format == "json" {
         let result = serde_json::json!({
             "schema_version": PAGINATED_JSON_SCHEMA_VERSION,
@@ -240,15 +253,22 @@ pub fn cmd_search(
         print_truncation_notice(content_pagination);
     }
 
-    if files_page.items.is_empty()
-        && symbols_page.items.is_empty()
-        && refs_page.items.is_empty()
-        && content_matches.is_empty()
-    {
+    if nothing_found {
         println!("  No results found.");
     }
 
     Ok(())
+}
+
+/// Two or more identifier-like terms of three or more characters. Mirrors the
+/// tokenizer used by `explore`, so a query that qualifies here always yields
+/// usable terms there.
+fn is_multi_term_query(query: &str) -> bool {
+    query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| t.chars().count() >= 3)
+        .count()
+        >= 2
 }
 
 /// Find symbol by name or glob pattern
