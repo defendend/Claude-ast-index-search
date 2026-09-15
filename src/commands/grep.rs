@@ -22,7 +22,8 @@ use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 
-use super::{print_truncation_notice, relative_path, search_files_limited, search_files_page};
+use super::{print_truncation_notice, relative_path, search_files_limited, PathResolver};
+use crate::db;
 
 /// All source code extensions (for grep-based commands: todo, search, callers, etc.)
 pub const ALL_SOURCE_EXTENSIONS: [&str; 58] = [
@@ -166,9 +167,13 @@ pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 pub fn cmd_callers(root: &Path, function_name: &str, limit: usize, format: &str) -> Result<()> {
     let pattern = build_caller_pattern(function_name);
     let def_pattern = build_def_skip_pattern(function_name);
+    let conn = db::open_db_leased(root)?;
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
+    let roots = resolver.grep_roots();
 
-    let page = search_files_page(
+    let page = super::search_files_page_in(
         root,
+        &roots,
         &pattern,
         &ALL_SOURCE_EXTENSIONS,
         limit,
@@ -177,7 +182,7 @@ pub fn cmd_callers(root: &Path, function_name: &str, limit: usize, format: &str)
                 return None;
             } // Skip definitions
 
-            let rel_path = relative_path(root, path);
+            let rel_path = super::display_path(&resolver, root, path);
             let content: String = line.chars().take(70).collect();
             Some((rel_path, line_num, content))
         },

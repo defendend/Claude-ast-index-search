@@ -175,6 +175,33 @@ impl PathResolver {
     /// Return the subtree name owning the given `root_path`, if any.
     /// `None` when the file belongs to the primary project or when no named
     /// subtrees are attached.
+    /// Directories a grep-based command must walk to see the same files the
+    /// index does: the primary root plus attached subtrees, narrowed by
+    /// `--subtree NAME` / `--local` exactly like the SQL-backed commands.
+    /// Pure: reads only resolver state, never the database, so it is safe to
+    /// call while the caller already holds a connection.
+    pub fn grep_roots(&self) -> Vec<PathBuf> {
+        if std::env::var_os("AST_INDEX_LOCAL_SCOPE").is_some() {
+            return vec![self.primary.clone()];
+        }
+        if let Ok(name) = std::env::var("AST_INDEX_SUBTREE") {
+            return self
+                .subtree_names
+                .iter()
+                .filter(|(_, n)| *n == name)
+                .map(|(canon, _)| PathBuf::from(canon))
+                .filter(|p| p.is_dir())
+                .collect();
+        }
+        let mut roots = vec![self.primary.clone()];
+        for (_, path) in &self.extra {
+            if path.is_dir() && !roots.contains(path) {
+                roots.push(path.clone());
+            }
+        }
+        roots
+    }
+
     pub fn subtree_name(&self, root_path: Option<&str>) -> Option<&str> {
         let root = root_path?;
         if root == self.primary_key {
@@ -339,6 +366,23 @@ pub fn num_cpus() -> usize {
 }
 
 /// Get relative path from root
+/// Path for grep-based output: relative to the primary root when the file
+/// lives there, otherwise the subtree-decorated absolute path (`[name] /abs`)
+/// that the SQL-backed commands print. `relative_path` alone would yield
+/// `../../other/file.rs` for a subtree file, which is useless to a reader.
+pub fn display_path(resolver: &PathResolver, root: &Path, path: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return rel.to_string_lossy().into_owned();
+    }
+    let abs = path.to_string_lossy();
+    for (key, subtree_root) in &resolver.extra {
+        if path.starts_with(subtree_root) {
+            return resolver.maybe_decorate(abs.into_owned(), Some(key));
+        }
+    }
+    abs.into_owned()
+}
+
 pub fn relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -347,8 +391,26 @@ pub fn relative_path(root: &Path, path: &Path) -> String {
 }
 
 /// Fast parallel file search using grep-searcher and ignore crates
-pub fn search_files<F>(
+pub fn search_files<F>(root: &Path, pattern: &str, extensions: &[&str], handler: F) -> Result<()>
+where
+    F: FnMut(&Path, usize, &str),
+{
+    search_files_in(
+        root,
+        std::slice::from_ref(&root.to_path_buf()),
+        pattern,
+        extensions,
+        handler,
+    )
+}
+
+/// `search_files` over several roots in one parallel walk. `root` is still
+/// the primary project (ignore rules and VCS detection come from it); `roots`
+/// lists every directory to scan, typically the primary plus attached
+/// subtrees from [`PathResolver::grep_roots`].
+pub fn search_files_in<F>(
     root: &Path,
+    roots: &[PathBuf],
     pattern: &str,
     extensions: &[&str],
     mut handler: F,
@@ -365,7 +427,11 @@ where
         crate::indexer::find_arc_root(root)
     };
 
-    let mut wb = WalkBuilder::new(root);
+    let first = roots.first().map(PathBuf::as_path).unwrap_or(root);
+    let mut wb = WalkBuilder::new(first);
+    for extra in roots.iter().skip(1) {
+        wb.add(extra);
+    }
     wb.hidden(true)
         .git_ignore(use_git)
         .git_exclude(use_git)
@@ -456,6 +522,28 @@ pub fn search_files_page<T, F>(
     pattern: &str,
     extensions: &[&str],
     limit: usize,
+    filter_map: F,
+) -> Result<Page<T>>
+where
+    F: FnMut(&Path, usize, &str) -> Option<T>,
+{
+    search_files_page_in(
+        root,
+        std::slice::from_ref(&root.to_path_buf()),
+        pattern,
+        extensions,
+        limit,
+        filter_map,
+    )
+}
+
+/// `search_files_page` over several roots; see [`search_files_in`].
+pub fn search_files_page_in<T, F>(
+    root: &Path,
+    roots: &[PathBuf],
+    pattern: &str,
+    extensions: &[&str],
+    limit: usize,
     mut filter_map: F,
 ) -> Result<Page<T>>
 where
@@ -463,7 +551,7 @@ where
 {
     let mut items = Vec::with_capacity(limit.min(1024));
     let mut total = 0usize;
-    search_files(root, pattern, extensions, |path, line_num, line| {
+    search_files_in(root, roots, pattern, extensions, |path, line_num, line| {
         if let Some(item) = filter_map(path, line_num, line) {
             total = total.saturating_add(1);
             if items.len() < limit {
