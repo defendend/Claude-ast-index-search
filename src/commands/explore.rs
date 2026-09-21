@@ -806,7 +806,6 @@ fn apply_rwr(
 
     // Build edges around each seed: callers (refs → owning symbol) + inheritance.
     let seeds: Vec<SearchResult> = cands.iter().take(seed_n).map(|c| c.sym.clone()).collect();
-    let mut file_cache: HashMap<String, Vec<SearchResult>> = HashMap::new();
     // Role a node plays relative to the seed — for the "Graph neighbours" section.
     let mut link_role: HashMap<(String, i64), &'static str> = HashMap::new();
     for sym in &seeds {
@@ -815,10 +814,7 @@ fn apply_rwr(
             if !resolver.matches_filter(r.root_path.as_deref()) {
                 continue;
             }
-            let fsyms = file_cache
-                .entry(r.path.clone())
-                .or_insert_with(|| db::get_file_symbols(conn, &r.path).unwrap_or_default());
-            if let Some(owner) = fsyms.iter().rev().find(|s| s.line <= r.line).cloned() {
+            if let Some(owner) = db::find_owning_symbol(conn, &r.path, r.line).unwrap_or(None) {
                 link_role
                     .entry((owner.path.clone(), owner.line))
                     .or_insert("caller");

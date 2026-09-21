@@ -4236,6 +4236,12 @@ fn create_secondary_indexes(conn: &Connection) -> Result<()> {
             ON symbols(qualified_name) WHERE qualified_name IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
         CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+        -- Covering index for find_owning_symbol: seeks straight to one file's
+        -- symbols ordered by start line and reads end_line without touching
+        -- the table, so "which symbol contains this line" stays a range scan
+        -- over a handful of index rows.
+        CREATE INDEX IF NOT EXISTS idx_symbols_file_line_end
+            ON symbols(file_id, line, end_line);
         CREATE INDEX IF NOT EXISTS idx_module_deps_module ON module_deps(module_id);
         CREATE INDEX IF NOT EXISTS idx_module_deps_dep ON module_deps(dep_module_id);
         CREATE INDEX IF NOT EXISTS idx_inheritance_child ON inheritance(child_id);
@@ -4343,6 +4349,8 @@ const CREATE_QUALIFIED_NAME_INDEX_SQL: &str = r#"
 "#;
 const CREATE_REFS_NAME_FILE_LINE_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_refs_name_file_line ON refs(name, file_id, line)";
+const CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_symbols_file_line_end ON symbols(file_id, line, end_line)";
 const DEFAULT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
@@ -4479,6 +4487,7 @@ struct OptionalIndexMigrations {
     drop_modules_name: bool,
     drop_refs_name: bool,
     rewrite_qualified_name: bool,
+    create_symbols_file_line_end: bool,
 }
 
 impl OptionalIndexMigrations {
@@ -4487,6 +4496,7 @@ impl OptionalIndexMigrations {
             || self.drop_modules_name
             || self.drop_refs_name
             || self.rewrite_qualified_name
+            || self.create_symbols_file_line_end
     }
 }
 
@@ -4546,6 +4556,9 @@ fn inspect_open_migrations(
         drop_modules_name: index_exists(conn, "idx_modules_name")?,
         drop_refs_name: index_exists(conn, "idx_refs_name")?,
         rewrite_qualified_name: !qualified_index_current,
+        create_symbols_file_line_end: symbols_exists
+            && symbols_current
+            && !index_exists(conn, "idx_symbols_file_line_end")?,
     };
 
     Ok(OpenMigrationPreflight {
@@ -4580,6 +4593,9 @@ fn apply_optional_index_migrations(
     if migrations.rewrite_qualified_name {
         conn.execute("DROP INDEX IF EXISTS idx_symbols_qualified_name", [])?;
         conn.execute(CREATE_QUALIFIED_NAME_INDEX_SQL, [])?;
+    }
+    if migrations.create_symbols_file_line_end {
+        conn.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])?;
     }
     Ok(())
 }
@@ -4648,6 +4664,8 @@ fn apply_open_migrations_transaction(
             .context("failed to replace idx_symbols_qualified_name")?;
         tx.execute(CREATE_QUALIFIED_NAME_INDEX_SQL, [])
             .context("failed to create idx_symbols_qualified_name")?;
+        tx.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])
+            .context("failed to create idx_symbols_file_line_end")?;
     }
 
     tx.execute("DROP INDEX IF EXISTS idx_files_root_path_path", [])
@@ -6483,10 +6501,7 @@ pub fn count_references_scoped(
     Ok(count as usize)
 }
 
-/// All symbols defined in a file, ordered by line. Used by `explore --rwr`
-/// to attribute a reference (file + line) to its owning symbol — the last
-/// symbol whose start line is <= the reference line. Approximate without
-/// `end_line`, but good enough to build a caller→callee graph in memory.
+/// All symbols defined in a file, ordered by line.
 pub fn get_file_symbols(conn: &Connection, path: &str) -> Result<Vec<SearchResult>> {
     let mut stmt = conn.prepare(
         r#"
@@ -6501,6 +6516,86 @@ pub fn get_file_symbols(conn: &Connection, path: &str) -> Result<Vec<SearchResul
         .query_map(params![path], row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
+}
+
+/// Whether the index knows line ranges for at least one symbol in this file.
+///
+/// `symbols.end_line` is only filled by parsers that report a range, so a
+/// `false` here means "this file's language has no range support" rather than
+/// "this file has no symbols". Callers use it to tell a genuine
+/// "the line belongs to no symbol" answer from [`find_owning_symbol`] apart
+/// from "the index cannot answer" — only the latter deserves a fallback.
+pub fn file_has_symbol_ranges(conn: &Connection, path: &str) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE f.path = ?1 AND s.end_line IS NOT NULL
+        )
+        "#,
+    )?;
+    let has_ranges: bool = stmt.query_row(params![path], |row| row.get(0))?;
+    Ok(has_ranges)
+}
+
+/// The symbol whose body contains `line` in `path`, narrowest range first.
+///
+/// Nested definitions all contain the line, so the ordering picks the method
+/// over the class that encloses it. A symbol without `end_line` is treated as
+/// spanning its own declaration line only, which keeps one-line declarations
+/// (constants, `scope`, `include`) eligible for a reference sitting on them
+/// without letting them claim the rest of the file.
+///
+/// Languages whose parsers report no range at all would then never match, so
+/// files with no `end_line` data fall back to the historical heuristic — the
+/// last symbol declared at or before `line`. That fallback is scoped to those
+/// files on purpose: applying it everywhere is what made module-level
+/// references get attributed to the preceding method.
+pub fn find_owning_symbol(
+    conn: &Connection,
+    path: &str,
+    line: i64,
+) -> Result<Option<SearchResult>> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM symbols s
+        JOIN files f ON s.file_id = f.id
+        WHERE f.path = ?1
+          AND s.line <= ?2
+          AND COALESCE(s.end_line, s.line) >= ?2
+        ORDER BY COALESCE(s.end_line, s.line) - s.line ASC, s.line DESC
+        LIMIT 1
+        "#,
+    )?;
+    let owner = stmt
+        .query_row(params![path, line], row_to_search_result)
+        .optional()?;
+    drop(stmt);
+    if owner.is_some() {
+        return Ok(owner);
+    }
+
+    let mut fallback = conn.prepare_cached(
+        r#"
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM symbols s
+        JOIN files f ON s.file_id = f.id
+        WHERE f.path = ?1
+          AND s.line <= ?2
+          AND NOT EXISTS (
+              SELECT 1 FROM symbols r
+              WHERE r.file_id = s.file_id AND r.end_line IS NOT NULL
+          )
+        ORDER BY s.line DESC
+        LIMIT 1
+        "#,
+    )?;
+    Ok(fallback
+        .query_row(params![path, line], row_to_search_result)
+        .optional()?)
 }
 
 /// Search references by name (prefix match, grouped by unique name)

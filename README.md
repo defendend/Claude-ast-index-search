@@ -611,6 +611,16 @@ exclude:
 
 ## Changelog
 
+### 3.54.0
+
+- **Attribute a call site to the function that really contains it** —
+  `call-tree` and `explore --rwr` used to blame the nearest definition line
+  above a reference, so a module-level call landed on the last method of the
+  file and an `include` or a constant could be reported as the caller. Both
+  now ask the index which symbol's line range encloses the reference and take
+  the innermost one. Languages whose parsers report no range keep the previous
+  behaviour.
+
 ### 3.53.0
 
 - **`search` no longer returns nothing for a multi-word query** — when a

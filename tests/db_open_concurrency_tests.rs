@@ -100,6 +100,7 @@ fn current_schema_reader_avoids_writer_lock_and_external_activity_protects_gc() 
             CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name);
             DROP INDEX IF EXISTS idx_symbols_qualified_name;
             CREATE INDEX idx_symbols_qualified_name ON symbols(qualified_name);
+            DROP INDEX IF EXISTS idx_symbols_file_line_end;
             "#,
         )
         .unwrap();
@@ -123,6 +124,7 @@ fn current_schema_reader_avoids_writer_lock_and_external_activity_protects_gc() 
     assert!(index_sql(&reader, "idx_files_root_path_path").is_some());
     assert!(index_sql(&reader, "idx_modules_name").is_some());
     assert!(index_sql(&reader, "idx_refs_name").is_some());
+    assert!(index_sql(&reader, "idx_symbols_file_line_end").is_none());
     assert!(
         fs::metadata(&marker).unwrap().modified().unwrap() > old_marker_time,
         "current-schema read must refresh external activity without writing SQLite"
@@ -137,6 +139,7 @@ fn current_schema_reader_avoids_writer_lock_and_external_activity_protects_gc() 
     assert!(index_sql(&cleaned, "idx_files_root_path_path").is_none());
     assert!(index_sql(&cleaned, "idx_modules_name").is_none());
     assert!(index_sql(&cleaned, "idx_refs_name").is_none());
+    assert!(index_sql(&cleaned, "idx_symbols_file_line_end").is_some());
     let qualified_sql = index_sql(&cleaned, "idx_symbols_qualified_name").unwrap();
     assert!(
         qualified_sql

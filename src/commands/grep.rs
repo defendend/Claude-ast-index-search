@@ -259,8 +259,13 @@ pub fn cmd_call_tree(
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     visited.insert(function_name.to_string());
 
+    // A missing or unreadable index is not fatal here: attribution falls back
+    // to the textual scan that predates the index.
+    let conn = db::open_db_leased(root).ok();
+
     build_call_tree(
         root,
+        conn.as_deref(),
         function_name,
         1,
         max_depth,
@@ -273,8 +278,10 @@ pub fn cmd_call_tree(
 }
 
 /// Recursively build call tree
+#[allow(clippy::too_many_arguments)]
 fn build_call_tree(
     root: &Path,
+    conn: Option<&rusqlite::Connection>,
     function_name: &str,
     current_depth: usize,
     max_depth: usize,
@@ -287,7 +294,7 @@ fn build_call_tree(
     }
 
     let indent = "  ".repeat(current_depth + 1);
-    let callers = find_caller_functions(root, function_name, limit, in_file)?;
+    let callers = find_caller_functions(root, conn, function_name, limit, in_file)?;
 
     if callers.is_empty() {
         return Ok(());
@@ -307,6 +314,7 @@ fn build_call_tree(
             // Recursively find callers of this function
             build_call_tree(
                 root,
+                conn,
                 &caller_func,
                 current_depth + 1,
                 max_depth,
@@ -322,9 +330,17 @@ fn build_call_tree(
     Ok(())
 }
 
-/// Find functions that call the given function
+/// Find functions that call the given function.
+///
+/// Call sites are still located textually: the regex knows call idioms the
+/// `refs` table does not record (`obj.method` without parentheses, Ruby
+/// `:symbol` callbacks, `await obj.fn(`), so replacing it would cost recall.
+/// Only the "which function is this line inside" step consults the index,
+/// which knows real symbol ranges instead of guessing from the nearest
+/// definition line above.
 fn find_caller_functions(
     root: &Path,
+    conn: Option<&rusqlite::Connection>,
     function_name: &str,
     limit: usize,
     in_file: Option<&str>,
@@ -375,23 +391,41 @@ fn find_caller_functions(
             break;
         }
 
-        let content = match std::fs::read_to_string(&file_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let lines: Vec<&str> = content.lines().collect();
         let rel_path = relative_path(root, &file_path);
+        // When the index has ranges for this file, "no owner" is an answer,
+        // not a gap: the call sits at module level and has no calling
+        // function. Only a file the index cannot speak for gets the scan,
+        // and only such a file has to be read off disk at all.
+        let ranges_known = conn
+            .map(|conn| db::file_has_symbol_ranges(conn, &rel_path).unwrap_or(false))
+            .unwrap_or(false);
+        let content = if ranges_known {
+            String::new()
+        } else {
+            match std::fs::read_to_string(&file_path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            }
+        };
+        let lines: Vec<&str> = content.lines().collect();
 
         for call_line in call_lines {
             if results.len() >= limit {
                 break;
             }
 
-            // Search backwards to find the containing function
-            if let Some((func_name, func_line)) =
-                find_containing_function(&lines, call_line, &func_def_re)
-            {
+            let owner = conn
+                .and_then(|conn| {
+                    db::find_owning_symbol(conn, &rel_path, call_line as i64).unwrap_or(None)
+                })
+                .map(|symbol| (symbol.name, symbol.line as usize));
+            let owner = match owner {
+                Some(owner) => Some(owner),
+                None if ranges_known => None,
+                None => find_containing_function(&lines, call_line, &func_def_re),
+            };
+
+            if let Some((func_name, func_line)) = owner {
                 // Avoid adding the same function twice for this target
                 if !results
                     .iter()

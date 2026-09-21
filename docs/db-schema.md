@@ -133,8 +133,9 @@ The current explicit secondary indexes are:
   `idx_files_path`,
   `idx_symbols_name`,
   `idx_symbols_qualified_name` (partial, only where `qualified_name IS NOT NULL`),
-  `idx_symbols_kind`, and
-  `idx_symbols_file`.
+  `idx_symbols_kind`,
+  `idx_symbols_file`, and
+  `idx_symbols_file_line_end` (covers "which symbol contains this line").
 - Modules and dependency edges:
   `idx_module_deps_module`,
   `idx_module_deps_dep`,
@@ -172,8 +173,9 @@ indexes:
   `idx_refs_name_file_line`.
 
 Older databases drop those indexes when opened. The qualified-name index is
-also migrated to its current partial definition, and a missing
-`symbols.end_line` column is added. This optimization changes
+also migrated to its current partial definition, a missing
+`symbols.end_line` column is added, and a missing
+`idx_symbols_file_line_end` is created. This optimization changes
 index structures only: all 15 base tables and their raw columns remain
 available to `ast-index query` and `ast-index schema` for compatibility.
 

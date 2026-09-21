@@ -101,6 +101,15 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     .unwrap()
 }
 
+fn index_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+        params![name],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 #[test]
 fn open_db_adds_end_line_column_to_an_existing_index() {
     let tmp = TempDir::new().unwrap();
@@ -113,6 +122,9 @@ fn open_db_adds_end_line_column_to_an_existing_index() {
 
     let conn = db::open_db(&project).unwrap();
     assert!(column_exists(&conn, "symbols", "end_line"));
+    // The owner-lookup index covers the new column, so the open that adds the
+    // column has to install it too — not the one after it.
+    assert!(index_exists(&conn, "idx_symbols_file_line_end"));
 
     // The pre-existing row survives and reads back as "range unknown".
     let (name, line, end_line): (String, i64, Option<i64>) = conn
