@@ -683,6 +683,15 @@ exclude:
 
 ### 3.54.0
 
+- **Rank symbol searches by relevance** — FTS symbol queries used to come back
+  in whatever order the engine produced, or sorted by name length, so a search
+  for `ApplicationService` listed every shorter sibling and never the class
+  itself. Matches are now ordered by exact name first (case-sensitive, then
+  case-insensitive), then by `bm25()` weighted towards the symbol name over its
+  signature, then by name length and finally by path and line, so repeated runs
+  return the same order. The candidate pool `explore` builds keeps its previous
+  unranked order — ranking it narrowed the pool to same-named symbols and made
+  its own scoring worse.
 - **Attribute a call site to the function that really contains it** —
   `call-tree` and `explore --rwr` used to blame the nearest definition line
   above a reference, so a module-level call landed on the last method of the
