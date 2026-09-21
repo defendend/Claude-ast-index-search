@@ -4224,6 +4224,7 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    conn.execute_batch(CREATE_GIT_SIGNALS_SQL)?;
     Ok(())
 }
 
@@ -4342,6 +4343,30 @@ const CREATE_SUBTREES_SQL: &str = r#"
         canonical_path TEXT NOT NULL UNIQUE,
         original_path TEXT NOT NULL
     )
+"#;
+/// Per-file VCS history signals, collected on demand by `hotspots --collect`.
+///
+/// Kept out of `files` and `symbols` on purpose: the rows survive a reindex,
+/// cover paths the indexer never parses (fixtures, configs, migrations), and
+/// accumulate incrementally from a commit cursor rather than from a file walk.
+/// `path` is relative to the project root, same key space as `files.path`.
+/// `current_lines` is NULL when the path no longer exists in the working tree.
+pub(crate) const CREATE_GIT_SIGNALS_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS git_file_stats (
+        path TEXT PRIMARY KEY,
+        commits INTEGER NOT NULL DEFAULT 0,
+        fix_commits INTEGER NOT NULL DEFAULT 0,
+        lines_added INTEGER NOT NULL DEFAULT 0,
+        lines_deleted INTEGER NOT NULL DEFAULT 0,
+        first_commit_at INTEGER,
+        last_commit_at INTEGER,
+        current_lines INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS git_file_authors (
+        path TEXT NOT NULL,
+        author TEXT NOT NULL,
+        PRIMARY KEY (path, author)
+    );
 "#;
 const CREATE_QUALIFIED_NAME_INDEX_SQL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
@@ -4514,6 +4539,8 @@ fn inspect_open_migrations(
 ) -> Result<OpenMigrationPreflight> {
     let metadata_exists = table_exists(conn, "metadata")?;
     let subtrees_exists = table_exists(conn, "subtrees")?;
+    let git_signals_exist =
+        table_exists(conn, "git_file_stats")? && table_exists(conn, "git_file_authors")?;
     let files_exists = table_exists(conn, "files")?;
     let symbols_exists = table_exists(conn, "symbols")?;
     let files_current = !files_exists || column_exists(conn, "files", "root_path")?;
@@ -4564,6 +4591,7 @@ fn inspect_open_migrations(
     Ok(OpenMigrationPreflight {
         functional_migration_required: !metadata_exists
             || !subtrees_exists
+            || !git_signals_exist
             || !files_current
             || !files_uniqueness_current
             || !symbols_current
@@ -4639,6 +4667,8 @@ fn apply_open_migrations_transaction(
         .context("failed to create metadata table")?;
     tx.execute(CREATE_SUBTREES_SQL, [])
         .context("failed to create subtrees table")?;
+    tx.execute_batch(CREATE_GIT_SIGNALS_SQL)
+        .context("failed to create git signal tables")?;
 
     if table_exists(&tx, "files")? && !column_exists(&tx, "files", "root_path")? {
         tx.execute(
@@ -8391,6 +8421,195 @@ pub fn complete_index_update(conn: &mut Connection) -> Result<()> {
 /// Record completion of module indexing as Unix milliseconds.
 pub fn mark_modules_indexed(conn: &Connection) -> Result<()> {
     mark_metadata_timestamp(conn, "last_modules_indexed_at")
+}
+
+/// Read an arbitrary `metadata` value, or `None` when the key is absent.
+pub fn get_metadata_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM metadata WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .with_context(|| format!("failed to read metadata key '{key}'"))
+}
+
+/// Write an arbitrary `metadata` value, replacing any previous one.
+pub fn set_metadata_value(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .with_context(|| format!("failed to write metadata key '{key}'"))?;
+    Ok(())
+}
+
+/// Delete a `metadata` key if present.
+pub fn delete_metadata_value(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM metadata WHERE key = ?1", params![key])
+        .with_context(|| format!("failed to delete metadata key '{key}'"))?;
+    Ok(())
+}
+
+/// Accumulated VCS history for one project-relative path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitFileStats {
+    pub path: String,
+    pub commits: i64,
+    pub fix_commits: i64,
+    pub lines_added: i64,
+    pub lines_deleted: i64,
+    pub first_commit_at: Option<i64>,
+    pub last_commit_at: Option<i64>,
+    pub current_lines: Option<i64>,
+    pub authors: Vec<String>,
+}
+
+/// Drop every collected git signal, leaving the (empty) tables in place.
+pub fn clear_git_file_stats(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CREATE_GIT_SIGNALS_SQL)?;
+    conn.execute("DELETE FROM git_file_stats", [])
+        .context("failed to clear git_file_stats")?;
+    conn.execute("DELETE FROM git_file_authors", [])
+        .context("failed to clear git_file_authors")?;
+    Ok(())
+}
+
+/// Load one path's accumulated signals, or `None` when it was never seen.
+pub fn load_git_file_stats(conn: &Connection, path: &str) -> Result<Option<GitFileStats>> {
+    let row = conn
+        .query_row(
+            "SELECT commits, fix_commits, lines_added, lines_deleted,
+                    first_commit_at, last_commit_at, current_lines
+             FROM git_file_stats WHERE path = ?1",
+            params![path],
+            |row| {
+                Ok(GitFileStats {
+                    path: path.to_string(),
+                    commits: row.get(0)?,
+                    fix_commits: row.get(1)?,
+                    lines_added: row.get(2)?,
+                    lines_deleted: row.get(3)?,
+                    first_commit_at: row.get(4)?,
+                    last_commit_at: row.get(5)?,
+                    current_lines: row.get(6)?,
+                    authors: Vec::new(),
+                })
+            },
+        )
+        .optional()
+        .context("failed to read git_file_stats")?;
+    let Some(mut stats) = row else {
+        return Ok(None);
+    };
+    let mut statement =
+        conn.prepare_cached("SELECT author FROM git_file_authors WHERE path = ?1")?;
+    stats.authors = statement
+        .query_map(params![path], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read git_file_authors")?;
+    Ok(Some(stats))
+}
+
+/// Load every collected path, authors included. Used by the reporting path.
+pub fn load_all_git_file_stats(conn: &Connection) -> Result<Vec<GitFileStats>> {
+    if !table_exists(conn, "git_file_stats")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn.prepare(
+        "SELECT path, commits, fix_commits, lines_added, lines_deleted,
+                first_commit_at, last_commit_at, current_lines
+         FROM git_file_stats",
+    )?;
+    let mut rows: Vec<GitFileStats> = statement
+        .query_map([], |row| {
+            Ok(GitFileStats {
+                path: row.get(0)?,
+                commits: row.get(1)?,
+                fix_commits: row.get(2)?,
+                lines_added: row.get(3)?,
+                lines_deleted: row.get(4)?,
+                first_commit_at: row.get(5)?,
+                last_commit_at: row.get(6)?,
+                current_lines: row.get(7)?,
+                authors: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read git_file_stats")?;
+
+    let mut index: HashMap<String, usize> = HashMap::with_capacity(rows.len());
+    for (position, row) in rows.iter().enumerate() {
+        index.insert(row.path.clone(), position);
+    }
+    let mut author_statement = conn.prepare("SELECT path, author FROM git_file_authors")?;
+    let mut author_rows = author_statement.query([])?;
+    while let Some(row) = author_rows.next()? {
+        let path: String = row.get(0)?;
+        if let Some(position) = index.get(&path) {
+            rows[*position].authors.push(row.get(1)?);
+        }
+    }
+    Ok(rows)
+}
+
+/// Replace the stored signals for the supplied paths inside one transaction.
+///
+/// Paths absent from `stats` are left untouched, which is what makes the
+/// incremental collector cheap: it rewrites only the files a commit range
+/// actually moved.
+pub fn store_git_file_stats(conn: &mut Connection, stats: &[GitFileStats]) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .context("failed to start git signal write")?;
+    {
+        let mut delete_authors = tx.prepare("DELETE FROM git_file_authors WHERE path = ?1")?;
+        let mut insert_author =
+            tx.prepare("INSERT OR IGNORE INTO git_file_authors (path, author) VALUES (?1, ?2)")?;
+        let mut upsert = tx.prepare(
+            "INSERT INTO git_file_stats
+                 (path, commits, fix_commits, lines_added, lines_deleted,
+                  first_commit_at, last_commit_at, current_lines)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(path) DO UPDATE SET
+                 commits = excluded.commits,
+                 fix_commits = excluded.fix_commits,
+                 lines_added = excluded.lines_added,
+                 lines_deleted = excluded.lines_deleted,
+                 first_commit_at = excluded.first_commit_at,
+                 last_commit_at = excluded.last_commit_at,
+                 current_lines = excluded.current_lines",
+        )?;
+        for entry in stats {
+            upsert.execute(params![
+                entry.path,
+                entry.commits,
+                entry.fix_commits,
+                entry.lines_added,
+                entry.lines_deleted,
+                entry.first_commit_at,
+                entry.last_commit_at,
+                entry.current_lines,
+            ])?;
+            delete_authors.execute(params![entry.path])?;
+            for author in &entry.authors {
+                insert_author.execute(params![entry.path, author])?;
+            }
+        }
+    }
+    tx.commit().context("failed to commit git signal write")?;
+    Ok(())
+}
+
+/// Forget one path entirely (used when a rename moves its history elsewhere).
+pub fn delete_git_file_stats(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute("DELETE FROM git_file_stats WHERE path = ?1", params![path])?;
+    conn.execute(
+        "DELETE FROM git_file_authors WHERE path = ?1",
+        params![path],
+    )?;
+    Ok(())
 }
 
 /// Returns module indexing time and the effective file-update time.

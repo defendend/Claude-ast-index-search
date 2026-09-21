@@ -293,6 +293,38 @@ remain relative to the repository root. Use it to inventory branch files
 before review; use raw `git diff` / `arc diff` for patch hunks. It does not
 report changed symbols or include staged/unstaged working-tree-only edits.
 
+**`hotspots`** - Rank files by what their Git history says about them: commit
+count, churn (added + deleted lines, and churn relative to the file's current
+size), bugfix share, distinct authors, age, and time since the last change.
+Use it when choosing which of several similar files to copy a pattern from, or
+when scoping a refactor: a file with 28 commits and 54% bugfixes is not the
+same as one written once and untouched for 86 days.
+
+Thresholds are **percentiles within this repository**, not constants — 28
+commits is a lot for a library and unremarkable in a monorepo. Raw numbers are
+always printed next to the label.
+
+```bash
+ast-index hotspots --collect                   # Read new Git history, then report
+ast-index hotspots --limit 50 --sort fixes     # Report only; no Git subprocess
+ast-index hotspots --path src/parsers          # Narrow output; percentiles stay global
+ast-index hotspots --collect --full            # Discard the cursor, rescan everything
+ast-index --format json hotspots --limit 10    # Paginated JSON schema v2
+```
+
+Collection is never implicit: `rebuild` and `update` do not run it. The first
+`--collect` walks the whole history; later runs resume from a stored commit
+cursor. When that cursor stops being an ancestor of `HEAD` (branch switch,
+rebase, force-push, garbage-collected object) the run says so and recollects
+from scratch rather than reporting stale numbers.
+
+Labels: `churn:high` / `churn:elevated`, `rewritten-often`, `fixes:high` /
+`fixes:elevated` (only for files with 4+ commits), `authors:many`, `veteran`.
+`--sort` takes `score` (default), `commits`, `churn`, `relative-churn`,
+`fixes`, `authors`, `recent`. Bugfix detection is a commit-subject heuristic
+(English and Russian, tracker key stripped first); merge commits are excluded
+and renames carry history onto the new path.
+
 ### Public API
 
 **`api`** - Show public API of a module. Accepts module path or module name (dots converted to slashes).

@@ -358,7 +358,7 @@ slice via offset/limit. Never bulk-read large files.
 - **Modules:** `module`, `deps`, `dependents`, `api` — module dependencies
 - **Files:** `outline`, `imports`, `changed` — file analysis
 - **iOS:** `storyboard-usages`, `asset-usages`, `asset-unused` — storyboard/asset search
-- **Quality:** `todo`, `deprecated` — find TODOs and deprecated items
+- **Quality:** `todo`, `deprecated`, `hotspots` — TODOs, deprecated items, Git-history risk
 - **Index:** `rebuild`, `update`, `watch`, `stats` — index management
 
 ## Common Use Cases
@@ -370,6 +370,7 @@ slice via offset/limit. Never bulk-read large files.
 - `ast-index deps "PaymentFeature"` — module dependencies
 - `ast-index dependents "NetworkKit"` — what depends on this module?
 - `ast-index changed` — what changed in my branch?
+- `ast-index hotspots --collect` — which files churn most and attract the most bugfixes?
 - `ast-index todo` — find all TODOs
 ````
 
@@ -428,6 +429,7 @@ ast-index hierarchy "BaseController"    # inheritance tree
 ast-index outline src/main.rs           # file structure
 ast-index imports src/main.rs           # imports/includes
 ast-index changed                       # files changed on the current branch
+ast-index hotspots --collect            # rank files by Git history (churn, fixes, authors)
 ast-index map                           # compact project map
 ast-index conventions                   # detected frameworks and patterns
 ```
