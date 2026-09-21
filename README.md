@@ -292,6 +292,7 @@ ast-index callers <FUNCTION>       # Function call sites
 ast-index implementations <PARENT> # Find implementations
 ast-index hierarchy <CLASS>        # Class hierarchy tree
 ast-index changed [--base BRANCH]  # Branch-level changed files (A/M/D/R)
+ast-index hotspots [--collect]     # Rank files by Git history (churn, fixes, authors)
 ast-index todo [PATTERN]           # TODO/FIXME/HACK comments
 ast-index deprecated [QUERY]       # Deprecated items
 ```
@@ -380,6 +381,75 @@ is that repository-relative directory path.
 This is a fast file summary for branch review, not a changed-symbol report and
 not a replacement for your version-control system's diff command when patch
 hunks are needed.
+
+### Git hotspots
+
+Two files can look equally good to copy from and have very different histories:
+one absorbed 28 commits in six months with 54% of them bugfixes, the other was
+written once and left alone for 86 days. `hotspots` puts that history next to
+the code.
+
+Per file, collected from the Git log: commit count, churn (added + deleted
+lines, plus churn relative to the file's current size), bugfix share, distinct
+author count, age of the first commit, and time since the last change.
+
+Thresholds are **percentiles within this repository**, not constants. 28
+commits is a lot for a small library and unremarkable in a monorepo, so
+`churn:high` means p90+ *here*. Raw numbers are always printed next to the
+label.
+
+```bash
+# Collect history into the index, then show the top 20
+ast-index hotspots --collect
+
+# Report from already-collected data (no Git subprocess at all)
+ast-index hotspots --limit 50 --sort fixes
+
+# Narrow to a directory; percentiles still come from the whole repository
+ast-index hotspots --path src/parsers --min-commits 5
+
+# Discard the cursor and rescan the full history
+ast-index hotspots --collect --full
+
+# Stable paginated schema v2
+ast-index --format json hotspots --limit 10
+```
+
+Collection is **never implicit**: `rebuild` and `update` do not run it, so
+indexing cost is unchanged for everyone who does not ask for this. The first
+`--collect` walks the whole history; every later one resumes from the stored
+commit cursor and reads only new commits. If that cursor stops being an
+ancestor of `HEAD` — branch switch, rebase, force-push, or a
+garbage-collected object — the run says so and rebuilds from scratch instead
+of failing or reporting stale numbers.
+
+Signals live in their own `git_file_stats` / `git_file_authors` tables keyed
+by project-relative path, so they survive a reindex and also cover files the
+parsers never look at (fixtures, configs, migrations).
+
+```text
+Git hotspots — 289 file(s) with history, 370 commit(s) analyzed, HEAD 50db069dbb, sorted by score:
+  Labels are percentiles within this repository (high = p90+, elevated = p75+).
+  src/indexer.rs
+    score 90 · commits 70 (p98) · fixes 17/70 = 24% (p72) · churn +8558/-3259 (p99, 2.2x file)
+    authors 6 (p99) · age 244d · last change 0d ago · 5298 lines
+    churn:high rewritten-often authors:many veteran
+```
+
+Labels: `churn:high` / `churn:elevated`, `rewritten-often` (high churn per
+current line), `fixes:high` / `fixes:elevated` (only for files with at least
+four commits, so 1-of-1 is never "100% bugs"), `authors:many`, `veteran`.
+`score` is the mean of the commit, churn and bugfix-ratio percentiles.
+
+Bugfix detection is a heuristic over commit subjects: a leading tracker key
+(`[ABC-123]`, `ABC-123:`, `#42`) is stripped first, then English and Russian
+bugfix vocabulary is matched on word boundaries — so `prefix` is not a fix and
+`Исправить падение` is. Merge commits are excluded. Renames follow the file:
+history recorded under the old path moves onto the new one.
+
+`--sort` accepts `score` (default), `commits`, `churn`, `relative-churn`,
+`fixes`, `authors`, `recent`. `--subtree` is rejected: the signals describe the
+project's own working tree.
 
 ### Module analysis
 
@@ -610,6 +680,23 @@ exclude:
 ```
 
 ## Changelog
+
+### 3.54.0
+
+- **`hotspots` — per-file Git history signals** — a new command ranks files by
+  what their history says about them: commit count, churn (absolute and
+  relative to the file's current size), bugfix share, distinct authors, age
+  and time since the last change. Thresholds are percentiles *within the
+  repository being indexed*, not absolute constants, so "high churn" means
+  something in a 300-file library and in a 30 000-file monorepo alike; raw
+  numbers are printed next to every label. Text and `--format json` output,
+  paginated JSON schema v2.
+- **Collection is opt-in and incremental** — `rebuild` and `update` are
+  unchanged and never walk the log. `hotspots --collect` stores a commit
+  cursor and later runs read only new commits; when that cursor stops being
+  an ancestor of `HEAD` (branch switch, rebase, force-push, pruned object)
+  the run reports why and recollects from scratch instead of serving stale
+  numbers. Signals live in their own tables, so they survive a reindex.
 
 ### 3.53.0
 

@@ -15,6 +15,7 @@ pub mod android;
 pub mod changed;
 pub mod explore;
 pub mod files;
+pub mod git_signals;
 pub mod grep;
 pub mod index;
 pub mod ios;

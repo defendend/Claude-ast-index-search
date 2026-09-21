@@ -87,6 +87,7 @@ Perl:
 Project Insights:
   map                    Show compact project map (key types per directory)
   conventions            Detect project conventions (architecture, frameworks, naming)
+  hotspots               Rank files by Git history (churn, bugfix ratio, authors, age)
 
 Project Configuration:
   add-root               Add additional source root
@@ -588,6 +589,36 @@ enum Commands {
         #[arg(long)]
         verbose: bool,
     },
+    /// Rank files by Git history signals (churn, bugfix ratio, authors, age)
+    Hotspots {
+        /// Collect new Git history into the index before reporting
+        #[arg(long)]
+        collect: bool,
+        /// Discard collected signals and rescan the whole history (implies --collect)
+        #[arg(long)]
+        full: bool,
+        /// Max files to list
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+        /// Skip files with fewer commits than this
+        #[arg(long, default_value = "1")]
+        min_commits: i64,
+        /// Only report files whose path starts with this prefix
+        #[arg(long)]
+        path: Option<String>,
+        /// Ranking key: score, commits, churn, relative-churn, fixes, authors, recent
+        #[arg(long, default_value = "score")]
+        sort: String,
+        /// Git subprocess wall-clock timeout in milliseconds (collection only)
+        #[arg(long, default_value = "600000")]
+        timeout_ms: u64,
+        /// Commits per `git log` window during collection
+        #[arg(long, default_value = "2000")]
+        window: usize,
+        /// Print collection diagnostics to stderr
+        #[arg(long)]
+        verbose: bool,
+    },
     // === iOS Commands ===
     /// Find class usages in storyboards/xibs (iOS)
     StoryboardUsages {
@@ -816,10 +847,18 @@ fn main() -> Result<()> {
     // formatters in subagents) can branch on text vs JSON without us
     // threading `format` through every signature.
     std::env::set_var("AST_INDEX_FORMAT", cli.format.as_str());
-    if matches!(&cli.command, Commands::Changed { .. }) && cli.subtree.is_some() {
-        return Err(anyhow::anyhow!(
-            "--subtree is not supported by 'changed'; invoke it from the desired directory"
-        ));
+    // Both commands read the working tree's own VCS history rather than the
+    // indexed symbol tables, so a subtree filter has nothing to filter.
+    if cli.subtree.is_some() {
+        if let Some(name) = match &cli.command {
+            Commands::Changed { .. } => Some("changed"),
+            Commands::Hotspots { .. } => Some("hotspots"),
+            _ => None,
+        } {
+            return Err(anyhow::anyhow!(
+                "--subtree is not supported by '{name}'; invoke it from the desired directory"
+            ));
+        }
     }
     // Conflict guard: --subtree and --local both narrow the workspace, but
     // they narrow it differently, so combining them is meaningless.
@@ -1265,6 +1304,29 @@ fn main() -> Result<()> {
             timeout_ms,
             verbose,
         } => commands::changed::cmd_changed(&root, base.as_deref(), timeout_ms, verbose, format),
+        Commands::Hotspots {
+            collect,
+            full,
+            limit,
+            min_commits,
+            path,
+            sort,
+            timeout_ms,
+            window,
+            verbose,
+        } => commands::git_signals::cmd_hotspots(
+            &root,
+            collect,
+            full,
+            limit,
+            min_commits,
+            path.as_deref(),
+            &sort,
+            timeout_ms,
+            window,
+            verbose,
+            format,
+        ),
         // Android commands
         Commands::XmlUsages { class_name, module } => {
             commands::android::cmd_xml_usages(&root, &class_name, module.as_deref())
