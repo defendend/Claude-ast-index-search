@@ -55,6 +55,7 @@ impl LanguageParser for ProtoParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -73,6 +74,7 @@ impl LanguageParser for ProtoParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -88,6 +90,7 @@ impl LanguageParser for ProtoParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -113,6 +116,7 @@ impl LanguageParser for ProtoParser {
                     line,
                     signature,
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -162,6 +166,7 @@ fn collect_messages_and_enums(
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
+                        end_line: None,
                     });
 
                     // Recurse into message_body for nested messages/enums
@@ -190,6 +195,7 @@ fn collect_messages_and_enums(
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
             }

@@ -43,7 +43,7 @@ Every declared foreign key below uses `ON DELETE CASCADE`.
 | Table | Columns | Declared foreign keys and constraints |
 |---|---|---|
 | `files` | `id INTEGER PK`, `path TEXT NN`, `root_path TEXT NN DEFAULT ''`, `mtime INTEGER NN`, `size INTEGER NN` | `UNIQUE(root_path, path)` |
-| `symbols` | `id INTEGER PK`, `file_id INTEGER NN`, `name TEXT NN`, `qualified_name TEXT`, `kind TEXT NN`, `line INTEGER NN`, `parent_id INTEGER`, `signature TEXT` | `file_id → files.id` |
+| `symbols` | `id INTEGER PK`, `file_id INTEGER NN`, `name TEXT NN`, `qualified_name TEXT`, `kind TEXT NN`, `line INTEGER NN`, `end_line INTEGER`, `parent_id INTEGER`, `signature TEXT` | `file_id → files.id` |
 | `modules` | `id INTEGER PK`, `name TEXT NN UQ`, `path TEXT NN`, `kind TEXT` | — |
 | `module_deps` | `id INTEGER PK`, `module_id INTEGER NN`, `dep_module_id INTEGER NN`, `dep_kind TEXT` | `module_id → modules.id`, `dep_module_id → modules.id` |
 | `inheritance` | `id INTEGER PK`, `child_id INTEGER NN`, `parent_name TEXT NN`, `kind TEXT NN` | `child_id → symbols.id` |
@@ -80,6 +80,14 @@ what the user entered, while `canonical_path` is the normalized value used in
 `symbols.qualified_name` stores the parser-provided qualified name when one is
 available. `signature` is nullable because not every language or declaration
 has a useful signature.
+
+`symbols.line` is the 1-based line where the definition starts; `end_line` is
+the 1-based inclusive line where it ends, so a class range encloses the ranges
+of its own methods. `end_line` is nullable: only parsers that report a range
+fill it (currently Ruby and TypeScript/JavaScript), every other language
+stores `NULL`. Existing databases gain the column through an `ALTER TABLE` on
+open and keep `NULL` until the affected files are re-indexed, so consumers must
+treat `NULL` as "range unknown" rather than an error.
 
 `symbols.parent_id` is a reserved, nullable compatibility column. It has no
 foreign-key constraint, and current indexing code does not populate it.
@@ -164,7 +172,8 @@ indexes:
   `idx_refs_name_file_line`.
 
 Older databases drop those indexes when opened. The qualified-name index is
-also migrated to its current partial definition. This optimization changes
+also migrated to its current partial definition, and a missing
+`symbols.end_line` column is added. This optimization changes
 index structures only: all 15 base tables and their raw columns remain
 available to `ast-index query` and `ast-index schema` for compatibility.
 

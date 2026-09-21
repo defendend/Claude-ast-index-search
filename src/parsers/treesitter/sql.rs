@@ -59,6 +59,7 @@ impl LanguageParser for SqlParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -73,6 +74,7 @@ impl LanguageParser for SqlParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -87,6 +89,7 @@ impl LanguageParser for SqlParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -101,6 +104,7 @@ impl LanguageParser for SqlParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -135,6 +139,7 @@ fn append_domain_symbols(content: &str, symbols: &mut Vec<ParsedSymbol>) {
                 line: line_no,
                 signature: line_text(content, line_no).trim().to_string(),
                 parents: vec![],
+                end_line: None,
             });
         }
     }

@@ -81,6 +81,7 @@ impl LanguageParser for ObjcParser {
                             line,
                             signature: sig,
                             parents: vec![(class_name, "extends".to_string())],
+                            end_line: None,
                         });
                     } else {
                         let mut parents = Vec::new();
@@ -101,6 +102,7 @@ impl LanguageParser for ObjcParser {
                             line,
                             signature: sig,
                             parents,
+                            end_line: None,
                         });
                     }
                 }
@@ -124,6 +126,7 @@ impl LanguageParser for ObjcParser {
                         line,
                         signature: sig,
                         parents,
+                        end_line: None,
                     });
                 }
                 continue;
@@ -144,6 +147,7 @@ impl LanguageParser for ObjcParser {
                             line,
                             signature: sig,
                             parents: vec![],
+                            end_line: None,
                         });
                     }
                 }
@@ -162,6 +166,7 @@ impl LanguageParser for ObjcParser {
                         line,
                         signature: sig,
                         parents: vec![],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -179,6 +184,7 @@ impl LanguageParser for ObjcParser {
                         line,
                         signature: sig,
                         parents: vec![],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -196,6 +202,7 @@ impl LanguageParser for ObjcParser {
                         line,
                         signature: sig,
                         parents: vec![],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -214,6 +221,7 @@ impl LanguageParser for ObjcParser {
                             line,
                             signature: sig,
                             parents: vec![],
+                            end_line: None,
                         });
                     }
                 }

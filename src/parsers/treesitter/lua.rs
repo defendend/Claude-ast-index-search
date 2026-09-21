@@ -61,6 +61,7 @@ impl LanguageParser for LuaParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![(path.to_string(), "from".to_string())],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -78,6 +79,7 @@ impl LanguageParser for LuaParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![(class.to_string(), "receiver".to_string())],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -95,6 +97,7 @@ impl LanguageParser for LuaParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![(class.to_string(), "receiver".to_string())],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -110,6 +113,7 @@ impl LanguageParser for LuaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -124,6 +128,7 @@ impl LanguageParser for LuaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -145,6 +150,7 @@ impl LanguageParser for LuaParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -160,6 +166,7 @@ impl LanguageParser for LuaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }

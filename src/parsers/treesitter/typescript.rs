@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_end_line, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::{truncate_context, FileType, ParsedRef, ParsedSymbol};
 
@@ -315,40 +315,56 @@ impl LanguageParser for TypeScriptParser {
 
         // Type alias captures
         let idx_type_alias_name = idx("type_alias_name");
+        let idx_type_alias_node = idx("type_alias_node");
         let idx_export_type_alias_name = idx("export_type_alias_name");
+        let idx_export_type_alias_node = idx("export_type_alias_node");
 
         // Enum captures
         let idx_enum_name = idx("enum_name");
+        let idx_enum_node = idx("enum_node");
         let idx_export_enum_name = idx("export_enum_name");
+        let idx_export_enum_node = idx("export_enum_node");
 
         // Function captures
         let idx_func_name = idx("func_name");
+        let idx_func_node = idx("func_node");
         let idx_export_func_name = idx("export_func_name");
+        let idx_export_func_node = idx("export_func_node");
 
         // Arrow function captures
         let idx_arrow_func_name = idx("arrow_func_name");
+        let idx_arrow_func_node = idx("arrow_func_node");
         let idx_export_arrow_func_name = idx("export_arrow_func_name");
+        let idx_export_arrow_func_node = idx("export_arrow_func_node");
 
         // Constant captures
         let idx_const_name = idx("const_name");
+        let idx_const_node = idx("const_node");
         let idx_export_const_name = idx("export_const_name");
+        let idx_export_const_node = idx("export_const_node");
 
         // Namespace captures
         let idx_namespace_name = idx("namespace_name");
+        let idx_namespace_node = idx("namespace_node");
         let idx_export_namespace_name = idx("export_namespace_name");
+        let idx_export_namespace_node = idx("export_namespace_node");
 
         // Ambient const captures (declare const without value)
         let idx_export_ambient_const_name = idx("export_ambient_const_name");
+        let idx_export_ambient_const_node = idx("export_ambient_const_node");
 
         // Export default captures
         let idx_export_default_value = idx("export_default_value");
 
         // Import captures
         let idx_import_source = idx("import_source");
+        let idx_import_node = idx("import_node");
 
         // Decorator captures
         let idx_decorator_id = idx("decorator_id");
+        let idx_decorator_node = idx("decorator_node");
         let idx_decorator_call_id = idx("decorator_call_id");
+        let idx_decorator_call_node = idx("decorator_call_node");
 
         // Method captures
         let idx_method_name = idx("method_name");
@@ -365,6 +381,10 @@ impl LanguageParser for TypeScriptParser {
         // Abstract method captures
         let idx_abstract_method_name = idx("abstract_method_name");
         let idx_abstract_method_node = idx("abstract_method_node");
+
+        let end_line_of = |m: &tree_sitter::QueryMatch, capture: Option<u32>| {
+            find_capture(m, capture).map(|c| node_end_line(&c.node))
+        };
 
         // Track emitted symbols to avoid duplicates
         let mut emitted_lines: std::collections::HashSet<(String, usize)> =
@@ -389,6 +409,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
+                        end_line: end_line_of(m, idx_class_node),
                     });
                 }
                 continue;
@@ -408,6 +429,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
+                        end_line: end_line_of(m, idx_abstract_class_node),
                     });
                 }
                 continue;
@@ -427,6 +449,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
+                        end_line: end_line_of(m, idx_export_class_node),
                     });
                 }
                 continue;
@@ -446,6 +469,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
+                        end_line: end_line_of(m, idx_export_abstract_class_node),
                     });
                 }
                 continue;
@@ -466,6 +490,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
+                        end_line: end_line_of(m, idx_interface_node),
                     });
                 }
                 continue;
@@ -484,6 +509,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
+                        end_line: end_line_of(m, idx_export_interface_node),
                     });
                 }
                 continue;
@@ -501,6 +527,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_type_alias_node),
                     });
                 }
                 continue;
@@ -516,6 +543,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_type_alias_node),
                     });
                 }
                 continue;
@@ -533,6 +561,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_enum_node),
                     });
                 }
                 continue;
@@ -548,6 +577,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_enum_node),
                     });
                 }
                 continue;
@@ -567,6 +597,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_func_node),
                     });
                 }
                 continue;
@@ -583,6 +614,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_func_node),
                     });
                 }
                 continue;
@@ -602,6 +634,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_arrow_func_node),
                     });
                 }
                 continue;
@@ -618,6 +651,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_arrow_func_node),
                     });
                 }
                 continue;
@@ -644,6 +678,7 @@ impl LanguageParser for TypeScriptParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
+                            end_line: end_line_of(m, idx_const_node),
                         });
                     } else if is_all_caps(name) {
                         // ALL_CAPS constants at module level
@@ -660,6 +695,7 @@ impl LanguageParser for TypeScriptParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: end_line_of(m, idx_const_node),
                             });
                         }
                     }
@@ -684,6 +720,7 @@ impl LanguageParser for TypeScriptParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
+                            end_line: end_line_of(m, idx_export_const_node),
                         });
                     } else if is_all_caps(name) {
                         // Export statement is always module-level
@@ -693,6 +730,7 @@ impl LanguageParser for TypeScriptParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
+                            end_line: end_line_of(m, idx_export_const_node),
                         });
                     }
                 }
@@ -711,6 +749,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_ambient_const_node),
                     });
                 }
                 continue;
@@ -728,6 +767,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_namespace_node),
                     });
                 }
                 continue;
@@ -743,6 +783,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_namespace_node),
                     });
                 }
                 continue;
@@ -762,6 +803,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_import_node),
                     });
                 }
                 continue;
@@ -779,6 +821,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_decorator_node),
                     });
                 }
                 continue;
@@ -794,6 +837,7 @@ impl LanguageParser for TypeScriptParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_decorator_call_node),
                     });
                 }
                 continue;
@@ -867,6 +911,7 @@ impl LanguageParser for TypeScriptParser {
                                 line,
                                 signature: sig,
                                 parents: vec![],
+                                end_line: Some(node_end_line(node)),
                             });
                         }
                     }
@@ -879,6 +924,7 @@ impl LanguageParser for TypeScriptParser {
                                 line,
                                 signature: sig,
                                 parents: vec![],
+                                end_line: Some(node_end_line(node)),
                             });
                         }
                     }
@@ -893,6 +939,7 @@ impl LanguageParser for TypeScriptParser {
                                     line,
                                     signature: sig,
                                     parents: vec![],
+                                    end_line: Some(node_end_line(node)),
                                 });
                             }
                         }
@@ -972,6 +1019,7 @@ fn emit_class_member(
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: Some(node_end_line(&node_cap.node)),
                     });
                 }
             }

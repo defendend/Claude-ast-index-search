@@ -117,6 +117,7 @@ impl LanguageParser for JavaParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
+                        end_line: None,
                     });
                 }
                 continue;
@@ -136,6 +137,7 @@ impl LanguageParser for JavaParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
+                        end_line: None,
                     });
                 }
                 continue;
@@ -155,6 +157,7 @@ impl LanguageParser for JavaParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
+                        end_line: None,
                     });
                 }
                 continue;
@@ -176,6 +179,7 @@ impl LanguageParser for JavaParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: None,
                             });
                         }
                     }
@@ -196,6 +200,7 @@ impl LanguageParser for JavaParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: None,
                             });
                         }
                     }
@@ -216,6 +221,7 @@ impl LanguageParser for JavaParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: None,
                             });
                         }
                     }
@@ -239,6 +245,7 @@ impl LanguageParser for JavaParser {
                             line,
                             signature: component_signature,
                             parents: vec![],
+                            end_line: None,
                         });
                     }
 
@@ -268,6 +275,7 @@ impl LanguageParser for JavaParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
+                            end_line: None,
                         });
                     }
                 }
@@ -286,6 +294,7 @@ impl LanguageParser for JavaParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
+                            end_line: None,
                         });
                     }
                 }
@@ -305,6 +314,7 @@ impl LanguageParser for JavaParser {
                     line,
                     signature,
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }

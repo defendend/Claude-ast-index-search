@@ -129,6 +129,7 @@ fn extract_import(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
             line,
             signature: sig,
             parents: vec![],
+            end_line: None,
         });
     }
 }
@@ -167,6 +168,7 @@ fn extract_top_level_variable_decl(node: &Node, content: &str, symbols: &mut Vec
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
             }
@@ -182,6 +184,7 @@ fn extract_top_level_variable_decl(node: &Node, content: &str, symbols: &mut Vec
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
+                            end_line: None,
                         });
                     }
                 }
@@ -220,6 +223,7 @@ fn extract_misparsed_typedef(node: &Node, content: &str, symbols: &mut Vec<Parse
                                     line,
                                     signature: sig.clone(),
                                     parents: vec![],
+                                    end_line: None,
                                 });
                             }
                             break;
@@ -268,6 +272,7 @@ fn extract_class(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
         line,
         signature: sig,
         parents,
+        end_line: None,
     });
 }
 
@@ -396,6 +401,7 @@ fn extract_mixin(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
         line,
         signature: sig,
         parents,
+        end_line: None,
     });
 }
 
@@ -446,6 +452,7 @@ fn extract_extension(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>
         line,
         signature: sig,
         parents,
+        end_line: None,
     });
 }
 
@@ -501,6 +508,7 @@ fn extract_extension_type(node: &Node, content: &str, symbols: &mut Vec<ParsedSy
         line,
         signature: sig,
         parents,
+        end_line: None,
     });
 }
 
@@ -531,6 +539,7 @@ fn extract_enum(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
         line,
         signature: sig,
         parents,
+        end_line: None,
     });
 }
 
@@ -567,6 +576,7 @@ fn extract_typedef(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) 
                 line,
                 signature: sig,
                 parents: vec![],
+                end_line: None,
             });
         }
     }
@@ -597,6 +607,7 @@ fn extract_function_signature(node: &Node, content: &str, symbols: &mut Vec<Pars
             line,
             signature: sig,
             parents: vec![],
+            end_line: None,
         });
     }
 }
@@ -614,6 +625,7 @@ fn extract_getter(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
             line,
             signature: sig,
             parents: vec![],
+            end_line: None,
         });
     }
 }
@@ -631,6 +643,7 @@ fn extract_setter(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
             line,
             signature: sig,
             parents: vec![],
+            end_line: None,
         });
     }
 }
@@ -754,6 +767,7 @@ fn extract_operator(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>)
         line,
         signature: sig,
         parents: vec![],
+        end_line: None,
     });
 }
 
@@ -773,6 +787,7 @@ fn extract_constructor(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbo
             line,
             signature: sig,
             parents: vec![],
+            end_line: None,
         });
     }
 }
@@ -808,6 +823,7 @@ fn extract_factory_constructor(node: &Node, content: &str, symbols: &mut Vec<Par
             line,
             signature: sig,
             parents: vec![],
+            end_line: None,
         });
     }
 }
@@ -826,6 +842,7 @@ fn extract_const_constructor(node: &Node, content: &str, symbols: &mut Vec<Parse
             line,
             signature: sig,
             parents: vec![],
+            end_line: None,
         });
     }
 }
@@ -844,6 +861,7 @@ fn extract_top_level_vars(node: &Node, content: &str, symbols: &mut Vec<ParsedSy
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
@@ -863,6 +881,7 @@ fn extract_top_level_consts(node: &Node, content: &str, symbols: &mut Vec<Parsed
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }

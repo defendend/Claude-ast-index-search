@@ -58,6 +58,7 @@ impl LanguageParser for MatlabParser {
                         line,
                         signature: sig,
                         parents,
+                        end_line: None,
                     });
                 } else if Some(cap.index) == idx_func_name {
                     // Check if this function is inside a class (method) or standalone
@@ -74,6 +75,7 @@ impl LanguageParser for MatlabParser {
                         line,
                         signature: sig,
                         parents,
+                        end_line: None,
                     });
                 } else if Some(cap.index) == idx_property_name {
                     let parent_class = find_parent_class(content, &cap.node);
@@ -88,6 +90,7 @@ impl LanguageParser for MatlabParser {
                         line,
                         signature: sig,
                         parents,
+                        end_line: None,
                     });
                 } else if Some(cap.index) == idx_enum_name {
                     let parent_class = find_parent_class(content, &cap.node);
@@ -102,6 +105,7 @@ impl LanguageParser for MatlabParser {
                         line,
                         signature: sig,
                         parents,
+                        end_line: None,
                     });
                 } else if Some(cap.index) == idx_event_name {
                     let parent_class = find_parent_class(content, &cap.node);
@@ -116,6 +120,7 @@ impl LanguageParser for MatlabParser {
                         line,
                         signature: sig,
                         parents,
+                        end_line: None,
                     });
                 }
             }

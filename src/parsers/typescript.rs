@@ -224,6 +224,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents,
+            end_line: None,
         });
     }
 
@@ -251,6 +252,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents,
+            end_line: None,
         });
     }
 
@@ -267,6 +269,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -283,6 +286,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -315,6 +319,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -356,6 +361,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                 line,
                 signature: line_text.trim().to_string(),
                 parents: vec![],
+                end_line: None,
             });
         }
     }
@@ -380,6 +386,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line,
                     signature: line_text.trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
@@ -403,6 +410,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -429,6 +437,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -445,6 +454,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -494,6 +504,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                 line,
                 signature: line_text.trim().to_string(),
                 parents: vec![],
+                end_line: None,
             });
         }
     }
@@ -516,6 +527,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -539,6 +551,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                 line,
                 signature: line_text.trim().to_string(),
                 parents: vec![],
+                end_line: None,
             });
         }
     }
@@ -556,6 +569,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -572,6 +586,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -588,6 +603,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -603,6 +619,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -624,6 +641,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -640,6 +658,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -676,6 +695,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -707,6 +727,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 
@@ -723,6 +744,7 @@ pub fn parse_typescript_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line,
             signature: line_text.trim().to_string(),
             parents: vec![],
+            end_line: None,
         });
     }
 

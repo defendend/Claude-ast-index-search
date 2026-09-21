@@ -87,6 +87,7 @@ impl LanguageParser for GdscriptParser {
                 line: *line,
                 signature: line_text(content, *line).trim().to_string(),
                 parents: vec![],
+                end_line: None,
             });
         }
 
@@ -109,6 +110,7 @@ impl LanguageParser for GdscriptParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
+                    end_line: None,
                 });
                 continue;
             }
@@ -123,6 +125,7 @@ impl LanguageParser for GdscriptParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -137,6 +140,7 @@ impl LanguageParser for GdscriptParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -151,6 +155,7 @@ impl LanguageParser for GdscriptParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -165,6 +170,7 @@ impl LanguageParser for GdscriptParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -179,6 +185,7 @@ impl LanguageParser for GdscriptParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -196,6 +203,7 @@ impl LanguageParser for GdscriptParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }

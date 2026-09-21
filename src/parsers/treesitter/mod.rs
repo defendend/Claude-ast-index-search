@@ -125,6 +125,11 @@ fn node_line(node: &tree_sitter::Node) -> usize {
     node.start_position().row + 1
 }
 
+/// Helper to get the last line (1-based, inclusive) covered by a node
+fn node_end_line(node: &tree_sitter::Node) -> usize {
+    node.end_position().row + 1
+}
+
 /// Helper to get the full line text for a node (for signature)
 fn line_text(content: &str, line: usize) -> &str {
     content.lines().nth(line - 1).unwrap_or("")

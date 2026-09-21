@@ -60,6 +60,7 @@ impl LanguageParser for ZigParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -78,6 +79,7 @@ impl LanguageParser for ZigParser {
                     line,
                     signature: sig_line.to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -93,6 +95,7 @@ impl LanguageParser for ZigParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -107,6 +110,7 @@ impl LanguageParser for ZigParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -121,6 +125,7 @@ impl LanguageParser for ZigParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }

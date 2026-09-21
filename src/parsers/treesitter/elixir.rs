@@ -69,6 +69,7 @@ impl LanguageParser for ElixirParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -87,6 +88,7 @@ impl LanguageParser for ElixirParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![(name.to_string(), "implements".to_string())],
+                            end_line: None,
                         });
                     }
                 }
@@ -106,6 +108,7 @@ impl LanguageParser for ElixirParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
+                            end_line: None,
                         });
                     }
                 }
@@ -125,6 +128,7 @@ impl LanguageParser for ElixirParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
+                            end_line: None,
                         });
                     }
                 }
@@ -144,6 +148,7 @@ impl LanguageParser for ElixirParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
+                            end_line: None,
                         });
                     }
                 }
@@ -161,6 +166,7 @@ impl LanguageParser for ElixirParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -183,6 +189,7 @@ impl LanguageParser for ElixirParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -204,6 +211,7 @@ impl LanguageParser for ElixirParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }

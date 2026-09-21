@@ -72,6 +72,7 @@ impl LanguageParser for ScalaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
+                    end_line: None,
                 });
                 continue;
             }
@@ -93,6 +94,7 @@ impl LanguageParser for ScalaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
+                    end_line: None,
                 });
                 continue;
             }
@@ -114,6 +116,7 @@ impl LanguageParser for ScalaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
+                    end_line: None,
                 });
                 continue;
             }
@@ -128,6 +131,7 @@ impl LanguageParser for ScalaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -142,6 +146,7 @@ impl LanguageParser for ScalaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -156,6 +161,7 @@ impl LanguageParser for ScalaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -172,6 +178,7 @@ impl LanguageParser for ScalaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -188,6 +195,7 @@ impl LanguageParser for ScalaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -202,6 +210,7 @@ impl LanguageParser for ScalaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -216,6 +225,7 @@ impl LanguageParser for ScalaParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }

@@ -1225,6 +1225,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                 line: 1,
                 signature: format!("module {}", rel_path),
                 parents: vec![],
+                end_line: None,
             });
         }
     }
@@ -1246,6 +1247,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                     line: 1,
                     signature: format!("component {}", stem),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
@@ -2111,7 +2113,7 @@ fn write_batch_to_db(
         };
         let mut file_stmt = tx.prepare_cached(file_sql)?;
         let mut sym_stmt = tx.prepare_cached(
-            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, end_line, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         )?;
         let mut inh_stmt = tx.prepare_cached(
             "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)",
@@ -2149,6 +2151,7 @@ fn write_batch_to_db(
                     qualified_name,
                     sym.kind.as_str(),
                     sym.line as i64,
+                    sym.end_line.map(|l| l as i64),
                     parsers::truncate_signature(&sym.signature)
                 ])?;
                 let symbol_id = tx.last_insert_rowid();

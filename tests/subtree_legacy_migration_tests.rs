@@ -167,6 +167,7 @@ fn open_db_migrates_legacy_schemas_atomically_and_idempotently() {
 
         assert!(column_exists(&conn, "files", "root_path"));
         assert!(column_exists(&conn, "symbols", "qualified_name"));
+        assert!(column_exists(&conn, "symbols", "end_line"));
         assert!(schema_object_exists(
             &conn,
             "index",

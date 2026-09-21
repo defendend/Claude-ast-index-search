@@ -5,7 +5,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_end_line, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -100,13 +100,22 @@ impl LanguageParser for RubyParser {
 
         let idx_class_name = idx("class_name");
         let idx_class_parent = idx("class_parent");
+        let idx_class_node = idx("class_node");
         let idx_module_name = idx("module_name");
+        let idx_module_node = idx("module_node");
         let idx_method_name = idx("method_name");
+        let idx_method_node = idx("method_node");
         let idx_singleton_object = idx("singleton_object");
         let idx_singleton_method_name = idx("singleton_method_name");
+        let idx_singleton_method_node = idx("singleton_method_node");
         let idx_assign_const_name = idx("assign_const_name");
+        let idx_assign_const_node = idx("assign_const_node");
         let idx_call_method = idx("call_method");
         let idx_call_first_arg = idx("call_first_arg");
+
+        let end_line_of = |m: &tree_sitter::QueryMatch, capture: Option<u32>| {
+            find_capture(m, capture).map(|c| node_end_line(&c.node))
+        };
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
@@ -128,6 +137,7 @@ impl LanguageParser for RubyParser {
                     name,
                     kind: SymbolKind::Class,
                     line,
+                    end_line: end_line_of(m, idx_class_node),
                     signature: line_text(content, line).trim().to_string(),
                     parents,
                 });
@@ -143,6 +153,7 @@ impl LanguageParser for RubyParser {
                     name,
                     kind: SymbolKind::Package,
                     line,
+                    end_line: end_line_of(m, idx_module_node),
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
                 });
@@ -159,6 +170,7 @@ impl LanguageParser for RubyParser {
                         name: format!("{}.{}", obj, method_name),
                         kind: SymbolKind::Function,
                         line,
+                        end_line: end_line_of(m, idx_singleton_method_node),
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
                     });
@@ -174,6 +186,7 @@ impl LanguageParser for RubyParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
+                    end_line: end_line_of(m, idx_method_node),
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
                 });
@@ -189,6 +202,7 @@ impl LanguageParser for RubyParser {
                         name: name.to_string(),
                         kind: SymbolKind::Constant,
                         line,
+                        end_line: end_line_of(m, idx_assign_const_node),
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
                     });
@@ -206,6 +220,7 @@ impl LanguageParser for RubyParser {
                 // Skip calls with a receiver (e.g., Foo.bar, obj.method)
                 // We only want bare calls like `require 'json'`, `include Mod`, etc.
                 let call_node = method_cap.node.parent();
+                let call_end_line = call_node.as_ref().map(node_end_line);
                 let has_receiver = call_node
                     .map(|n| n.child_by_field_name("receiver").is_some())
                     .unwrap_or(false);
@@ -221,6 +236,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -234,6 +250,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -253,6 +270,7 @@ impl LanguageParser for RubyParser {
                                             line,
                                             signature: sig.clone(),
                                             parents: vec![],
+                                            end_line: call_end_line,
                                         });
                                     }
                                 }
@@ -272,6 +290,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -287,6 +306,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -306,6 +326,7 @@ impl LanguageParser for RubyParser {
                                             line,
                                             signature: sig.clone(),
                                             parents: vec![],
+                                            end_line: call_end_line,
                                         });
                                     }
                                 }
@@ -326,6 +347,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -340,6 +362,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -378,6 +401,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -392,6 +416,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -419,6 +444,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -433,6 +459,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -447,6 +474,7 @@ impl LanguageParser for RubyParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }

@@ -63,6 +63,7 @@ impl LanguageParser for GoParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -87,6 +88,7 @@ impl LanguageParser for GoParser {
                         format!("import \"{}\"", path)
                     },
                     parents: vec![(path.to_string(), "from".to_string())],
+                    end_line: None,
                 });
                 continue;
             }
@@ -101,6 +103,7 @@ impl LanguageParser for GoParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -115,6 +118,7 @@ impl LanguageParser for GoParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -132,6 +136,7 @@ impl LanguageParser for GoParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![(target.to_string(), "alias".to_string())],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -149,6 +154,7 @@ impl LanguageParser for GoParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![(receiver.to_string(), "receiver".to_string())],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -166,6 +172,7 @@ impl LanguageParser for GoParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![(receiver.to_string(), "receiver".to_string())],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -181,6 +188,7 @@ impl LanguageParser for GoParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -195,6 +203,7 @@ impl LanguageParser for GoParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -209,6 +218,7 @@ impl LanguageParser for GoParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }

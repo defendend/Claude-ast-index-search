@@ -56,6 +56,7 @@ impl LanguageParser for GroovyParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -72,6 +73,7 @@ impl LanguageParser for GroovyParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![(full_path.to_string(), "from".to_string())],
+                    end_line: None,
                 });
                 continue;
             }
@@ -86,6 +88,7 @@ impl LanguageParser for GroovyParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -100,6 +103,7 @@ impl LanguageParser for GroovyParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -114,6 +118,7 @@ impl LanguageParser for GroovyParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -128,6 +133,7 @@ impl LanguageParser for GroovyParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -142,6 +148,7 @@ impl LanguageParser for GroovyParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -156,6 +163,7 @@ impl LanguageParser for GroovyParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }

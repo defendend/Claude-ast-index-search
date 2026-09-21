@@ -4085,6 +4085,7 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
             qualified_name TEXT,
             kind TEXT NOT NULL,
             line INTEGER NOT NULL,
+            end_line INTEGER,
             parent_id INTEGER,
             signature TEXT,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
@@ -4507,7 +4508,9 @@ fn inspect_open_migrations(
     let symbols_exists = table_exists(conn, "symbols")?;
     let files_current = !files_exists || column_exists(conn, "files", "root_path")?;
     let files_uniqueness_current = !files_exists || !files_has_legacy_path_unique(conn)?;
-    let symbols_current = !symbols_exists || column_exists(conn, "symbols", "qualified_name")?;
+    let symbols_current = !symbols_exists
+        || (column_exists(conn, "symbols", "qualified_name")?
+            && column_exists(conn, "symbols", "end_line")?);
 
     let (stored_root, has_legacy_extra_roots) = if metadata_exists {
         let stored_root = conn
@@ -4636,6 +4639,10 @@ fn apply_open_migrations_transaction(
         if !column_exists(&tx, "symbols", "qualified_name")? {
             tx.execute("ALTER TABLE symbols ADD COLUMN qualified_name TEXT", [])
                 .context("failed to add symbols.qualified_name")?;
+        }
+        if !column_exists(&tx, "symbols", "end_line")? {
+            tx.execute("ALTER TABLE symbols ADD COLUMN end_line INTEGER", [])
+                .context("failed to add symbols.end_line")?;
         }
         tx.execute("DROP INDEX IF EXISTS idx_symbols_qualified_name", [])
             .context("failed to replace idx_symbols_qualified_name")?;

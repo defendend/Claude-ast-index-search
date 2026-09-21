@@ -29,6 +29,9 @@ pub struct ParsedSymbol {
     pub name: String,
     pub kind: SymbolKind,
     pub line: usize,
+    /// Last line of the whole definition, 1-based and inclusive. `None` when
+    /// the language parser does not report ranges yet.
+    pub end_line: Option<usize>,
     pub signature: String,
     pub parents: Vec<(String, String)>, // (parent_name, inherit_kind)
 }
@@ -1109,6 +1112,7 @@ mod tests {
             line: 1,
             signature: "export const ICONS".to_string(),
             parents: vec![],
+            end_line: None,
         }];
         let refs = extract_references(content, &symbols).unwrap();
         assert!(
@@ -1163,6 +1167,7 @@ mod tests {
             line: 1,
             signature: "class MyClass".to_string(),
             parents: vec![],
+            end_line: None,
         }];
         let refs = extract_references(content, &symbols).unwrap();
         assert!(

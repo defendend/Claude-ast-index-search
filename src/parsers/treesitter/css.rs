@@ -172,6 +172,7 @@ fn push_named(
         line,
         signature: line_text(content, line).trim().to_string(),
         parents: vec![],
+        end_line: None,
     });
 }
 
@@ -196,6 +197,7 @@ fn push_string_value(
         line,
         signature: line_text(content, line).trim().to_string(),
         parents: vec![(unquoted.to_string(), inherit_kind.to_string())],
+        end_line: None,
     });
 }
 

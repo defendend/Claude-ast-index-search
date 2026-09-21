@@ -297,6 +297,7 @@ impl LanguageParser for BslParser {
                         line: ann_line,
                         signature: line_text(content, ann_line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
 
@@ -306,6 +307,7 @@ impl LanguageParser for BslParser {
                     line,
                     signature: sig,
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -334,6 +336,7 @@ impl LanguageParser for BslParser {
                         line: ann_line,
                         signature: line_text(content, ann_line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
 
@@ -343,6 +346,7 @@ impl LanguageParser for BslParser {
                     line,
                     signature: sig,
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -357,6 +361,7 @@ impl LanguageParser for BslParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -371,6 +376,7 @@ impl LanguageParser for BslParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -390,6 +396,7 @@ impl LanguageParser for BslParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
                 continue;

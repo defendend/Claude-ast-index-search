@@ -99,6 +99,7 @@ impl LanguageParser for RustParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -113,6 +114,7 @@ impl LanguageParser for RustParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -127,6 +129,7 @@ impl LanguageParser for RustParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -149,6 +152,7 @@ impl LanguageParser for RustParser {
                         line: impl_line,
                         signature: line_text(content, impl_line).trim().to_string(),
                         parents: vec![(trait_name.to_string(), "implements".to_string())],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -169,6 +173,7 @@ impl LanguageParser for RustParser {
                     line: impl_line,
                     signature: line_text(content, impl_line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -183,6 +188,7 @@ impl LanguageParser for RustParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -197,6 +203,7 @@ impl LanguageParser for RustParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -211,6 +218,7 @@ impl LanguageParser for RustParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -225,6 +233,7 @@ impl LanguageParser for RustParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -240,6 +249,7 @@ impl LanguageParser for RustParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -256,6 +266,7 @@ impl LanguageParser for RustParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
+                        end_line: None,
                     });
                 }
                 continue;
@@ -271,6 +282,7 @@ impl LanguageParser for RustParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -285,6 +297,7 @@ impl LanguageParser for RustParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -299,6 +312,7 @@ impl LanguageParser for RustParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
                 continue;
             }
@@ -324,6 +338,7 @@ impl LanguageParser for RustParser {
                                         line,
                                         signature: sig.clone(),
                                         parents: vec![],
+                                        end_line: None,
                                     });
                                 }
                             }
@@ -339,6 +354,7 @@ impl LanguageParser for RustParser {
                             line,
                             signature: sig,
                             parents: vec![],
+                            end_line: None,
                         });
                     }
                 }
