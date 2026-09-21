@@ -82,7 +82,7 @@ fn run_explore(
     let mut cands: Vec<Cand> = Vec::new();
     let mut seen: HashSet<(String, i64)> = HashSet::new();
     for term in &terms {
-        let mut hits = db::search_symbols(&conn, term, SEED_PER_TERM)?;
+        let mut hits = db::search_symbol_seeds(&conn, term, SEED_PER_TERM)?;
         if hits.len() < 3 {
             hits.extend(db::search_symbols_fuzzy(&conn, term, SEED_PER_TERM)?);
         }

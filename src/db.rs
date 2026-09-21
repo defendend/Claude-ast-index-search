@@ -5492,6 +5492,49 @@ fn escape_fts5_query(query: &str) -> String {
     format!("\"{}\"{}", escaped, suffix)
 }
 
+/// FTS5 relevance score. `bm25()` is negative and smaller means more relevant;
+/// the column weights rank a hit in `name` an order of magnitude above one in
+/// `signature`, so `ApplicationService` outranks the hundreds of subclasses
+/// that only name it in their `class X < ApplicationService` signature.
+const FTS_RANK: &str = "bm25(symbols_fts, 10.0, 1.0)";
+
+/// Deterministic ordering for a query that matches `symbols_fts`.
+///
+/// `exact_name_placeholders` bind the raw query terms, and each one is read
+/// twice, so every caller must pass numbered placeholders.
+///
+/// A symbol whose own name equals a term is pinned to the front: bm25 alone
+/// can rank a long symbol with several term occurrences above the short exact
+/// hit the user typed. FTS5 folds case, so that tier splits in two, and
+/// `Applicant` the class lands above `applicant` the accessor for a
+/// capitalised query.
+///
+/// bm25 is then suppressed for those exact rows. They all carry the same name,
+/// so the only thing left for the score to measure is signature length —
+/// ranking `User` in `app/models/user.rb` below `User` in a spec fixture
+/// because the model has a longer `class … < ApplicationRecord` line is noise,
+/// not relevance. Name length and `f.path, s.line` decide instead, which also
+/// makes repeated runs return the same page.
+fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
+    let tail = "length(COALESCE(s.qualified_name, s.name)), f.path, s.line";
+    if exact_name_placeholders.is_empty() {
+        return format!(" ORDER BY {FTS_RANK}, {tail}");
+    }
+    let cased = exact_name_placeholders.join(", ");
+    let folded = exact_name_placeholders
+        .iter()
+        .map(|placeholder| format!("lower({placeholder})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        " ORDER BY \
+         CASE WHEN s.name IN ({cased}) THEN 0 \
+         WHEN lower(s.name) IN ({folded}) THEN 1 ELSE 2 END, \
+         CASE WHEN lower(s.name) IN ({folded}) THEN 0.0 ELSE {FTS_RANK} END, \
+         {tail}"
+    )
+}
+
 /// Search symbols by name (FTS5)
 pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
     // Handle empty query
@@ -5545,6 +5588,49 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
     }
 
     let escaped_query = escape_fts5_query(query);
+    let exact_name = query.trim_end_matches('*');
+
+    let sql = format!(
+        r#"
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM symbols_fts fts
+        JOIN symbols s ON fts.rowid = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE symbols_fts MATCH ?1{order}
+        LIMIT ?3
+        "#,
+        order = fts_order_by(&["?2"])
+    );
+    let mut stmt = conn.prepare(&sql)?;
+
+    let results = stmt
+        .query_map(
+            params![escaped_query, exact_name, limit as i64],
+            row_to_search_result,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Candidate sample for callers that rank symbols themselves, such as
+/// `explore`.
+///
+/// Matches exactly what [`search_symbols`] matches, but orders by insertion id
+/// instead of relevance. A relevance-ordered head is the wrong input for a
+/// re-ranker: for a term like `service` the best-scoring rows are the symbols
+/// literally named `service`, and a caller that scores candidates lexically
+/// needs the spread of names FTS actually matched, not the head of another
+/// ranking. Insertion order keeps that spread and makes the sample
+/// reproducible for a given index.
+pub fn search_symbol_seeds(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    if query.trim().is_empty() || query.contains("::") {
+        return search_symbols(conn, query, limit);
+    }
 
     let mut stmt = conn.prepare(
         r#"
@@ -5553,12 +5639,16 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
         WHERE symbols_fts MATCH ?1
+        ORDER BY s.id
         LIMIT ?2
         "#,
     )?;
 
     let results = stmt
-        .query_map(params![escaped_query, limit as i64], row_to_search_result)?
+        .query_map(
+            params![escape_fts5_query(query), limit as i64],
+            row_to_search_result,
+        )?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(results)
@@ -7407,7 +7497,22 @@ pub fn search_symbol_terms_scoped(
         sql.push_str(" AND s.kind = ?");
         values.push(kind.to_string());
     }
-    sql.push_str(" ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), f.path, s.line LIMIT ?");
+    if fuzzy {
+        sql.push_str(" ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), f.path, s.line");
+    } else {
+        let first = values.len() + 1;
+        let placeholders = (0..terms.len())
+            .map(|offset| format!("?{}", first + offset))
+            .collect::<Vec<_>>();
+        let placeholder_refs = placeholders.iter().map(String::as_str).collect::<Vec<_>>();
+        sql.push_str(&fts_order_by(&placeholder_refs));
+        values.extend(
+            terms
+                .iter()
+                .map(|term| term.trim_end_matches('*').to_string()),
+        );
+    }
+    sql.push_str(&format!(" LIMIT ?{}", values.len() + 1));
     values.push(limit.to_string());
     let params: Vec<&dyn rusqlite::types::ToSql> = values
         .iter()
@@ -7527,16 +7632,17 @@ pub fn search_symbols_for_command(
         );
         values.push(escape_fts5_query(query));
         values.extend(scope_params);
-        if kind.is_some() {
+        if let Some(kind) = kind {
             sql.push_str(" AND s.kind = ?");
+            values.push(kind.to_string());
         }
         if class_only {
             sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
         }
-        sql.push_str(" LIMIT ?");
-        if let Some(kind) = kind {
-            values.push(kind.to_string());
-        }
+        let exact_placeholder = format!("?{}", values.len() + 1);
+        sql.push_str(&fts_order_by(&[exact_placeholder.as_str()]));
+        values.push(query.trim_end_matches('*').to_string());
+        sql.push_str(&format!(" LIMIT ?{}", values.len() + 1));
         values.push(limit.to_string());
     }
 
@@ -7609,17 +7715,19 @@ pub fn search_symbols_scoped(
     let escaped_query = escape_fts5_query(query);
     let (scope_clause, scope_params) = scope.path_condition();
 
+    let exact_placeholder = format!("?{}", 2 + scope_params.len());
     let sql = format!(
         r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
-        WHERE symbols_fts MATCH ?1{}
+        WHERE symbols_fts MATCH ?1{}{}
         LIMIT ?{}
         "#,
         scope_clause,
-        2 + scope_params.len()
+        fts_order_by(&[exact_placeholder.as_str()]),
+        3 + scope_params.len()
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -7628,6 +7736,7 @@ pub fn search_symbols_scoped(
     for p in &scope_params {
         all_params.push(Box::new(p.clone()));
     }
+    all_params.push(Box::new(query.trim_end_matches('*').to_string()));
     all_params.push(Box::new(limit as i64));
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
