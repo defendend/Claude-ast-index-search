@@ -164,7 +164,13 @@ pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 }
 
 /// Find function callers
-pub fn cmd_callers(root: &Path, function_name: &str, limit: usize, format: &str) -> Result<()> {
+pub fn cmd_callers(
+    root: &Path,
+    function_name: &str,
+    limit: usize,
+    format: &str,
+    in_file: Option<&str>,
+) -> Result<()> {
     let pattern = build_caller_pattern(function_name);
     let def_pattern = build_def_skip_pattern(function_name);
     let conn = db::open_db_leased(root)?;
@@ -183,6 +189,11 @@ pub fn cmd_callers(root: &Path, function_name: &str, limit: usize, format: &str)
             } // Skip definitions
 
             let rel_path = super::display_path(&resolver, root, path);
+            if let Some(filter) = in_file {
+                if !rel_path.contains(filter) {
+                    return None;
+                }
+            }
             let content: String = line.chars().take(70).collect();
             Some((rel_path, line_num, content))
         },
@@ -240,6 +251,7 @@ pub fn cmd_call_tree(
     function_name: &str,
     max_depth: usize,
     limit_per_level: usize,
+    in_file: Option<&str>,
 ) -> Result<()> {
     println!("{}", format!("Call tree for '{}':", function_name).bold());
     println!("  {}", function_name.cyan());
@@ -253,6 +265,7 @@ pub fn cmd_call_tree(
         1,
         max_depth,
         limit_per_level,
+        in_file,
         &mut visited,
     )?;
 
@@ -266,6 +279,7 @@ fn build_call_tree(
     current_depth: usize,
     max_depth: usize,
     limit: usize,
+    in_file: Option<&str>,
     visited: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
     if current_depth > max_depth {
@@ -273,7 +287,7 @@ fn build_call_tree(
     }
 
     let indent = "  ".repeat(current_depth + 1);
-    let callers = find_caller_functions(root, function_name, limit)?;
+    let callers = find_caller_functions(root, function_name, limit, in_file)?;
 
     if callers.is_empty() {
         return Ok(());
@@ -297,6 +311,7 @@ fn build_call_tree(
                 current_depth + 1,
                 max_depth,
                 limit,
+                in_file,
                 visited,
             )?;
         } else {
@@ -312,6 +327,7 @@ fn find_caller_functions(
     root: &Path,
     function_name: &str,
     limit: usize,
+    in_file: Option<&str>,
 ) -> Result<Vec<(String, String, usize)>> {
     let pattern = build_caller_pattern(function_name);
     let def_pattern = build_def_skip_pattern(function_name);
@@ -338,6 +354,12 @@ fn find_caller_functions(
         |path, line_num, line| {
             if def_pattern.is_match(line) {
                 return;
+            }
+
+            if let Some(filter) = in_file {
+                if !relative_path(root, path).contains(filter) {
+                    return;
+                }
             }
 
             files_with_calls

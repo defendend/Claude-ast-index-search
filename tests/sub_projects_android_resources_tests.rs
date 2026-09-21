@@ -44,7 +44,10 @@ fn sub_project_with_values_but_no_layouts_still_indexes_resources() {
 
     // Single Android sub-project with res/values/ only — no layouts/menu/navigation.
     let app = root.join("myapp");
-    write(&app.join("build.gradle.kts"), "plugins { id(\"com.android.application\") }\n");
+    write(
+        &app.join("build.gradle.kts"),
+        "plugins { id(\"com.android.application\") }\n",
+    );
     write(
         &app.join("src/main/res/values/strings.xml"),
         r#"<resources>
@@ -63,7 +66,10 @@ fn sub_project_with_values_but_no_layouts_still_indexes_resources() {
     // Add a second top-level dir so find_sub_projects returns ≥ 2 entries
     // and the --sub-projects path is actually exercised.
     let lib = root.join("mylib");
-    write(&lib.join("build.gradle.kts"), "plugins { id(\"com.android.library\") }\n");
+    write(
+        &lib.join("build.gradle.kts"),
+        "plugins { id(\"com.android.library\") }\n",
+    );
 
     // Drive the sub-projects path the way the CLI does.
     let mut conn = open_fresh_db(root);
@@ -83,15 +89,17 @@ fn sub_project_with_values_but_no_layouts_still_indexes_resources() {
         all_res.extend(walk.res_files);
         all_xml_layouts.extend(walk.xml_layout_files);
     }
-    assert!(any_android, "any_android must be true for android sub-project");
+    assert!(
+        any_android,
+        "any_android must be true for android sub-project"
+    );
     assert!(
         all_xml_layouts.is_empty(),
         "test fixture has no layout/menu/navigation xml on purpose"
     );
     assert!(!all_res.is_empty(), "res/values/*.xml must be collected");
 
-    let (resource_count, _) =
-        indexer::index_resources(&mut conn, root, &all_res, false).unwrap();
+    let (resource_count, _) = indexer::index_resources(&mut conn, root, &all_res, false).unwrap();
     assert!(
         resource_count >= 3,
         "expected ≥ 3 resources (app_title, ok_button, brand_primary), got {}: {:?} / {:?}",
@@ -121,14 +129,10 @@ fn non_android_res_subdir_does_not_get_picked_up() {
         &root.join("ml/res/dataset/labels.xml"),
         "<root><label>not-android</label></root>\n",
     );
-    write(
-        &root.join("ml/res/raw_inputs/data.bin"),
-        "binary",
-    );
+    write(&root.join("ml/res/raw_inputs/data.bin"), "binary");
 
     let mut conn = open_fresh_db(root);
-    let walk =
-        indexer::index_directory_scoped(&mut conn, root, root, false, false, None).unwrap();
+    let walk = indexer::index_directory_scoped(&mut conn, root, root, false, false, None).unwrap();
 
     // None of these should land in res_files — they are not under an
     // Android-canonical subdir (values, layout, drawable, menu, ...).
@@ -160,8 +164,7 @@ fn values_qualifier_dirs_are_recognised() {
     );
 
     let mut conn = open_fresh_db(root);
-    let walk =
-        indexer::index_directory_scoped(&mut conn, root, root, false, false, None).unwrap();
+    let walk = indexer::index_directory_scoped(&mut conn, root, root, false, false, None).unwrap();
     assert!(
         walk.res_files.len() >= 2,
         "qualifier res dirs not collected: {:?}",

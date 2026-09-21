@@ -549,7 +549,13 @@ pub fn cmd_implementations(
 }
 
 /// Show cross-references: definitions, imports, usages
-pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result<()> {
+pub fn cmd_refs(
+    root: &Path,
+    symbol: &str,
+    limit: usize,
+    format: &str,
+    scope: &SearchScope,
+) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -559,13 +565,12 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
     }
 
     let conn = db::open_db_leased(root)?;
-    let no_scope = SearchScope::none();
-    let definitions_total = db::count_symbols_by_name_scoped(&conn, symbol, None, &no_scope, true)?;
-    let imports_total = db::count_imports_scoped(&conn, symbol, &no_scope)?;
-    let usages_total = db::count_references_scoped(&conn, symbol, &no_scope)?;
-    let mut definitions = db::find_definitions_scoped(&conn, symbol, limit, &no_scope)?;
-    let mut imports = db::find_imports_scoped(&conn, symbol, limit, &no_scope)?;
-    let mut usages = db::find_references_scoped(&conn, symbol, limit, &no_scope)?;
+    let definitions_total = db::count_symbols_by_name_scoped(&conn, symbol, None, scope, true)?;
+    let imports_total = db::count_imports_scoped(&conn, symbol, scope)?;
+    let usages_total = db::count_references_scoped(&conn, symbol, scope)?;
+    let mut definitions = db::find_definitions_scoped(&conn, symbol, limit, scope)?;
+    let mut imports = db::find_imports_scoped(&conn, symbol, limit, scope)?;
+    let mut usages = db::find_references_scoped(&conn, symbol, limit, scope)?;
 
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     definitions.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
@@ -683,11 +688,12 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
 
     let conn = db::open_db_leased(root)?;
 
-    // Find the class/interface/package
-    let classes = db::find_symbols_by_name(&conn, name, Some("class"), 1)?;
-    let interfaces = db::find_symbols_by_name(&conn, name, Some("interface"), 1)?;
-    let packages = db::find_symbols_by_name(&conn, name, Some("package"), 1)?;
-    let protocols = db::find_symbols_by_name(&conn, name, Some("protocol"), 1)?;
+    // Find the class/interface/package, respecting scope so --in-file picks the right definition
+    // when multiple classes share the same name.
+    let classes = db::find_symbols_by_name_scoped(&conn, name, Some("class"), 1, scope)?;
+    let interfaces = db::find_symbols_by_name_scoped(&conn, name, Some("interface"), 1, scope)?;
+    let packages = db::find_symbols_by_name_scoped(&conn, name, Some("package"), 1, scope)?;
+    let protocols = db::find_symbols_by_name_scoped(&conn, name, Some("protocol"), 1, scope)?;
 
     let target = classes
         .first()
@@ -702,15 +708,7 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
 
     println!("{}", format!("Hierarchy for '{}':", name).bold());
 
-    // Find parents
-    let mut stmt = conn.prepare(
-        "SELECT i.parent_name, i.kind FROM inheritance i JOIN symbols s ON i.child_id = s.id WHERE s.name = ?1 OR s.qualified_name = ?2",
-    )?;
-    let parents: Vec<(String, String)> = stmt
-        .query_map([target.unwrap().name.as_str(), name], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?
-        .collect::<Result<_, _>>()?;
+    let parents: Vec<(String, String)> = db::find_parents_scoped(&conn, name, scope)?;
 
     if !parents.is_empty() {
         println!("\n  {}", "Parents:".cyan());

@@ -150,6 +150,9 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "50")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
     },
     /// Show call hierarchy (callers tree up) for a function
     CallTree {
@@ -161,6 +164,9 @@ enum Commands {
         /// Max callers per level
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
     },
     /// Find @Provides/@Binds for a type
     Provides {
@@ -519,6 +525,12 @@ enum Commands {
         /// Max results per section
         #[arg(short, long, default_value = "20")]
         limit: usize,
+        /// Filter by file path
+        #[arg(long)]
+        in_file: Option<String>,
+        /// Filter by module path
+        #[arg(long)]
+        module: Option<String>,
     },
     /// Explore an area: ranked relevant symbols' source + tests, in one shot
     Explore {
@@ -928,12 +940,14 @@ fn main() -> Result<()> {
         Commands::Callers {
             function_name,
             limit,
-        } => commands::grep::cmd_callers(&root, &function_name, limit, format),
+            in_file,
+        } => commands::grep::cmd_callers(&root, &function_name, limit, format, in_file.as_deref()),
         Commands::CallTree {
             function_name,
             depth,
             limit,
-        } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit),
+            in_file,
+        } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit, in_file.as_deref()),
         Commands::Provides { type_name, limit } => {
             commands::grep::cmd_provides(&root, &type_name, limit)
         }
@@ -1147,8 +1161,18 @@ fn main() -> Result<()> {
             };
             commands::index::cmd_implementations(&root, &parent, limit, format, &scope)
         }
-        Commands::Refs { symbol, limit } => {
-            commands::index::cmd_refs(&root, &symbol, limit, format)
+        Commands::Refs {
+            symbol,
+            limit,
+            in_file,
+            module,
+        } => {
+            let scope = db::SearchScope {
+                in_file: in_file.as_deref(),
+                module: module.as_deref(),
+                dir_prefix: dir_prefix_ref,
+            };
+            commands::index::cmd_refs(&root, &symbol, limit, format, &scope)
         }
         Commands::Explore {
             query,
