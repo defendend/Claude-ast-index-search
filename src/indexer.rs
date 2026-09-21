@@ -4583,7 +4583,10 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
     }
 
     let content = fs::read_to_string(file_path)?;
-    let (symbols, refs) = parsers::parse_file_symbols(&content, parsers::FileType::TypeScript)?;
+    // Symbols only: a .d.ts is indexed so that a library's exported types resolve,
+    // and its internal references would otherwise dominate `usages`/`refs` output
+    // for common names, pushing the project's own code past the result limit.
+    let symbols = parsers::parse_file_symbols_only(&content, parsers::FileType::TypeScript)?;
 
     Ok(ParsedFile {
         rel_path: rel_path.to_string(),
@@ -4592,7 +4595,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
         size,
         symbols,
         qualified_names: HashMap::new(),
-        refs,
+        refs: Vec::new(),
     })
 }
 
