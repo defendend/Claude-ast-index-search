@@ -534,3 +534,76 @@ fn unknown_preset_is_rejected() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("proven"));
 }
+
+#[test]
+fn exclude_tests_leaves_test_files_out_of_ranked_sections() {
+    let ws = billing_project();
+    for round in 1..=8 {
+        let body = format!("    amount if {round} > 0\n");
+        ws.commit(
+            &format!("2026-0{}-20T10:00:00", round % 9 + 1),
+            "dev1",
+            &format!("Fix billing spec helper {round}"),
+            &[(
+                "spec/billing_retry_spec.rb",
+                &ruby_class("BillingSpecHelper", &body),
+            )],
+        );
+    }
+    collect_everything(&ws);
+
+    let spec = "spec/billing_retry_spec.rb";
+    let file_paths = |report: &Value| -> Vec<String> {
+        report["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let symbol_paths = |report: &Value| -> Vec<String> {
+        report["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| symbol["path"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let with_tests = ws.json(&["search", "Billing", "--rank", "hotspots"]);
+    assert!(file_paths(&with_tests).contains(&spec.to_string()));
+    assert!(symbol_paths(&with_tests).contains(&spec.to_string()));
+
+    let without = ws.json(&["search", "Billing", "--rank", "hotspots", "--exclude-tests"]);
+    assert!(!file_paths(&without).contains(&spec.to_string()));
+    assert!(!symbol_paths(&without).contains(&spec.to_string()));
+    assert_eq!(without["rank"]["pool"]["tests_excluded"], true);
+    assert_eq!(
+        without["pagination"]["files"]["total"].as_u64().unwrap() + 1,
+        with_tests["pagination"]["files"]["total"].as_u64().unwrap()
+    );
+    assert_eq!(
+        without["pagination"]["symbols"]["total"].as_u64().unwrap() + 1,
+        with_tests["pagination"]["symbols"]["total"]
+            .as_u64()
+            .unwrap()
+    );
+    // The file's history is ranked against every file either way.
+    let retry = |report: &Value| {
+        report["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|symbol| symbol["name"] == "BillingRetry")
+            .unwrap()["rank"]["score"]
+            .clone()
+    };
+    assert_eq!(retry(&with_tests), retry(&without));
+
+    let text = ws.run(&["search", "Billing", "--rank", "hotspots", "--exclude-tests"]);
+    assert!(text.contains("test files left out"), "{text}");
+
+    let plain = ws.ast_index(&["search", "Billing", "--exclude-tests"]);
+    assert!(!plain.status.success(), "--exclude-tests needs --rank");
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("--rank"));
+}

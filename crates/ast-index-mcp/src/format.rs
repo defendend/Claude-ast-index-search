@@ -245,6 +245,9 @@ fn write_rank_header(preset: &str, rank: &serde_json::Map<String, Value>, out: &
             pool.get("symbols").and_then(Value::as_u64).unwrap_or(0),
             pool.get("files").and_then(Value::as_u64).unwrap_or(0),
         ));
+        if pool.get("tests_excluded").and_then(Value::as_bool) == Some(true) {
+            evidence.push("test files left out".to_string());
+        }
     }
     writeln!(out, "{}.", capitalize(&evidence.join("; "))).ok();
 
@@ -496,11 +499,16 @@ fn render_hotspots(v: &Value, out: &mut String) -> bool {
     let number = |key: &str| obj.get(key).and_then(Value::as_u64).unwrap_or(0);
     writeln!(
         out,
-        "Git hotspots: {} live files with history, {} commits (HEAD {}), sorted by {}; pNN = percentile within this repo",
+        "Git hotspots: {} live files with history, {} commits (HEAD {}), sorted by {}{}; pNN = percentile within this repo",
         number("files_with_history"),
         number("commits_analyzed"),
         short_sha(head),
         obj.get("sort").and_then(Value::as_str).unwrap_or("score"),
+        if obj.get("tests_excluded").and_then(Value::as_bool) == Some(true) {
+            ", test files left out"
+        } else {
+            ""
+        },
     )
     .ok();
 

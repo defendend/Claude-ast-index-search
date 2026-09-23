@@ -1050,6 +1050,9 @@ pub struct GraphSummary {
 pub struct PoolSummary {
     pub symbols: usize,
     pub files: usize,
+    /// `--exclude-tests`: test files were left out of the pool and the totals.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tests_excluded: bool,
 }
 
 /// The `rank` object of a ranked search report.
@@ -1153,8 +1156,14 @@ pub fn render_header(summary: &RankSummary) -> Vec<String> {
     }
     lines.push(
         format!(
-            "Re-ranked the top {} project symbol(s) and {} project file(s) by relevance; an exact name stays above a partial one, third-party code goes last.",
-            summary.pool.symbols, summary.pool.files
+            "Re-ranked the top {} project symbol(s) and {} project file(s) by relevance{}; an exact name stays above a partial one, third-party code goes last.",
+            summary.pool.symbols,
+            summary.pool.files,
+            if summary.pool.tests_excluded {
+                ", test files left out"
+            } else {
+                ""
+            }
         )
         .dimmed()
         .to_string(),

@@ -27,6 +27,7 @@ use serde::Serialize;
 use super::changed::{
     discover_vcs_root, os_args, parse_utf8, render_stderr, run_bounded, Deadline, Vcs, STDOUT_LIMIT,
 };
+use super::graph::is_test_path;
 use super::Page;
 use crate::db::{self, GitFileSignalRow, GitFileStats};
 
@@ -1507,6 +1508,10 @@ pub struct HotspotsReport {
     /// Every path the collector ever saw, deleted ones included.
     pub paths_in_history: usize,
     pub sort: String,
+    /// `--exclude-tests`: test files are left out of `items`, not out of the
+    /// percentile population.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tests_excluded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collection: Option<CollectOutcome>,
     #[serde(flatten)]
@@ -1783,6 +1788,7 @@ pub fn cmd_hotspots(
     limit: usize,
     min_commits: i64,
     path_filter: Option<&str>,
+    exclude_tests: bool,
     sort: &str,
     timeout_ms: u64,
     window: usize,
@@ -1848,14 +1854,16 @@ pub fn cmd_hotspots(
         .collect();
     let files_with_history = rows.len();
     let now_seconds = unix_millis_now() / 1000;
-    // `--path` and `--min-commits` are applied after ranking, so narrowing the
-    // report never silently redefines what "high" means.
+    // `--path`, `--min-commits` and `--exclude-tests` are applied after
+    // ranking, so narrowing the report never silently redefines what "high"
+    // means: a file keeps its percentiles whether or not tests are listed.
     let mut hotspots = build_hotspots(rows, now_seconds);
     hotspots.retain(|hotspot| {
         hotspot.commits >= min_commits
             && path_filter
                 .map(|prefix| hotspot.path.starts_with(prefix))
                 .unwrap_or(true)
+            && !(exclude_tests && is_test_path(&hotspot.path))
     });
     sort_hotspots(&mut hotspots, sort);
 
@@ -1868,6 +1876,7 @@ pub fn cmd_hotspots(
         files_with_history,
         paths_in_history,
         sort: sort.to_string(),
+        tests_excluded: exclude_tests,
         collection,
         page,
     };
@@ -1919,12 +1928,17 @@ fn render_text(report: &HotspotsReport) {
     println!(
         "{}",
         format!(
-            "Git hotspots — {} live file(s) of {} with history, {} commit(s) analyzed, HEAD {}, sorted by {}:",
+            "Git hotspots — {} live file(s) of {} with history, {} commit(s) analyzed, HEAD {}, sorted by {}{}:",
             report.files_with_history,
             report.paths_in_history,
             report.commits_analyzed,
             report.head.as_deref().map(short_sha).unwrap_or("?"),
-            report.sort
+            report.sort,
+            if report.tests_excluded {
+                ", test files left out"
+            } else {
+                ""
+            }
         )
         .bold()
     );

@@ -1069,3 +1069,61 @@ fn random_history_walk_matches_a_fresh_full_collection() {
         workspace.collect_and_compare(&label);
     }
 }
+
+#[test]
+fn exclude_tests_narrows_the_list_but_not_the_percentiles() {
+    let workspace = workspace();
+    workspace.init_git();
+    let mut spec = String::new();
+    for round in 0..6 {
+        spec.push_str(&format!("it {round}\n"));
+        workspace.commit(
+            &format!("Fix flaky spec {round}"),
+            &[("spec/models/merge_spec.rb", &spec)],
+        );
+    }
+    workspace.commit(
+        "Add merge",
+        &[("app/models/merge.rb", "class Merge\nend\n")],
+    );
+    workspace.commit(
+        "Fix merge crash",
+        &[("app/models/merge.rb", "class Merge\n  def a; end\nend\n")],
+    );
+    workspace.commit("Add helper test", &[("src/util_test.go", "package util\n")]);
+    workspace.commit("Add readme", &[("README.md", "docs\n")]);
+    workspace.rebuild();
+
+    let all = workspace.hotspots_json(&["--collect"]);
+    assert_eq!(all["items"][0]["path"], "spec/models/merge_spec.rb");
+    assert!(all.get("tests_excluded").is_none());
+
+    let narrowed = workspace.hotspots_json(&["--exclude-tests"]);
+    assert_eq!(narrowed["tests_excluded"], true);
+    let paths: Vec<&str> = narrowed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["app/models/merge.rb", "README.md"]);
+    assert_eq!(narrowed["pagination"]["total"], 2);
+    // The population is still every live file, so a file's numbers do not
+    // depend on whether tests are listed.
+    assert_eq!(narrowed["files_with_history"], all["files_with_history"]);
+    let before = find_item(&all, "app/models/merge.rb");
+    let after = find_item(&narrowed, "app/models/merge.rb");
+    for field in [
+        "score_exact",
+        "commits_pct",
+        "churn_pct",
+        "fix_ratio_pct",
+        "labels",
+    ] {
+        assert_eq!(before[field], after[field], "{field}");
+    }
+
+    let text = workspace.ast_index(&["hotspots", "--exclude-tests"]);
+    assert_success(&text);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("test files left out"));
+}

@@ -357,6 +357,10 @@ enum Commands {
         /// (structurally central). Needs `hotspots --collect` and/or `graph build`
         #[arg(long, value_parser = ["proven", "hotspots", "risky", "central"])]
         rank: Option<String>,
+        /// With --rank: leave test files (spec/, tests/, *_test.*, *.spec.*, ...) out
+        /// of the ranked Files and Symbols sections
+        #[arg(long, requires = "rank")]
+        exclude_tests: bool,
     },
     /// Find files by name
     File {
@@ -612,6 +616,9 @@ enum Commands {
         /// Only report files whose path starts with this prefix
         #[arg(long)]
         path: Option<String>,
+        /// Leave test files out of the list; percentiles still rank every file
+        #[arg(long)]
+        exclude_tests: bool,
         /// Ranking key: score, commits, churn, relative-churn, fixes, authors, recent
         #[arg(long, default_value = "score")]
         sort: String,
@@ -1314,6 +1321,7 @@ fn main() -> Result<()> {
             module,
             fuzzy,
             rank,
+            exclude_tests,
         } => {
             let scope = db::SearchScope {
                 in_file: in_file.as_deref(),
@@ -1329,6 +1337,7 @@ fn main() -> Result<()> {
                 &scope,
                 fuzzy,
                 rank.as_deref(),
+                exclude_tests,
             )
         }
         Commands::Symbol {
@@ -1502,6 +1511,7 @@ fn main() -> Result<()> {
             limit,
             min_commits,
             path,
+            exclude_tests,
             sort,
             timeout_ms,
             window,
@@ -1513,6 +1523,7 @@ fn main() -> Result<()> {
             limit,
             min_commits,
             path.as_deref(),
+            exclude_tests,
             &sort,
             timeout_ms,
             window,

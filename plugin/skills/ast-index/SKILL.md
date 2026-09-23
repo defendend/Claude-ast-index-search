@@ -115,6 +115,7 @@ is not "where is X" but "which of these X":
 ast-index search Service --fuzzy --module app/services/ --rank proven  # safe to copy as a pattern
 ast-index search Merge --rank risky                   # dangerous to touch: many dependents + unstable history
 ast-index search Import --rank hotspots               # keeps being changed and fixed
+ast-index search Import --rank hotspots --exclude-tests  # same, spec/test files left out
 ast-index search Event --module app/models/ --rank central  # what the rest leans on (PageRank)
 ast-index --format json search Merge --rank risky     # rank.applied / rank.missing + per-result dossier
 ```
@@ -383,6 +384,7 @@ always printed next to the label.
 ast-index hotspots --collect                   # Read new Git history, then report
 ast-index hotspots --limit 50 --sort fixes     # Report only; no Git subprocess
 ast-index hotspots --path src/parsers          # Narrow output; percentiles stay global
+ast-index hotspots --exclude-tests             # Hide spec/test files; percentiles stay global
 ast-index hotspots --collect --full            # Discard the cursor, rescan everything
 ast-index --format json hotspots --limit 10    # Paginated JSON schema v2
 ```

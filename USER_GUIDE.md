@@ -508,6 +508,7 @@ ast-index search Service --fuzzy --module app/services/ --rank proven   # what t
 ast-index search Merge --rank risky                       # what is dangerous to touch
 ast-index search Import --module app/services/ --rank hotspots          # where it keeps breaking
 ast-index search Event --module app/models/ --rank central
+ast-index search Import --rank hotspots --exclude-tests   # without spec/test files
 ast-index --format json search Merge --rank risky         # dossier per result
 ```
 
@@ -596,6 +597,14 @@ result. Project files without collected history (untracked, or newer than the
 last `hotspots --collect`) and files of attached subtrees (history covers the
 primary root only) keep their relevance order after the scored results of
 their tier, marked `unscored`.
+
+**Test files.** Specs churn and get fixed by nature, so they crowd the top of
+`hotspots` and `risky`. `--exclude-tests` leaves them out of the ranked files
+and symbols sections and their totals (the same test-path rule as `graph top
+--exclude-tests`: `spec/`, `test/`, `tests/`, `__tests__/`, `_spec.`, `_test.`,
+`.spec.`, `.test.`). Percentiles are still computed against every file, so a
+file's score does not change with the flag; `hotspots --exclude-tests` works
+the same way.
 
 **Output.** Each file and symbol carries its dossier: the preset score and its
 terms, the relevance position and tier, the raw history numbers with their
