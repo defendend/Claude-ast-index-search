@@ -5,7 +5,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -45,10 +45,13 @@ impl LanguageParser for SqlParser {
         let idx_func_name = idx("func_name");
         let idx_index_name = idx("index_name");
         let idx_type_name = idx("type_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // CREATE TABLE
             if let Some(cap) = find_capture(m, idx_table_name) {
                 let name = node_text(content, &cap.node);
@@ -59,7 +62,7 @@ impl LanguageParser for SqlParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -74,7 +77,7 @@ impl LanguageParser for SqlParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -89,7 +92,7 @@ impl LanguageParser for SqlParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -104,7 +107,7 @@ impl LanguageParser for SqlParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }

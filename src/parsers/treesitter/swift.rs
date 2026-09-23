@@ -5,7 +5,8 @@ use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{
-    line_text, node_line, node_text, parse_tree, walk_tree_preorder, LanguageParser, WalkControl,
+    line_text, node_line, node_text, parse_tree, text_end_line, walk_tree_preorder, LanguageParser,
+    WalkControl,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -47,10 +48,13 @@ impl LanguageParser for SwiftParser {
         let idx_prop_name = idx("prop_name");
         let idx_typealias_name = idx("typealias_name");
         let idx_import_name = idx("import_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Import: the imported module name (a Swift module is its target name)
             if let Some(cap) = find_capture(m, idx_import_name) {
                 let line = node_line(&cap.node);
@@ -58,7 +62,7 @@ impl LanguageParser for SwiftParser {
                     name: node_text(content, &cap.node).to_string(),
                     kind: SymbolKind::Import,
                     line,
-                    end_line: None,
+                    end_line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
                 });
@@ -92,7 +96,7 @@ impl LanguageParser for SwiftParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -114,7 +118,7 @@ impl LanguageParser for SwiftParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -143,7 +147,7 @@ impl LanguageParser for SwiftParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -165,7 +169,7 @@ impl LanguageParser for SwiftParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -186,7 +190,7 @@ impl LanguageParser for SwiftParser {
                     line,
                     signature,
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -200,7 +204,7 @@ impl LanguageParser for SwiftParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -218,7 +222,7 @@ impl LanguageParser for SwiftParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -233,7 +237,7 @@ impl LanguageParser for SwiftParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }

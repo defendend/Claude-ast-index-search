@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -48,10 +48,13 @@ impl LanguageParser for ElixirParser {
         let idx_attr_name_simple = idx("attr_name_simple");
         let idx_impl_call = idx("impl_call");
         let idx_impl_protocol = idx("impl_protocol");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Module / Protocol definition: defmodule MyModule / defprotocol MyProtocol
             if let Some(type_cap) = find_capture(m, idx_call_type) {
                 let call_type = node_text(content, &type_cap.node);
@@ -69,7 +72,7 @@ impl LanguageParser for ElixirParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -88,7 +91,7 @@ impl LanguageParser for ElixirParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![(name.to_string(), "implements".to_string())],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -108,7 +111,7 @@ impl LanguageParser for ElixirParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -128,7 +131,7 @@ impl LanguageParser for ElixirParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -148,7 +151,7 @@ impl LanguageParser for ElixirParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -166,7 +169,7 @@ impl LanguageParser for ElixirParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -189,7 +192,7 @@ impl LanguageParser for ElixirParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -211,7 +214,7 @@ impl LanguageParser for ElixirParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }

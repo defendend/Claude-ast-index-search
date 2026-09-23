@@ -443,9 +443,14 @@ fn classify_usage<'a>(context: Option<&'a str>, name: &str, ruby: bool) -> Usage
 fn classify_prefix(before: &str) -> Usage<'_> {
     if before.ends_with("::") {
         let chain = trailing_run(before, |c| is_ident_char(c) || c == ':');
+        let path = chain.trim_start_matches("::").trim_end_matches("::");
+        // Rust `Self::name` names an item of the enclosing `impl` block.
+        if path == "Self" {
+            return Usage::SelfReceiver;
+        }
         return Usage::Qualified {
             absolute: chain.starts_with("::"),
-            path: chain.trim_start_matches("::").trim_end_matches("::"),
+            path,
         };
     }
     let trimmed = before.trim_end();
@@ -708,7 +713,12 @@ impl Builder {
                     .find(|&c| self.syms[c as usize].end >= end);
                 let qual = {
                     let sym = &self.syms[s as usize];
-                    let short = short_name(&sym.name).unwrap_or(&sym.name);
+                    let reopened = is_container_kind(&sym.kind)
+                        .then(|| reopened_type(&sym.name))
+                        .flatten();
+                    let short = reopened
+                        .or_else(|| short_name(&sym.name))
+                        .unwrap_or(&sym.name);
                     // Singleton methods keep their `self.` marker so `Type.call`
                     // and an instance-level `call` stay distinct definitions.
                     let singleton;
@@ -718,7 +728,8 @@ impl Builder {
                     } else {
                         short
                     };
-                    if is_container_kind(&sym.kind) && sym.name.contains("::") {
+                    if reopened.is_none() && is_container_kind(&sym.kind) && sym.name.contains("::")
+                    {
                         sym.name.trim_start_matches("::").to_string()
                     } else if let Some(c) = container {
                         format!("{}::{}", self.syms[c as usize].qual, own)
@@ -728,7 +739,9 @@ impl Builder {
                 };
                 let file_private = container.is_some_and(|c| {
                     let outer = &self.syms[c as usize];
-                    outer.file_private || short_name(&outer.name).is_none()
+                    outer.file_private
+                        || (short_name(&outer.name).is_none()
+                            && reopened_type(&outer.name).is_none())
                 });
                 let sym = &mut self.syms[s as usize];
                 sym.container = container;
@@ -1487,6 +1500,31 @@ impl Builder {
     }
 }
 
+/// The type a block reopens: a Rust `impl Type` / `impl Trait for Type`, a
+/// Swift `Type+Extension`, an Objective-C `Type+Category`. Its members live in
+/// that type's namespace, and the block name is no namespace of its own — nor,
+/// despite the space in `impl Type`, a file-private DSL block.
+fn reopened_type(name: &str) -> Option<&str> {
+    let target = match name.strip_prefix("impl ") {
+        Some(rest) => rest.rsplit_once(" for ").map_or(rest, |(_, target)| target),
+        None => name
+            .strip_suffix("+Extension")
+            .or_else(|| name.strip_suffix("+Category"))?,
+    };
+    let path = target.split('<').next().unwrap_or(target);
+    let last = path.rsplit("::").next().unwrap_or(path);
+    let ident = last
+        .rsplit(|c: char| c.is_whitespace() || c == '&' || c == '*')
+        .next()
+        .unwrap_or(last);
+    let valid = ident
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
+        && ident.chars().all(|c| c.is_alphanumeric() || c == '_');
+    valid.then_some(ident)
+}
+
 /// File stem Zeitwerk expects for a constant path: `Billing::HTTPClient` ->
 /// `billing/http_client`.
 fn autoload_path(qual: &str) -> String {
@@ -1858,6 +1896,83 @@ mod tests {
         let bare = ImportTarget::parse("lib/tasks/x.rb", "billing/invoice").unwrap();
         assert!(bare.matches("lib/billing/invoice"));
         assert!(!bare.matches("lib/xbilling/invoice"));
+    }
+
+    #[test]
+    fn reopened_type_names_the_type_a_block_extends() {
+        assert_eq!(reopened_type("impl Point"), Some("Point"));
+        assert_eq!(
+            reopened_type("impl std::fmt::Display for geo::Point<T>"),
+            Some("Point")
+        );
+        assert_eq!(
+            reopened_type("impl Iterator for &'a mut Walker"),
+            Some("Walker")
+        );
+        assert_eq!(reopened_type("Greeter+Extension"), Some("Greeter"));
+        assert_eq!(reopened_type("NSString+Category"), Some("NSString"));
+        assert_eq!(reopened_type("impl [u8]"), None);
+        assert_eq!(reopened_type("Point"), None);
+        assert_eq!(reopened_type("describe \"impl Point\""), None);
+    }
+
+    #[test]
+    fn rust_impl_members_live_in_their_type_namespace() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_db(&conn).unwrap();
+        for (id, path) in [(1, "src/point.rs"), (2, "src/main.rs")] {
+            conn.execute(
+                "INSERT INTO files (id, path, root_path, mtime, size) VALUES (?1, ?2, '', 0, 0)",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+        }
+        let symbols: [(i64, &str, &str, i64, i64); 5] = [
+            (1, "Point", "class", 1, 3),
+            (1, "impl Point", "class", 5, 13),
+            (1, "new", "function", 6, 8),
+            (1, "norm", "function", 10, 12),
+            (2, "main", "function", 1, 3),
+        ];
+        for (file, name, kind, line, end_line) in symbols {
+            conn.execute(
+                "INSERT INTO symbols (file_id, name, kind, line, end_line) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![file, name, kind, line, end_line],
+            )
+            .unwrap();
+        }
+        let builder = Builder::load(&conn, Path::new("/nonexistent")).unwrap();
+        let find = |name: &str| {
+            builder
+                .syms
+                .iter()
+                .position(|sym| sym.name == name)
+                .unwrap() as u32
+        };
+        let new = find("new");
+        assert_eq!(builder.syms[new as usize].qual, "Point::new");
+        assert!(!builder.syms[new as usize].file_private);
+
+        let main = find("main");
+        let main_file = builder.syms[main as usize].file;
+        let resolution = builder
+            .resolve_reference(
+                main_file,
+                main,
+                "new",
+                2,
+                Some("    let p = Point::new(1);"),
+            )
+            .unwrap();
+        assert_eq!(resolution.confidence, Confidence::Scoped);
+        assert_eq!(resolution.targets, vec![new]);
+
+        let norm = find("norm");
+        let point_file = builder.syms[norm as usize].file;
+        let resolution = builder
+            .resolve_reference(point_file, norm, "new", 11, Some("        Self::new(0)"))
+            .unwrap();
+        assert_eq!(resolution.targets, vec![new]);
     }
 
     #[test]

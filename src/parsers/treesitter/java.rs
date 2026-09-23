@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -93,16 +93,20 @@ impl LanguageParser for JavaParser {
         let idx_record_component_node = idx("record_component_node");
         let idx_annotation_name = idx("annotation_name");
         let idx_annotation_call_name = idx("annotation_call_name");
+        let idx_definition = idx("definition");
 
         let mut emitted: std::collections::HashSet<(String, usize)> =
             std::collections::HashSet::new();
         let mut explicit_methods: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
-        let mut pending_record_accessors: Vec<(String, String, usize, String)> = Vec::new();
+        let mut pending_record_accessors: Vec<(String, String, usize, Option<usize>, String)> =
+            Vec::new();
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // === Classes ===
             if let Some(name_cap) = find_capture(m, idx_class_name) {
                 let name = node_text(content, &name_cap.node);
@@ -117,7 +121,7 @@ impl LanguageParser for JavaParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -137,7 +141,7 @@ impl LanguageParser for JavaParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -157,7 +161,7 @@ impl LanguageParser for JavaParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -179,7 +183,7 @@ impl LanguageParser for JavaParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
-                                end_line: None,
+                                end_line,
                             });
                         }
                     }
@@ -200,7 +204,7 @@ impl LanguageParser for JavaParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
-                                end_line: None,
+                                end_line,
                             });
                         }
                     }
@@ -221,7 +225,7 @@ impl LanguageParser for JavaParser {
                                 line,
                                 signature: line_text(content, line).trim().to_string(),
                                 parents: vec![],
-                                end_line: None,
+                                end_line,
                             });
                         }
                     }
@@ -245,7 +249,7 @@ impl LanguageParser for JavaParser {
                             line,
                             signature: component_signature,
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                     }
 
@@ -257,6 +261,7 @@ impl LanguageParser for JavaParser {
                         owner,
                         name.to_string(),
                         line,
+                        end_line,
                         accessor_signature,
                     ));
                 }
@@ -275,7 +280,7 @@ impl LanguageParser for JavaParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -294,7 +299,7 @@ impl LanguageParser for JavaParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -303,7 +308,7 @@ impl LanguageParser for JavaParser {
         }
 
         // Java records synthesize public accessor methods for components unless explicitly overridden.
-        for (owner, name, line, signature) in pending_record_accessors {
+        for (owner, name, line, end_line, signature) in pending_record_accessors {
             if explicit_methods.contains(&(owner, name.clone())) {
                 continue;
             }
@@ -314,7 +319,7 @@ impl LanguageParser for JavaParser {
                     line,
                     signature,
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
             }
         }

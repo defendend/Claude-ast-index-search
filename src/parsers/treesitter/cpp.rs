@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -75,10 +75,14 @@ impl LanguageParser for CppParser {
         let idx_using_alias_name = idx("using_alias_name");
         let idx_macro_name = idx("macro_name");
         let idx_include_path = idx("include_path");
+        let idx_definition = idx("definition");
+        let idx_enum_value_node = idx("enum_value_node");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // --- Class with body (not forward declaration) ---
             if let Some(name_cap) = find_capture(m, idx_class_name) {
                 if find_capture(m, idx_class_node).is_some() {
@@ -91,7 +95,7 @@ impl LanguageParser for CppParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -109,7 +113,7 @@ impl LanguageParser for CppParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -127,7 +131,7 @@ impl LanguageParser for CppParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -145,7 +149,7 @@ impl LanguageParser for CppParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -169,7 +173,7 @@ impl LanguageParser for CppParser {
                                 line,
                                 signature: sig_line,
                                 parents: vec![],
-                                end_line: None,
+                                end_line,
                             });
                             continue;
                         }
@@ -182,7 +186,7 @@ impl LanguageParser for CppParser {
                             line,
                             signature: sig_line,
                             parents: vec![(class_name.to_string(), "member".to_string())],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -202,7 +206,7 @@ impl LanguageParser for CppParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![(class_name.to_string(), "member".to_string())],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -221,7 +225,7 @@ impl LanguageParser for CppParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![(class_name.to_string(), "member".to_string())],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -238,7 +242,7 @@ impl LanguageParser for CppParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -259,7 +263,7 @@ impl LanguageParser for CppParser {
                             line,
                             signature: sig_line,
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                         continue;
                     }
@@ -272,7 +276,7 @@ impl LanguageParser for CppParser {
                         line,
                         signature: sig_line,
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -293,7 +297,7 @@ impl LanguageParser for CppParser {
                                 line,
                                 signature: sig.clone(),
                                 parents: vec![],
-                                end_line: None,
+                                end_line,
                             });
                         }
                     } else {
@@ -303,7 +307,7 @@ impl LanguageParser for CppParser {
                             line,
                             signature: sig,
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -320,7 +324,7 @@ impl LanguageParser for CppParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
 
                 if let Some(value_cap) = find_capture(m, idx_enum_value) {
@@ -332,7 +336,8 @@ impl LanguageParser for CppParser {
                         line: value_line,
                         signature: line_text(content, value_line).trim().to_string(),
                         parents: vec![(name.to_string(), "member".to_string())],
-                        end_line: None,
+                        end_line: find_capture(m, idx_enum_value_node)
+                            .map(|c| text_end_line(content, &c.node)),
                     });
                 }
                 continue;
@@ -348,7 +353,7 @@ impl LanguageParser for CppParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -366,7 +371,7 @@ impl LanguageParser for CppParser {
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -383,7 +388,7 @@ impl LanguageParser for CppParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -398,7 +403,7 @@ impl LanguageParser for CppParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -420,7 +425,7 @@ impl LanguageParser for CppParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![(path.to_string(), "from".to_string())],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }

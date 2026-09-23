@@ -1240,7 +1240,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                 line: 1,
                 signature: format!("module {}", rel_path),
                 parents: vec![],
-                end_line: None,
+                end_line: Some(content.lines().count().max(1)),
             });
         }
     }

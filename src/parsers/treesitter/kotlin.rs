@@ -5,7 +5,8 @@ use std::sync::LazyLock;
 use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator, Tree};
 
 use super::{
-    line_text, node_line, node_text, parse_tree, walk_tree_preorder, LanguageParser, WalkControl,
+    line_text, node_line, node_text, parse_tree, text_end_line, walk_tree_preorder, LanguageParser,
+    WalkControl,
 };
 use crate::db::SymbolKind;
 use crate::parsers::{
@@ -45,10 +46,13 @@ impl LanguageParser for KotlinParser {
         let idx_func_name = idx("func_name");
         let idx_property_name = idx("property_name");
         let idx_typealias_name = idx("typealias_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Class or Interface declaration
             if let Some(name_cap) = find_capture(m, idx_class_name) {
                 let decl_cap = find_capture(m, idx_class_decl);
@@ -87,7 +91,7 @@ impl LanguageParser for KotlinParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -110,7 +114,7 @@ impl LanguageParser for KotlinParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -125,7 +129,7 @@ impl LanguageParser for KotlinParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -143,7 +147,7 @@ impl LanguageParser for KotlinParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -158,7 +162,7 @@ impl LanguageParser for KotlinParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
