@@ -553,6 +553,9 @@ fn labels_and_percentiles_are_relative_to_this_repository() {
     assert_eq!(hot["fix_commits"], 15);
     assert!(hot["churn_pct"].as_u64().unwrap() >= 90);
     assert!(hot["commits_pct"].as_u64().unwrap() >= 90);
+    let exact = hot["score_exact"].as_f64().unwrap();
+    assert_eq!(hot["score"].as_u64().unwrap(), exact.round() as u64);
+    assert_eq!(json["items"][0]["path"], "src/hot.rs");
     let labels: Vec<&str> = hot["labels"]
         .as_array()
         .unwrap()

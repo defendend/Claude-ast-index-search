@@ -523,7 +523,9 @@ live files of the repository, graph percentiles against all symbols with at
 least one resolved caller.
 
 - `hotspots` = the file's hotspot score: mean percentile of commits, churn and
-  bugfix ratio — the same number `ast-index hotspots` prints.
+  bugfix ratio — the number `ast-index hotspots` prints rounded (`score`) and
+  in full (`score_exact` in JSON). Presets use the unrounded percentiles, so
+  files that share a rounded score near the top still order meaningfully.
 - `proven` = mean of four terms: *calm* (1 − hotspot score), *age* (file age
   percentile), *idle* (percentile of days since the file last changed) and
   *used* (1 when at least one resolved reference points at the symbol, else 0).

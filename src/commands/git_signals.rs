@@ -1455,7 +1455,13 @@ pub(crate) fn midrank_percentile(sorted: &[f64], value: f64) -> f64 {
 #[derive(Clone, Debug, Serialize)]
 pub struct Hotspot {
     pub path: String,
+    /// `score_exact` rounded for display.
     pub score: u32,
+    /// Mean of the unrounded commits, churn and fix-ratio percentiles: what
+    /// `--sort score` and the ranking presets order by, so files that share a
+    /// rounded score near the top still come out in a meaningful order.
+    #[serde(serialize_with = "serialize_round3")]
+    pub score_exact: f64,
     pub commits: i64,
     pub commits_pct: u32,
     pub fix_commits: i64,
@@ -1475,6 +1481,8 @@ pub struct Hotspot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub age_days: Option<f64>,
     pub age_pct: u32,
+    #[serde(skip)]
+    pub age_pct_exact: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub days_since_change: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1539,8 +1547,8 @@ fn labels_for(hotspot: &Hotspot) -> Vec<String> {
 /// how often it moves, how often those moves are repairs, and how much text
 /// the repairs rewrite. Reported as a 0..100 percentile blend, not an
 /// absolute unit, for the same reason the labels are percentile-based.
-fn hotspot_score(commits_pct: f64, churn_pct: f64, fix_ratio_pct: f64) -> u32 {
-    ((commits_pct + churn_pct + fix_ratio_pct) / 3.0).round() as u32
+fn hotspot_score(commits_pct: f64, churn_pct: f64, fix_ratio_pct: f64) -> f64 {
+    (commits_pct + churn_pct + fix_ratio_pct) / 3.0
 }
 
 fn build_hotspots(rows: Vec<GitFileSignalRow>, now_seconds: i64) -> Vec<Hotspot> {
@@ -1585,12 +1593,14 @@ fn build_hotspots(rows: Vec<GitFileSignalRow>, now_seconds: i64) -> Vec<Hotspot>
     rows.into_iter()
         .enumerate()
         .map(|(position, row)| {
+            let score_exact = hotspot_score(
+                commits_pct[position],
+                churn_pct[position],
+                fix_ratio_pct[position],
+            );
             let mut hotspot = Hotspot {
-                score: hotspot_score(
-                    commits_pct[position],
-                    churn_pct[position],
-                    fix_ratio_pct[position],
-                ),
+                score: score_exact.round() as u32,
+                score_exact,
                 commits: row.commits,
                 commits_pct: commits_pct[position].round() as u32,
                 fix_commits: row.fix_commits,
@@ -1610,6 +1620,7 @@ fn build_hotspots(rows: Vec<GitFileSignalRow>, now_seconds: i64) -> Vec<Hotspot>
                 current_lines: row.current_lines,
                 age_days: row.first_commit_at.map(|_| round1(age[position])),
                 age_pct: age_pct[position].round() as u32,
+                age_pct_exact: age_pct[position],
                 days_since_change: row
                     .last_commit_at
                     .map(|last| round1((now_seconds - last).max(0) as f64 / SECONDS_PER_DAY)),
@@ -1632,6 +1643,8 @@ pub struct FileHistory {
     /// Percentile of days since the last change: high means untouched for
     /// longer than most files.
     pub idle_pct: u32,
+    /// `idle_pct` unrounded, for scoring.
+    pub idle_pct_exact: f64,
 }
 
 /// The collected history, keyed by primary-root-relative path.
@@ -1680,6 +1693,7 @@ pub fn load_history_snapshot(conn: &Connection) -> Result<HistoryAvailability> {
                 FileHistory {
                     hotspot,
                     idle_pct: idle.round() as u32,
+                    idle_pct_exact: idle,
                 },
             )
         })
@@ -1701,6 +1715,28 @@ fn round1(value: f64) -> f64 {
 
 fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
+}
+
+fn round3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
+
+/// Precise values are kept for ordering and printed with three decimals.
+pub(crate) fn serialize_round3<S: serde::Serializer>(
+    value: &f64,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_f64(round3(*value))
+}
+
+pub(crate) fn serialize_round3_option<S: serde::Serializer>(
+    value: &Option<f64>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serializer.serialize_some(&round3(*value)),
+        None => serializer.serialize_none(),
+    }
 }
 
 const SORT_KEYS: [&str; 7] = [
@@ -1730,7 +1766,7 @@ fn sort_hotspots(hotspots: &mut [Hotspot], sort: &str) {
                 .then_with(|| right.fix_commits.cmp(&left.fix_commits)),
             "authors" => right.authors.cmp(&left.authors),
             "recent" => right.last_commit_at.cmp(&left.last_commit_at),
-            _ => right.score.cmp(&left.score),
+            _ => right.score_exact.total_cmp(&left.score_exact),
         };
         ordering
             .then_with(|| right.churn.cmp(&left.churn))
@@ -1984,6 +2020,35 @@ mod tests {
     #[test]
     fn percentile_ranks_handle_empty_input() {
         assert!(percentile_ranks(&[]).is_empty());
+    }
+
+    fn signal_row(path: &str, commits: i64, fix_commits: i64, churn: i64) -> GitFileSignalRow {
+        GitFileSignalRow {
+            path: path.to_string(),
+            commits,
+            fix_commits,
+            lines_added: churn,
+            current_lines: Some(100),
+            ..GitFileSignalRow::default()
+        }
+    }
+
+    #[test]
+    fn score_order_uses_unrounded_percentiles() {
+        let mut rows: Vec<GitFileSignalRow> = (1..=100)
+            .map(|index| signal_row(&format!("filler{index}.rs"), index, 0, index * 10))
+            .collect();
+        // `steady.rs` leads on commits and fix ratio, `churny.rs` only on churn:
+        // both round to the same score, and the churn tie-break alone would
+        // put `churny.rs` first.
+        rows.push(signal_row("steady.rs", 1000, 800, 5000));
+        rows.push(signal_row("churny.rs", 900, 700, 6000));
+        let mut hotspots = build_hotspots(rows, 0);
+        sort_hotspots(&mut hotspots, "score");
+        assert_eq!(hotspots[0].score, hotspots[1].score);
+        assert!(hotspots[0].score_exact > hotspots[1].score_exact);
+        assert_eq!(hotspots[0].path, "steady.rs");
+        assert_eq!(hotspots[1].path, "churny.rs");
     }
 
     #[test]

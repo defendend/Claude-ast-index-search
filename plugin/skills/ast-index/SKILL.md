@@ -399,9 +399,11 @@ or `--full` rebuild from scratch.
 Labels: `churn:high` / `churn:elevated`, `rewritten-often`, `fixes:high` /
 `fixes:elevated` (only for files with 4+ commits), `authors:many`, `veteran`.
 `--sort` takes `score` (default), `commits`, `churn`, `relative-churn`,
-`fixes`, `authors`, `recent`. Bugfix detection is a commit-subject heuristic
-(English and Russian, tracker key stripped first); merge commits are excluded
-and renames carry history onto the new path.
+`fixes`, `authors`, `recent`. `score` is printed rounded; the order (and
+`score_exact` in JSON) uses the unrounded mean of the percentiles, so the top
+of a large repository does not collapse into ties. Bugfix detection is a
+commit-subject heuristic (English and Russian, tracker key stripped first);
+merge commits are excluded and renames carry history onto the new path.
 
 ### Public API
 
