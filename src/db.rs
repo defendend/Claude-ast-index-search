@@ -5552,6 +5552,14 @@ fn escape_fts5_query(query: &str) -> String {
 /// that only name it in their `class X < ApplicationService` signature.
 const FTS_RANK: &str = "bm25(symbols_fts, 10.0, 1.0)";
 
+/// Kind filter for a query driven by `symbols_fts MATCH`. The unary `+` keeps
+/// the planner off `idx_symbols_kind`: with it, the bundled SQLite scans every
+/// symbol of that kind and re-runs the full-text query per row (tens of seconds
+/// on a large index) instead of filtering the handful of full-text hits.
+const FTS_KIND_FILTER: &str = " AND +s.kind = ?";
+const FTS_CLASS_ONLY_FILTER: &str =
+    " AND +s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')";
+
 /// Whether an indexed path is third-party code: installed packages and type
 /// declarations. Rankers demote such hits below the project's own.
 ///
@@ -7472,7 +7480,7 @@ pub fn count_search_symbols_scoped(
         "#
     );
     if kind.is_some() {
-        sql.push_str(" AND s.kind = ?");
+        sql.push_str(FTS_KIND_FILTER);
     }
     let mut values = vec![escaped_query];
     values.extend(scope_params);
@@ -7528,7 +7536,11 @@ pub fn count_search_symbol_terms_scoped(
     };
     values.extend(scope_params);
     if let Some(kind) = kind {
-        sql.push_str(" AND s.kind = ?");
+        sql.push_str(if fuzzy {
+            " AND s.kind = ?"
+        } else {
+            FTS_KIND_FILTER
+        });
         values.push(kind.to_string());
     }
     let params: Vec<&dyn rusqlite::types::ToSql> = values
@@ -7614,7 +7626,11 @@ pub fn search_symbol_terms_scoped_with_ids(
     };
     values.extend(scope_params);
     if let Some(kind) = kind {
-        sql.push_str(" AND s.kind = ?");
+        sql.push_str(if fuzzy {
+            " AND s.kind = ?"
+        } else {
+            FTS_KIND_FILTER
+        });
         values.push(kind.to_string());
     }
     if fuzzy {
@@ -7757,11 +7773,11 @@ pub fn search_symbols_for_command(
         values.push(escape_fts5_query(query));
         values.extend(scope_params);
         if let Some(kind) = kind {
-            sql.push_str(" AND s.kind = ?");
+            sql.push_str(FTS_KIND_FILTER);
             values.push(kind.to_string());
         }
         if class_only {
-            sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+            sql.push_str(FTS_CLASS_ONLY_FILTER);
         }
         let exact_placeholder = format!("?{}", values.len() + 1);
         sql.push_str(&fts_order_by(&[exact_placeholder.as_str()]));
@@ -9665,6 +9681,36 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         conn
+    }
+
+    fn fts_count_plan(conn: &Connection, kind_filter: &str) -> String {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM symbols_fts fts \
+             JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id \
+             WHERE symbols_fts MATCH ?1{kind_filter}"
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let values = ["\"Job\"*", "class"];
+        let bound = &values[..stmt.parameter_count()];
+        let details = stmt
+            .query_map(rusqlite::params_from_iter(bound), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        details.join("\n")
+    }
+
+    #[test]
+    fn kind_filtered_full_text_search_is_driven_by_the_full_text_index() {
+        let conn = create_test_db();
+        let plan = fts_count_plan(&conn, FTS_KIND_FILTER);
+        assert!(!plan.contains("idx_symbols_kind"), "{plan}");
+        assert!(plan.starts_with("SCAN fts VIRTUAL TABLE"), "{plan}");
+
+        let class_only = fts_count_plan(&conn, FTS_CLASS_ONLY_FILTER);
+        assert!(!class_only.contains("idx_symbols_kind"), "{class_only}");
     }
 
     #[test]
