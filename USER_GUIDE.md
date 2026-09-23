@@ -188,6 +188,12 @@ index fresh automatically. A manual `update` is still a good habit after a large
 checkout, rebase, or branch switch because it reconciles the full file list with
 the database.
 
+Collected Git history (`hotspots --collect`) is not refreshed by `update`. Run
+`ast-index hotspots --collect` again after switching: it subtracts the commits
+the new `HEAD` no longer reaches and adds the new ones, reusing diffs it has
+read before, so a branch switch or a rebase costs about a second instead of a
+full rescan, and the numbers match a fresh `hotspots --collect --full`.
+
 Use `rebuild` instead of `update` when:
 
 - the project root or `.ast-index.yaml` changed significantly;

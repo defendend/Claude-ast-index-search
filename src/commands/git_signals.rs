@@ -1,25 +1,27 @@
 //! Per-file VCS history signals and the `hotspots` report built on top.
 //!
-//! Two code paths live here. The collector walks `git log --numstat` in
-//! bounded windows and accumulates commit counts, churn, bugfix ratio,
-//! author sets and timestamps into `git_file_stats` / `git_file_authors`.
-//! The reporter reads those rows back and turns the raw numbers into
-//! percentile ranks *within this repository*, so "high churn" means high
-//! relative to its neighbours instead of relative to a constant that only
-//! ever fits one repository size.
+//! Two code paths live here. The collector reads `git log --numstat` in
+//! bounded windows into a per-commit store (what each commit did to each
+//! path) and folds the commits HEAD reaches into commit counts, churn, bugfix
+//! ratio, author sets and timestamps in `git_file_stats` /
+//! `git_file_authors`. The reporter reads those rows back and turns the raw
+//! numbers into percentile ranks *within this repository*, so "high churn"
+//! means high relative to its neighbours instead of relative to a constant
+//! that only ever fits one repository size.
 //!
 //! Collection is never implicit: `rebuild` and `update` stay untouched and
 //! the user opts in with `hotspots --collect`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use colored::Colorize;
+use rayon::prelude::*;
 use regex::Regex;
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use serde::Serialize;
 
 use super::changed::{
@@ -28,7 +30,7 @@ use super::changed::{
 use super::Page;
 use crate::db::{self, GitFileSignalRow, GitFileStats};
 
-/// Commit cursor: the last commit whose diffs are already accumulated.
+/// Commit cursor: HEAD at the last successful collection.
 const META_HEAD: &str = "git_signals_head";
 /// Absolute VCS root the cursor belongs to.
 const META_REPO_ROOT: &str = "git_signals_repo_root";
@@ -36,8 +38,22 @@ const META_REPO_ROOT: &str = "git_signals_repo_root";
 const META_SCOPE: &str = "git_signals_scope";
 /// Wall-clock time of the last successful collection, Unix milliseconds.
 const META_COLLECTED_AT: &str = "git_signals_collected_at";
-/// Number of commits folded into the tables so far.
+/// Commits HEAD reaches that changed the project: the analysed history.
 const META_COMMITS: &str = "git_signals_commits";
+/// Layout of the per-commit store the derived tables were folded from.
+const META_STORE: &str = "git_signals_store";
+const STORE_LAYOUT: &str = "commits-v1";
+/// Paths that carry history once renames are followed, deleted ones included.
+const META_PATHS: &str = "git_signals_paths";
+
+/// Commits per `git rev-list` window when listing the commit graph; a line
+/// is about 100 bytes, well under the captured-stdout ceiling.
+const GRAPH_WINDOW: usize = 100_000;
+/// Commits HEAD no longer reaches stay in the store, so switching back costs
+/// nothing, until there are more than this many of them or more than one
+/// per [`DEAD_COMMITS_SHARE`] live commits; then all of them are dropped.
+const DEAD_COMMITS_FLOOR: usize = 1_000;
+const DEAD_COMMITS_SHARE: usize = 4;
 
 /// Files bigger than this are not line-counted; relative churn is skipped.
 const MAX_LINE_COUNT_BYTES: u64 = 8 * 1024 * 1024;
@@ -103,20 +119,29 @@ pub fn is_bugfix_subject(subject: &str) -> bool {
 // Collection
 // ---------------------------------------------------------------------------
 
-/// Why a collection run had to start from scratch instead of resuming.
+/// How a collection run reached the current HEAD.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CollectMode {
-    /// No usable cursor: first run, `--full`, or the cursor was discarded.
+    /// Nothing reusable: first run, `--full`, or the stored history had to be
+    /// discarded (see `reset_reason`).
     Full,
-    /// The stored cursor is still an ancestor of HEAD; only new commits read.
+    /// The stored history was moved to HEAD: commits HEAD no longer reaches
+    /// were subtracted, commits it newly reaches were added.
     Incremental,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CollectOutcome {
     pub mode: CollectMode,
+    /// Commits whose diffs were read from Git in this run.
     pub commits_scanned: usize,
+    /// Commits HEAD reaches again whose diffs came from the per-commit store
+    /// (switching back to a branch collected before).
+    pub commits_restored: usize,
+    /// Commits that left the collected history (branch switch, rebase, reset).
+    pub commits_dropped: usize,
+    /// Paths whose history was recomputed.
     pub paths_touched: usize,
     pub head: String,
     pub previous_head: Option<String>,
@@ -125,7 +150,16 @@ pub struct CollectOutcome {
     pub elapsed_ms: u128,
 }
 
+/// A commit as `git rev-list --parents --timestamp` lists it.
+struct GraphCommit {
+    sha: String,
+    committed_at: i64,
+    parents: Vec<String>,
+}
+
+/// One commit of `git log --numstat`.
 struct CommitRecord {
+    sha: String,
     timestamp: i64,
     author: String,
     is_fix: bool,
@@ -146,81 +180,39 @@ enum FileChange {
     },
 }
 
-/// Mutable accumulator for one path while a collection run is in flight.
-#[derive(Default)]
-struct Accumulator {
-    commits: i64,
-    fix_commits: i64,
-    lines_added: i64,
-    lines_deleted: i64,
-    first_commit_at: Option<i64>,
-    last_commit_at: Option<i64>,
-    authors: HashSet<String>,
-    dirty: bool,
+/// A [`FileChange`] in project-relative terms, ready for the store.
+struct ProjectChange {
+    kind: i64,
+    path: String,
+    from: Option<String>,
+    added: i64,
+    deleted: i64,
 }
 
-impl Accumulator {
-    fn from_stored(stats: GitFileStats) -> Self {
-        Self {
-            commits: stats.commits,
-            fix_commits: stats.fix_commits,
-            lines_added: stats.lines_added,
-            lines_deleted: stats.lines_deleted,
-            first_commit_at: stats.first_commit_at,
-            last_commit_at: stats.last_commit_at,
-            authors: stats.authors.into_iter().collect(),
-            dirty: false,
-        }
-    }
-
-    fn record(&mut self, commit: &CommitRecord, added: i64, deleted: i64) {
-        self.commits += 1;
-        if commit.is_fix {
-            self.fix_commits += 1;
-        }
-        self.lines_added += added;
-        self.lines_deleted += deleted;
-        self.first_commit_at = Some(match self.first_commit_at {
-            Some(existing) => existing.min(commit.timestamp),
-            None => commit.timestamp,
-        });
-        self.last_commit_at = Some(match self.last_commit_at {
-            Some(existing) => existing.max(commit.timestamp),
-            None => commit.timestamp,
-        });
-        self.authors.insert(commit.author.clone());
-        self.dirty = true;
-    }
-
-    /// Fold a renamed predecessor's history into this path.
-    fn absorb(&mut self, other: Accumulator) {
-        self.commits += other.commits;
-        self.fix_commits += other.fix_commits;
-        self.lines_added += other.lines_added;
-        self.lines_deleted += other.lines_deleted;
-        self.first_commit_at = min_option(self.first_commit_at, other.first_commit_at);
-        self.last_commit_at = max_option(self.last_commit_at, other.last_commit_at);
-        self.authors.extend(other.authors);
-        self.dirty = true;
-    }
+struct NewCommit {
+    sha: String,
+    order_key: i64,
 }
 
-fn min_option(left: Option<i64>, right: Option<i64>) -> Option<i64> {
-    match (left, right) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (value, None) | (None, value) => value,
-    }
+/// What a run changes in the per-commit store, worked out from Git before
+/// the write transaction starts.
+struct Plan {
+    full: bool,
+    /// The stored cursor the plan starts from; `None` for a full plan.
+    base: Option<String>,
+    new_commits: Vec<NewCommit>,
+    records: Vec<CommitRecord>,
+    restored: Vec<db::StoredGitCommit>,
+    dropped: Vec<db::StoredGitCommit>,
 }
 
-fn max_option(left: Option<i64>, right: Option<i64>) -> Option<i64> {
-    match (left, right) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (value, None) | (None, value) => value,
-    }
+struct Applied {
+    paths_touched: usize,
+    commits_restored: usize,
+    commits_dropped: usize,
 }
 
-struct Collector<'a> {
-    conn: &'a mut Connection,
+struct Collector {
     executable: OsString,
     repo_root: PathBuf,
     project_root: PathBuf,
@@ -229,13 +221,9 @@ struct Collector<'a> {
     deadline: Deadline,
     verbose: bool,
     window: usize,
-    accumulators: HashMap<String, Accumulator>,
-    /// Paths removed by a rename; their rows must disappear from the DB.
-    retired: HashSet<String>,
-    commits_scanned: usize,
 }
 
-impl Collector<'_> {
+impl Collector {
     fn git(&self, args: &[OsString]) -> Result<Vec<u8>> {
         self.git_allow_truncation(args)?
             .ok_or_else(|| anyhow!("git output exceeded {STDOUT_LIMIT} bytes"))
@@ -271,33 +259,13 @@ impl Collector<'_> {
         Ok(Some(output.stdout.bytes))
     }
 
-    fn rev_parse_head(&self) -> Result<Option<String>> {
-        let args = os_args(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
-        let output = run_bounded(
-            &self.executable,
-            &args,
-            &self.repo_root,
-            self.deadline,
-            self.verbose,
-        )
-        .context("failed to resolve HEAD")?;
-        if !output.status.success() {
-            return Ok(None);
-        }
-        let head = parse_utf8(&output.stdout.bytes, "git rev-parse output")?
-            .trim()
-            .to_string();
-        Ok((!head.is_empty()).then_some(head))
-    }
-
-    /// `Ok(true)` when `commit` exists and is an ancestor of HEAD, i.e. the
-    /// stored cursor still describes a prefix of the current history.
-    fn is_ancestor_of_head(&self, commit: &str) -> Result<bool> {
+    /// Full hash of `revision` as a commit, `None` when it does not name one.
+    fn resolve_commit(&self, revision: &str) -> Result<Option<String>> {
         let args = vec![
-            OsString::from("merge-base"),
-            OsString::from("--is-ancestor"),
-            OsString::from(commit),
-            OsString::from("HEAD"),
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from(format!("{revision}^{{commit}}")),
         ];
         let output = run_bounded(
             &self.executable,
@@ -306,18 +274,14 @@ impl Collector<'_> {
             self.deadline,
             self.verbose,
         )
-        .context("failed to compare stored cursor with HEAD")?;
-        Ok(output.status.success())
-    }
-
-    fn count_commits(&self, range: &str) -> Result<usize> {
-        let mut args = os_args(&["rev-list", "--count", "--no-merges", range]);
-        self.push_pathspec(&mut args);
-        let bytes = self.git(&args)?;
-        let text = parse_utf8(&bytes, "git rev-list output")?;
-        text.trim()
-            .parse::<usize>()
-            .context("git rev-list --count did not return a number")
+        .with_context(|| format!("failed to resolve {revision}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let sha = parse_utf8(&output.stdout.bytes, "git rev-parse output")?
+            .trim()
+            .to_string();
+        Ok((!sha.is_empty()).then_some(sha))
     }
 
     fn push_pathspec(&self, args: &mut Vec<OsString>) {
@@ -327,35 +291,116 @@ impl Collector<'_> {
         }
     }
 
-    /// Walk `range` oldest-commit-first in `--skip`/`-n` windows.
-    ///
-    /// Oldest-first matters for renames: when `old => new` shows up we move
-    /// everything accumulated under `old` onto `new`, and that only produces
-    /// the right totals if the pre-rename commits were folded in already.
-    /// `--skip` and `-n` are applied during traversal, before `--reverse`
-    /// re-orders the output, so window `w` always covers the same commits.
-    fn walk(&mut self, range: &str, total: usize) -> Result<()> {
-        if total == 0 {
-            return Ok(());
+    /// Git's own history simplification would hide side-branch commits whose
+    /// changes a merge discarded, and hide them differently depending on
+    /// where the walk starts. Every commit that changes the project counts,
+    /// so that a commit's contribution never depends on the range it was
+    /// read in.
+    fn push_history_mode(&self, args: &mut Vec<OsString>) {
+        if self.scope.is_some() {
+            args.push(OsString::from("--full-history"));
         }
-        let window = self.window.max(1);
-        let mut boundaries = Vec::new();
-        let mut cursor = 0usize;
-        while cursor < total {
-            boundaries.push((cursor, window.min(total - cursor)));
-            cursor += window;
-        }
-        // Highest `--skip` first: that window holds the oldest commits.
-        for (offset, count) in boundaries.into_iter().rev() {
-            self.walk_window(range, offset, count)?;
-        }
-        Ok(())
     }
 
-    fn walk_window(&mut self, range: &str, skip: usize, count: usize) -> Result<()> {
-        let mut args = os_args(&[
+    fn count(&self, prefix: &[OsString], revs: &[OsString], pathspec: bool) -> Result<usize> {
+        let mut args = prefix.to_vec();
+        args.extend(revs.iter().cloned());
+        if pathspec {
+            self.push_pathspec(&mut args);
+        }
+        let bytes = self.git(&args)?;
+        parse_utf8(&bytes, "git rev-list output")?
+            .trim()
+            .parse::<usize>()
+            .context("git rev-list --count did not return a number")
+    }
+
+    /// Run `prefix … revs` over `total` commits in `--skip`/`--max-count`
+    /// windows. A window whose output overflows is split in half.
+    fn windowed<T>(
+        &self,
+        prefix: &[OsString],
+        revs: &[OsString],
+        pathspec: bool,
+        total: usize,
+        window: usize,
+        parse: fn(&[u8]) -> Result<Vec<T>>,
+    ) -> Result<Vec<T>> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        while offset < total {
+            let count = window.max(1).min(total - offset);
+            self.window_into(prefix, revs, pathspec, offset, count, parse, &mut out)?;
+            offset += count;
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn window_into<T>(
+        &self,
+        prefix: &[OsString],
+        revs: &[OsString],
+        pathspec: bool,
+        skip: usize,
+        count: usize,
+        parse: fn(&[u8]) -> Result<Vec<T>>,
+        out: &mut Vec<T>,
+    ) -> Result<()> {
+        let mut args = prefix.to_vec();
+        args.push(OsString::from(format!("--skip={skip}")));
+        args.push(OsString::from(format!("--max-count={count}")));
+        args.extend(revs.iter().cloned());
+        if pathspec {
+            self.push_pathspec(&mut args);
+        }
+        match self.git_allow_truncation(&args)? {
+            Some(bytes) => {
+                out.extend(parse(&bytes)?);
+                Ok(())
+            }
+            None if count <= 1 => bail!(
+                "a single commit's output exceeded {STDOUT_LIMIT} bytes; \
+                 collection cannot proceed"
+            ),
+            None => {
+                let first = count / 2;
+                self.window_into(prefix, revs, pathspec, skip, first, parse, out)?;
+                self.window_into(
+                    prefix,
+                    revs,
+                    pathspec,
+                    skip + first,
+                    count - first,
+                    parse,
+                    out,
+                )
+            }
+        }
+    }
+
+    /// Every commit `revs` selects, merges and commits outside the project
+    /// included, with its parents: the graph the order keys are built from.
+    fn list_graph(&self, revs: &[OsString]) -> Result<Vec<GraphCommit>> {
+        let total = self.count(&os_args(&["rev-list", "--count"]), revs, false)?;
+        self.windowed(
+            &os_args(&["rev-list", "--parents", "--timestamp"]),
+            revs,
+            false,
+            total,
+            GRAPH_WINDOW,
+            parse_graph,
+        )
+    }
+
+    /// Diffstats of every non-merge commit `revs` selects that changes the
+    /// project.
+    fn read_numstat(&self, revs: &[OsString]) -> Result<Vec<CommitRecord>> {
+        let mut count_args = os_args(&["rev-list", "--count", "--no-merges"]);
+        self.push_history_mode(&mut count_args);
+        let total = self.count(&count_args, revs, true)?;
+        let mut log_args = os_args(&[
             "log",
-            "--reverse",
             "--no-merges",
             "--numstat",
             "-z",
@@ -364,105 +409,163 @@ impl Collector<'_> {
             "--no-textconv",
             "--format=%x01%H%x1f%at%x1f%ae%x1f%an%x1f%s",
         ]);
-        args.push(OsString::from(format!("--skip={skip}")));
-        args.push(OsString::from(format!("-n{count}")));
-        args.push(OsString::from(range));
-        self.push_pathspec(&mut args);
-
-        match self.git_allow_truncation(&args)? {
-            Some(bytes) => {
-                for commit in parse_git_log(&bytes)? {
-                    self.apply(&commit);
-                }
-                Ok(())
-            }
-            None if count <= 1 => bail!(
-                "a single commit's diffstat exceeded {STDOUT_LIMIT} bytes; \
-                 collection cannot proceed"
-            ),
-            None => {
-                // Older half first, then the newer one, preserving order.
-                let newer = count / 2;
-                let older = count - newer;
-                self.walk_window(range, skip + newer, older)?;
-                self.walk_window(range, skip, newer)
-            }
+        self.push_history_mode(&mut log_args);
+        if self.verbose {
+            eprintln!(
+                "hotspots: reading diffs of {total} commit(s) in windows of {}",
+                self.window.max(1)
+            );
         }
+        self.windowed(&log_args, revs, true, total, self.window, parse_git_log)
     }
 
-    fn apply(&mut self, commit: &CommitRecord) {
-        self.commits_scanned += 1;
-        for change in &commit.files {
-            match change {
-                FileChange::Touched {
-                    path,
-                    added,
-                    deleted,
-                } => {
-                    let Some(key) = self.project_relative(path) else {
-                        continue;
-                    };
-                    self.entry(&key).record(commit, *added, *deleted);
-                }
-                FileChange::Renamed {
-                    from,
-                    to,
-                    added,
-                    deleted,
-                } => {
-                    let source = self.project_relative(from);
-                    let Some(target) = self.project_relative(to) else {
-                        // Renamed out of the project root: retire the source.
-                        if let Some(source) = source {
-                            self.retire(source);
-                        }
-                        continue;
-                    };
-                    if let Some(source) = source {
-                        if source != target {
-                            self.ensure_loaded(&source);
-                            let previous = self.retire(source);
-                            self.entry(&target).absorb(previous);
-                        }
-                    }
-                    self.entry(&target).record(commit, *added, *deleted);
-                }
+    /// Plan for a store rebuilt from scratch at `head`.
+    fn plan_full(&self, head: &str) -> Result<Plan> {
+        let revs = vec![OsString::from(head)];
+        let graph = self.list_graph(&revs)?;
+        // A shallow clone lists parents it does not have; they are skipped.
+        let keys = order_keys(&graph, |_| Ok(None), false)?
+            .ok_or_else(|| anyhow!("commit graph has a parent loop"))?;
+        let records = self.read_numstat(&revs)?;
+        let new_commits = graph
+            .into_iter()
+            .map(|commit| NewCommit {
+                order_key: keys[&commit.sha],
+                sha: commit.sha,
+            })
+            .collect();
+        Ok(Plan {
+            full: true,
+            base: None,
+            new_commits,
+            records,
+            restored: Vec::new(),
+            dropped: Vec::new(),
+        })
+    }
+
+    /// Plan that moves the stored history from `base` to `head`: commits only
+    /// `base` reaches leave it, commits only `head` reaches join it, read
+    /// from Git unless the store still has them. `None` when the store does
+    /// not match the repository and has to be rebuilt.
+    fn plan_sync(&self, conn: &Connection, base: &str, head: &str) -> Result<Option<Plan>> {
+        let mut plan = Plan {
+            full: false,
+            base: Some(base.to_string()),
+            new_commits: Vec::new(),
+            records: Vec::new(),
+            restored: Vec::new(),
+            dropped: Vec::new(),
+        };
+        if base == head {
+            return Ok(Some(plan));
+        }
+        let arrived = self.list_graph(&os_args(&[head, "--not", base]))?;
+        let departed = self.list_graph(&os_args(&[base, "--not", head]))?;
+
+        for commit in departed {
+            match db::find_git_commit(conn, &commit.sha)? {
+                Some(stored) if stored.live => plan.dropped.push(stored),
+                _ => return Ok(None),
             }
         }
-    }
-
-    /// Hand back everything accumulated under `path` and leave a blank slate
-    /// in its place.
-    ///
-    /// The blank accumulator is what keeps a resurrected path honest: the
-    /// stored row is only deleted once the run commits, so without it a later
-    /// commit re-creating this path would load the pre-rename history from
-    /// the database and count it a second time.
-    fn retire(&mut self, path: String) -> Accumulator {
-        let previous = self
-            .accumulators
-            .insert(path.clone(), Accumulator::default());
-        self.retired.insert(path);
-        previous.unwrap_or_default()
-    }
-
-    fn entry(&mut self, path: &str) -> &mut Accumulator {
-        self.ensure_loaded(path);
-        self.accumulators
-            .get_mut(path)
-            .expect("accumulator was just inserted")
-    }
-
-    fn ensure_loaded(&mut self, path: &str) {
-        if self.accumulators.contains_key(path) {
-            return;
+        let mut unread = Vec::new();
+        for commit in arrived {
+            match db::find_git_commit(conn, &commit.sha)? {
+                Some(stored) if !stored.live => plan.restored.push(stored),
+                Some(_) => return Ok(None),
+                None => unread.push(commit),
+            }
         }
-        let stored = db::load_git_file_stats(self.conn, path)
-            .ok()
-            .flatten()
-            .map(Accumulator::from_stored)
-            .unwrap_or_default();
-        self.accumulators.insert(path.to_string(), stored);
+
+        // Every parent of an unread commit is either unread too or already
+        // stored; the stored ones bound the range Git has to diff. Stored
+        // commits are closed under "parent of", so `head --not <boundary>`
+        // selects exactly the unread commits.
+        let mut boundary: BTreeSet<String> = BTreeSet::new();
+        boundary.insert(base.to_string());
+        let keys = order_keys(
+            &unread,
+            |parent| {
+                let stored = db::find_git_commit(conn, parent)?;
+                if stored.is_some() {
+                    boundary.insert(parent.to_string());
+                }
+                Ok(stored.map(|stored| stored.order_key))
+            },
+            true,
+        )?;
+        let Some(keys) = keys else {
+            return Ok(None);
+        };
+        if unread.iter().any(|commit| commit.parents.len() <= 1) {
+            let mut revs = os_args(&[head, "--not"]);
+            revs.extend(boundary.iter().map(OsString::from));
+            plan.records = self.read_numstat(&revs)?;
+            let unread_shas: HashSet<&str> = unread.iter().map(|c| c.sha.as_str()).collect();
+            if plan
+                .records
+                .iter()
+                .any(|record| !unread_shas.contains(record.sha.as_str()))
+            {
+                return Ok(None);
+            }
+        }
+        plan.new_commits = unread
+            .into_iter()
+            .map(|commit| NewCommit {
+                order_key: keys[&commit.sha],
+                sha: commit.sha,
+            })
+            .collect();
+        Ok(Some(plan))
+    }
+
+    /// Translate a repo-relative change into project-relative terms, or drop
+    /// it when it happens entirely outside the project.
+    fn project_change(&self, change: &FileChange) -> Option<ProjectChange> {
+        match change {
+            FileChange::Touched {
+                path,
+                added,
+                deleted,
+            } => Some(ProjectChange {
+                kind: db::GIT_CHANGE_TOUCH,
+                path: self.project_relative(path)?,
+                from: None,
+                added: *added,
+                deleted: *deleted,
+            }),
+            FileChange::Renamed {
+                from,
+                to,
+                added,
+                deleted,
+            } => match (self.project_relative(from), self.project_relative(to)) {
+                (Some(source), Some(target)) if source != target => Some(ProjectChange {
+                    kind: db::GIT_CHANGE_RENAME,
+                    path: target,
+                    from: Some(source),
+                    added: *added,
+                    deleted: *deleted,
+                }),
+                (_, Some(target)) => Some(ProjectChange {
+                    kind: db::GIT_CHANGE_TOUCH,
+                    path: target,
+                    from: None,
+                    added: *added,
+                    deleted: *deleted,
+                }),
+                (Some(source), None) => Some(ProjectChange {
+                    kind: db::GIT_CHANGE_MOVED_OUT,
+                    path: source,
+                    from: None,
+                    added: 0,
+                    deleted: 0,
+                }),
+                (None, None) => None,
+            },
+        }
     }
 
     /// Convert a repo-root-relative path into a project-root-relative one,
@@ -476,32 +579,553 @@ impl Collector<'_> {
                 .map(str::to_string),
         }
     }
+}
 
-    fn flush(&mut self) -> Result<Vec<GitFileStats>> {
-        let mut rows = Vec::new();
-        let accumulators = std::mem::take(&mut self.accumulators);
-        for (path, accumulator) in accumulators {
-            if !accumulator.dirty {
+/// Corrected commit date of every commit in `pending`: its committer date,
+/// raised to one past its latest parent's.
+///
+/// This is the order the history fold replays commits in. It is a property
+/// of the commit alone (its date and ancestry), so a commit sits in the same
+/// place whichever range it was read in, and it never puts a commit before
+/// its parent even when clocks disagree. Parents outside `pending` come from
+/// `known`; one it does not know makes the result `None` when `strict`, and
+/// is skipped otherwise (a shallow clone's missing parents).
+fn order_keys(
+    pending: &[GraphCommit],
+    mut known: impl FnMut(&str) -> Result<Option<i64>>,
+    strict: bool,
+) -> Result<Option<HashMap<String, i64>>> {
+    let index: HashMap<&str, &GraphCommit> = pending
+        .iter()
+        .map(|commit| (commit.sha.as_str(), commit))
+        .collect();
+    let mut keys: HashMap<String, i64> = HashMap::with_capacity(pending.len());
+    let mut outside: HashMap<String, Option<i64>> = HashMap::new();
+    for start in pending {
+        if keys.contains_key(&start.sha) {
+            continue;
+        }
+        let mut stack: Vec<(&str, bool)> = vec![(start.sha.as_str(), false)];
+        while let Some((sha, expanded)) = stack.pop() {
+            if keys.contains_key(sha) {
                 continue;
             }
-            let current_lines = count_lines(&self.project_root.join(&path));
-            let mut authors: Vec<String> = accumulator.authors.into_iter().collect();
-            authors.sort();
-            rows.push(GitFileStats {
-                path,
+            let commit = index[sha];
+            if !expanded {
+                stack.push((sha, true));
+                for parent in &commit.parents {
+                    if index.contains_key(parent.as_str()) && !keys.contains_key(parent) {
+                        stack.push((parent.as_str(), false));
+                    }
+                }
+                continue;
+            }
+            let mut key = commit.committed_at;
+            for parent in &commit.parents {
+                let parent_key = if index.contains_key(parent.as_str()) {
+                    match keys.get(parent) {
+                        Some(value) => Some(*value),
+                        None => bail!("commit graph has a parent loop at {}", short_sha(sha)),
+                    }
+                } else {
+                    if !outside.contains_key(parent) {
+                        let value = known(parent)?;
+                        outside.insert(parent.clone(), value);
+                    }
+                    outside[parent]
+                };
+                match parent_key {
+                    Some(value) => key = key.max(value + 1),
+                    None if strict => return Ok(None),
+                    None => {}
+                }
+            }
+            keys.insert(sha.to_string(), key);
+        }
+    }
+    Ok(Some(keys))
+}
+
+/// Parse `git rev-list --parents --timestamp` output.
+fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphCommit>> {
+    let text = parse_utf8(bytes, "git rev-list output")?;
+    let mut commits = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(timestamp), Some(sha)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        commits.push(GraphCommit {
+            committed_at: timestamp
+                .parse::<i64>()
+                .with_context(|| format!("bad commit timestamp in '{line}'"))?,
+            sha: sha.to_string(),
+            parents: fields.map(str::to_string).collect(),
+        });
+    }
+    Ok(commits)
+}
+
+// ---------------------------------------------------------------------------
+// History fold
+// ---------------------------------------------------------------------------
+
+/// One stored change, as the fold replays it.
+#[derive(Clone, Copy)]
+enum FoldChange {
+    Touch {
+        path: i64,
+        added: i64,
+        deleted: i64,
+    },
+    Rename {
+        from: i64,
+        to: i64,
+        added: i64,
+        deleted: i64,
+    },
+    MovedOut {
+        path: i64,
+    },
+}
+
+struct FoldCommit<'a> {
+    order_key: i64,
+    sha: &'a str,
+    timestamp: i64,
+    author: u32,
+    is_fix: bool,
+    changes: Vec<FoldChange>,
+}
+
+/// Mutable accumulator for one path while the fold runs.
+#[derive(Default)]
+struct Accumulator {
+    commits: i64,
+    fix_commits: i64,
+    lines_added: i64,
+    lines_deleted: i64,
+    first_commit_at: Option<i64>,
+    last_commit_at: Option<i64>,
+    authors: HashSet<u32>,
+    dirty: bool,
+}
+
+impl Accumulator {
+    fn record(&mut self, commit: &FoldCommit<'_>, added: i64, deleted: i64) {
+        self.commits += 1;
+        if commit.is_fix {
+            self.fix_commits += 1;
+        }
+        self.lines_added += added;
+        self.lines_deleted += deleted;
+        self.first_commit_at = min_option(self.first_commit_at, Some(commit.timestamp));
+        self.last_commit_at = max_option(self.last_commit_at, Some(commit.timestamp));
+        self.authors.insert(commit.author);
+        self.dirty = true;
+    }
+
+    /// Fold a renamed predecessor's history into this path.
+    fn absorb(&mut self, other: Accumulator) {
+        self.commits += other.commits;
+        self.fix_commits += other.fix_commits;
+        self.lines_added += other.lines_added;
+        self.lines_deleted += other.lines_deleted;
+        self.first_commit_at = min_option(self.first_commit_at, other.first_commit_at);
+        self.last_commit_at = max_option(self.last_commit_at, other.last_commit_at);
+        self.authors.extend(other.authors);
+        self.dirty = true;
+    }
+}
+
+fn min_option(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (value, None) | (None, value) => value,
+    }
+}
+
+fn max_option(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (value, None) | (None, value) => value,
+    }
+}
+
+/// Author strings interned to small ids for the fold.
+#[derive(Default)]
+struct Authors {
+    ids: HashMap<String, u32>,
+    names: Vec<String>,
+}
+
+impl Authors {
+    fn intern(&mut self, author: &str) -> u32 {
+        if let Some(id) = self.ids.get(author) {
+            return *id;
+        }
+        let id = self.names.len() as u32;
+        self.names.push(author.to_string());
+        self.ids.insert(author.to_string(), id);
+        id
+    }
+}
+
+/// Group stored changes into the commits `member` admits.
+fn fold_input<'a>(
+    changes: &[db::StoredGitChange],
+    details: &'a HashMap<i64, db::StoredGitCommitDetail>,
+    authors: &mut Authors,
+    member: impl Fn(i64, &db::StoredGitCommitDetail) -> bool,
+) -> Result<Vec<FoldCommit<'a>>> {
+    let mut grouped: HashMap<i64, Vec<FoldChange>> = HashMap::new();
+    for change in changes {
+        let fold = match change.kind {
+            db::GIT_CHANGE_RENAME => FoldChange::Rename {
+                from: change
+                    .from_path_id
+                    .ok_or_else(|| anyhow!("stored rename without a source path"))?,
+                to: change.path_id,
+                added: change.added,
+                deleted: change.deleted,
+            },
+            db::GIT_CHANGE_MOVED_OUT => FoldChange::MovedOut {
+                path: change.path_id,
+            },
+            _ => FoldChange::Touch {
+                path: change.path_id,
+                added: change.added,
+                deleted: change.deleted,
+            },
+        };
+        grouped.entry(change.commit_id).or_default().push(fold);
+    }
+    let mut commits = Vec::with_capacity(grouped.len());
+    for (commit_id, changes) in grouped {
+        let detail = details
+            .get(&commit_id)
+            .ok_or_else(|| anyhow!("stored change points at unknown commit {commit_id}"))?;
+        if !member(commit_id, detail) {
+            continue;
+        }
+        commits.push(FoldCommit {
+            order_key: detail.order_key,
+            sha: detail.sha.as_str(),
+            timestamp: detail.authored_at,
+            author: authors.intern(&detail.author),
+            is_fix: detail.is_fix,
+            changes,
+        });
+    }
+    Ok(commits)
+}
+
+/// Replay commits oldest first and accumulate per-path history.
+///
+/// A rename hands everything accumulated under the old path to the new one
+/// and leaves the old path blank, so a file later created at the old path
+/// starts from zero. Within one commit the order of changes does not matter:
+/// a rename's source is a deleted path and its target an added one, so no
+/// path is touched twice.
+fn fold_history(commits: &mut [FoldCommit<'_>]) -> HashMap<i64, Accumulator> {
+    commits.sort_by(|left, right| {
+        left.order_key
+            .cmp(&right.order_key)
+            .then_with(|| left.sha.cmp(right.sha))
+    });
+    let mut paths: HashMap<i64, Accumulator> = HashMap::new();
+    for commit in commits.iter() {
+        for change in &commit.changes {
+            match *change {
+                FoldChange::Touch {
+                    path,
+                    added,
+                    deleted,
+                } => paths
+                    .entry(path)
+                    .or_default()
+                    .record(commit, added, deleted),
+                FoldChange::Rename {
+                    from,
+                    to,
+                    added,
+                    deleted,
+                } => {
+                    let previous = paths
+                        .insert(from, Accumulator::default())
+                        .unwrap_or_default();
+                    let target = paths.entry(to).or_default();
+                    target.absorb(previous);
+                    target.record(commit, added, deleted);
+                }
+                FoldChange::MovedOut { path } => {
+                    paths.insert(path, Accumulator::default());
+                }
+            }
+        }
+    }
+    paths.retain(|_, accumulator| accumulator.dirty);
+    paths
+}
+
+/// Rows for the folded paths that exist in the working tree.
+fn stats_rows(
+    folded: HashMap<i64, Accumulator>,
+    names: &HashMap<i64, String>,
+    authors: &Authors,
+    project_root: &Path,
+) -> Result<Vec<GitFileStats>> {
+    let mut folded: Vec<(&String, Accumulator)> = folded
+        .into_iter()
+        .map(|(path_id, accumulator)| {
+            names
+                .get(&path_id)
+                .map(|path| (path, accumulator))
+                .ok_or_else(|| anyhow!("stored change points at unknown path {path_id}"))
+        })
+        .collect::<Result<_>>()?;
+    folded.sort_by(|left, right| left.0.cmp(right.0));
+    // Line counting reads every surviving file; on a large tree that is most
+    // of a full collection's post-processing, and it parallelises cleanly.
+    let rows = folded
+        .into_par_iter()
+        .filter_map(|(path, accumulator)| {
+            let current_lines = count_lines(&project_root.join(path))?;
+            let mut author_names: Vec<String> = accumulator
+                .authors
+                .iter()
+                .map(|id| authors.names[*id as usize].clone())
+                .collect();
+            author_names.sort();
+            Some(GitFileStats {
+                path: path.clone(),
                 commits: accumulator.commits,
                 fix_commits: accumulator.fix_commits,
                 lines_added: accumulator.lines_added,
                 lines_deleted: accumulator.lines_deleted,
                 first_commit_at: accumulator.first_commit_at,
                 last_commit_at: accumulator.last_commit_at,
-                current_lines,
-                authors,
-            });
-        }
-        rows.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(rows)
+                current_lines: Some(current_lines),
+                authors: author_names,
+            })
+        })
+        .collect();
+    Ok(rows)
+}
+
+/// `seeds` plus every path connected to one of them by a rename.
+///
+/// History only ever moves along renames, so the paths outside this set keep
+/// exactly the history they had: no commit that joined or left touched them,
+/// and none of their renames did either.
+fn rename_closure(seeds: &HashSet<i64>, renames: &[(i64, i64)]) -> Vec<i64> {
+    let mut neighbours: HashMap<i64, Vec<i64>> = HashMap::new();
+    for &(from, to) in renames {
+        neighbours.entry(from).or_default().push(to);
+        neighbours.entry(to).or_default().push(from);
     }
+    let mut seen: HashSet<i64> = seeds.clone();
+    let mut queue: Vec<i64> = seeds.iter().copied().collect();
+    while let Some(path) = queue.pop() {
+        if let Some(next) = neighbours.get(&path) {
+            for &other in next {
+                if seen.insert(other) {
+                    queue.push(other);
+                }
+            }
+        }
+    }
+    let mut closure: Vec<i64> = seen.into_iter().collect();
+    closure.sort_unstable();
+    closure
+}
+
+/// Write a plan into the store and bring the derived tables up to date, all
+/// in one transaction.
+fn apply_plan(
+    conn: &mut Connection,
+    collector: &Collector,
+    plan: &Plan,
+    head: &str,
+    repo_root: &str,
+    scope_key: &str,
+) -> Result<Applied> {
+    let started = Instant::now();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to start git signal write")?;
+    if !plan.full && db::get_metadata_value(&tx, META_HEAD)? != plan.base {
+        bail!("another 'hotspots --collect' changed the collected history meanwhile; run it again");
+    }
+    if plan.full {
+        db::clear_git_signals(&tx)?;
+    }
+
+    let records: HashMap<&str, &CommitRecord> = plan
+        .records
+        .iter()
+        .map(|record| (record.sha.as_str(), record))
+        .collect();
+    let mut arrived: HashSet<i64> = HashSet::new();
+    let mut commit_ids: HashMap<&str, i64> = HashMap::with_capacity(plan.new_commits.len());
+    for commit in &plan.new_commits {
+        let meta = records
+            .get(commit.sha.as_str())
+            .map(|record| db::GitCommitMeta {
+                authored_at: record.timestamp,
+                author: record.author.as_str(),
+                is_fix: record.is_fix,
+            });
+        let id = db::insert_git_commit(&tx, &commit.sha, commit.order_key, meta)?;
+        commit_ids.insert(commit.sha.as_str(), id);
+        arrived.insert(id);
+    }
+
+    let mut touched: HashSet<i64> = HashSet::new();
+    let mut path_ids: HashMap<String, i64> = HashMap::new();
+    let mut path_id = |tx: &Connection, path: &str| -> Result<i64> {
+        if let Some(id) = path_ids.get(path) {
+            return Ok(*id);
+        }
+        let id = db::git_path_id(tx, path)?;
+        path_ids.insert(path.to_string(), id);
+        Ok(id)
+    };
+    for record in &plan.records {
+        let commit_id = commit_ids[record.sha.as_str()];
+        for change in &record.files {
+            let Some(change) = collector.project_change(change) else {
+                continue;
+            };
+            let target = path_id(&tx, &change.path)?;
+            let source = match &change.from {
+                Some(from) => Some(path_id(&tx, from)?),
+                None => None,
+            };
+            db::insert_git_change(
+                &tx,
+                commit_id,
+                target,
+                change.kind,
+                source,
+                change.added,
+                change.deleted,
+            )?;
+            touched.insert(target);
+            touched.extend(source);
+        }
+    }
+    let mut departed: HashSet<i64> = HashSet::new();
+    for commit in &plan.restored {
+        db::set_git_commit_live(&tx, commit.id, true)?;
+        touched.extend(db::git_commit_touched_paths(&tx, commit.id)?);
+        arrived.insert(commit.id);
+    }
+    for commit in &plan.dropped {
+        db::set_git_commit_live(&tx, commit.id, false)?;
+        touched.extend(db::git_commit_touched_paths(&tx, commit.id)?);
+        departed.insert(commit.id);
+    }
+
+    let stored_at = started.elapsed();
+    let mut authors = Authors::default();
+    let (rows, paths_in_history, paths_touched) = if plan.full {
+        let changes = db::load_git_changes(&tx, None)?;
+        let details = db::load_git_commit_details(&tx, None)?;
+        let mut commits = fold_input(&changes, &details, &mut authors, |_, detail| detail.live)?;
+        let folded = fold_history(&mut commits);
+        let names = db::load_git_paths(&tx, None)?;
+        let paths_in_history = folded.len();
+        let rows = stats_rows(folded, &names, &authors, &collector.project_root)?;
+        (rows, paths_in_history, paths_in_history)
+    } else if touched.is_empty() {
+        (Vec::new(), stored_paths_in_history(&tx)?, 0)
+    } else {
+        let closure = rename_closure(&touched, &db::load_live_git_renames(&tx)?);
+        let changes = db::load_git_changes(&tx, Some(&closure))?;
+        let mut involved: Vec<i64> = changes.iter().map(|change| change.commit_id).collect();
+        involved.sort_unstable();
+        involved.dedup();
+        let details = db::load_git_commit_details(&tx, Some(&involved))?;
+        // The closure is closed under renames before and after the move, so
+        // folding it both ways yields exactly its old and its new rows.
+        let mut before = fold_input(&changes, &details, &mut authors, |id, detail| {
+            (detail.live && !arrived.contains(&id)) || departed.contains(&id)
+        })?;
+        let old_paths = fold_history(&mut before).len();
+        let mut after = fold_input(&changes, &details, &mut authors, |_, detail| detail.live)?;
+        let folded = fold_history(&mut after);
+        let new_paths = folded.len();
+        let names = db::load_git_paths(&tx, Some(&closure))?;
+        let stale: Vec<&str> = closure
+            .iter()
+            .filter_map(|path_id| names.get(path_id).map(String::as_str))
+            .collect();
+        db::delete_git_file_stats(&tx, &stale)?;
+        let rows = stats_rows(folded, &names, &authors, &collector.project_root)?;
+        let paths_in_history =
+            (stored_paths_in_history(&tx)? + new_paths).saturating_sub(old_paths);
+        (rows, paths_in_history, closure.len())
+    };
+    db::write_git_file_stats(&tx, &rows)?;
+    let folded_at = started.elapsed();
+
+    db::set_metadata_value(&tx, META_HEAD, head)?;
+    db::set_metadata_value(&tx, META_REPO_ROOT, repo_root)?;
+    db::set_metadata_value(&tx, META_SCOPE, scope_key)?;
+    db::set_metadata_value(&tx, META_STORE, STORE_LAYOUT)?;
+    db::set_metadata_value(&tx, META_COLLECTED_AT, &unix_millis_now().to_string())?;
+    db::set_metadata_value(
+        &tx,
+        META_COMMITS,
+        &db::count_live_git_commits(&tx)?.to_string(),
+    )?;
+    db::set_metadata_value(&tx, META_PATHS, &paths_in_history.to_string())?;
+
+    let (live, dead) = db::count_git_commits(&tx)?;
+    if dead > dead_commits_limit(live) {
+        let pruned = db::prune_dead_git_commits(&tx)?;
+        if collector.verbose {
+            eprintln!("hotspots: pruned {pruned} commit(s) HEAD no longer reaches from the store");
+        }
+    }
+    tx.commit().context("failed to commit git signal write")?;
+    if collector.verbose {
+        eprintln!(
+            "hotspots: store written in {}ms, history folded in {}ms, committed in {}ms",
+            stored_at.as_millis(),
+            (folded_at - stored_at).as_millis(),
+            (started.elapsed() - folded_at).as_millis()
+        );
+    }
+
+    let changed_project = |commits: &[db::StoredGitCommit]| {
+        commits
+            .iter()
+            .filter(|commit| commit.changed_project)
+            .count()
+    };
+    Ok(Applied {
+        paths_touched,
+        commits_restored: changed_project(&plan.restored),
+        commits_dropped: changed_project(&plan.dropped),
+    })
+}
+
+fn dead_commits_limit(live: usize) -> usize {
+    if let Some(limit) = std::env::var("AST_INDEX_TEST_GIT_DEAD_COMMITS_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        return limit;
+    }
+    DEAD_COMMITS_FLOOR.max(live / DEAD_COMMITS_SHARE)
+}
+
+fn stored_paths_in_history(conn: &Connection) -> Result<usize> {
+    Ok(db::get_metadata_value(conn, META_PATHS)?
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0))
 }
 
 /// Count newlines in a working-tree file; `None` when it is gone or huge.
@@ -612,6 +1236,7 @@ fn parse_commit_header(field: &[u8]) -> Result<Option<CommitRecord>> {
     let subject = parts.next().unwrap_or("");
     let author = if email.is_empty() { name } else { email };
     Ok(Some(CommitRecord {
+        sha: sha.to_string(),
         timestamp,
         author,
         is_fix: is_bugfix_subject(subject),
@@ -643,6 +1268,13 @@ fn scope_within_repo(project_root: &Path, repo_root: &Path) -> Result<Option<Str
 }
 
 /// Collect (or refresh) git signals for `project_root`.
+///
+/// The per-commit store is moved to HEAD by set difference: commits only the
+/// stored cursor reaches are subtracted, commits only HEAD reaches are added
+/// (read from Git unless the store still has them from an earlier visit), and
+/// only the paths those commits touched, plus paths linked to them by
+/// renames, are recomputed. The result is the same as a full collection at
+/// HEAD, row for row.
 pub fn collect_git_signals(
     project_root: &Path,
     conn: &mut Connection,
@@ -668,140 +1300,109 @@ pub fn collect_git_signals(
         .canonicalize()
         .unwrap_or_else(|_| vcs_root.path.clone());
     let scope = scope_within_repo(&canonical_project, &canonical_repo)?;
+    let repo_key = canonical_repo.to_string_lossy().into_owned();
+    let scope_key = scope.clone().unwrap_or_default();
 
-    let mut collector = Collector {
-        conn,
+    let collector = Collector {
         executable: super::changed::vcs_executable(Vcs::Git),
         repo_root: canonical_repo.clone(),
         project_root: canonical_project,
-        scope: scope.clone(),
+        scope,
         deadline: Deadline::new(Duration::from_millis(timeout_ms)),
         verbose,
         window,
-        accumulators: HashMap::new(),
-        retired: HashSet::new(),
-        commits_scanned: 0,
     };
 
-    let Some(head) = collector.rev_parse_head()? else {
+    let Some(head) = collector.resolve_commit("HEAD")? else {
         bail!(
             "{} has no commits yet; nothing to collect",
             canonical_repo.display()
         );
     };
 
-    let stored_head = db::get_metadata_value(collector.conn, META_HEAD)?;
-    let stored_root = db::get_metadata_value(collector.conn, META_REPO_ROOT)?;
-    let stored_scope = db::get_metadata_value(collector.conn, META_SCOPE)?;
-    let scope_key = scope.clone().unwrap_or_default();
+    let stored_head = db::get_metadata_value(conn, META_HEAD)?;
+    let stored_root = db::get_metadata_value(conn, META_REPO_ROOT)?;
+    let stored_scope = db::get_metadata_value(conn, META_SCOPE)?;
+    let stored_layout = db::get_metadata_value(conn, META_STORE)?;
 
-    // A reset the user asked for needs no explanation; only a cursor we had to
+    // A reset the user asked for needs no explanation; only history we had to
     // throw away on our own does.
     let mut reset_reason = None;
-    let resume_from = if full {
-        None
-    } else {
-        match stored_head.as_deref() {
-            None => None,
-            Some(previous)
-                if stored_root.as_deref() != Some(canonical_repo.to_string_lossy().as_ref()) =>
-            {
+    let base = match stored_head.as_deref() {
+        _ if full => None,
+        None => None,
+        Some(previous) if stored_root.as_deref() != Some(repo_key.as_str()) => {
+            reset_reason = Some(format!(
+                "stored cursor {} belongs to a different working tree",
+                short_sha(previous)
+            ));
+            None
+        }
+        Some(_) if stored_scope.as_deref().unwrap_or("") != scope_key => {
+            reset_reason = Some("collection scope changed".to_string());
+            None
+        }
+        Some(_) if stored_layout.as_deref() != Some(STORE_LAYOUT) => {
+            reset_reason = Some(
+                "history collected by an older version has no per-commit store; \
+                 recollecting once"
+                    .to_string(),
+            );
+            None
+        }
+        Some(previous) => match collector.resolve_commit(previous)? {
+            Some(_) => Some(previous.to_string()),
+            None => {
                 reset_reason = Some(format!(
-                    "stored cursor {} belongs to a different working tree",
+                    "stored cursor {} is no longer in the repository; recollecting from scratch",
                     short_sha(previous)
                 ));
                 None
             }
-            Some(_) if stored_scope.as_deref().unwrap_or("") != scope_key => {
-                reset_reason = Some("collection scope changed".to_string());
-                None
-            }
-            Some(previous) if previous == head => Some(previous.to_string()),
-            Some(previous) => {
-                if collector.is_ancestor_of_head(previous)? {
-                    Some(previous.to_string())
-                } else {
-                    reset_reason = Some(format!(
-                        "stored cursor {} is no longer an ancestor of HEAD \
-                         (branch switch, rebase or force-push); recollecting from scratch",
-                        short_sha(previous)
-                    ));
-                    None
-                }
-            }
-        }
+        },
     };
 
-    let mode = if resume_from.is_some() {
-        CollectMode::Incremental
-    } else {
-        CollectMode::Full
+    let plan = match base.as_deref() {
+        Some(base) => match collector.plan_sync(conn, base, &head)? {
+            Some(plan) => plan,
+            None => {
+                reset_reason = Some(
+                    "the stored history does not match the repository; recollecting from scratch"
+                        .to_string(),
+                );
+                collector.plan_full(&head)?
+            }
+        },
+        None => collector.plan_full(&head)?,
     };
     if let (Some(reason), true) = (reset_reason.as_deref(), verbose) {
         eprintln!("hotspots: {reason}");
     }
-    if mode == CollectMode::Full {
-        db::clear_git_file_stats(collector.conn)?;
-        db::delete_metadata_value(collector.conn, META_HEAD)?;
-    }
-
-    let range = match resume_from.as_deref() {
-        Some(previous) => format!("{previous}..{head}"),
-        None => head.clone(),
-    };
-    let total = collector.count_commits(&range)?;
     if verbose {
         eprintln!(
-            "hotspots: mode={mode:?} range={range} commits={total} window={} scope={}",
-            collector.window,
-            scope.as_deref().unwrap_or(".")
+            "hotspots: full={} new={} read={} restored={} dropped={} scope={}",
+            plan.full,
+            plan.new_commits.len(),
+            plan.records.len(),
+            plan.restored.len(),
+            plan.dropped.len(),
+            collector.scope.as_deref().unwrap_or(".")
         );
     }
-    collector.walk(&range, total)?;
 
-    let rows = collector.flush()?;
-    let paths_touched = rows.len();
-    let written: HashSet<&str> = rows.iter().map(|row| row.path.as_str()).collect();
-    let retired: Vec<String> = collector
-        .retired
-        .iter()
-        .filter(|path| !written.contains(path.as_str()))
-        .cloned()
-        .collect();
-    db::store_git_file_stats(collector.conn, &rows)?;
-    for path in &retired {
-        db::delete_git_file_stats(collector.conn, path)?;
-    }
-
-    let previous_head = stored_head.clone();
-    db::set_metadata_value(collector.conn, META_HEAD, &head)?;
-    db::set_metadata_value(
-        collector.conn,
-        META_REPO_ROOT,
-        canonical_repo.to_string_lossy().as_ref(),
-    )?;
-    db::set_metadata_value(collector.conn, META_SCOPE, &scope_key)?;
-    db::set_metadata_value(
-        collector.conn,
-        META_COLLECTED_AT,
-        &unix_millis_now().to_string(),
-    )?;
-    let previous_commits = db::get_metadata_value(collector.conn, META_COMMITS)?
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    let cumulative = if mode == CollectMode::Full {
-        collector.commits_scanned
-    } else {
-        previous_commits + collector.commits_scanned
-    };
-    db::set_metadata_value(collector.conn, META_COMMITS, &cumulative.to_string())?;
-
+    let applied = apply_plan(conn, &collector, &plan, &head, &repo_key, &scope_key)?;
     Ok(CollectOutcome {
-        mode,
-        commits_scanned: collector.commits_scanned,
-        paths_touched,
+        mode: if plan.full {
+            CollectMode::Full
+        } else {
+            CollectMode::Incremental
+        },
+        commits_scanned: plan.records.len(),
+        commits_restored: applied.commits_restored,
+        commits_dropped: applied.commits_dropped,
+        paths_touched: applied.paths_touched,
         head,
-        previous_head,
+        previous_head: stored_head,
         reset_reason,
         elapsed_ms: started.elapsed().as_millis(),
     })
@@ -1196,7 +1797,11 @@ pub fn cmd_hotspots(
     // ever describe the primary root's own working tree (`--subtree` is
     // rejected up front), and probing extra roots could resolve a path onto a
     // same-named file in a different repository.
-    let paths_in_history = rows.len();
+    // Tables written before the per-commit store kept a row per deleted path
+    // too, and no path count.
+    let paths_in_history = db::get_metadata_value(&conn, META_PATHS)?
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(rows.len());
     // Percentiles describe the files a reader can actually choose between, so
     // paths that no longer exist are dropped before ranking: a repository that
     // deleted half its history would otherwise inflate every survivor.
@@ -1245,10 +1850,28 @@ fn render_text(report: &HotspotsReport) {
         if let Some(reason) = &collection.reset_reason {
             println!("  {}", format!("Full recollect: {reason}").yellow());
         }
+        let mut moved = Vec::new();
+        if collection.commits_restored > 0 {
+            moved.push(format!(
+                "{} restored from the history store",
+                collection.commits_restored
+            ));
+        }
+        if collection.commits_dropped > 0 {
+            moved.push(format!(
+                "{} no longer reachable from HEAD",
+                collection.commits_dropped
+            ));
+        }
+        let moved = if moved.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", moved.join(", "))
+        };
         println!(
             "{}",
             format!(
-                "Collected {} commit(s) [{:?}] touching {} file(s) in {}ms.",
+                "Collected {} commit(s) [{:?}]{moved}, recomputed {} path(s) in {}ms.",
                 collection.commits_scanned,
                 collection.mode,
                 collection.paths_touched,

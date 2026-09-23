@@ -4349,9 +4349,21 @@ const CREATE_SUBTREES_SQL: &str = r#"
 ///
 /// Kept out of `files` and `symbols` on purpose: the rows survive a reindex,
 /// cover paths the indexer never parses (fixtures, configs, migrations), and
-/// accumulate incrementally from a commit cursor rather than from a file walk.
-/// `path` is relative to the project root, same key space as `files.path`.
-/// `current_lines` is NULL when the path no longer exists in the working tree.
+/// follow the commit history rather than a file walk.
+///
+/// `git_commits`, `git_paths` and `git_commit_changes` are the per-commit
+/// store: what each commit did to each project path. `git_commits.live` marks
+/// the commits reachable from the collected HEAD; the rest are kept so that
+/// switching back to a branch does not re-read its diffs. `order_key` is the
+/// commit's corrected commit date (never below a parent's plus one), the
+/// order in which renames hand history from one path to the next.
+/// `git_commit_changes.kind` is 0 for a plain change of `path_id`, 1 for a
+/// rename from `from_path_id` to `path_id`, 2 for `path_id` moved out of the
+/// project.
+///
+/// `git_file_stats` / `git_file_authors` are derived from the live commits:
+/// one row per path that exists in the working tree, keyed by the
+/// project-relative path (same key space as `files.path`).
 pub(crate) const CREATE_GIT_SIGNALS_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS git_file_stats (
         path TEXT PRIMARY KEY,
@@ -4368,7 +4380,44 @@ pub(crate) const CREATE_GIT_SIGNALS_SQL: &str = r#"
         author TEXT NOT NULL,
         PRIMARY KEY (path, author)
     );
+    CREATE TABLE IF NOT EXISTS git_commits (
+        id INTEGER PRIMARY KEY,
+        sha TEXT NOT NULL UNIQUE,
+        order_key INTEGER NOT NULL,
+        live INTEGER NOT NULL,
+        authored_at INTEGER,
+        author TEXT,
+        is_fix INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS git_paths (
+        id INTEGER PRIMARY KEY,
+        hash INTEGER NOT NULL,
+        path TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_git_paths_hash ON git_paths(hash);
+    CREATE TABLE IF NOT EXISTS git_commit_changes (
+        commit_id INTEGER NOT NULL,
+        path_id INTEGER NOT NULL,
+        kind INTEGER NOT NULL,
+        from_path_id INTEGER,
+        added INTEGER NOT NULL,
+        deleted INTEGER NOT NULL,
+        PRIMARY KEY (commit_id, path_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS idx_git_commit_changes_path
+        ON git_commit_changes(path_id);
+    CREATE INDEX IF NOT EXISTS idx_git_commit_changes_renames
+        ON git_commit_changes(commit_id, from_path_id, path_id) WHERE kind = 1;
 "#;
+/// Tables [`CREATE_GIT_SIGNALS_SQL`] creates; all must exist for the schema
+/// to count as current.
+const GIT_SIGNAL_TABLES: [&str; 5] = [
+    "git_file_stats",
+    "git_file_authors",
+    "git_commits",
+    "git_paths",
+    "git_commit_changes",
+];
 /// Symbol-to-symbol dependency graph, built on demand by `graph build`.
 ///
 /// Both tables key on `symbols.id` without a foreign key on purpose: a
@@ -4575,8 +4624,10 @@ fn inspect_open_migrations(
 ) -> Result<OpenMigrationPreflight> {
     let metadata_exists = table_exists(conn, "metadata")?;
     let subtrees_exists = table_exists(conn, "subtrees")?;
-    let git_signals_exist =
-        table_exists(conn, "git_file_stats")? && table_exists(conn, "git_file_authors")?;
+    let mut git_signals_exist = true;
+    for table in GIT_SIGNAL_TABLES {
+        git_signals_exist &= table_exists(conn, table)?;
+    }
     let symbol_graph_exists =
         table_exists(conn, "symbol_edges")? && table_exists(conn, "symbol_metrics")?;
     let files_exists = table_exists(conn, "files")?;
@@ -8773,50 +8824,15 @@ pub struct GitFileStats {
     pub authors: Vec<String>,
 }
 
-/// Drop every collected git signal, leaving the (empty) tables in place.
-pub fn clear_git_file_stats(conn: &Connection) -> Result<()> {
+/// Drop every collected git signal and the per-commit store behind it,
+/// leaving the (empty) tables in place.
+pub fn clear_git_signals(conn: &Connection) -> Result<()> {
     conn.execute_batch(CREATE_GIT_SIGNALS_SQL)?;
-    conn.execute("DELETE FROM git_file_stats", [])
-        .context("failed to clear git_file_stats")?;
-    conn.execute("DELETE FROM git_file_authors", [])
-        .context("failed to clear git_file_authors")?;
+    for table in GIT_SIGNAL_TABLES {
+        conn.execute(&format!("DELETE FROM {table}"), [])
+            .with_context(|| format!("failed to clear {table}"))?;
+    }
     Ok(())
-}
-
-/// Load one path's accumulated signals, or `None` when it was never seen.
-pub fn load_git_file_stats(conn: &Connection, path: &str) -> Result<Option<GitFileStats>> {
-    let row = conn
-        .query_row(
-            "SELECT commits, fix_commits, lines_added, lines_deleted,
-                    first_commit_at, last_commit_at, current_lines
-             FROM git_file_stats WHERE path = ?1",
-            params![path],
-            |row| {
-                Ok(GitFileStats {
-                    path: path.to_string(),
-                    commits: row.get(0)?,
-                    fix_commits: row.get(1)?,
-                    lines_added: row.get(2)?,
-                    lines_deleted: row.get(3)?,
-                    first_commit_at: row.get(4)?,
-                    last_commit_at: row.get(5)?,
-                    current_lines: row.get(6)?,
-                    authors: Vec::new(),
-                })
-            },
-        )
-        .optional()
-        .context("failed to read git_file_stats")?;
-    let Some(mut stats) = row else {
-        return Ok(None);
-    };
-    let mut statement =
-        conn.prepare_cached("SELECT author FROM git_file_authors WHERE path = ?1")?;
-    stats.authors = statement
-        .query_map(params![path], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("failed to read git_file_authors")?;
-    Ok(Some(stats))
 }
 
 /// Load every collected path, authors included. Used by the reporting path.
@@ -8924,62 +8940,404 @@ pub fn load_live_git_file_signals(conn: &Connection) -> Result<Vec<GitFileSignal
     Ok(rows)
 }
 
-/// Replace the stored signals for the supplied paths inside one transaction.
-///
-/// Paths absent from `stats` are left untouched, which is what makes the
-/// incremental collector cheap: it rewrites only the files a commit range
-/// actually moved.
-pub fn store_git_file_stats(conn: &mut Connection, stats: &[GitFileStats]) -> Result<()> {
-    let tx = conn
-        .transaction()
-        .context("failed to start git signal write")?;
-    {
-        let mut delete_authors = tx.prepare("DELETE FROM git_file_authors WHERE path = ?1")?;
-        let mut insert_author =
-            tx.prepare("INSERT OR IGNORE INTO git_file_authors (path, author) VALUES (?1, ?2)")?;
-        let mut upsert = tx.prepare(
-            "INSERT INTO git_file_stats
-                 (path, commits, fix_commits, lines_added, lines_deleted,
-                  first_commit_at, last_commit_at, current_lines)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(path) DO UPDATE SET
-                 commits = excluded.commits,
-                 fix_commits = excluded.fix_commits,
-                 lines_added = excluded.lines_added,
-                 lines_deleted = excluded.lines_deleted,
-                 first_commit_at = excluded.first_commit_at,
-                 last_commit_at = excluded.last_commit_at,
-                 current_lines = excluded.current_lines",
-        )?;
-        for entry in stats {
-            upsert.execute(params![
-                entry.path,
-                entry.commits,
-                entry.fix_commits,
-                entry.lines_added,
-                entry.lines_deleted,
-                entry.first_commit_at,
-                entry.last_commit_at,
-                entry.current_lines,
-            ])?;
-            delete_authors.execute(params![entry.path])?;
-            for author in &entry.authors {
-                insert_author.execute(params![entry.path, author])?;
-            }
+/// Upsert the signals of the supplied paths, authors included, inside the
+/// caller's transaction. Paths absent from `stats` are left untouched.
+pub fn write_git_file_stats(conn: &Connection, stats: &[GitFileStats]) -> Result<()> {
+    let mut delete_authors = conn.prepare_cached("DELETE FROM git_file_authors WHERE path = ?1")?;
+    let mut insert_author = conn
+        .prepare_cached("INSERT OR IGNORE INTO git_file_authors (path, author) VALUES (?1, ?2)")?;
+    let mut upsert = conn.prepare_cached(
+        "INSERT INTO git_file_stats
+             (path, commits, fix_commits, lines_added, lines_deleted,
+              first_commit_at, last_commit_at, current_lines)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(path) DO UPDATE SET
+             commits = excluded.commits,
+             fix_commits = excluded.fix_commits,
+             lines_added = excluded.lines_added,
+             lines_deleted = excluded.lines_deleted,
+             first_commit_at = excluded.first_commit_at,
+             last_commit_at = excluded.last_commit_at,
+             current_lines = excluded.current_lines",
+    )?;
+    for entry in stats {
+        upsert.execute(params![
+            entry.path,
+            entry.commits,
+            entry.fix_commits,
+            entry.lines_added,
+            entry.lines_deleted,
+            entry.first_commit_at,
+            entry.last_commit_at,
+            entry.current_lines,
+        ])?;
+        delete_authors.execute(params![entry.path])?;
+        for author in &entry.authors {
+            insert_author.execute(params![entry.path, author])?;
         }
     }
-    tx.commit().context("failed to commit git signal write")?;
     Ok(())
 }
 
-/// Forget one path entirely (used when a rename moves its history elsewhere).
-pub fn delete_git_file_stats(conn: &Connection, path: &str) -> Result<()> {
-    conn.execute("DELETE FROM git_file_stats WHERE path = ?1", params![path])?;
-    conn.execute(
-        "DELETE FROM git_file_authors WHERE path = ?1",
-        params![path],
-    )?;
+/// Forget the derived signals of `paths`.
+pub fn delete_git_file_stats(conn: &Connection, paths: &[&str]) -> Result<()> {
+    for chunk in paths.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        for table in ["git_file_stats", "git_file_authors"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE path IN ({placeholders})"),
+                rusqlite::params_from_iter(chunk.iter()),
+            )
+            .with_context(|| format!("failed to delete from {table}"))?;
+        }
+    }
     Ok(())
+}
+
+/// `git_commit_changes.kind`: a plain change of `path_id`.
+pub const GIT_CHANGE_TOUCH: i64 = 0;
+/// `git_commit_changes.kind`: `path_id` renamed from `from_path_id`.
+pub const GIT_CHANGE_RENAME: i64 = 1;
+// `load_live_git_renames` and `idx_git_commit_changes_renames` spell the rename kind
+// out as a literal so the planner can match the partial index.
+const _: () = assert!(GIT_CHANGE_RENAME == 1);
+/// `git_commit_changes.kind`: `path_id` moved out of the project.
+pub const GIT_CHANGE_MOVED_OUT: i64 = 2;
+
+/// A commit of the per-commit store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredGitCommit {
+    pub id: i64,
+    pub order_key: i64,
+    pub live: bool,
+    /// Non-merge commit that changed the project (it has an author row).
+    pub changed_project: bool,
+}
+
+/// Look a commit up by its full hash.
+pub fn find_git_commit(conn: &Connection, sha: &str) -> Result<Option<StoredGitCommit>> {
+    conn.prepare_cached(
+        "SELECT id, order_key, live, author IS NOT NULL FROM git_commits WHERE sha = ?1",
+    )?
+    .query_row(params![sha], |row| {
+        Ok(StoredGitCommit {
+            id: row.get(0)?,
+            order_key: row.get(1)?,
+            live: row.get::<_, i64>(2)? != 0,
+            changed_project: row.get::<_, i64>(3)? != 0,
+        })
+    })
+    .optional()
+    .context("failed to read git_commits")
+}
+
+/// Author and intent of a commit that changed the project.
+#[derive(Clone, Copy, Debug)]
+pub struct GitCommitMeta<'a> {
+    pub authored_at: i64,
+    pub author: &'a str,
+    pub is_fix: bool,
+}
+
+/// Insert a live commit. `meta` is `None` for merges and for commits that
+/// did not change the project: the store keeps them for their place in the
+/// graph only.
+pub fn insert_git_commit(
+    conn: &Connection,
+    sha: &str,
+    order_key: i64,
+    meta: Option<GitCommitMeta<'_>>,
+) -> Result<i64> {
+    conn.prepare_cached(
+        "INSERT INTO git_commits (sha, order_key, live, authored_at, author, is_fix)
+         VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+    )?
+    .execute(params![
+        sha,
+        order_key,
+        meta.map(|meta| meta.authored_at),
+        meta.map(|meta| meta.author),
+        meta.map(|meta| i64::from(meta.is_fix)),
+    ])
+    .context("failed to insert git_commits row")?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 64-bit FNV-1a of a path: `git_paths` is looked up through an index on
+/// this instead of on the text, which would store every path a second time.
+fn git_path_hash(path: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash as i64
+}
+
+/// Id of a project path in the per-commit store, inserted when new.
+pub fn git_path_id(conn: &Connection, path: &str) -> Result<i64> {
+    let hash = git_path_hash(path);
+    if let Some(id) = conn
+        .prepare_cached("SELECT id FROM git_paths WHERE hash = ?1 AND path = ?2")?
+        .query_row(params![hash, path], |row| row.get::<_, i64>(0))
+        .optional()?
+    {
+        return Ok(id);
+    }
+    conn.prepare_cached("INSERT INTO git_paths (hash, path) VALUES (?1, ?2)")?
+        .execute(params![hash, path])
+        .context("failed to insert git_paths row")?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Record what one commit did to one path.
+///
+/// A second record for the same pair can only come from two raw Git paths
+/// that decode to the same text; their line counts are summed.
+pub fn insert_git_change(
+    conn: &Connection,
+    commit_id: i64,
+    path_id: i64,
+    kind: i64,
+    from_path_id: Option<i64>,
+    added: i64,
+    deleted: i64,
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO git_commit_changes (commit_id, path_id, kind, from_path_id, added, deleted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(commit_id, path_id) DO UPDATE SET
+             added = added + excluded.added,
+             deleted = deleted + excluded.deleted",
+    )?
+    .execute(params![
+        commit_id,
+        path_id,
+        kind,
+        from_path_id,
+        added,
+        deleted
+    ])
+    .context("failed to insert git_commit_changes row")?;
+    Ok(())
+}
+
+/// Mark a stored commit as reachable (or no longer reachable) from HEAD.
+pub fn set_git_commit_live(conn: &Connection, id: i64, live: bool) -> Result<()> {
+    conn.prepare_cached("UPDATE git_commits SET live = ?2 WHERE id = ?1")?
+        .execute(params![id, i64::from(live)])
+        .context("failed to update git_commits.live")?;
+    Ok(())
+}
+
+/// Every path a stored commit changed, renamed from, or moved out.
+pub fn git_commit_touched_paths(conn: &Connection, commit_id: i64) -> Result<Vec<i64>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT path_id, from_path_id FROM git_commit_changes WHERE commit_id = ?1",
+    )?;
+    let mut rows = statement.query(params![commit_id])?;
+    let mut paths = Vec::new();
+    while let Some(row) = rows.next()? {
+        paths.push(row.get::<_, i64>(0)?);
+        if let Some(from) = row.get::<_, Option<i64>>(1)? {
+            paths.push(from);
+        }
+    }
+    Ok(paths)
+}
+
+/// `(from, to)` path ids of every rename made by a live commit.
+pub fn load_live_git_renames(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut statement = conn.prepare(
+        "SELECT c.from_path_id, c.path_id
+         FROM git_commit_changes c JOIN git_commits k ON k.id = c.commit_id
+         WHERE c.kind = 1 AND k.live = 1",
+    )?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read git renames")?;
+    Ok(rows)
+}
+
+/// One row of `git_commit_changes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredGitChange {
+    pub commit_id: i64,
+    pub path_id: i64,
+    pub kind: i64,
+    pub from_path_id: Option<i64>,
+    pub added: i64,
+    pub deleted: i64,
+}
+
+fn read_git_change(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredGitChange> {
+    Ok(StoredGitChange {
+        commit_id: row.get(0)?,
+        path_id: row.get(1)?,
+        kind: row.get(2)?,
+        from_path_id: row.get(3)?,
+        added: row.get(4)?,
+        deleted: row.get(5)?,
+    })
+}
+
+/// Changes whose `path_id` is one of `paths` (every change for `None`),
+/// live or not.
+pub fn load_git_changes(conn: &Connection, paths: Option<&[i64]>) -> Result<Vec<StoredGitChange>> {
+    const COLUMNS: &str = "commit_id, path_id, kind, from_path_id, added, deleted";
+    let Some(paths) = paths else {
+        let mut statement = conn.prepare(&format!("SELECT {COLUMNS} FROM git_commit_changes"))?;
+        return statement
+            .query_map([], read_git_change)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read git_commit_changes");
+    };
+    let mut changes = Vec::new();
+    for chunk in paths.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut statement = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM git_commit_changes WHERE path_id IN ({placeholders})"
+        ))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(chunk.iter()), read_git_change)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read git_commit_changes")?;
+        changes.extend(rows);
+    }
+    Ok(changes)
+}
+
+/// Everything the history fold needs to know about a stored commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredGitCommitDetail {
+    pub order_key: i64,
+    pub sha: String,
+    pub live: bool,
+    pub authored_at: i64,
+    pub author: String,
+    pub is_fix: bool,
+}
+
+fn read_git_commit_detail(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(i64, StoredGitCommitDetail)> {
+    Ok((
+        row.get(0)?,
+        StoredGitCommitDetail {
+            order_key: row.get(1)?,
+            sha: row.get(2)?,
+            live: row.get::<_, i64>(3)? != 0,
+            authored_at: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            author: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            is_fix: row.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+        },
+    ))
+}
+
+/// Details of the commits in `ids` (of every commit that changed the
+/// project for `None`).
+pub fn load_git_commit_details(
+    conn: &Connection,
+    ids: Option<&[i64]>,
+) -> Result<HashMap<i64, StoredGitCommitDetail>> {
+    const COLUMNS: &str = "id, order_key, sha, live, authored_at, author, is_fix";
+    let mut details = HashMap::new();
+    let Some(ids) = ids else {
+        let mut statement = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM git_commits WHERE author IS NOT NULL"
+        ))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let (id, detail) = read_git_commit_detail(row)?;
+            details.insert(id, detail);
+        }
+        return Ok(details);
+    };
+    for chunk in ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut statement = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM git_commits WHERE id IN ({placeholders})"
+        ))?;
+        let mut rows = statement.query(rusqlite::params_from_iter(chunk.iter()))?;
+        while let Some(row) = rows.next()? {
+            let (id, detail) = read_git_commit_detail(row)?;
+            details.insert(id, detail);
+        }
+    }
+    Ok(details)
+}
+
+/// Text of the path ids in `ids` (of every stored path for `None`).
+pub fn load_git_paths(conn: &Connection, ids: Option<&[i64]>) -> Result<HashMap<i64, String>> {
+    let mut paths = HashMap::new();
+    let Some(ids) = ids else {
+        let mut statement = conn.prepare("SELECT id, path FROM git_paths")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            paths.insert(row.get::<_, i64>(0)?, row.get::<_, String>(1)?);
+        }
+        return Ok(paths);
+    };
+    for chunk in ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut statement = conn.prepare(&format!(
+            "SELECT id, path FROM git_paths WHERE id IN ({placeholders})"
+        ))?;
+        let mut rows = statement.query(rusqlite::params_from_iter(chunk.iter()))?;
+        while let Some(row) = rows.next()? {
+            paths.insert(row.get::<_, i64>(0)?, row.get::<_, String>(1)?);
+        }
+    }
+    Ok(paths)
+}
+
+/// Live commits that changed the project: the history the tables describe.
+pub fn count_live_git_commits(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM git_commits WHERE live = 1 AND author IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// `(live, not live)` counts of every stored commit, merges included.
+pub fn count_git_commits(conn: &Connection) -> Result<(usize, usize)> {
+    let (live, dead): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(live = 1), 0), COALESCE(SUM(live = 0), 0) FROM git_commits",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((live as usize, dead as usize))
+}
+
+/// Drop every commit that is no longer reachable from HEAD, with its changes
+/// and the paths nothing else refers to. Returns how many commits went.
+///
+/// It is all or nothing on purpose: the stored commits stay closed under
+/// "parent of", which is what lets a later run find the commits it has not
+/// read yet with a plain `HEAD --not <stored boundary>` range.
+pub fn prune_dead_git_commits(conn: &Connection) -> Result<usize> {
+    let dead: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM git_commits WHERE live = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "DELETE FROM git_commit_changes
+         WHERE commit_id IN (SELECT id FROM git_commits WHERE live = 0)",
+        [],
+    )?;
+    conn.execute("DELETE FROM git_commits WHERE live = 0", [])?;
+    conn.execute(
+        "DELETE FROM git_paths
+         WHERE id NOT IN (SELECT path_id FROM git_commit_changes)
+           AND id NOT IN (SELECT from_path_id FROM git_commit_changes
+                          WHERE from_path_id IS NOT NULL)",
+        [],
+    )?;
+    Ok(dead as usize)
 }
 
 // ---------------------------------------------------------------------------

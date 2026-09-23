@@ -388,10 +388,13 @@ ast-index --format json hotspots --limit 10    # Paginated JSON schema v2
 ```
 
 Collection is never implicit: `rebuild` and `update` do not run it. The first
-`--collect` walks the whole history; later runs resume from a stored commit
-cursor. When that cursor stops being an ancestor of `HEAD` (branch switch,
-rebase, force-push, garbage-collected object) the run says so and recollects
-from scratch rather than reporting stale numbers.
+`--collect` walks the whole history into a per-commit store; later runs move it
+to the current `HEAD` by set difference — commits `HEAD` no longer reaches
+(branch switch, rebase, reset, force-push) are subtracted, new ones are added —
+so switching branches costs time proportional to the commits that differ, and
+switching back re-reads nothing. The numbers always equal a full recollection
+at that `HEAD`. Only a garbage-collected cursor commit, a changed project root
+or `--full` rebuild from scratch.
 
 Labels: `churn:high` / `churn:elevated`, `rewritten-often`, `fixes:high` /
 `fixes:elevated` (only for files with 4+ commits), `authors:many`, `veteran`.
