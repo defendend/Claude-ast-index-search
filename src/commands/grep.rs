@@ -124,21 +124,47 @@ fn build_any_caller_pattern(function_names: &[String]) -> String {
     caller_pattern(&format!("(?:{})", names.join("|")), "")
 }
 
+/// Words the Java-style branch of [`build_def_skip_pattern`] would otherwise
+/// read as a return type. Standing right before a name they make the line a
+/// call, never a definition: `return foo(`, `await foo(`, `new Foo(`,
+/// `if foo(`, `for x in foo(`, `export default foo(`, `go foo(`, `puts foo(`.
+const KEYWORDS_BEFORE_CALL: [&str; 33] = [
+    "and", "assert", "await", "case", "default", "defer", "echo", "elif", "else", "elsif", "from",
+    "go", "if", "in", "match", "new", "not", "of", "or", "print", "puts", "raise", "range",
+    "return", "then", "throw", "try", "unless", "until", "when", "while", "with", "yield",
+];
+
+/// Lines that define one particular function, as opposed to calling it.
+struct DefinitionPattern(Regex);
+
+impl DefinitionPattern {
+    fn is_match(&self, line: &str) -> bool {
+        // `regex` has no lookaround, so the word in return-type position is
+        // captured and a keyword there is ruled out here instead.
+        self.0.captures_iter(line).any(|caps| {
+            caps.name("type")
+                .map_or(true, |word| !KEYWORDS_BEFORE_CALL.contains(&word.as_str()))
+        })
+    }
+}
+
 /// Build regex pattern that skips function/method definitions
-fn build_def_skip_pattern(function_name: &str) -> Regex {
+fn build_def_skip_pattern(function_name: &str) -> DefinitionPattern {
     let fn_escaped = regex::escape(function_name);
     let tb = trailing_boundary(function_name);
-    Regex::new(&format!(
-        concat!(
-            r"\b(?:fun|func|sub)\s+{fn}\s*[<({{\[]",           // Kotlin/Swift/Perl
-            r"|\bdef\s+(?:self\.)?{fn}{tb}",                    // Ruby: def method / def self.method
-            r"|\b(?:(?:public|private|protected|static|final|abstract|synchronized|override)\s+)*",
-            r"(?:void|int|long|boolean|char|byte|short|float|double|[\w.]+(?:<[^{{;]*>)?(?:\[\])*)\s+{fn}\s*\(", // Java
-        ),
-        fn = fn_escaped,
-        tb = tb
-    ))
-    .expect("Invalid def skip pattern")
+    DefinitionPattern(
+        Regex::new(&format!(
+            concat!(
+                r"\b(?:fun|func|sub)\s+{fn}\s*[<({{\[]",           // Kotlin/Swift/Perl
+                r"|\bdef\s+(?:self\.)?{fn}{tb}",                    // Ruby: def method / def self.method
+                r"|\b(?:(?:public|private|protected|static|final|abstract|synchronized|override)\s+)*",
+                r"(?:void|int|long|boolean|char|byte|short|float|double|(?P<type>[\w.]+)(?:<[^{{;]*>)?(?:\[\])*)\s+{fn}\s*\(", // Java
+            ),
+            fn = fn_escaped,
+            tb = tb
+        ))
+        .expect("Invalid def skip pattern"),
+    )
 }
 
 /// Find TODO/FIXME/HACK comments
@@ -441,7 +467,7 @@ fn find_caller_functions(
         .iter()
         .map(|name| (build_caller_pattern(name), name.clone()))
         .collect();
-    let def_patterns: Vec<Regex> = function_names
+    let def_patterns: Vec<DefinitionPattern> = function_names
         .iter()
         .map(|name| build_def_skip_pattern(name))
         .collect();
@@ -1578,6 +1604,59 @@ mod tests {
     fn test_def_skip_kotlin_fun() {
         let pat = build_def_skip_pattern("calculate");
         assert!(pat.is_match("  fun calculate(x: Int)"));
+    }
+
+    #[test]
+    fn def_skip_keeps_calls_behind_a_keyword() {
+        let calls = [
+            ("foo", "    return foo(x)"),
+            ("foo", "  const y = await foo(x)"),
+            ("Foo", "    throw new Foo(message)"),
+            ("foo", "  } else foo(x)"),
+            ("foo", "    yield foo(x)"),
+            ("foo", "    puts foo(x)"),
+            ("Foo", "    raise Foo(message)"),
+            ("foo", "    if foo(x)"),
+            ("foo", "    elsif foo(x)"),
+            ("foo", "  for item in foo(items):"),
+            ("foo", "  for (const item of foo(items)) {"),
+            ("foo", "export default foo(App)"),
+            ("foo", "  go foo(ch)"),
+            ("foo", "  defer foo(conn)"),
+            ("foo", "  echo foo($x);"),
+            ("foo", "  with foo(path) as handle:"),
+            ("foo", "    assert foo(x)"),
+            ("foo", "  match foo(x) {"),
+            ("foo", "  return await foo(x)"),
+        ];
+        for (name, line) in calls {
+            assert!(matches(&build_caller_pattern(name), line), "{line}");
+            assert!(!build_def_skip_pattern(name).is_match(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn def_skip_still_recognises_typed_definitions() {
+        let definitions = [
+            "  public void foo(int x) {",
+            "  String foo(String x) {",
+            "  public static List<String> foo(Map<String, Integer> x) {",
+            "  int[] foo() {",
+            "  private override fun foo() {",
+            "export function foo(x) {",
+            "  async function foo(x) {",
+            "  public foo(x: number): void {",
+            "  static foo() {",
+            "  async foo() {",
+            "  private def foo(x)",
+            "  defp foo(x) do",
+            "pub fn foo(x: u32) -> u32 {",
+            "local function foo(x)",
+        ];
+        let pat = build_def_skip_pattern("foo");
+        for line in definitions {
+            assert!(pat.is_match(line), "{line}");
+        }
     }
 
     // --- find_containing_function tests ---
