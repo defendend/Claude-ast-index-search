@@ -181,9 +181,10 @@ The current explicit secondary indexes are:
   `idx_files_path`,
   `idx_symbols_name`,
   `idx_symbols_qualified_name` (partial, only where `qualified_name IS NOT NULL`),
-  `idx_symbols_kind`,
-  `idx_symbols_file`, and
-  `idx_symbols_file_line_end` (covers "which symbol contains this line").
+  `idx_symbols_kind`, and
+  `idx_symbols_file_line_end` on `(file_id, line, end_line)` (covers "which
+  symbol contains this line"; its `file_id` prefix serves every per-file
+  lookup and the cascade from `files`).
 - Modules and dependency edges:
   `idx_module_deps_module`,
   `idx_module_deps_dep`,
@@ -223,13 +224,22 @@ indexes:
 - `idx_modules_name`: duplicates `UNIQUE(name)`.
 - `idx_refs_name`: the leftmost `name` prefix is already covered by
   `idx_refs_name_file_line`.
+- `idx_symbols_file` on `(file_id)`: the leftmost prefix of
+  `idx_symbols_file_line_end`.
 
 Older databases drop those indexes when opened. The qualified-name index is
 also migrated to its current partial definition, a missing
 `symbols.end_line` column is added, and a missing
-`idx_symbols_file_line_end` is created. This optimization changes
-index structures only: all base tables and their raw columns remain
-available to `ast-index query` and `ast-index schema` for compatibility.
+`idx_symbols_file_line_end` is created (always before `idx_symbols_file` is
+dropped). This optimization changes index structures only: all base tables
+and their raw columns remain available to `ast-index query` and
+`ast-index schema` for compatibility.
+
+`restore` applies the same migrations to its private snapshot before it
+validates the snapshot, so a backup taken in any earlier index layout restores
+into the current one. A backup made by this version lacks `idx_symbols_file`,
+which the validation of older releases requires: restore it with this version
+or later.
 
 ## Full-text search
 

@@ -300,3 +300,37 @@ fn restore_rejects_a_symlink_source_without_touching_the_live_database() {
     assert_eq!(file_paths(&live_db), ["old.rs"]);
     assert_no_restore_artifacts(&live_db);
 }
+
+#[test]
+fn a_backup_in_the_previous_index_layout_restores_to_the_current_one() {
+    let harness = RestoreHarness::new();
+    let live_db = harness.create_live_index("old.rs");
+    let source = harness.project.join("backup.db");
+    create_source(&source, "restored.rs");
+    // Older releases created `idx_symbols_file` and, before that, had no
+    // owner-lookup index at all.
+    Connection::open(&source)
+        .unwrap()
+        .execute_batch(
+            "CREATE INDEX idx_symbols_file ON symbols(file_id);
+             DROP INDEX idx_symbols_file_line_end;",
+        )
+        .unwrap();
+
+    assert_success(&harness.restore(&source));
+
+    assert_eq!(file_paths(&live_db), ["restored.rs"]);
+    let conn = Connection::open(&live_db).unwrap();
+    let index_exists = |name: &str| -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert!(index_exists("idx_symbols_file_line_end"));
+    assert!(!index_exists("idx_symbols_file"));
+    assert_no_restore_artifacts(&live_db);
+}
+

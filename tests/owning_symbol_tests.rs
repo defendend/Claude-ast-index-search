@@ -276,3 +276,29 @@ fn the_primary_root_is_found_under_either_spelling() {
     }
     assert_eq!(owner(Some("/work/shared"), "app/legacy.rb"), None);
 }
+
+#[test]
+fn a_fresh_database_leaves_out_the_prefix_of_the_owner_lookup_index() {
+    let conn = fresh_db();
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_symbols_file')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!exists);
+    // Per-file lookups and the cascade from `files` seek on its prefix.
+    let plan: Vec<String> = conn
+        .prepare("EXPLAIN QUERY PLAN SELECT name FROM symbols WHERE file_id = ?1")
+        .unwrap()
+        .query_map([1], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("idx_symbols_file_line_end (file_id=?)")),
+        "{plan:?}"
+    );
+}

@@ -4237,11 +4237,11 @@ fn create_secondary_indexes(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
             ON symbols(qualified_name) WHERE qualified_name IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
-        CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
         -- Covering index for find_owning_symbol: seeks straight to one file's
         -- symbols ordered by start line and reads end_line without touching
         -- the table, so "which symbol contains this line" stays a range scan
-        -- over a handful of index rows.
+        -- over a handful of index rows. Its file_id prefix also serves every
+        -- per-file lookup and the ON DELETE CASCADE from files.
         CREATE INDEX IF NOT EXISTS idx_symbols_file_line_end
             ON symbols(file_id, line, end_line);
         CREATE INDEX IF NOT EXISTS idx_module_deps_module ON module_deps(module_id);
@@ -4549,6 +4549,7 @@ struct OptionalIndexMigrations {
     drop_refs_name: bool,
     rewrite_qualified_name: bool,
     create_symbols_file_line_end: bool,
+    drop_symbols_file: bool,
 }
 
 impl OptionalIndexMigrations {
@@ -4558,8 +4559,14 @@ impl OptionalIndexMigrations {
             || self.drop_refs_name
             || self.rewrite_qualified_name
             || self.create_symbols_file_line_end
+            || self.drop_symbols_file
     }
 }
+
+/// `idx_symbols_file (file_id)` is the leftmost prefix of
+/// `idx_symbols_file_line_end`, so it only costs space. Dropped once its
+/// replacement exists, never before.
+const DROP_SYMBOLS_FILE_INDEX_SQL: &str = "DROP INDEX IF EXISTS idx_symbols_file";
 
 struct OpenMigrationPreflight {
     functional_migration_required: bool,
@@ -4624,6 +4631,7 @@ fn inspect_open_migrations(
         create_symbols_file_line_end: symbols_exists
             && symbols_current
             && !index_exists(conn, "idx_symbols_file_line_end")?,
+        drop_symbols_file: symbols_current && index_exists(conn, "idx_symbols_file")?,
     };
 
     Ok(OpenMigrationPreflight {
@@ -4663,6 +4671,10 @@ fn apply_optional_index_migrations(
     }
     if migrations.create_symbols_file_line_end {
         conn.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])?;
+    }
+    if migrations.drop_symbols_file {
+        conn.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])?;
+        conn.execute(DROP_SYMBOLS_FILE_INDEX_SQL, [])?;
     }
     Ok(())
 }
@@ -4737,6 +4749,8 @@ fn apply_open_migrations_transaction(
             .context("failed to create idx_symbols_qualified_name")?;
         tx.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])
             .context("failed to create idx_symbols_file_line_end")?;
+        tx.execute(DROP_SYMBOLS_FILE_INDEX_SQL, [])
+            .context("failed to drop idx_symbols_file")?;
     }
 
     tx.execute("DROP INDEX IF EXISTS idx_files_root_path_path", [])
@@ -5046,12 +5060,16 @@ fn cleanup_restore_staging(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Checked after the snapshot has been migrated, so an index a migration
+/// installs (`idx_symbols_file_line_end`) is required even of a backup taken
+/// before it existed, and one a migration drops (`idx_symbols_file`) must not
+/// be listed.
 const REQUIRED_RESTORE_INDEXES: &[&str] = &[
     "idx_files_path",
     "idx_symbols_name",
     "idx_symbols_qualified_name",
     "idx_symbols_kind",
-    "idx_symbols_file",
+    "idx_symbols_file_line_end",
     "idx_module_deps_module",
     "idx_module_deps_dep",
     "idx_inheritance_child",
