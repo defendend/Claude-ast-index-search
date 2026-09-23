@@ -31,7 +31,9 @@ modules ── module_deps
 
 metadata                         symbols ── external content ── symbols_fts
                                  symbols ── id match ── symbol_edges / symbol_metrics
-git_file_stats ── git_file_authors
+git_commits ── git_commit_changes ── git_paths
+   (fold of the live commits)
+   └──▶ git_file_stats ── git_file_authors
 ```
 
 The line between `subtrees.canonical_path` and `files.root_path` is a value
@@ -61,6 +63,9 @@ Every declared foreign key below uses `ON DELETE CASCADE`.
 | `subtrees` | `id INTEGER PK`, `name TEXT NN UQ`, `canonical_path TEXT NN UQ`, `original_path TEXT NN` | — |
 | `git_file_stats` | `path TEXT PK`, `commits`, `fix_commits`, `lines_added`, `lines_deleted` (`INTEGER NN DEFAULT 0`), `first_commit_at INTEGER`, `last_commit_at INTEGER`, `current_lines INTEGER` | — |
 | `git_file_authors` | `path TEXT NN`, `author TEXT NN` | `PRIMARY KEY(path, author)` |
+| `git_commits` | `id INTEGER PK`, `sha TEXT NN UQ`, `order_key INTEGER NN`, `live INTEGER NN`, `authored_at INTEGER`, `author TEXT`, `is_fix INTEGER` | — |
+| `git_paths` | `id INTEGER PK`, `hash INTEGER NN`, `path TEXT NN` | — |
+| `git_commit_changes` | `commit_id INTEGER NN`, `path_id INTEGER NN`, `kind INTEGER NN`, `from_path_id INTEGER`, `added INTEGER NN`, `deleted INTEGER NN` | `PRIMARY KEY(commit_id, path_id)`, `WITHOUT ROWID` |
 | `symbol_edges` | `source_id INTEGER NN`, `target_id INTEGER NN`, `confidence INTEGER NN`, `candidates INTEGER NN`, `ref_count INTEGER NN`, `line INTEGER NN` | `PRIMARY KEY(source_id, target_id)`, `WITHOUT ROWID` |
 | `symbol_metrics` | `symbol_id INTEGER PK`, `fan_in`, `fan_in_files`, `fan_in_ambiguous`, `fan_out`, `fan_out_ambiguous`, `dependents` (`INTEGER NN`), `pagerank REAL NN`, `pagerank_pct REAL NN` | — |
 
@@ -118,10 +123,34 @@ language-agnostic, and an inheritance parent may live outside the index.
 
 ### VCS history signals
 
-`git_file_stats` and `git_file_authors` hold per-file Git history collected
-on demand by `hotspots --collect`. `path` is relative to the project root, the
-same key space as `files.path`, but rows also exist for paths the indexer
-never parses and for deleted files (`current_lines IS NULL`).
+Git history is collected on demand by `hotspots --collect` into a per-commit
+store, and the per-file tables are derived from it.
+
+- `git_commits` has one row per commit the collector has seen, merges and
+  commits outside the project included. `live = 1` marks the commits the
+  collected HEAD reaches; the others are kept so switching back to a branch
+  does not re-read its diffs, until they outnumber `max(1000, live / 4)` and
+  are dropped all at once. `order_key` is the corrected commit date: the
+  committer date, raised to one past the latest parent's, so it never puts a
+  commit before its parent and does not depend on the range a commit was read
+  in. `authored_at`, `author` (lower-cased email) and `is_fix` (bugfix subject
+  heuristic) are `NULL` for commits that did not change the project.
+- `git_paths` interns project-relative paths; `hash` is a 64-bit FNV-1a of the
+  path, indexed instead of the text.
+- `git_commit_changes` records what a commit did to a path: `kind = 0` a
+  change of `path_id`, `1` a rename from `from_path_id` to `path_id`, `2`
+  `path_id` moved out of the project. `added` / `deleted` are numstat line
+  counts (0 for binary files).
+- `git_file_stats` and `git_file_authors` fold the live commits in
+  `(order_key, sha)` order, a rename handing the old path's history to the new
+  one. `path` is relative to the project root, the same key space as
+  `files.path`; rows exist only for paths present in the working tree,
+  including paths the indexer never parses.
+
+When HEAD moves, commits only the old HEAD reaches leave the live set, commits
+only the new HEAD reaches join it, and only the paths those commits touched
+(plus paths linked to them by renames) are refolded. The result equals a
+full collection at the same HEAD row for row.
 
 ### Symbol graph
 
@@ -172,7 +201,10 @@ keys:
 | `last_update_at` | Unix timestamp in milliseconds for the last completed file-index update. |
 | `index_update_dirty_at` | Unix timestamp in milliseconds marking an incremental update that may be partial; removed when completion is published. |
 | `last_modules_indexed_at` | Unix timestamp in milliseconds for completed module indexing. |
-| `git_signals_head`, `git_signals_repo_root`, `git_signals_scope`, `git_signals_collected_at`, `git_signals_commits` | Commit cursor and bookkeeping of the last `hotspots --collect`. |
+| `git_signals_head`, `git_signals_repo_root`, `git_signals_scope`, `git_signals_collected_at` | Commit cursor and bookkeeping of the last `hotspots --collect`. |
+| `git_signals_commits` | Live commits that changed the project (the analysed history). |
+| `git_signals_paths` | Paths that carry history once renames are followed, deleted ones included. |
+| `git_signals_store` | Layout of the per-commit store (`commits-v1`); history collected without it is recollected once. |
 | `symbol_graph_fingerprint` | Digest of `files`, `symbols`, `refs` and `inheritance` row counts, highest ids and summed file mtimes/sizes when the graph was built; a mismatch marks the graph stale. |
 | `symbol_graph_built_at` | Unix timestamp in milliseconds of the last `graph build`. |
 | `symbol_graph_summary` | JSON summary of the last build: edges and references per confidence level, references not linked per reason. |
@@ -207,6 +239,11 @@ The current explicit secondary indexes are:
   `idx_symbol_edges_target` on `(target_id, confidence)` for incoming-edge
   lookups (outgoing ones use the primary key). It is created with the table
   and dropped/recreated around each `graph build` bulk load.
+- Git history:
+  `idx_git_commit_changes_path` on `path_id`,
+  `idx_git_commit_changes_renames` (partial, `kind = 1`) on
+  `(commit_id, from_path_id, path_id)`, and
+  `idx_git_paths_hash` on `hash`.
 - Android data:
   `idx_xml_usages_class`,
   `idx_xml_usages_module`,

@@ -38,8 +38,8 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use super::git_signals::{
-    self, midrank_percentile, short_sha, FileHistory, HistoryAvailability, HistorySnapshot,
-    PERCENTILE_ELEVATED, PERCENTILE_HIGH,
+    self, midrank_percentile, serialize_round3_option, short_sha, FileHistory, HistoryAvailability,
+    HistorySnapshot, PERCENTILE_ELEVATED, PERCENTILE_HIGH,
 };
 use super::graph::DEPENDENTS_DEPTH;
 use super::PathResolver;
@@ -509,8 +509,10 @@ pub struct Component {
 #[derive(Clone, Debug, Serialize)]
 pub struct Dossier {
     /// Preset score 0..1; `null` when the candidate could not be scored.
+    #[serde(serialize_with = "serialize_round3_option")]
     pub score: Option<f64>,
     /// The key the tier is sorted by: weighted blend of score and relevance.
+    #[serde(serialize_with = "serialize_round3_option")]
     pub blended: Option<f64>,
     /// 1-based position in the plain relevance order of the pool; absent for
     /// files, whose path matches have no relevance order.
@@ -585,7 +587,7 @@ fn score(
     history: Option<&FileHistory>,
     graph: Option<&GraphDossier>,
 ) -> Option<(f64, Vec<Component>)> {
-    let hot = history.map(|history| f64::from(history.hotspot.score) / 100.0);
+    let hot = history.map(|history| history.hotspot.score_exact / 100.0);
     let components = match preset {
         Preset::Hotspots => vec![Component {
             name: "hotspot",
@@ -601,11 +603,11 @@ fn score(
                 },
                 Component {
                     name: "age",
-                    value: f64::from(history.hotspot.age_pct) / 100.0,
+                    value: history.hotspot.age_pct_exact / 100.0,
                 },
                 Component {
                     name: "idle",
-                    value: f64::from(history.idle_pct) / 100.0,
+                    value: history.idle_pct_exact / 100.0,
                 },
                 Component {
                     name: "used",
@@ -718,9 +720,8 @@ fn order<T>(candidates: &mut [Candidate<T>], grading: Grading) {
         };
         *position += 1;
         if let Some(score) = candidate.dossier.score {
-            candidate.dossier.blended = Some(round3(
-                PRESET_WEIGHT * score + (1.0 - PRESET_WEIGHT) * relevance,
-            ));
+            candidate.dossier.blended =
+                Some(PRESET_WEIGHT * score + (1.0 - PRESET_WEIGHT) * relevance);
         }
     }
     let hard_tier = |candidate: &Candidate<T>| match grading {
@@ -997,7 +998,7 @@ fn fill(
     }
     if dossier.unscored.is_none() {
         if let Some((value, components)) = score(ctx.preset, history, graph.as_ref()) {
-            dossier.score = Some(round3(value));
+            dossier.score = Some(value);
             dossier.components = components;
         }
     }
@@ -1063,6 +1064,9 @@ pub struct GraphSummary {
 pub struct PoolSummary {
     pub symbols: usize,
     pub files: usize,
+    /// `--exclude-tests`: test files were left out of the pool and the totals.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tests_excluded: bool,
 }
 
 /// The `rank` object of a ranked search report.
@@ -1166,8 +1170,14 @@ pub fn render_header(summary: &RankSummary) -> Vec<String> {
     }
     lines.push(
         format!(
-            "Re-ranked the top {} project symbol(s) and {} project file(s) by relevance; an exact name stays above a partial one, third-party code goes last.",
-            summary.pool.symbols, summary.pool.files
+            "Re-ranked the top {} project symbol(s) and {} project file(s) by relevance{}; an exact name stays above a partial one, third-party code goes last.",
+            summary.pool.symbols,
+            summary.pool.files,
+            if summary.pool.tests_excluded {
+                ", test files left out"
+            } else {
+                ""
+            }
         )
         .dimmed()
         .to_string(),

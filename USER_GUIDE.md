@@ -188,6 +188,12 @@ index fresh automatically. A manual `update` is still a good habit after a large
 checkout, rebase, or branch switch because it reconciles the full file list with
 the database.
 
+Collected Git history (`hotspots --collect`) is not refreshed by `update`. Run
+`ast-index hotspots --collect` again after switching: it subtracts the commits
+the new `HEAD` no longer reaches and adds the new ones, reusing diffs it has
+read before, so a branch switch or a rebase costs about a second instead of a
+full rescan, and the numbers match a fresh `hotspots --collect --full`.
+
 Use `rebuild` instead of `update` when:
 
 - the project root or `.ast-index.yaml` changed significantly;
@@ -502,6 +508,7 @@ ast-index search Service --fuzzy --module app/services/ --rank proven   # what t
 ast-index search Merge --rank risky                       # what is dangerous to touch
 ast-index search Import --module app/services/ --rank hotspots          # where it keeps breaking
 ast-index search Event --module app/models/ --rank central
+ast-index search Import --rank hotspots --exclude-tests   # without spec/test files
 ast-index --format json search Merge --rank risky         # dossier per result
 ```
 
@@ -517,7 +524,9 @@ live files of the repository, graph percentiles against all symbols with at
 least one resolved caller.
 
 - `hotspots` = the file's hotspot score: mean percentile of commits, churn and
-  bugfix ratio — the same number `ast-index hotspots` prints.
+  bugfix ratio — the number `ast-index hotspots` prints rounded (`score`) and
+  in full (`score_exact` in JSON). Presets use the unrounded percentiles, so
+  files that share a rounded score near the top still order meaningfully.
 - `proven` = mean of four terms: *calm* (1 − hotspot score), *age* (file age
   percentile), *idle* (percentile of days since the file last changed) and
   *used* (1 when at least one resolved reference points at the symbol, else 0).
@@ -591,6 +600,14 @@ last `hotspots --collect`) and files of attached subtrees (history covers the
 primary root only) keep their relevance order after the scored results of
 their tier, marked `unscored`.
 
+**Test files.** Specs churn and get fixed by nature, so they crowd the top of
+`hotspots` and `risky`. `--exclude-tests` leaves them out of the ranked files
+and symbols sections and their totals (the same test-path rule as `graph top
+--exclude-tests`: `spec/`, `test/`, `tests/`, `__tests__/`, `_spec.`, `_test.`,
+`.spec.`, `.test.`). Percentiles are still computed against every file, so a
+file's score does not change with the flag; `hotspots --exclude-tests` works
+the same way.
+
 **Output.** Each file and symbol carries its dossier: the preset score and its
 terms, the relevance position and tier, the raw history numbers with their
 percentiles and labels (`churn:high`, `fixes:elevated`, `authors:many`,
@@ -599,6 +616,12 @@ percentiles and labels (`churn:high`, `fixes:elevated`, `authors:many`,
 references point at it). In JSON, `files` become objects `{path, rank}` and
 symbols gain a `rank` object; the top-level `rank` object carries the preset,
 formula, evidence summary, pool sizes and weight.
+
+`rewritten-often` (churn relative to the file's current size, top 10%) is only
+computed for files of 10 lines or more. Below that a line count stops measuring
+content: a one-line minified bundle or fixture, or a view gutted to a mount
+point, would read as "3000x file", and a routine one-line edit already moves a
+three-line file by a third. Such files keep their absolute churn labels.
 
 **Known limits.** When a query's exact-name tier fills the page (`search
 Policy` in a code base full of `POLICY` constants), a preset can only re-order

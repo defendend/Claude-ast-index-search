@@ -200,6 +200,7 @@ fn tool_descriptors() -> Vec<Value> {
                     "module":       { "type": "string",  "description": "Restrict to files whose path starts with this prefix." },
                     "fuzzy":        { "type": "boolean", "description": "Enable typo-tolerant fuzzy matching." },
                     "rank":         { "type": "string",  "enum": ["proven", "hotspots", "risky", "central"], "description": "Re-order files and symbols by Git history and the dependency graph, evidence next to each result. proven: safest to copy as a pattern (calm, old, untouched, used); risky: dangerous to change (many dependents × unstable history); hotspots: keeps being changed and fixed; central: what the code leans on. Exact-name matches stay first. Needs collected history (all but central: `ast-index hotspots --collect` in a shell) and the symbol graph (all but hotspots: `graph_build`); if missing, results stay in plain order and say what to run." },
+                    "exclude_tests": { "type": "boolean", "description": "With `rank`: leave test files (spec/, tests/, *_test.*, *.spec.*) out of the ranked files and symbols; they otherwise crowd the top of `hotspots` and `risky`." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional if the server was started with --root or AST_INDEX_ROOT." },
                     "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
                 },
@@ -576,6 +577,7 @@ fn tool_descriptors() -> Vec<Value> {
                     "sort":         { "type": "string",  "enum": ["score", "commits", "churn", "relative-churn", "fixes", "authors", "recent"], "description": "Ranking key (default score = mean percentile of commits, churn and bugfix ratio)." },
                     "path":         { "type": "string",  "description": "Only files whose path starts with this prefix." },
                     "min_commits":  { "type": "integer", "description": "Skip files with fewer commits (default 1)." },
+                    "exclude_tests": { "type": "boolean", "description": "Leave test files out of the list (percentiles still rank every file). Spec files churn by nature and crowd the top otherwise." },
                     "limit":        { "type": "integer", "description": "Max files (default 20)." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
                     "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact). 'json' = raw CLI JSON." }
@@ -703,6 +705,18 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
                 }
                 argv.push("--rank".into());
                 argv.push(preset.into());
+            }
+            if arguments
+                .get("exclude_tests")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                if arguments.get("rank").and_then(Value::as_str).is_none() {
+                    return Err(anyhow!(
+                        "'exclude_tests' applies to ranked search; add 'rank'"
+                    ));
+                }
+                argv.push("--exclude-tests".into());
             }
         }
         "outline" => {
@@ -920,6 +934,7 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             push_if_num(&mut argv, arguments, "min_commits", "--min-commits");
             push_if_str(&mut argv, arguments, "path", "--path");
             push_if_str(&mut argv, arguments, "sort", "--sort");
+            push_if_flag(&mut argv, arguments, "exclude_tests", "--exclude-tests");
         }
         other => return Err(anyhow!("unknown tool: {other}")),
     }
@@ -1433,6 +1448,41 @@ mod tests {
                 "json"
             ]
         );
+    }
+
+    #[test]
+    fn hotspots_forwards_exclude_tests() {
+        let argv = build_argv("hotspots", &json!({"exclude_tests": true})).unwrap();
+        assert_eq!(
+            argv,
+            vec!["hotspots", "--exclude-tests", "--format", "json"]
+        );
+        let argv = build_argv("hotspots", &json!({"exclude_tests": false})).unwrap();
+        assert!(!argv.contains(&"--exclude-tests".to_string()));
+    }
+
+    #[test]
+    fn search_exclude_tests_needs_a_preset() {
+        let argv = build_argv(
+            "search",
+            &json!({"query": "Merge", "rank": "risky", "exclude_tests": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "search",
+                "Merge",
+                "--rank",
+                "risky",
+                "--exclude-tests",
+                "--format",
+                "json"
+            ]
+        );
+        let err =
+            build_argv("search", &json!({"query": "Merge", "exclude_tests": true})).unwrap_err();
+        assert!(err.to_string().contains("add 'rank'"), "{err}");
     }
 
     #[test]

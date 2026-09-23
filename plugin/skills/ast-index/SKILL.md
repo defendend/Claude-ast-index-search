@@ -115,6 +115,7 @@ is not "where is X" but "which of these X":
 ast-index search Service --fuzzy --module app/services/ --rank proven  # safe to copy as a pattern
 ast-index search Merge --rank risky                   # dangerous to touch: many dependents + unstable history
 ast-index search Import --rank hotspots               # keeps being changed and fixed
+ast-index search Import --rank hotspots --exclude-tests  # same, spec/test files left out
 ast-index search Event --module app/models/ --rank central  # what the rest leans on (PageRank)
 ast-index --format json search Merge --rank risky     # rank.applied / rank.missing + per-result dossier
 ```
@@ -370,7 +371,8 @@ report changed symbols or include staged/unstaged working-tree-only edits.
 
 **`hotspots`** - Rank files by what their Git history says about them: commit
 count, churn (added + deleted lines, and churn relative to the file's current
-size), bugfix share, distinct authors, age, and time since the last change.
+size for files of 10+ lines), bugfix share, distinct authors, age, and time
+since the last change.
 Use it when choosing which of several similar files to copy a pattern from, or
 when scoping a refactor: a file with 28 commits and 54% bugfixes is not the
 same as one written once and untouched for 86 days.
@@ -383,22 +385,30 @@ always printed next to the label.
 ast-index hotspots --collect                   # Read new Git history, then report
 ast-index hotspots --limit 50 --sort fixes     # Report only; no Git subprocess
 ast-index hotspots --path src/parsers          # Narrow output; percentiles stay global
+ast-index hotspots --exclude-tests             # Hide spec/test files; percentiles stay global
 ast-index hotspots --collect --full            # Discard the cursor, rescan everything
 ast-index --format json hotspots --limit 10    # Paginated JSON schema v2
 ```
 
 Collection is never implicit: `rebuild` and `update` do not run it. The first
-`--collect` walks the whole history; later runs resume from a stored commit
-cursor. When that cursor stops being an ancestor of `HEAD` (branch switch,
-rebase, force-push, garbage-collected object) the run says so and recollects
-from scratch rather than reporting stale numbers.
+`--collect` walks the whole history into a per-commit store; later runs move it
+to the current `HEAD` by set difference — commits `HEAD` no longer reaches
+(branch switch, rebase, reset, force-push) are subtracted, new ones are added —
+so switching branches costs time proportional to the commits that differ, and
+switching back re-reads nothing. The numbers always equal a full recollection
+at that `HEAD`. Only a garbage-collected cursor commit, a changed project root
+or `--full` rebuild from scratch.
 
-Labels: `churn:high` / `churn:elevated`, `rewritten-often`, `fixes:high` /
+Labels: `churn:high` / `churn:elevated`, `rewritten-often` (relative churn,
+only for files of 10+ lines: below that a line count no longer measures
+content — one-line bundles, fixtures, gutted views), `fixes:high` /
 `fixes:elevated` (only for files with 4+ commits), `authors:many`, `veteran`.
 `--sort` takes `score` (default), `commits`, `churn`, `relative-churn`,
-`fixes`, `authors`, `recent`. Bugfix detection is a commit-subject heuristic
-(English and Russian, tracker key stripped first); merge commits are excluded
-and renames carry history onto the new path.
+`fixes`, `authors`, `recent`. `score` is printed rounded; the order (and
+`score_exact` in JSON) uses the unrounded mean of the percentiles, so the top
+of a large repository does not collapse into ties. Bugfix detection is a
+commit-subject heuristic (English and Russian, tracker key stripped first);
+merge commits are excluded and renames carry history onto the new path.
 
 ### Public API
 

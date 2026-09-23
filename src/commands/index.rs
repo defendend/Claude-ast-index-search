@@ -14,12 +14,52 @@ use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 
+use super::graph::is_test_path;
 use super::rank::{self, PoolSummary, Preset, RankContext, RankSummary, RankedFile, RankedSymbol};
 use super::{
     print_truncation_notice, relative_path, search_files_page, Page, Pagination, PathResolver,
     PAGINATED_JSON_SCHEMA_VERSION,
 };
 use crate::db::{self, SearchScope};
+
+/// Matches read per section when `search --rank --exclude-tests` filters
+/// test files out: the path test runs in Rust, so the section is read whole
+/// (up to this many rows) to keep its pool and total exact.
+const EXCLUDE_TESTS_SCAN: usize = 50_000;
+
+/// One ranked section with test files left out: the project candidates to
+/// re-rank, the third-party ones to append when the page is not full, and
+/// how many matches remain.
+struct TestlessSection<T> {
+    project: Vec<T>,
+    vendor: Vec<T>,
+    total: usize,
+}
+
+fn without_tests<T>(
+    scanned: Vec<T>,
+    path: impl Fn(&T) -> &str,
+    sql_total: usize,
+    pool: usize,
+    probe: usize,
+) -> TestlessSection<T> {
+    let read = scanned.len();
+    let kept: Vec<T> = scanned
+        .into_iter()
+        .filter(|item| !is_test_path(path(item)))
+        .collect();
+    // Matches past the scan cap were never looked at; counting them as they
+    // are keeps the total an upper bound instead of an undercount.
+    let total = kept.len() + sql_total.saturating_sub(read);
+    let (vendor, project): (Vec<T>, Vec<T>) = kept
+        .into_iter()
+        .partition(|item| db::is_vendor_path(path(item)));
+    TestlessSection {
+        project: project.into_iter().take(pool).collect(),
+        vendor: vendor.into_iter().take(probe).collect(),
+        total,
+    }
+}
 
 fn symbol_display_name(symbol: &db::SearchResult) -> &str {
     symbol.display_name()
@@ -53,8 +93,10 @@ pub fn cmd_search(
     scope: &SearchScope,
     fuzzy: bool,
     rank: Option<&str>,
+    exclude_tests: bool,
 ) -> Result<()> {
     let preset = rank.map(Preset::parse).transpose()?;
+    let exclude_tests = exclude_tests && preset.is_some();
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -75,8 +117,8 @@ pub fn cmd_search(
     let mut content_matches: Vec<(String, usize, String)> = vec![];
 
     let mut seen_content = std::collections::HashSet::new();
-    let files_total = db::count_files_with_roots_terms_scoped(&conn, &terms, scope)?;
-    let symbols_total =
+    let mut files_total = db::count_files_with_roots_terms_scoped(&conn, &terms, scope)?;
+    let mut symbols_total =
         db::count_search_symbol_terms_scoped(&conn, &terms, kind_filter, scope, fuzzy)?;
     let refs_total = db::count_search_ref_terms_scoped(&conn, &terms, scope)?;
 
@@ -89,7 +131,43 @@ pub fn cmd_search(
     // preset instead needs a pool of project candidates to re-rank: it lists
     // third-party candidates after every project one, so they must not use
     // up the pool and are only fetched when the page is not full without them.
-    let (files, mut symbols) = if ranking.is_some() {
+    let mut vendor_files: Option<Vec<db::FileResult>> = None;
+    let mut vendor_symbols: Option<Vec<(i64, db::SearchResult)>> = None;
+    let (files, mut symbols) = if exclude_tests {
+        let files = without_tests(
+            db::find_files_with_roots_terms_filtered(
+                &conn,
+                &terms,
+                EXCLUDE_TESTS_SCAN,
+                scope,
+                None,
+            )?,
+            |file| file.path.as_str(),
+            files_total,
+            Preset::file_pool(limit),
+            probe_limit,
+        );
+        let symbols = without_tests(
+            db::search_symbol_terms_scoped_with_ids(
+                &conn,
+                &terms,
+                kind_filter,
+                EXCLUDE_TESTS_SCAN,
+                scope,
+                fuzzy,
+                None,
+            )?,
+            |(_, symbol)| symbol.path.as_str(),
+            symbols_total,
+            Preset::symbol_pool(limit),
+            probe_limit,
+        );
+        files_total = files.total;
+        symbols_total = symbols.total;
+        vendor_files = Some(files.vendor);
+        vendor_symbols = Some(symbols.vendor);
+        (files.project, symbols.project)
+    } else if ranking.is_some() {
         (
             db::find_files_with_roots_terms_filtered(
                 &conn,
@@ -185,24 +263,30 @@ pub fn cmd_search(
         let pool = PoolSummary {
             symbols: symbols.len(),
             files: files.len(),
+            tests_excluded: exclude_tests,
         };
         let mut files = files;
         if files.len() < limit {
-            files.extend(
-                db::find_files_with_roots_terms_filtered(
+            let vendor = match vendor_files {
+                Some(vendor) => vendor,
+                None => db::find_files_with_roots_terms_filtered(
                     &conn,
                     &terms,
                     probe_limit,
                     scope,
                     Some(true),
-                )?
-                .into_iter()
-                .filter(|f| resolver.matches_filter(f.root_path.as_deref())),
+                )?,
+            };
+            files.extend(
+                vendor
+                    .into_iter()
+                    .filter(|f| resolver.matches_filter(f.root_path.as_deref())),
             );
         }
         if symbols.len() < limit {
-            symbols.extend(
-                db::search_symbol_terms_scoped_with_ids(
+            let vendor = match vendor_symbols {
+                Some(vendor) => vendor,
+                None => db::search_symbol_terms_scoped_with_ids(
                     &conn,
                     &terms,
                     kind_filter,
@@ -210,9 +294,12 @@ pub fn cmd_search(
                     scope,
                     fuzzy,
                     Some(true),
-                )?
-                .into_iter()
-                .filter(|(_, s)| resolver.matches_filter(s.root_path.as_deref())),
+                )?,
+            };
+            symbols.extend(
+                vendor
+                    .into_iter()
+                    .filter(|(_, s)| resolver.matches_filter(s.root_path.as_deref())),
             );
         }
         // Ranking reads history by the stored, root-relative path, so paths
