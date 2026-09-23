@@ -90,8 +90,16 @@ has a useful signature.
 `symbols.line` is the 1-based line where the definition starts; `end_line` is
 the 1-based inclusive line where it ends, so a class range encloses the ranges
 of its own methods. `end_line` is nullable: only parsers that report a range
-fill it (currently Ruby and TypeScript/JavaScript), every other language
-stores `NULL`. Existing databases gain the column through an `ALTER TABLE` on
+fill it. Every tree-sitter parser does except CSS, SCSS and Less; the regex
+parsers (Perl, WSDL/XSD, Vue and Svelte script blocks) store `NULL`. Within a
+ranged language a few symbols still store `NULL`: 1C `#Область` regions, which
+fold code without scoping it, and SQL `CREATE DOMAIN` statements. The range
+starts at `line`, the declaration line, so decorators, annotations and
+attributes written above a declaration fall outside it; they are indexed as
+`annotation` symbols with ranges of their own. A declaration that scopes the
+rest of its file without enclosing it in the syntax tree — a C#
+`namespace A.B;`, a PHP `namespace A\B;`, a GDScript `class_name` — ends where
+its scope does. Existing databases gain the column through an `ALTER TABLE` on
 open and keep `NULL` until the affected files are re-indexed, so consumers must
 treat `NULL` as "range unknown" rather than an error.
 
