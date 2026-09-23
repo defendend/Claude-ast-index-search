@@ -273,3 +273,47 @@ fn call_tree_spends_the_limit_on_calls_inside_the_file_filter() {
         )
     );
 }
+
+/// Two components wrapped in a higher-order function on their `export
+/// default` line, one declared above it and one written inline.
+#[test]
+fn call_tree_names_a_wrapped_default_export_after_what_it_wraps() {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(project.path().join("package.json"), "{}\n").unwrap();
+    fs::write(
+        src.join("Header.jsx"),
+        concat!(
+            "import { withLocale } from 'locale';\n",
+            "\n",
+            "const Header = ({ title }) => <h1>{title}</h1>;\n",
+            "\n",
+            "export default withLocale(Header);\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        src.join("Card.jsx"),
+        concat!(
+            "import { withLocale } from 'locale';\n",
+            "\n",
+            "export default withLocale(({ locale }) => (\n",
+            "  <div>{locale}</div>\n",
+            "));\n",
+        ),
+    )
+    .unwrap();
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    let output = run(project.path(), cache.path(), &["call-tree", "withLocale"]);
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "Call tree for 'withLocale':\n",
+            "  withLocale\n",
+            "    ← Card (src/Card.jsx:3)\n",
+            "    ← default(Header) (src/Header.jsx:5)\n",
+        )
+    );
+}

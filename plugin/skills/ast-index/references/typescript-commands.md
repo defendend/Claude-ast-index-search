@@ -234,6 +234,23 @@ export { default as Button } from './Button';
 
 Use `ast-index exports "index.ts"` to see all exports with line numbers.
 
+### Default exports
+
+A default export is indexed under the name the module's code goes by:
+
+| Code | Symbol |
+|------|--------|
+| `export default function useMap() {}`, `export default class Widget {}` | `useMap`, `Widget` — the declared name |
+| `export default () => {}`, `function () {}`, `class {}` in `hooks/useMap.js` | `useMap` — the file name; an `index` file takes its directory's (`Button/index.jsx` → `Button`) |
+| `export default forwardRef((props, ref) => {})` | the file name, as above |
+| `export default memo(Button)`, `connect(mapState)(Button)`, `compose(a, b)(Button)` | `default(Button)` [object] — what the call wraps, never the wrapper |
+| `export default Button` | `default(Button)` [object] |
+| `export default { … }` | `default` [object] |
+| `export default createRouter({ … })` | `createRouter` — the call builds a value rather than wraps one |
+
+The symbol spans the whole exported expression, so the wrapper call and the
+calls inside an inline component are attributed to it in `call-tree`.
+
 ## TypeScript-Specific
 
 ### Type Aliases

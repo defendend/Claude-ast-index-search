@@ -928,10 +928,36 @@ impl LanguageParser for TypeScriptParser {
                             });
                         }
                     }
-                    // export default someCall(...) or export default defineComponent(...)
-                    "call_expression" => {
-                        if let Some(func_node) = node.child_by_field_name("function") {
-                            let name = node_text(content, &func_node);
+                    // A higher-order call is named after what it wraps. Named after the
+                    // wrapper, every file applying `injectIntl` claimed a definition of
+                    // it, and the call on that line made `injectIntl` its own caller.
+                    "call_expression" => match wrapped_value(*node) {
+                        // export default memo(Button) / connect(mapState)(Button)
+                        Some(wrapped) if wrapped.kind() == "identifier" => {
+                            let name = format!("default({})", node_text(content, &wrapped));
+                            if emitted_lines.insert((name.clone(), line)) {
+                                symbols.push(ParsedSymbol {
+                                    name,
+                                    kind: SymbolKind::Object,
+                                    line,
+                                    signature: sig,
+                                    parents: vec![],
+                                    end_line: Some(node_end_line(node)),
+                                });
+                            }
+                        }
+                        // export default forwardRef((props, ref) => {})
+                        Some(wrapped) => push_anonymous_default(
+                            content,
+                            &wrapped,
+                            node,
+                            sig,
+                            &mut symbols,
+                            &mut emitted_lines,
+                        ),
+                        // export default createRouter({...}) / defineComponent({...})
+                        None => {
+                            let name = node_text(content, &root_callee(*node));
                             if emitted_lines.insert((name.to_string(), line)) {
                                 symbols.push(ParsedSymbol {
                                     name: name.to_string(),
@@ -943,24 +969,17 @@ impl LanguageParser for TypeScriptParser {
                                 });
                             }
                         }
-                    }
+                    },
                     // export default () => {} / function () {} / class {}
                     "arrow_function" | "function_expression" | "generator_function" | "class" => {
-                        let (kind, parents) = if node.kind() == "class" {
-                            (SymbolKind::Class, extract_class_parents(content, node))
-                        } else {
-                            (SymbolKind::Function, vec![])
-                        };
-                        if emitted_lines.insert((ANONYMOUS_DEFAULT_EXPORT.to_string(), line)) {
-                            symbols.push(ParsedSymbol {
-                                name: ANONYMOUS_DEFAULT_EXPORT.to_string(),
-                                kind,
-                                line,
-                                signature: sig,
-                                parents,
-                                end_line: Some(node_end_line(node)),
-                            });
-                        }
+                        push_anonymous_default(
+                            content,
+                            node,
+                            node,
+                            sig,
+                            &mut symbols,
+                            &mut emitted_lines,
+                        )
                     }
                     // A named `export default function f() {}` or `class F {}` is a
                     // declaration, not a value, and the declaration patterns emit it.
@@ -1059,6 +1078,76 @@ fn classify_function_name(name: &str) -> SymbolKind {
     } else {
         SymbolKind::Function
     }
+}
+
+/// Pushes the placeholder symbol for an anonymous default-exported function or
+/// class `value`, ranged over `export` — the value itself, or the call that
+/// wraps it.
+fn push_anonymous_default(
+    content: &str,
+    value: &tree_sitter::Node,
+    export: &tree_sitter::Node,
+    signature: String,
+    symbols: &mut Vec<ParsedSymbol>,
+    emitted_lines: &mut HashSet<(String, usize)>,
+) {
+    let line = node_line(export);
+    if !emitted_lines.insert((ANONYMOUS_DEFAULT_EXPORT.to_string(), line)) {
+        return;
+    }
+    let (kind, parents) = if value.kind() == "class" {
+        (SymbolKind::Class, extract_class_parents(content, value))
+    } else {
+        (SymbolKind::Function, vec![])
+    };
+    symbols.push(ParsedSymbol {
+        name: ANONYMOUS_DEFAULT_EXPORT.to_string(),
+        kind,
+        line,
+        signature,
+        parents,
+        end_line: Some(node_end_line(export)),
+    });
+}
+
+/// What a higher-order call wraps: `Button` in `memo(Button)`,
+/// `connect(mapState)(Button)`, `compose(a, b)(Button)` or
+/// `memo(injectIntl(Button))`, and the inline function or class in
+/// `forwardRef((props, ref) => …)`. It is the first argument, looked into
+/// through nested calls. Any other first argument — `createRouter({ … })`,
+/// `connect(null, actions)` — means the call builds a value rather than wraps
+/// one, and there is nothing to name the export after.
+fn wrapped_value(call: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let arguments = call
+        .child_by_field_name("arguments")
+        .filter(|arguments| arguments.kind() == "arguments")?;
+    let mut cursor = arguments.walk();
+    let first = arguments
+        .named_children(&mut cursor)
+        .find(|argument| argument.kind() != "comment")?;
+    let first = unwrap_ref_expr(first);
+    match first.kind() {
+        "identifier"
+        | "arrow_function"
+        | "function_expression"
+        | "generator_function"
+        | "class" => Some(first),
+        "call_expression" => wrapped_value(first),
+        _ => None,
+    }
+}
+
+/// The function a possibly curried call starts from: `connect` in
+/// `connect(a)(b)`, `styled` in ``styled(Button)`…` ``.
+fn root_callee(call: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    let mut callee = call;
+    while callee.kind() == "call_expression" {
+        match callee.child_by_field_name("function") {
+            Some(function) => callee = function,
+            None => break,
+        }
+    }
+    callee
 }
 
 /// Placeholder name [`TypeScriptParser`] gives an anonymous `export default`
@@ -1878,6 +1967,131 @@ declare function internalHelper(): void;
                 "{content}: {symbols:?}"
             );
             assert!(!symbols.iter().any(|s| s.name == "router"), "{symbols:?}");
+        }
+    }
+
+    fn ranged_symbols(content: &str) -> Vec<(String, SymbolKind, usize, Option<usize>)> {
+        TYPESCRIPT_PARSER
+            .parse_symbols(content)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.name, s.kind, s.line, s.end_line))
+            .collect()
+    }
+
+    #[test]
+    fn hoc_default_export_is_named_after_the_wrapped_identifier() {
+        for (content, wrapped, end) in [
+            ("export default injectIntl(Header);\n", "Header", 1),
+            ("export default memo(Button, areEqual);\n", "Button", 1),
+            ("export default React.memo(injectIntl(Card));\n", "Card", 1),
+            (
+                "export default connect(mapState, mapDispatch)(Page);\n",
+                "Page",
+                1,
+            ),
+            (
+                "export default connect((state) => ({ a: state.a }))(Page);\n",
+                "Page",
+                1,
+            ),
+            (
+                "export default compose(\n  withRouter,\n  connect\n)(Page);\n",
+                "Page",
+                4,
+            ),
+        ] {
+            assert_eq!(
+                ranged_symbols(content),
+                vec![(
+                    format!("default({wrapped})"),
+                    SymbolKind::Object,
+                    1,
+                    Some(end)
+                )],
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn hoc_default_export_leaves_the_wrapped_declaration_alone() {
+        let content = "const Header = () => null;\n\nexport default injectIntl(Header);\n";
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        let named = symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.line))
+            .collect::<Vec<_>>();
+        assert_eq!(named, vec![("Header", 1), ("default(Header)", 3)]);
+    }
+
+    #[test]
+    fn hoc_wrapping_an_inline_value_is_an_anonymous_default() {
+        let cases = [
+            (
+                "export default forwardRef((props, ref) => {\n  return render(ref);\n});\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default injectIntl(({ intl }) => (\n  <div>{intl.locale}</div>\n));\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default memo(function () {\n  return null;\n});\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default observer(class extends Component {\n  render() {}\n});\n",
+                SymbolKind::Class,
+            ),
+        ];
+        for (content, kind) in cases {
+            assert_eq!(
+                anonymous_default(content),
+                vec![(kind, 1, Some(3))],
+                "{content}"
+            );
+        }
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(cases[3].0).unwrap();
+        let class = symbols
+            .iter()
+            .find(|s| s.name == ANONYMOUS_DEFAULT_EXPORT)
+            .unwrap();
+        assert_eq!(
+            class.parents,
+            vec![("Component".to_string(), "extends".to_string())]
+        );
+
+        let mut symbols = TYPESCRIPT_PARSER.parse_symbols(cases[1].0).unwrap();
+        name_default_export(&mut symbols, "src/components/Card.jsx");
+        assert_eq!(symbols[0].name, "Card");
+        assert_eq!(symbols[0].kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn default_export_of_a_built_value_keeps_the_callee_name() {
+        for (content, name) in [
+            ("export default createRouter({ routes });\n", "createRouter"),
+            ("export default connect(null, actions);\n", "connect"),
+            ("export default createStore();\n", "createStore"),
+            (
+                "export default defineStore('auth', () => ({}));\n",
+                "defineStore",
+            ),
+            (
+                "export default styled(Button)`\n  color: red;\n`;\n",
+                "styled",
+            ),
+        ] {
+            let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+            assert_eq!(
+                symbols
+                    .iter()
+                    .map(|s| (s.name.as_str(), s.kind))
+                    .collect::<Vec<_>>(),
+                vec![(name, SymbolKind::Function)],
+                "{content}"
+            );
         }
     }
 
