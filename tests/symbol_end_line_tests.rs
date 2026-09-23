@@ -717,3 +717,43 @@ fn scala_class_object_and_methods_get_ranges() {
     assert_eq!(span(&conn, "function", "top"), (18, 19));
     assert_all_ranges_filled(&conn);
 }
+
+#[test]
+fn dart_class_methods_and_function_get_ranges() {
+    let conn = index_single(
+        "lib/greeter.dart",
+        concat!(
+            "import 'base.dart';\n",
+            "\n",
+            "class Greeter extends Base {\n",
+            "  final int count = 0;\n",
+            "\n",
+            "  String hello() {\n",
+            "    return greet();\n",
+            "  }\n",
+            "\n",
+            "  void bye() {\n",
+            "    run();\n",
+            "  }\n",
+            "}\n",
+            "\n",
+            "void top() {\n",
+            "  void local() {\n",
+            "    run();\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+
+    let class = span(&conn, "class", "Greeter");
+    assert_eq!(class, (3, 13));
+    // The body is a sibling of the signature in the grammar.
+    assert_eq!(span(&conn, "function", "hello"), (6, 8));
+    assert_eq!(span(&conn, "function", "bye"), (10, 12));
+    assert_encloses(class, span(&conn, "function", "hello"));
+    assert_encloses(class, span(&conn, "function", "bye"));
+    let top = span(&conn, "function", "top");
+    assert_eq!(top, (15, 19));
+    assert_encloses(top, span(&conn, "function", "local"));
+    assert_all_ranges_filled(&conn);
+}

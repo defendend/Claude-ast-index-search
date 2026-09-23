@@ -5,7 +5,8 @@ use std::sync::LazyLock;
 use tree_sitter::{Language, Node};
 
 use super::{
-    line_text, node_line, node_text, parse_tree, walk_tree_preorder, LanguageParser, WalkControl,
+    line_text, node_line, node_text, parse_tree, text_end_line, walk_tree_preorder, LanguageParser,
+    WalkControl,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -129,7 +130,7 @@ fn extract_import(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
             line,
             signature: sig,
             parents: vec![],
-            end_line: None,
+            end_line: Some(text_end_line(content, node)),
         });
     }
 }
@@ -168,7 +169,7 @@ fn extract_top_level_variable_decl(node: &Node, content: &str, symbols: &mut Vec
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line: Some(text_end_line(content, &child)),
                     });
                 }
             }
@@ -184,7 +185,7 @@ fn extract_top_level_variable_decl(node: &Node, content: &str, symbols: &mut Vec
                             line,
                             signature: line_text(content, line).trim().to_string(),
                             parents: vec![],
-                            end_line: None,
+                            end_line: Some(text_end_line(content, &id)),
                         });
                     }
                 }
@@ -223,7 +224,7 @@ fn extract_misparsed_typedef(node: &Node, content: &str, symbols: &mut Vec<Parse
                                     line,
                                     signature: sig.clone(),
                                     parents: vec![],
-                                    end_line: None,
+                                    end_line: Some(text_end_line(content, node)),
                                 });
                             }
                             break;
@@ -272,7 +273,7 @@ fn extract_class(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
         line,
         signature: sig,
         parents,
-        end_line: None,
+        end_line: Some(text_end_line(content, node)),
     });
 }
 
@@ -401,7 +402,7 @@ fn extract_mixin(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
         line,
         signature: sig,
         parents,
-        end_line: None,
+        end_line: Some(text_end_line(content, node)),
     });
 }
 
@@ -452,7 +453,7 @@ fn extract_extension(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>
         line,
         signature: sig,
         parents,
-        end_line: None,
+        end_line: Some(text_end_line(content, node)),
     });
 }
 
@@ -508,7 +509,7 @@ fn extract_extension_type(node: &Node, content: &str, symbols: &mut Vec<ParsedSy
         line,
         signature: sig,
         parents,
-        end_line: None,
+        end_line: Some(text_end_line(content, node)),
     });
 }
 
@@ -539,7 +540,7 @@ fn extract_enum(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
         line,
         signature: sig,
         parents,
-        end_line: None,
+        end_line: Some(text_end_line(content, node)),
     });
 }
 
@@ -576,7 +577,7 @@ fn extract_typedef(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) 
                 line,
                 signature: sig,
                 parents: vec![],
-                end_line: None,
+                end_line: Some(text_end_line(content, node)),
             });
         }
     }
@@ -607,7 +608,7 @@ fn extract_function_signature(node: &Node, content: &str, symbols: &mut Vec<Pars
             line,
             signature: sig,
             parents: vec![],
-            end_line: None,
+            end_line: Some(declaration_end_line(content, node)),
         });
     }
 }
@@ -625,7 +626,7 @@ fn extract_getter(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
             line,
             signature: sig,
             parents: vec![],
-            end_line: None,
+            end_line: Some(declaration_end_line(content, node)),
         });
     }
 }
@@ -643,7 +644,7 @@ fn extract_setter(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>) {
             line,
             signature: sig,
             parents: vec![],
-            end_line: None,
+            end_line: Some(declaration_end_line(content, node)),
         });
     }
 }
@@ -767,7 +768,7 @@ fn extract_operator(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbol>)
         line,
         signature: sig,
         parents: vec![],
-        end_line: None,
+        end_line: Some(declaration_end_line(content, node)),
     });
 }
 
@@ -787,7 +788,7 @@ fn extract_constructor(node: &Node, content: &str, symbols: &mut Vec<ParsedSymbo
             line,
             signature: sig,
             parents: vec![],
-            end_line: None,
+            end_line: Some(declaration_end_line(content, node)),
         });
     }
 }
@@ -823,7 +824,7 @@ fn extract_factory_constructor(node: &Node, content: &str, symbols: &mut Vec<Par
             line,
             signature: sig,
             parents: vec![],
-            end_line: None,
+            end_line: Some(declaration_end_line(content, node)),
         });
     }
 }
@@ -842,7 +843,7 @@ fn extract_const_constructor(node: &Node, content: &str, symbols: &mut Vec<Parse
             line,
             signature: sig,
             parents: vec![],
-            end_line: None,
+            end_line: Some(declaration_end_line(content, node)),
         });
     }
 }
@@ -861,7 +862,7 @@ fn extract_top_level_vars(node: &Node, content: &str, symbols: &mut Vec<ParsedSy
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line: Some(text_end_line(content, &child)),
                 });
             }
         }
@@ -881,11 +882,39 @@ fn extract_top_level_consts(node: &Node, content: &str, symbols: &mut Vec<Parsed
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line: Some(text_end_line(content, &child)),
                 });
             }
         }
     }
+}
+
+/// Last line of the declaration a signature belongs to. The grammar keeps a
+/// member's body beside its signature (`method_declaration` holds both, and a
+/// `class_member` wraps that), so the range comes from the outermost wrapper
+/// rather than from the signature itself.
+fn declaration_end_line(content: &str, signature: &Node) -> usize {
+    let mut declaration = *signature;
+    while let Some(parent) = declaration.parent() {
+        if !matches!(
+            parent.kind(),
+            "method_signature"
+                | "method_declaration"
+                | "declaration"
+                | "class_member"
+                | "function_declaration"
+                | "local_function_declaration"
+                | "getter_declaration"
+                | "setter_declaration"
+                | "external_function_declaration"
+                | "external_getter_declaration"
+                | "external_setter_declaration"
+        ) {
+            break;
+        }
+        declaration = parent;
+    }
+    text_end_line(content, &declaration)
 }
 
 /// Return the first `identifier` direct child of `node`.
