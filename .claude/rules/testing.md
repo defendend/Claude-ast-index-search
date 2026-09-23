@@ -96,9 +96,16 @@ builds are 3× slower. CI runs `cargo test --release --workspace`.
 
 ## Anti-patterns
 
-- **Using the user's real cache dir.** `db::get_db_path()` defaults to
-  `~/Library/Caches/…`; in a test you'll trash the dev's own index. Always
-  create a `TempDir`, pass it as the `root`, and let the DB land under it.
+- **Using the user's real cache dir.** `db::open_db(root)` puts the index in
+  the cache base (`<base>/<hash of root>/index.db`), not under `root`.
+  `.cargo/config.toml` points `AST_INDEX_CACHE_DIR` at
+  `target/ast-index-cache` for everything cargo starts, so `cargo test` never
+  writes to `~/Library/Caches/ast-index`. Don't remove that variable in a test
+  without setting `AST_INDEX_DB_PATH` or another cache dir, and give spawned
+  binaries their own `TempDir` cache (`.env("AST_INDEX_CACHE_DIR", …)`) as the
+  CLI tests do. Every run leaves ~90 entries in `target/ast-index-cache`, and
+  opening a new project costs more the more entries there are; `rm -r
+  target/ast-index-cache` resets it.
 - **Mocking `rusqlite`.** Tests use a real SQLite file. It's fast
   (milliseconds) and catches schema/migration mistakes that a mock would
   happily ignore.
