@@ -683,6 +683,31 @@ exclude:
 
 ### Unreleased
 
+- **`graph` — a symbol dependency graph** — `graph build` resolves indexed
+  references into symbol-to-symbol edges and stores them with per-edge
+  resolution confidence (`local`, `scoped`, `import`, `unique`, `ambiguous`).
+  Queries on top of it: `dependents`, `dependencies`, `impact` (transitive
+  dependents), `path`, `cycles`, `top` and `metrics` (fan-in, fan-out,
+  PageRank). Ruby references resolve through namespaces, lexical nesting,
+  constant receivers, inheritance and mixins; JavaScript/TypeScript references
+  through the module's own imports. Metrics count resolved edges only and
+  report ambiguous ones separately, so a name defined in hundreds of places
+  does not inflate a symbol's centrality. The graph is opt-in: `rebuild` and
+  `update` never build it, and queries flag a stale graph after the index
+  changes and accept `--refresh`.
+- **`call-tree` scans once per level** — every function in the tree took a
+  scan of the whole repository to find its callers, so a level with nine
+  callers meant nine scans. Since calls resolve to the symbol that really
+  contains them, levels are wider and `call-tree` had slowed down several
+  times over. The functions a level needs are now looked up together in one
+  scan that still gives each of them its own match budget, so the printed tree
+  is the same and a level costs about one scan.
+- **Calls behind a keyword are no longer taken for definitions** — `callers`
+  and `call-tree` skip definition lines by reading `Type name(` as a
+  declaration, and a keyword in the type position fooled it: `return foo(`,
+  `await foo(`, `new Foo(`, `if foo(`, `export default connect(` and the like
+  were dropped as if they declared `foo`. Such lines now count as calls; real
+  typed declarations are still skipped.
 - **Index anonymous `export default` functions and classes** —
   `export default () => {}`, `export default function () {}` and
   `export default class {}` produced no symbol, so the function could not be
