@@ -1,0 +1,68 @@
+{
+  "graph": {
+    "built": true,
+    "stale": false,
+    "built_at": 1790180724015
+  },
+  "sort": "pagerank",
+  "schema_version": 2,
+  "items": [
+    {
+      "symbol": {
+        "name": "ApplicationService",
+        "kind": "class",
+        "path": "app/services/application_service.rb",
+        "line": 1
+      },
+      "fan_in": 3,
+      "fan_in_files": 3,
+      "fan_in_ambiguous": 0,
+      "fan_out": 0,
+      "fan_out_ambiguous": 0,
+      "dependents": 8,
+      "dependents_depth": 3,
+      "pagerank": 2.97696,
+      "pagerank_pct": 97.06
+    },
+    {
+      "symbol": {
+        "name": "Invoice",
+        "kind": "class",
+        "path": "app/models/invoice.rb",
+        "line": 1
+      },
+      "fan_in": 4,
+      "fan_in_files": 3,
+      "fan_in_ambiguous": 0,
+      "fan_out": 2,
+      "fan_out_ambiguous": 0,
+      "dependents": 6,
+      "dependents_depth": 3,
+      "pagerank": 2.382826,
+      "pagerank_pct": 91.18
+    },
+    {
+      "symbol": {
+        "name": "ApplicationRecord",
+        "kind": "class",
+        "path": "app/models/application_record.rb",
+        "line": 1
+      },
+      "fan_in": 2,
+      "fan_in_files": 2,
+      "fan_in_ambiguous": 0,
+      "fan_out": 0,
+      "fan_out_ambiguous": 0,
+      "dependents": 7,
+      "dependents_depth": 3,
+      "pagerank": 2.335667,
+      "pagerank_pct": 85.29
+    }
+  ],
+  "pagination": {
+    "total": 17,
+    "returned": 3,
+    "truncated": true,
+    "limit": 3
+  }
+}

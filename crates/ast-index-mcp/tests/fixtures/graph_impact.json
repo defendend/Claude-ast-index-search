@@ -1,0 +1,85 @@
+{
+  "graph": {
+    "built": true,
+    "stale": false,
+    "built_at": 1790180724015
+  },
+  "matched": [
+    {
+      "name": "ApplicationRecord",
+      "kind": "class",
+      "path": "app/models/application_record.rb",
+      "line": 1
+    }
+  ],
+  "depth": 3,
+  "include_ambiguous": false,
+  "members": false,
+  "levels": [
+    {
+      "depth": 1,
+      "symbols": 2,
+      "files": 2
+    },
+    {
+      "depth": 2,
+      "symbols": 5,
+      "files": 4
+    }
+  ],
+  "total_symbols": 7,
+  "total_files": 4,
+  "schema_version": 2,
+  "items": [
+    {
+      "depth": 1,
+      "symbol": {
+        "name": "Invoice",
+        "kind": "class",
+        "path": "app/models/invoice.rb",
+        "line": 1
+      },
+      "via": "ApplicationRecord",
+      "confidence": "scoped"
+    },
+    {
+      "depth": 1,
+      "symbol": {
+        "name": "LineItem",
+        "kind": "class",
+        "path": "app/models/line_item.rb",
+        "line": 1
+      },
+      "via": "ApplicationRecord",
+      "confidence": "scoped"
+    },
+    {
+      "depth": 2,
+      "symbol": {
+        "name": "total",
+        "kind": "function",
+        "path": "app/models/invoice.rb",
+        "line": 4
+      },
+      "via": "LineItem",
+      "confidence": "scoped"
+    },
+    {
+      "depth": 2,
+      "symbol": {
+        "name": "self.total_for",
+        "kind": "function",
+        "path": "app/models/invoice.rb",
+        "line": 8
+      },
+      "via": "LineItem",
+      "confidence": "scoped"
+    }
+  ],
+  "pagination": {
+    "total": 7,
+    "returned": 4,
+    "truncated": true,
+    "limit": 4
+  }
+}

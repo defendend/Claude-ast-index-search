@@ -1,0 +1,65 @@
+{
+  "graph": {
+    "built": true,
+    "stale": false,
+    "built_at": 1790180724015
+  },
+  "direction": "dependencies",
+  "matched": [
+    {
+      "name": "OrdersController",
+      "kind": "class",
+      "path": "app/controllers/orders_controller.rb",
+      "line": 1
+    }
+  ],
+  "resolved_edges": 2,
+  "ambiguous_edges": 0,
+  "include_ambiguous": false,
+  "members": true,
+  "schema_version": 2,
+  "items": [
+    {
+      "subject": {
+        "name": "create",
+        "kind": "function",
+        "path": "app/controllers/orders_controller.rb",
+        "line": 2
+      },
+      "other": {
+        "name": "Billing::ChargeService",
+        "kind": "class",
+        "path": "app/services/billing/charge_service.rb",
+        "line": 2
+      },
+      "confidence": "scoped",
+      "candidates": 1,
+      "references": 1,
+      "line": 3
+    },
+    {
+      "subject": {
+        "name": "refund",
+        "kind": "function",
+        "path": "app/controllers/orders_controller.rb",
+        "line": 6
+      },
+      "other": {
+        "name": "Billing::RefundService",
+        "kind": "class",
+        "path": "app/services/billing/refund_service.rb",
+        "line": 2
+      },
+      "confidence": "scoped",
+      "candidates": 1,
+      "references": 1,
+      "line": 7
+    }
+  ],
+  "pagination": {
+    "total": 2,
+    "returned": 2,
+    "truncated": false,
+    "limit": 50
+  }
+}

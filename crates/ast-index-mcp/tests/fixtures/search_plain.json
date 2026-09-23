@@ -1,0 +1,75 @@
+{
+  "content_matches": [
+    {
+      "content": "RSpec.describe Billing::ChargeService do",
+      "line": 1,
+      "path": "spec/services/charge_service_spec.rb"
+    },
+    {
+      "content": "Billing::ChargeService.call",
+      "line": 3,
+      "path": "spec/services/charge_service_spec.rb"
+    },
+    {
+      "content": "class DraftService < ApplicationService",
+      "line": 2,
+      "path": "app/services/billing/draft_service.rb"
+    }
+  ],
+  "files": [
+    "app/services/application_service.rb",
+    "app/services/billing/charge_service.rb",
+    "app/services/billing/draft_service.rb"
+  ],
+  "pagination": {
+    "content_matches": {
+      "limit": 3,
+      "returned": 3,
+      "total": 9,
+      "truncated": true
+    },
+    "files": {
+      "limit": 3,
+      "returned": 3,
+      "total": 9,
+      "truncated": true
+    },
+    "references": {
+      "limit": 3,
+      "returned": 0,
+      "total": 0,
+      "truncated": false
+    },
+    "symbols": {
+      "limit": 3,
+      "returned": 3,
+      "total": 5,
+      "truncated": true
+    }
+  },
+  "references": [],
+  "schema_version": 2,
+  "symbols": [
+    {
+      "kind": "class",
+      "line": 1,
+      "name": "ApplicationService",
+      "path": "app/services/application_service.rb",
+      "signature": "class ApplicationService"
+    },
+    {
+      "kind": "class",
+      "line": 2,
+      "name": "Billing::DraftService",
+      "path": "app/services/billing/draft_service.rb",
+      "signature": "class DraftService < ApplicationService"
+    },
+    {
+      "kind": "class",
+      "line": 2,
+      "name": "Billing::ChargeService",
+      "path": "app/services/billing/charge_service.rb",
+      "signature": "class ChargeService < ApplicationService"
+    }
+  ]
+}

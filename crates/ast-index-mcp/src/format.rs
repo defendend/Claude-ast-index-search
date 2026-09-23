@@ -16,6 +16,7 @@
 //! pretty JSON by ~40%.
 
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fmt::Write;
 
 /// Format an ast-index JSON response as compact text.
@@ -40,6 +41,8 @@ pub fn to_compact(tool: &str, raw_json: &str) -> String {
         "file" | "find_file" => render_file_list(&value, &mut out),
         "stats" => render_stats(&value, &mut out),
         "changed" => render_changed(&value, &mut out),
+        "hotspots" => render_hotspots(&value, &mut out),
+        graph if graph.starts_with("graph_") => render_graph(&value, &mut out),
         _ => false,
     };
 
@@ -59,6 +62,9 @@ fn render_search(v: &Value, out: &mut String) -> bool {
     let Some(obj) = v.as_object() else {
         return false;
     };
+    if let Some(rank) = obj.get("rank").and_then(Value::as_object) {
+        return render_ranked_search(obj, rank, out);
+    }
 
     let mut any_section = false;
 
@@ -86,40 +92,987 @@ fn render_search(v: &Value, out: &mut String) -> bool {
         }
     }
 
-    if let Some(refs) = obj.get("references").and_then(Value::as_array) {
-        if !refs.is_empty() {
-            any_section = true;
-            writeln!(out, "\nReferences (usage counts):").ok();
-            for r in refs {
-                if let (Some(name), Some(count)) = (
-                    r.get("name").and_then(Value::as_str),
-                    r.get("usage_count").and_then(Value::as_i64),
-                ) {
-                    writeln!(out, "  {name} ×{count}").ok();
-                }
-            }
-            write_named_pagination_notice(obj, "references", out);
-        }
-    }
-
-    if let Some(content) = obj.get("content_matches").and_then(Value::as_array) {
-        if !content.is_empty() {
-            any_section = true;
-            writeln!(out, "\nContent:").ok();
-            for m in content {
-                if let (Some(path), Some(line), Some(snippet)) = (
-                    m.get("path").and_then(Value::as_str),
-                    m.get("line").and_then(Value::as_i64),
-                    m.get("content").and_then(Value::as_str),
-                ) {
-                    writeln!(out, "  {path}:{line}  {}", truncate(snippet, 100)).ok();
-                }
-            }
-            write_named_pagination_notice(obj, "content_matches", out);
-        }
-    }
+    any_section |= write_search_references(obj, "References (usage counts):", out);
+    any_section |= write_search_content(obj, "Content:", out);
 
     any_section || obj.contains_key("files")
+}
+
+fn write_search_references(
+    obj: &serde_json::Map<String, Value>,
+    heading: &str,
+    out: &mut String,
+) -> bool {
+    let Some(refs) = obj.get("references").and_then(Value::as_array) else {
+        return false;
+    };
+    if refs.is_empty() {
+        return false;
+    }
+    writeln!(out, "\n{heading}").ok();
+    for r in refs {
+        if let (Some(name), Some(count)) = (
+            r.get("name").and_then(Value::as_str),
+            r.get("usage_count").and_then(Value::as_i64),
+        ) {
+            writeln!(out, "  {name} ×{count}").ok();
+        }
+    }
+    write_named_pagination_notice(obj, "references", out);
+    true
+}
+
+fn write_search_content(
+    obj: &serde_json::Map<String, Value>,
+    heading: &str,
+    out: &mut String,
+) -> bool {
+    let Some(content) = obj.get("content_matches").and_then(Value::as_array) else {
+        return false;
+    };
+    if content.is_empty() {
+        return false;
+    }
+    writeln!(out, "\n{heading}").ok();
+    for m in content {
+        if let (Some(path), Some(line), Some(snippet)) = (
+            m.get("path").and_then(Value::as_str),
+            m.get("line").and_then(Value::as_i64),
+            m.get("content").and_then(Value::as_str),
+        ) {
+            writeln!(out, "  {path}:{line}  {}", truncate(snippet, 100)).ok();
+        }
+    }
+    write_named_pagination_notice(obj, "content_matches", out);
+    true
+}
+
+// ---------------------------------------------------------------------------
+// search --rank
+// ---------------------------------------------------------------------------
+
+/// Evidence already printed in this response. History is per file and a
+/// file result borrows the graph numbers of its strongest symbol, so the same
+/// history or graph line would otherwise repeat under a file and again under
+/// each of its symbols.
+#[derive(Default)]
+struct PrintedEvidence {
+    histories: HashSet<String>,
+    graphs: HashSet<String>,
+}
+
+/// `search --rank` wraps the plain report: files become `{path, rank}`
+/// objects and symbols gain a `rank` dossier, `null` when the preset was not
+/// applied.
+fn render_ranked_search(
+    obj: &serde_json::Map<String, Value>,
+    rank: &serde_json::Map<String, Value>,
+    out: &mut String,
+) -> bool {
+    let preset = rank.get("preset").and_then(Value::as_str).unwrap_or("?");
+    if rank.get("applied").and_then(Value::as_bool) == Some(true) {
+        write_rank_header(preset, rank, out);
+    } else {
+        write_rank_not_applied(preset, rank, out);
+    }
+
+    let mut printed = PrintedEvidence::default();
+    if let Some(files) = obj.get("files").and_then(Value::as_array) {
+        if !files.is_empty() {
+            writeln!(out, "\nFiles:").ok();
+            for file in files {
+                let path = file
+                    .as_str()
+                    .or_else(|| file.get("path").and_then(Value::as_str))
+                    .unwrap_or("?");
+                writeln!(out, "  {path}").ok();
+                if let Some(dossier) = file.get("rank").filter(|d| d.is_object()) {
+                    write_dossier(dossier, preset, path, None, &mut printed, out);
+                }
+            }
+            write_named_pagination_notice(obj, "files", out);
+        }
+    }
+    if let Some(symbols) = obj.get("symbols").and_then(Value::as_array) {
+        if !symbols.is_empty() {
+            writeln!(out, "\nSymbols:").ok();
+            for symbol in symbols {
+                write_symbol_line(symbol, "  ", out);
+                if let Some(dossier) = symbol.get("rank").filter(|d| d.is_object()) {
+                    let path = symbol.get("path").and_then(Value::as_str).unwrap_or("?");
+                    let key = evidence_key(
+                        symbol.get("name").and_then(Value::as_str).unwrap_or("?"),
+                        path,
+                        symbol.get("line").and_then(Value::as_i64).unwrap_or(0),
+                    );
+                    write_dossier(dossier, preset, path, Some(key), &mut printed, out);
+                }
+            }
+            write_named_pagination_notice(obj, "symbols", out);
+        }
+    }
+    write_search_references(obj, "References (usage counts, not ranked):", out);
+    write_search_content(obj, "Content (not ranked):", out);
+    true
+}
+
+fn write_rank_header(preset: &str, rank: &serde_json::Map<String, Value>, out: &mut String) {
+    let formula = rank.get("formula").and_then(Value::as_str).unwrap_or("");
+    writeln!(out, "Ranked by {preset} = {formula}.").ok();
+
+    let mut evidence = Vec::new();
+    if let Some(history) = rank.get("history").filter(|h| h.is_object()) {
+        let commits = history
+            .get("commits_analyzed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let head = history
+            .get("head")
+            .and_then(Value::as_str)
+            .map(short_sha)
+            .unwrap_or("?");
+        evidence.push(format!(
+            "history is per file ({commits} commits, HEAD {head})"
+        ));
+    }
+    if rank.get("graph").is_some_and(Value::is_object) {
+        evidence.push("graph numbers are per symbol".to_string());
+    }
+    evidence.push("pNN = percentile within this repo".to_string());
+    if let Some(pool) = rank.get("pool") {
+        evidence.push(format!(
+            "re-ranked the top {} symbols and {} files by relevance, exact names first",
+            pool.get("symbols").and_then(Value::as_u64).unwrap_or(0),
+            pool.get("files").and_then(Value::as_u64).unwrap_or(0),
+        ));
+    }
+    writeln!(out, "{}.", capitalize(&evidence.join("; "))).ok();
+
+    if rank
+        .get("graph")
+        .and_then(|g| g.get("stale"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        writeln!(
+            out,
+            "warning: the symbol graph is stale (the index changed since it was built); call graph_build for current numbers."
+        )
+        .ok();
+    }
+    for warning in string_items(rank.get("warnings")) {
+        if !warning.contains("stale") {
+            writeln!(out, "warning: {warning}").ok();
+        }
+    }
+}
+
+fn write_rank_not_applied(preset: &str, rank: &serde_json::Map<String, Value>, out: &mut String) {
+    writeln!(
+        out,
+        "Ranking '{preset}' NOT applied: results are in plain relevance order. Missing:"
+    )
+    .ok();
+    for missing in rank
+        .get("missing")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let reason = missing
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("evidence");
+        let command = missing.get("command").and_then(Value::as_str).unwrap_or("");
+        let remedy = match missing.get("signal").and_then(Value::as_str) {
+            Some("graph") => "call graph_build (takes seconds)".to_string(),
+            Some("history") => format!(
+                "run `{command}` in a shell (not available through MCP; the first run reads the whole history)"
+            ),
+            _ => format!("run `{command}`"),
+        };
+        writeln!(out, "  - {reason}: {remedy}").ok();
+    }
+}
+
+fn write_dossier(
+    dossier: &Value,
+    preset: &str,
+    path: &str,
+    symbol_key: Option<String>,
+    printed: &mut PrintedEvidence,
+    out: &mut String,
+) {
+    let tier = dossier.get("tier").and_then(Value::as_str).unwrap_or("?");
+    let position = match dossier.get("relevance_rank").and_then(Value::as_u64) {
+        Some(position) => format!("relevance #{position}, {tier}"),
+        None => format!("match: {tier}"),
+    };
+    let head = match (
+        dossier.get("score").and_then(Value::as_f64),
+        dossier.get("unscored").and_then(Value::as_str),
+    ) {
+        (Some(score), _) => format!(
+            "{preset} {score:.2} = {} · {position}",
+            combine_components(preset, dossier.get("components"))
+        ),
+        (None, Some(reason)) => format!(
+            "{preset} not scored: {} · {position}",
+            describe_unscored(reason)
+        ),
+        (None, None) => position,
+    };
+    writeln!(out, "    {head}").ok();
+
+    let mut repeated: Vec<String> = Vec::new();
+    if let Some(history) = dossier.get("history").filter(|h| h.is_object()) {
+        if printed.histories.insert(path.to_string()) {
+            writeln!(out, "    history: {}", history_line(history)).ok();
+        } else {
+            repeated.push("history".to_string());
+        }
+    }
+
+    if let Some(graph) = dossier.get("graph").filter(|g| g.is_object()) {
+        let strongest = graph.get("strongest_symbol").filter(|s| s.is_object());
+        let (label, key) = match strongest {
+            Some(symbol) => {
+                let name = symbol.get("name").and_then(Value::as_str).unwrap_or("?");
+                let kind = symbol.get("kind").and_then(Value::as_str).unwrap_or("?");
+                let line = symbol.get("line").and_then(Value::as_i64).unwrap_or(0);
+                (
+                    format!("graph via {name} [{kind}]:{line}"),
+                    evidence_key(name, path, line),
+                )
+            }
+            None => (
+                "graph".to_string(),
+                symbol_key.unwrap_or_else(|| format!("file {path}")),
+            ),
+        };
+        if printed.graphs.insert(key) {
+            writeln!(out, "    {label}: {}", graph_dossier_line(graph)).ok();
+        } else {
+            repeated.push(label);
+        }
+    }
+    if !repeated.is_empty() {
+        writeln!(out, "    {}: as above", repeated.join(" and ")).ok();
+    }
+}
+
+fn evidence_key(name: &str, path: &str, line: i64) -> String {
+    format!("{name}@{path}:{line}")
+}
+
+fn combine_components(preset: &str, components: Option<&Value>) -> String {
+    let parts: Vec<String> = components
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|component| {
+            Some(format!(
+                "{} {:.2}",
+                component.get("name")?.as_str()?,
+                component.get("value")?.as_f64()?
+            ))
+        })
+        .collect();
+    match preset {
+        "proven" => format!("mean({})", parts.join(", ")),
+        "risky" => parts.join(" × "),
+        _ => parts.join(", "),
+    }
+}
+
+fn describe_unscored(reason: &str) -> &str {
+    match reason {
+        "vendor" => "third-party code",
+        "extra_root" => "outside the primary root, which is all the history covers",
+        "no_history" => {
+            "no collected history for this file (untracked or newer than the last collection)"
+        }
+        other => other,
+    }
+}
+
+fn history_line(history: &Value) -> String {
+    let int = |key: &str| history.get(key).and_then(Value::as_i64).unwrap_or(0);
+    let commits = int("commits");
+    let mut parts = vec![
+        format!("{commits} commits p{}", int("commits_pct")),
+        format!(
+            "fixes {}/{commits}={:.0}% p{}",
+            int("fix_commits"),
+            history
+                .get("fix_ratio")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                * 100.0,
+            int("fix_ratio_pct")
+        ),
+        format!("churn {} p{}", int("churn"), int("churn_pct")),
+        format!("{} authors p{}", int("authors"), int("authors_pct")),
+    ];
+    if let Some(age) = history.get("age_days").and_then(Value::as_f64) {
+        parts.push(format!("age {age:.0}d p{}", int("age_pct")));
+    }
+    if let Some(idle) = history.get("days_since_change").and_then(Value::as_f64) {
+        parts.push(format!("changed {idle:.0}d ago p{}", int("idle_pct")));
+    }
+    push_labels(&mut parts, history.get("labels"));
+    parts.join(" · ")
+}
+
+fn graph_dossier_line(graph: &Value) -> String {
+    if graph.get("in_graph").and_then(Value::as_bool) == Some(false) {
+        return "no resolved or ambiguous edges".to_string();
+    }
+    let int = |key: &str| graph.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let pct = |key: &str| graph.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+    let ambiguous = int("fan_in_ambiguous");
+    let mut parts = if int("fan_in") == 0 {
+        // Percentiles are measured among referenced symbols, so every one of
+        // them is 0 here and would only repeat that nothing resolves to it.
+        let mut none = "no resolved callers".to_string();
+        if ambiguous > 0 {
+            write!(none, " (+{ambiguous} ambiguous)").ok();
+        }
+        vec![none]
+    } else {
+        let mut fan_in = format!(
+            "fan-in {} from {} files p{:.0}",
+            int("fan_in"),
+            int("fan_in_files"),
+            pct("fan_in_files_pct")
+        );
+        if ambiguous > 0 {
+            write!(fan_in, " (+{ambiguous} ambiguous)").ok();
+        }
+        vec![
+            fan_in,
+            format!(
+                "dependents {} p{:.0}",
+                int("dependents"),
+                pct("dependents_pct")
+            ),
+            format!("pagerank p{:.0}", pct("pagerank_pct")),
+        ]
+    };
+    push_labels(&mut parts, graph.get("labels"));
+    parts.join(" · ")
+}
+
+fn push_labels(parts: &mut Vec<String>, labels: Option<&Value>) {
+    let labels: Vec<&str> = string_items(labels).collect();
+    if !labels.is_empty() {
+        parts.push(labels.join(" "));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hotspots
+// ---------------------------------------------------------------------------
+
+const HISTORY_NOT_COLLECTED: &str = "No Git history collected for this index yet. \
+Collection is not available through MCP: run `ast-index hotspots --collect` in the project \
+(the first run reads the whole history, about a minute on a large monorepo; later runs are \
+incremental), then call again.";
+
+fn render_hotspots(v: &Value, out: &mut String) -> bool {
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    let (Some(items), true) = (
+        obj.get("items").and_then(Value::as_array),
+        obj.contains_key("commits_analyzed"),
+    ) else {
+        return false;
+    };
+    let Some(head) = obj.get("head").and_then(Value::as_str) else {
+        writeln!(out, "{HISTORY_NOT_COLLECTED}").ok();
+        return true;
+    };
+    let number = |key: &str| obj.get(key).and_then(Value::as_u64).unwrap_or(0);
+    writeln!(
+        out,
+        "Git hotspots: {} live files with history, {} commits (HEAD {}), sorted by {}; pNN = percentile within this repo",
+        number("files_with_history"),
+        number("commits_analyzed"),
+        short_sha(head),
+        obj.get("sort").and_then(Value::as_str).unwrap_or("score"),
+    )
+    .ok();
+
+    for hotspot in items {
+        let int = |key: &str| hotspot.get(key).and_then(Value::as_i64).unwrap_or(0);
+        let path = hotspot.get("path").and_then(Value::as_str).unwrap_or("?");
+        let commits = int("commits");
+        let mut line = format!(
+            "score {} · {commits} commits p{} · fixes {}/{commits}={:.0}% p{} · churn +{}/-{} p{}",
+            int("score"),
+            int("commits_pct"),
+            int("fix_commits"),
+            hotspot
+                .get("fix_ratio")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                * 100.0,
+            int("fix_ratio_pct"),
+            int("lines_added"),
+            int("lines_deleted"),
+            int("churn_pct"),
+        );
+        if let Some(relative) = hotspot.get("relative_churn").and_then(Value::as_f64) {
+            write!(line, " ({relative:.1}x file)").ok();
+        }
+        write!(
+            line,
+            " · {} authors p{}",
+            int("authors"),
+            int("authors_pct")
+        )
+        .ok();
+        if let Some(age) = hotspot.get("age_days").and_then(Value::as_f64) {
+            write!(line, " · age {age:.0}d p{}", int("age_pct")).ok();
+        }
+        if let Some(idle) = hotspot.get("days_since_change").and_then(Value::as_f64) {
+            write!(line, " · changed {idle:.0}d ago").ok();
+        }
+        if let Some(lines) = hotspot.get("current_lines").and_then(Value::as_i64) {
+            write!(line, " · {lines} lines").ok();
+        }
+        writeln!(out, "{path}\n  {line}").ok();
+        let labels: Vec<&str> = string_items(hotspot.get("labels")).collect();
+        if !labels.is_empty() {
+            writeln!(out, "  {}", labels.join(" ")).ok();
+        }
+    }
+    if items.is_empty() {
+        writeln!(out, "No files matched the filters.").ok();
+    }
+    write_more_notice(obj.get("pagination"), out);
+    true
+}
+
+// ---------------------------------------------------------------------------
+// graph
+// ---------------------------------------------------------------------------
+
+/// Matched definitions listed in full before the list is cut, for queries
+/// whose name matched several definitions.
+const MATCHED_SHOWN: usize = 8;
+
+/// Every `graph_*` tool; the report shape tells the subcommand apart
+/// (`graph_dependents` returns either direct edges or an impact report).
+fn render_graph(v: &Value, out: &mut String) -> bool {
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    if let Some(error) = obj.get("error").and_then(Value::as_str) {
+        writeln!(out, "{}", graph_error_hint(error)).ok();
+        return true;
+    }
+    if obj.contains_key("nodes") && obj.contains_key("by_confidence") {
+        return render_graph_summary(obj, out);
+    }
+    if obj
+        .get("graph")
+        .and_then(|g| g.get("stale"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        writeln!(
+            out,
+            "warning: the symbol graph is stale (the index changed since it was built); results may be outdated — repeat with refresh: true."
+        )
+        .ok();
+    }
+    if obj.contains_key("levels") {
+        render_graph_impact(obj, out)
+    } else if obj.contains_key("from") && obj.contains_key("to") {
+        render_graph_path(obj, out)
+    } else if obj.contains_key("direction") && obj.contains_key("matched") {
+        render_graph_edges(obj, out)
+    } else if obj.contains_key("components") {
+        render_graph_cycles(obj, out)
+    } else if obj.contains_key("graph") && obj.contains_key("items") {
+        // `top` carries its sort key; `metrics` is the bare graph page.
+        render_graph_metrics(obj, out)
+    } else {
+        false
+    }
+}
+
+fn graph_error_hint(error: &str) -> String {
+    if error.starts_with("symbol graph not built") {
+        "Symbol graph not built for this index. Repeat the call with refresh: true, or call graph_build (takes seconds).".to_string()
+    } else if error.starts_with("no symbol matches") {
+        format!(
+            "{}. Symbol specs are `Name`, `Outer::Name` or `Class#member`; `symbol` or `search` find the exact name.",
+            capitalize(error)
+        )
+    } else {
+        capitalize(error)
+    }
+}
+
+fn render_graph_summary(obj: &serde_json::Map<String, Value>, out: &mut String) -> bool {
+    let number = |key: &str| obj.get(key).and_then(Value::as_u64).unwrap_or(0);
+    writeln!(
+        out,
+        "Symbol graph built: {} nodes, {} edges ({} resolved) in {} ms.",
+        number("nodes"),
+        number("edges"),
+        number("resolved_edges"),
+        number("elapsed_ms")
+    )
+    .ok();
+    let levels: Vec<String> = obj
+        .get("by_confidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|level| {
+            let edges = level.get("edges")?.as_u64()?;
+            let confidence = level.get("confidence")?.as_str()?;
+            (edges > 0).then(|| format!("{confidence} {edges}"))
+        })
+        .collect();
+    if !levels.is_empty() {
+        writeln!(out, "Edges by confidence: {}.", levels.join(" · ")).ok();
+    }
+    let seen = number("references_seen");
+    let linked = number("references_linked");
+    if seen > 0 {
+        writeln!(
+            out,
+            "References: {seen} seen, {linked} linked ({:.1}%).",
+            100.0 * linked as f64 / seen as f64
+        )
+        .ok();
+    }
+    true
+}
+
+fn render_graph_edges(obj: &serde_json::Map<String, Value>, out: &mut String) -> bool {
+    let (Some(matched), Some(items)) = (
+        obj.get("matched").and_then(Value::as_array),
+        obj.get("items").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    let dependents = obj.get("direction").and_then(Value::as_str) == Some("dependents");
+    let members = obj.get("members").and_then(Value::as_bool) == Some(true);
+    let include_ambiguous = obj.get("include_ambiguous").and_then(Value::as_bool) == Some(true);
+    let resolved = obj
+        .get("resolved_edges")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let ambiguous = obj
+        .get("ambiguous_edges")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    write_matched(
+        if dependents {
+            "Dependents of"
+        } else {
+            "Dependencies of"
+        },
+        matched,
+        out,
+    );
+    writeln!(
+        out,
+        "{resolved} resolved, {ambiguous} ambiguous edges{}{}",
+        if members {
+            " (class members included)"
+        } else {
+            ""
+        },
+        if ambiguous > 0 && !include_ambiguous {
+            "; include_ambiguous: true lists the ambiguous ones"
+        } else {
+            ""
+        }
+    )
+    .ok();
+
+    let per_subject = matched.len() > 1 || members;
+    for item in items {
+        let other = &item["other"];
+        let reference_line = item.get("line").and_then(Value::as_i64).unwrap_or(0);
+        let shown_line = if dependents {
+            reference_line
+        } else {
+            other.get("line").and_then(Value::as_i64).unwrap_or(0)
+        };
+        let mut line = format!(
+            "{} {} [{}] {}:{shown_line}",
+            confidence_label(item),
+            other.get("name").and_then(Value::as_str).unwrap_or("?"),
+            other.get("kind").and_then(Value::as_str).unwrap_or("?"),
+            other.get("path").and_then(Value::as_str).unwrap_or("?"),
+        );
+        let references = item.get("references").and_then(Value::as_u64).unwrap_or(1);
+        if references > 1 {
+            write!(line, " ×{references}").ok();
+        }
+        if per_subject {
+            let subject = item["subject"]
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            if dependents {
+                write!(line, " (on {subject})").ok();
+            } else {
+                write!(line, " (from {subject}, line {reference_line})").ok();
+            }
+        }
+        writeln!(out, "{line}").ok();
+    }
+    if items.is_empty() {
+        writeln!(out, "(no edges)").ok();
+    }
+    write_more_notice(obj.get("pagination"), out);
+    true
+}
+
+fn confidence_label(item: &Value) -> String {
+    match item.get("confidence").and_then(Value::as_str) {
+        Some("ambiguous") => format!(
+            "[ambiguous 1/{}]",
+            item.get("candidates").and_then(Value::as_u64).unwrap_or(0)
+        ),
+        Some(level) => format!("[{level}]"),
+        None => "[?]".to_string(),
+    }
+}
+
+fn render_graph_impact(obj: &serde_json::Map<String, Value>, out: &mut String) -> bool {
+    let (Some(matched), Some(levels), Some(items)) = (
+        obj.get("matched").and_then(Value::as_array),
+        obj.get("levels").and_then(Value::as_array),
+        obj.get("items").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    let depth = obj.get("depth").and_then(Value::as_u64).unwrap_or(0);
+    let include_ambiguous = obj.get("include_ambiguous").and_then(Value::as_bool) == Some(true);
+    let members = obj.get("members").and_then(Value::as_bool) == Some(true);
+    write_matched("Impact of", matched, out);
+
+    let mut summary: Vec<String> = levels
+        .iter()
+        .map(|level| {
+            let number = |key: &str| level.get(key).and_then(Value::as_u64).unwrap_or(0);
+            format!(
+                "depth {}: {} symbols in {} files",
+                number("depth"),
+                number("symbols"),
+                number("files")
+            )
+        })
+        .collect();
+    summary.push(format!(
+        "total {} symbols in {} files",
+        obj.get("total_symbols")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        obj.get("total_files").and_then(Value::as_u64).unwrap_or(0)
+    ));
+    writeln!(
+        out,
+        "Transitive dependents up to depth {depth} over {} edges: {}",
+        if include_ambiguous {
+            "resolved + ambiguous"
+        } else {
+            "resolved"
+        },
+        summary.join(" · ")
+    )
+    .ok();
+    if let (Some(symbols), Some(files)) = (
+        obj.get("resolved_only_symbols").and_then(Value::as_u64),
+        obj.get("resolved_only_files").and_then(Value::as_u64),
+    ) {
+        writeln!(
+            out,
+            "resolved edges alone: {symbols} symbols in {files} files; the rest is an upper bound through ambiguous names"
+        )
+        .ok();
+    }
+
+    let via_is_the_seed = matched.len() == 1 && !members;
+    for item in items {
+        let item_depth = item.get("depth").and_then(Value::as_u64).unwrap_or(0);
+        let mut line = format!("d{item_depth} {}", symbol_ref(&item["symbol"]));
+        if !(via_is_the_seed && item_depth == 1) {
+            if let Some(via) = item.get("via").and_then(Value::as_str) {
+                write!(line, " via {via}").ok();
+            }
+        }
+        if let Some(confidence) = item.get("confidence").and_then(Value::as_str) {
+            write!(line, " ({confidence})").ok();
+        }
+        writeln!(out, "{line}").ok();
+    }
+    if items.is_empty() {
+        writeln!(out, "(nothing depends on it within depth {depth})").ok();
+    }
+    write_more_notice(obj.get("pagination"), out);
+    true
+}
+
+fn render_graph_path(obj: &serde_json::Map<String, Value>, out: &mut String) -> bool {
+    let (Some(from), Some(to), Some(paths)) = (
+        obj.get("from").and_then(Value::as_array),
+        obj.get("to").and_then(Value::as_array),
+        obj.get("items").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    let from = matched_names(from);
+    let to = matched_names(to);
+    let length = obj.get("length").and_then(Value::as_u64);
+    let direction = obj.get("direction").and_then(Value::as_str);
+    let shortest = obj
+        .get("shortest_paths")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    match (length, direction) {
+        (Some(length), Some(direction)) => {
+            let counts = format!(
+                "{length} hop(s), {shortest} shortest path(s), {} shown",
+                paths.len()
+            );
+            if direction == "reverse" {
+                writeln!(
+                    out,
+                    "No path {from} -> {to}; the reverse direction connects them: {to} -> {from} in {counts}"
+                )
+                .ok();
+            } else {
+                writeln!(out, "{from} -> {to}: {counts}").ok();
+            }
+        }
+        _ => {
+            let hint = if obj.get("include_ambiguous").and_then(Value::as_bool) == Some(true) {
+                ""
+            } else {
+                " over resolved edges (include_ambiguous: true also follows ambiguous names)"
+            };
+            writeln!(
+                out,
+                "No dependency path between {from} and {to} within the hop limit{hint}; raise max_depth to look further."
+            )
+            .ok();
+            return true;
+        }
+    }
+    for (index, path) in paths.iter().enumerate() {
+        writeln!(out, "path {}:", index + 1).ok();
+        let mut previous_edge: Option<&str> = None;
+        for hop in path.as_array().into_iter().flatten() {
+            let symbol = symbol_ref(&hop["symbol"]);
+            match previous_edge {
+                None => writeln!(out, "  {symbol}").ok(),
+                Some(edge) => writeln!(out, "  -[{edge}]-> {symbol}").ok(),
+            };
+            previous_edge = hop.get("edge").and_then(Value::as_str);
+        }
+    }
+    true
+}
+
+fn render_graph_cycles(obj: &serde_json::Map<String, Value>, out: &mut String) -> bool {
+    let Some(items) = obj.get("items").and_then(Value::as_array) else {
+        return false;
+    };
+    let components = obj.get("components").and_then(Value::as_u64).unwrap_or(0);
+    if components == 0 {
+        writeln!(out, "No dependency cycles over resolved edges.").ok();
+        return true;
+    }
+    writeln!(
+        out,
+        "{components} dependency cycle(s) over resolved edges, largest first:"
+    )
+    .ok();
+    for item in items {
+        let size = item.get("size").and_then(Value::as_u64).unwrap_or(0);
+        let chain: Vec<&str> = item
+            .get("example")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|hop| hop.get("name").and_then(Value::as_str))
+            .collect();
+        writeln!(
+            out,
+            "{size} symbols in {} files: {}",
+            item.get("files").and_then(Value::as_u64).unwrap_or(0),
+            chain.join(" -> ")
+        )
+        .ok();
+        let members = item
+            .get("members")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for member in members {
+            writeln!(out, "  {}", symbol_ref(member)).ok();
+        }
+        if size as usize > members.len() {
+            writeln!(out, "  … +{} more", size as usize - members.len()).ok();
+        }
+    }
+    write_more_notice(obj.get("pagination"), out);
+    true
+}
+
+fn render_graph_metrics(obj: &serde_json::Map<String, Value>, out: &mut String) -> bool {
+    let Some(items) = obj.get("items").and_then(Value::as_array) else {
+        return false;
+    };
+    let sort = obj.get("sort").and_then(Value::as_str);
+    let depth = items
+        .first()
+        .and_then(|item| item.get("dependents_depth"))
+        .and_then(Value::as_u64)
+        .unwrap_or(3);
+    let scope = format!("resolved edges; dependents = transitive within {depth} hops");
+    match sort {
+        Some(sort) => writeln!(out, "Top symbols by {sort} ({scope}):").ok(),
+        None => writeln!(out, "Graph metrics ({scope}):").ok(),
+    };
+    for (index, item) in items.iter().enumerate() {
+        let symbol = symbol_ref(&item["symbol"]);
+        let (marker, indent) = match sort {
+            Some(_) => (format!("{}. ", index + 1), "   "),
+            None => (String::new(), "  "),
+        };
+        writeln!(out, "{marker}{symbol}").ok();
+        writeln!(out, "{indent}{}", metrics_line(item)).ok();
+    }
+    if items.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            if sort.is_some() {
+                "No symbols matched."
+            } else {
+                "No symbol matches."
+            }
+        )
+        .ok();
+    }
+    write_more_notice(obj.get("pagination"), out);
+    true
+}
+
+fn metrics_line(item: &Value) -> String {
+    let int = |key: &str| item.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let mut fan_in = format!("fan-in {} ({} files", int("fan_in"), int("fan_in_files"));
+    if int("fan_in_ambiguous") > 0 {
+        write!(fan_in, ", +{} ambiguous", int("fan_in_ambiguous")).ok();
+    }
+    fan_in.push(')');
+    let mut fan_out = format!("fan-out {}", int("fan_out"));
+    if int("fan_out_ambiguous") > 0 {
+        write!(fan_out, " (+{} ambiguous)", int("fan_out_ambiguous")).ok();
+    }
+    format!(
+        "{fan_in} · {fan_out} · dependents {} · pagerank {:.2} p{:.0}",
+        int("dependents"),
+        item.get("pagerank").and_then(Value::as_f64).unwrap_or(0.0),
+        item.get("pagerank_pct")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+    )
+}
+
+fn write_matched(title: &str, matched: &[Value], out: &mut String) {
+    if let [only] = matched {
+        writeln!(out, "{title} {}", symbol_ref(only)).ok();
+        return;
+    }
+    writeln!(
+        out,
+        "{title} {} definitions (narrow with in_file or kind):",
+        matched.len()
+    )
+    .ok();
+    for symbol in matched.iter().take(MATCHED_SHOWN) {
+        writeln!(out, "  {}", symbol_ref(symbol)).ok();
+    }
+    if matched.len() > MATCHED_SHOWN {
+        writeln!(out, "  … +{} more", matched.len() - MATCHED_SHOWN).ok();
+    }
+}
+
+/// `Name` for one match, `Name (+N more definitions)` for several.
+fn matched_names(matched: &[Value]) -> String {
+    let first = matched
+        .first()
+        .and_then(|symbol| symbol.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    match matched.len() {
+        0 | 1 => first.to_string(),
+        n => format!("{first} (+{} more definitions)", n - 1),
+    }
+}
+
+fn symbol_ref(symbol: &Value) -> String {
+    format!(
+        "{} [{}] {}:{}",
+        symbol.get("name").and_then(Value::as_str).unwrap_or("?"),
+        symbol.get("kind").and_then(Value::as_str).unwrap_or("?"),
+        symbol.get("path").and_then(Value::as_str).unwrap_or("?"),
+        symbol.get("line").and_then(Value::as_i64).unwrap_or(0)
+    )
+}
+
+/// Truncation notice for the newer reports: their totals run into the
+/// thousands, so it asks for a larger page rather than for all of it.
+fn write_more_notice(pagination: Option<&Value>, out: &mut String) {
+    let Some(pagination) = pagination else {
+        return;
+    };
+    if pagination.get("truncated").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let returned = pagination
+        .get("returned")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = pagination
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or(returned);
+    writeln!(out, "… {returned} of {total} shown; raise limit for more").ok();
+}
+
+fn string_items(value: Option<&Value>) -> impl Iterator<Item = &str> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..10).unwrap_or(sha)
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 fn render_refs(v: &Value, out: &mut String) -> bool {
@@ -703,6 +1656,309 @@ mod tests {
         let rendered: Value = serde_json::from_str(&to_compact("changed", json)).unwrap();
         let original: Value = serde_json::from_str(json).unwrap();
         assert_eq!(rendered, original);
+    }
+
+    // --- fixtures captured from the real `ast-index --format json` ---
+    //
+    // `tests/fixtures/` holds unedited CLI output: most of it from a small
+    // Ruby repository with a scripted Git history (symbol graph + collected
+    // history), `graph_dependents_ambiguous.json` from this repository's own
+    // index, and the `*_not_*` files from the same Ruby index before
+    // `graph build` / `hotspots --collect` ran.
+
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!("../tests/fixtures/", $name, ".json"))
+        };
+    }
+
+    fn lines_starting_with(out: &str, prefix: &str) -> usize {
+        out.lines()
+            .filter(|line| line.trim_start().starts_with(prefix))
+            .count()
+    }
+
+    #[test]
+    fn hotspots_report_keeps_every_signal_on_two_lines_per_file() {
+        let json = fixture!("hotspots");
+        let out = to_compact("hotspots", json);
+        assert!(out.starts_with(
+            "Git hotspots: 13 live files with history, 11 commits (HEAD bcc236d01a), sorted by score"
+        ));
+        assert!(out.contains(concat!(
+            "app/services/billing/charge_service.rb\n",
+            "  score 96 · 5 commits p96 · fixes 3/5=60% p96 · churn +12/-3 p96 (1.7x file)",
+            " · 5 authors p96 · age 1298d p58 · changed 450d ago · 9 lines\n",
+            "  churn:high fixes:high authors:many\n"
+        )));
+        assert!(out.ends_with("… 3 of 13 shown; raise limit for more"));
+        assert!(out.len() * 2 < json.len(), "not compact: {out}");
+    }
+
+    #[test]
+    fn hotspots_without_collected_history_names_the_cli_command() {
+        let out = to_compact("hotspots", fixture!("hotspots_not_collected"));
+        assert!(out.contains("`ast-index hotspots --collect`"));
+        assert!(out.contains("not available through MCP"));
+    }
+
+    #[test]
+    fn graph_build_summary_lists_only_confidences_with_edges() {
+        let out = to_compact("graph_build", fixture!("graph_build"));
+        assert_eq!(
+            out,
+            concat!(
+                "Symbol graph built: 17 nodes, 17 edges (17 resolved) in 0 ms.\n",
+                "Edges by confidence: scoped 17.\n",
+                "References: 35 seen, 17 linked (48.6%)."
+            )
+        );
+    }
+
+    #[test]
+    fn graph_dependents_list_one_line_per_edge_at_the_reference() {
+        assert_eq!(
+            to_compact("graph_dependents", fixture!("graph_dependents")),
+            concat!(
+                "Dependents of ApplicationService [class] app/services/application_service.rb:1\n",
+                "3 resolved, 0 ambiguous edges\n",
+                "[scoped] Billing::ChargeService [class] app/services/billing/charge_service.rb:2\n",
+                "[scoped] Billing::DraftService [class] app/services/billing/draft_service.rb:2\n",
+                "[scoped] Billing::RefundService [class] app/services/billing/refund_service.rb:2"
+            )
+        );
+    }
+
+    #[test]
+    fn graph_dependents_show_ambiguous_candidates_and_truncation() {
+        let out = to_compact("graph_dependents", fixture!("graph_dependents_ambiguous"));
+        assert!(out.contains("7 resolved, 6 ambiguous edges\n"));
+        assert!(out.contains("[ambiguous 1/1] cmd_composables [function] src/commands/grep.rs:821"));
+        assert!(
+            !out.contains("include_ambiguous: true lists"),
+            "ambiguous edges are already listed: {out}"
+        );
+        assert!(out.ends_with("… 9 of 13 shown; raise limit for more"));
+    }
+
+    #[test]
+    fn stale_graph_is_flagged_with_the_refresh_remedy() {
+        let out = to_compact("graph_dependents", fixture!("graph_dependents_stale"));
+        let first = out.lines().next().unwrap();
+        assert!(first.starts_with("warning: the symbol graph is stale"));
+        assert!(first.contains("refresh: true"));
+    }
+
+    #[test]
+    fn graph_dependencies_with_members_name_the_referring_member() {
+        let out = to_compact("graph_dependencies", fixture!("graph_dependencies_members"));
+        assert!(out.contains("2 resolved, 0 ambiguous edges (class members included)"));
+        assert!(out.contains(
+            "[scoped] Billing::ChargeService [class] app/services/billing/charge_service.rb:2 (from create, line 3)"
+        ));
+    }
+
+    #[test]
+    fn graph_impact_summarizes_depths_and_names_the_hop_it_came_through() {
+        let out = to_compact("graph_dependents", fixture!("graph_impact"));
+        assert!(out.contains(
+            "depth 1: 2 symbols in 2 files · depth 2: 5 symbols in 4 files · total 7 symbols in 4 files"
+        ));
+        assert!(out.contains("\nd1 Invoice [class] app/models/invoice.rb:1 (scoped)\n"));
+        assert!(
+            out.contains("\nd2 total [function] app/models/invoice.rb:4 via LineItem (scoped)\n")
+        );
+        assert!(out.ends_with("… 4 of 7 shown; raise limit for more"));
+    }
+
+    #[test]
+    fn graph_path_draws_each_hop_with_the_edge_that_reaches_it() {
+        assert_eq!(
+            to_compact("graph_path", fixture!("graph_path")),
+            concat!(
+                "OrdersController -> Invoice: 3 hop(s), 1 shortest path(s), 1 shown\n",
+                "path 1:\n",
+                "  create [function] app/controllers/orders_controller.rb:2\n",
+                "  -[scoped]-> Billing::ChargeService [class] app/services/billing/charge_service.rb:2\n",
+                "  -[contains]-> call [function] app/services/billing/charge_service.rb:3\n",
+                "  -[scoped]-> Invoice [class] app/models/invoice.rb:1"
+            )
+        );
+    }
+
+    #[test]
+    fn graph_path_labels_a_reverse_connection() {
+        let out = to_compact("graph_path", fixture!("graph_path_reverse"));
+        assert!(out.starts_with(
+            "No path Invoice -> OrdersController; the reverse direction connects them: OrdersController -> Invoice"
+        ));
+    }
+
+    #[test]
+    fn graph_path_without_connection_suggests_what_to_widen() {
+        let out = to_compact("graph_path", fixture!("graph_path_none"));
+        assert!(out.starts_with(
+            "No dependency path between Billing::Report (+1 more definitions) and Invoice"
+        ));
+        assert!(out.contains("include_ambiguous: true"));
+        assert!(out.contains("max_depth"));
+    }
+
+    #[test]
+    fn graph_cycles_print_the_chain_and_members() {
+        assert_eq!(
+            to_compact("graph_cycles", fixture!("graph_cycles")),
+            concat!(
+                "1 dependency cycle(s) over resolved edges, largest first:\n",
+                "2 symbols in 2 files: Invoice -> LineItem -> Invoice\n",
+                "  Invoice [class] app/models/invoice.rb:1\n",
+                "  LineItem [class] app/models/line_item.rb:1"
+            )
+        );
+    }
+
+    #[test]
+    fn graph_top_numbers_rows_and_metrics_do_not() {
+        let top = to_compact("graph_metrics", fixture!("graph_top"));
+        assert!(top.starts_with("Top symbols by pagerank"));
+        assert!(top.contains(concat!(
+            "1. ApplicationService [class] app/services/application_service.rb:1\n",
+            "   fan-in 3 (3 files) · fan-out 0 · dependents 8 · pagerank 2.98 p97\n"
+        )));
+
+        let metrics = to_compact("graph_metrics", fixture!("graph_metrics"));
+        assert!(metrics.starts_with("Graph metrics"));
+        assert_eq!(lines_starting_with(&metrics, "fan-in"), 3);
+        assert!(metrics.contains("Sales::Report [class] app/services/sales/report.rb:2"));
+        assert!(!metrics.contains("1. "));
+    }
+
+    #[test]
+    fn graph_errors_point_at_mcp_remedies() {
+        let not_built = to_compact("graph_dependents", fixture!("graph_not_built"));
+        assert!(not_built.contains("refresh: true"));
+        assert!(not_built.contains("graph_build"));
+
+        let no_match = to_compact("graph_dependents", fixture!("graph_no_match"));
+        assert!(no_match.starts_with("No symbol matches 'NoSuchThing'."));
+        assert!(no_match.contains("`Class#member`"));
+    }
+
+    #[test]
+    fn graph_unrecognised_shape_falls_back_to_compact_json() {
+        let json = r#"{"graph":{"built":true,"stale":false},"unexpected":1}"#;
+        let out = to_compact("graph_dependents", json);
+        let rendered: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(rendered, serde_json::from_str::<Value>(json).unwrap());
+    }
+
+    #[test]
+    fn ranked_search_prints_each_history_and_graph_once() {
+        let json = fixture!("search_rank_proven");
+        let out = to_compact("search", json);
+        assert!(out.starts_with("Ranked by proven = mean of calm"));
+        assert_eq!(lines_starting_with(&out, "history: "), 3, "{out}");
+        assert_eq!(lines_starting_with(&out, "graph via "), 3, "{out}");
+        assert_eq!(
+            lines_starting_with(&out, "history and graph: as above"),
+            3,
+            "{out}"
+        );
+        assert!(out.contains(concat!(
+            "  app/services/billing/charge_service.rb\n",
+            "    proven 0.49 = mean(calm 0.04, age 0.58, idle 0.35, used 1.00) · match: file_name\n",
+            "    history: 5 commits p96 · fixes 3/5=60% p96 · churn 15 p96 · 5 authors p96",
+            " · age 1298d p58 · changed 450d ago p35 · churn:high fixes:high authors:many\n"
+        )));
+        assert!(out.contains(concat!(
+            "  Billing::ChargeService [class] app/services/billing/charge_service.rb:2\n",
+            "    class ChargeService < ApplicationService\n",
+            "    proven 0.49 = mean(calm 0.04, age 0.58, idle 0.35, used 1.00) · relevance #3, name\n",
+            "    history and graph: as above\n"
+        )));
+        assert!(out.contains("\nContent (not ranked):\n"));
+        assert!(
+            out.len() * 4 < json.len(),
+            "not compact: {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn ranked_search_not_applied_keeps_plain_results_and_names_remedies() {
+        let out = to_compact("search", fixture!("search_rank_not_applied"));
+        assert!(
+            out.starts_with("Ranking 'risky' NOT applied: results are in plain relevance order.")
+        );
+        assert!(out.contains("the symbol graph has not been built: call graph_build"));
+        assert!(out.contains(
+            "git history has not been collected: run `ast-index hotspots --collect` in a shell"
+        ));
+        assert!(out.contains("\nFiles:\n  app/services/application_service.rb\n"));
+        assert!(out.contains(
+            "\nSymbols:\n  ApplicationService [class] app/services/application_service.rb:1\n"
+        ));
+        assert!(!out.contains('{'), "fell back to JSON: {out}");
+    }
+
+    #[test]
+    fn ranked_search_explains_unscored_results() {
+        let out = to_compact("search", fixture!("search_rank_unscored"));
+        assert!(out.contains(concat!(
+            "proven not scored: no collected history for this file ",
+            "(untracked or newer than the last collection) · match: file_name"
+        )));
+        assert!(out.contains("graph via Billing::DraftService [class]:2: no resolved callers"));
+        assert!(out.contains("\n    graph: as above\n"));
+    }
+
+    #[test]
+    fn ranked_search_with_stale_graph_warns_once() {
+        let out = to_compact("search", fixture!("search_rank_stale"));
+        assert_eq!(lines_starting_with(&out, "warning:"), 1, "{out}");
+        assert!(out.contains("call graph_build"));
+        assert!(!out.contains("history"), "central uses no history: {out}");
+    }
+
+    #[test]
+    fn ranked_search_survives_null_and_foreign_dossiers() {
+        let json = r#"{
+            "rank": {"preset": "risky", "applied": false, "missing": [{"signal": "x"}]},
+            "files": [{"path": "a.rb", "rank": null}, "b.rb", {"rank": 3}],
+            "symbols": [{"name": "A", "kind": "class", "path": "a.rb", "line": 1, "rank": {"tier": 7}}]
+        }"#;
+        let out = to_compact("search", json);
+        assert!(out.contains("  a.rb\n  b.rb\n  ?\n"));
+        assert!(out.contains("A [class] a.rb:1"));
+    }
+
+    #[test]
+    fn plain_search_render_is_unchanged() {
+        assert_eq!(
+            to_compact("search", fixture!("search_plain")),
+            concat!(
+                "Files:\n",
+                "  app/services/application_service.rb\n",
+                "  app/services/billing/charge_service.rb\n",
+                "  app/services/billing/draft_service.rb\n",
+                "  … truncated: showing 3 of 9; raise limit to 9\n",
+                "\n",
+                "Symbols:\n",
+                "  ApplicationService [class] app/services/application_service.rb:1\n",
+                "    class ApplicationService\n",
+                "  Billing::DraftService [class] app/services/billing/draft_service.rb:2\n",
+                "    class DraftService < ApplicationService\n",
+                "  Billing::ChargeService [class] app/services/billing/charge_service.rb:2\n",
+                "    class ChargeService < ApplicationService\n",
+                "  … truncated: showing 3 of 5; raise limit to 5\n",
+                "\n",
+                "Content:\n",
+                "  spec/services/charge_service_spec.rb:1  RSpec.describe Billing::ChargeService do\n",
+                "  spec/services/charge_service_spec.rb:3  Billing::ChargeService.call\n",
+                "  app/services/billing/draft_service.rb:2  class DraftService < ApplicationService\n",
+                "  … truncated: showing 3 of 9; raise limit to 9"
+            )
+        );
     }
 
     // --- fall-through behaviour ---

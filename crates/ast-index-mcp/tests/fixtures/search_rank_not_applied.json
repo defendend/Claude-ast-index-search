@@ -1,0 +1,119 @@
+{
+  "content_matches": [
+    {
+      "content": "RSpec.describe Billing::ChargeService do",
+      "line": 1,
+      "path": "spec/services/charge_service_spec.rb"
+    },
+    {
+      "content": "Billing::ChargeService.call",
+      "line": 3,
+      "path": "spec/services/charge_service_spec.rb"
+    },
+    {
+      "content": "class DraftService < ApplicationService",
+      "line": 2,
+      "path": "app/services/billing/draft_service.rb"
+    }
+  ],
+  "files": [
+    {
+      "path": "app/services/application_service.rb",
+      "rank": null
+    },
+    {
+      "path": "app/services/billing/charge_service.rb",
+      "rank": null
+    },
+    {
+      "path": "app/services/billing/refund_service.rb",
+      "rank": null
+    }
+  ],
+  "pagination": {
+    "content_matches": {
+      "limit": 3,
+      "returned": 3,
+      "total": 9,
+      "truncated": true
+    },
+    "files": {
+      "limit": 3,
+      "returned": 3,
+      "total": 4,
+      "truncated": true
+    },
+    "references": {
+      "limit": 3,
+      "returned": 0,
+      "total": 0,
+      "truncated": false
+    },
+    "symbols": {
+      "limit": 3,
+      "returned": 3,
+      "total": 4,
+      "truncated": true
+    }
+  },
+  "rank": {
+    "applied": false,
+    "formula": "blast radius x file hotspot score: percentile of transitive dependents among referenced symbols (0 when nothing resolves to it) times the hotspot score",
+    "graph": {
+      "built": false,
+      "granularity": "symbol",
+      "stale": false
+    },
+    "missing": [
+      {
+        "command": "ast-index graph build",
+        "reason": "the symbol graph has not been built",
+        "signal": "graph"
+      },
+      {
+        "command": "ast-index hotspots --collect",
+        "reason": "git history has not been collected",
+        "signal": "history"
+      }
+    ],
+    "pool": {
+      "files": 4,
+      "symbols": 4
+    },
+    "preset": "risky",
+    "preset_weight": 0.9,
+    "ranked_sections": [
+      "files",
+      "symbols"
+    ],
+    "warnings": []
+  },
+  "references": [],
+  "schema_version": 2,
+  "symbols": [
+    {
+      "kind": "class",
+      "line": 1,
+      "name": "ApplicationService",
+      "path": "app/services/application_service.rb",
+      "rank": null,
+      "signature": "class ApplicationService"
+    },
+    {
+      "kind": "class",
+      "line": 2,
+      "name": "Billing::ChargeService",
+      "path": "app/services/billing/charge_service.rb",
+      "rank": null,
+      "signature": "class ChargeService < ApplicationService"
+    },
+    {
+      "kind": "class",
+      "line": 2,
+      "name": "Billing::RefundService",
+      "path": "app/services/billing/refund_service.rb",
+      "rank": null,
+      "signature": "class RefundService < ApplicationService"
+    }
+  ]
+}
