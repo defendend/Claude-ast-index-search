@@ -106,6 +106,41 @@ ast-index search "@RestController"   # Find Spring REST controllers (annotation 
 ast-index search "@GetMapping"       # Find GET endpoint mappings
 ```
 
+**`search --rank <preset>`** - Re-rank the Files and Symbols sections by the
+file's Git history and the symbol's place in the dependency graph, with a
+dossier next to every result explaining its position. Use it when the question
+is not "where is X" but "which of these X":
+
+```bash
+ast-index search Service --fuzzy --module app/services/ --rank proven  # safe to copy as a pattern
+ast-index search Merge --rank risky                   # dangerous to touch: many dependents + unstable history
+ast-index search Import --rank hotspots               # keeps being changed and fixed
+ast-index search Event --module app/models/ --rank central  # what the rest leans on (PageRank)
+ast-index --format json search Merge --rank risky     # rank.applied / rank.missing + per-result dossier
+```
+
+| Preset | Score | Needs |
+|--------|-------|-------|
+| `proven` | mean(1 − hotspot score, file age pct, days-idle pct, used 1/0) | `hotspots --collect` + `graph build` |
+| `hotspots` | file hotspot score (commits, churn, bugfix ratio pct) | `hotspots --collect` |
+| `risky` | dependents pct × hotspot score | both |
+| `central` | PageRank pct | `graph build` |
+
+- Relevance stays in charge: the pool is the top 100 project symbols of the
+  plain order, exact-name matches stay above partial ones, and inside a tier
+  the key is `0.9 × score + 0.1 × 1/(1 + position/20)`. File path matches use
+  where the match sits (stem, name, directory) as the relevance term.
+- **History is per file** — every symbol in a file shares it ("file history"
+  in the output). Graph numbers are per symbol; a file result borrows them from
+  its strongest symbol.
+- Missing data is never ranked as zeros: the preset is not applied, results
+  keep plain order, and the output names the command to run
+  (`rank.missing[].command` in JSON). A stale graph ranks with a warning.
+- Third-party code (`node_modules`, `.d.ts`) is never scored and is listed
+  after all project results.
+- Formulas were picked by backtesting next-year bugfixes on a 40k-file
+  monorepo; the numbers are in USER_GUIDE.md ("Ranking search results").
+
 ### File Search
 
 **`file`** - Find files by name pattern.

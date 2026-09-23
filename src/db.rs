@@ -5851,6 +5851,19 @@ pub fn find_files_with_roots_terms_scoped(
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<FileResult>> {
+    find_files_with_roots_terms_filtered(conn, terms, limit, scope, None)
+}
+
+/// [`find_files_with_roots_terms_scoped`] restricted to third-party paths
+/// (`vendor = Some(true)`, see [`is_vendor_path`]) or to the project's own
+/// (`Some(false)`), so a ranker can fill its pool with project files only.
+pub fn find_files_with_roots_terms_filtered(
+    conn: &Connection,
+    terms: &[&str],
+    limit: usize,
+    scope: &SearchScope,
+    vendor: Option<bool>,
+) -> Result<Vec<FileResult>> {
     if terms.is_empty() {
         return Ok(Vec::new());
     }
@@ -5859,8 +5872,9 @@ pub fn find_files_with_roots_terms_scoped(
         .collect::<Vec<_>>()
         .join(" OR ");
     let (scope_clause, scope_params) = scope.path_condition();
+    let vendor_clause = vendor_condition(vendor);
     let sql = format!(
-        "SELECT f.path, f.root_path FROM files f WHERE ({predicates}){scope_clause} ORDER BY f.path LIMIT ?"
+        "SELECT f.path, f.root_path FROM files f WHERE ({predicates}){scope_clause}{vendor_clause} ORDER BY f.path LIMIT ?"
     );
     let mut values: Vec<String> = terms.iter().map(|term| format!("%{term}%")).collect();
     values.extend(scope_params);
@@ -7533,10 +7547,42 @@ pub fn search_symbol_terms_scoped(
     scope: &SearchScope,
     fuzzy: bool,
 ) -> Result<Vec<SearchResult>> {
+    Ok(
+        search_symbol_terms_scoped_with_ids(conn, terms, kind, limit, scope, fuzzy, None)?
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect(),
+    )
+}
+
+/// `AND` clause keeping only third-party paths, only project paths, or
+/// (for `None`) everything.
+fn vendor_condition(vendor: Option<bool>) -> String {
+    match vendor {
+        None => String::new(),
+        Some(true) => format!(" AND {VENDOR_PATH_SQL}"),
+        Some(false) => format!(" AND NOT {VENDOR_PATH_SQL}"),
+    }
+}
+
+/// [`search_symbol_terms_scoped`] with each row's symbol id, in the same
+/// order, optionally restricted to third-party (`vendor = Some(true)`) or
+/// project (`Some(false)`) paths. Rankers need the id to look up per-symbol
+/// graph metrics.
+pub fn search_symbol_terms_scoped_with_ids(
+    conn: &Connection,
+    terms: &[&str],
+    kind: Option<&str>,
+    limit: usize,
+    scope: &SearchScope,
+    fuzzy: bool,
+    vendor: Option<bool>,
+) -> Result<Vec<(i64, SearchResult)>> {
     if terms.is_empty() {
         return Ok(Vec::new());
     }
     let (scope_clause, scope_params) = scope.path_condition();
+    let vendor_clause = vendor_condition(vendor);
     let mut values = Vec::new();
     let mut sql = if fuzzy {
         let predicates = terms
@@ -7552,7 +7598,7 @@ pub fn search_symbol_terms_scoped(
             .collect::<Vec<_>>()
             .join(" OR ");
         format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicates}){scope_clause}"
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.id FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicates}){scope_clause}{vendor_clause}"
         )
     } else {
         values.push(
@@ -7563,7 +7609,7 @@ pub fn search_symbol_terms_scoped(
                 .join(" OR "),
         );
         format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols_fts fts JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id WHERE symbols_fts MATCH ?{scope_clause}"
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.id FROM symbols_fts fts JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id WHERE symbols_fts MATCH ?{scope_clause}{vendor_clause}"
         )
     };
     values.extend(scope_params);
@@ -7596,7 +7642,9 @@ pub fn search_symbol_terms_scoped(
         .collect();
     let mut stmt = conn.prepare(&sql)?;
     let results = stmt
-        .query_map(params.as_slice(), row_to_search_result)?
+        .query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(7)?, row_to_search_result(row)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }
@@ -8797,6 +8845,69 @@ pub fn load_all_git_file_stats(conn: &Connection) -> Result<Vec<GitFileStats>> {
     Ok(rows)
 }
 
+/// [`GitFileStats`] with the author count instead of the author list: what
+/// percentile ranking needs, without materializing every author string.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitFileSignalRow {
+    pub path: String,
+    pub commits: i64,
+    pub fix_commits: i64,
+    pub lines_added: i64,
+    pub lines_deleted: i64,
+    pub first_commit_at: Option<i64>,
+    pub last_commit_at: Option<i64>,
+    pub current_lines: Option<i64>,
+    pub authors: usize,
+}
+
+impl From<GitFileStats> for GitFileSignalRow {
+    fn from(stats: GitFileStats) -> Self {
+        GitFileSignalRow {
+            authors: stats.authors.len(),
+            path: stats.path,
+            commits: stats.commits,
+            fix_commits: stats.fix_commits,
+            lines_added: stats.lines_added,
+            lines_deleted: stats.lines_deleted,
+            first_commit_at: stats.first_commit_at,
+            last_commit_at: stats.last_commit_at,
+            current_lines: stats.current_lines,
+        }
+    }
+}
+
+/// Signals of every path that still exists in the working tree (the
+/// population `hotspots` ranks against), with author counts.
+pub fn load_live_git_file_signals(conn: &Connection) -> Result<Vec<GitFileSignalRow>> {
+    if !table_exists(conn, "git_file_stats")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn.prepare(
+        "SELECT s.path, s.commits, s.fix_commits, s.lines_added, s.lines_deleted,
+                s.first_commit_at, s.last_commit_at, s.current_lines,
+                (SELECT COUNT(*) FROM git_file_authors a WHERE a.path = s.path)
+         FROM git_file_stats s
+         WHERE s.current_lines IS NOT NULL",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(GitFileSignalRow {
+                path: row.get(0)?,
+                commits: row.get(1)?,
+                fix_commits: row.get(2)?,
+                lines_added: row.get(3)?,
+                lines_deleted: row.get(4)?,
+                first_commit_at: row.get(5)?,
+                last_commit_at: row.get(6)?,
+                current_lines: row.get(7)?,
+                authors: row.get::<_, i64>(8)? as usize,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read git_file_stats")?;
+    Ok(rows)
+}
+
 /// Replace the stored signals for the supplied paths inside one transaction.
 ///
 /// Paths absent from `stats` are left untouched, which is what makes the
@@ -9250,6 +9361,70 @@ pub fn load_symbol_graph_metrics(
         }
     }
     Ok(metrics)
+}
+
+/// A symbol that has a `symbol_metrics` row, with the file it lives in.
+#[derive(Clone, Debug)]
+pub struct FileSymbolMetrics {
+    pub path: String,
+    pub root_path: Option<String>,
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+    pub metrics: SymbolGraphMetrics,
+}
+
+/// Graph metrics of every symbol defined in any of `paths` (all roots), for
+/// rankers that score whole files by the symbols inside them.
+pub fn load_file_symbol_metrics(
+    conn: &Connection,
+    paths: &[&str],
+) -> Result<Vec<FileSymbolMetrics>> {
+    let mut rows = Vec::new();
+    if !table_exists(conn, "symbol_metrics")? {
+        return Ok(rows);
+    }
+    for chunk in paths.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT f.path, f.root_path, s.name, s.kind, s.line,
+                    m.symbol_id, m.fan_in, m.fan_in_files, m.fan_in_ambiguous, m.fan_out,
+                    m.fan_out_ambiguous, m.dependents, m.pagerank, m.pagerank_pct
+             FROM files f
+             JOIN symbols s ON s.file_id = f.id
+             JOIN symbol_metrics m ON m.symbol_id = s.id
+             WHERE f.path IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|path| path as &dyn rusqlite::types::ToSql)
+            .collect();
+        let found = stmt.query_map(values.as_slice(), |row| {
+            Ok(FileSymbolMetrics {
+                path: row.get(0)?,
+                root_path: row.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty()),
+                name: row.get(2)?,
+                kind: row.get(3)?,
+                line: row.get(4)?,
+                metrics: SymbolGraphMetrics {
+                    symbol_id: row.get(5)?,
+                    fan_in: row.get(6)?,
+                    fan_in_files: row.get(7)?,
+                    fan_in_ambiguous: row.get(8)?,
+                    fan_out: row.get(9)?,
+                    fan_out_ambiguous: row.get(10)?,
+                    dependents: row.get(11)?,
+                    pagerank: row.get(12)?,
+                    pagerank_pct: row.get(13)?,
+                },
+            })
+        })?;
+        for row in found {
+            rows.push(row?);
+        }
+    }
+    Ok(rows)
 }
 
 /// Every stored metrics row (symbols touching at least one edge).

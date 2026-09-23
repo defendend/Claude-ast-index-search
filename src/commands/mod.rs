@@ -24,6 +24,7 @@ pub mod management;
 pub mod modules;
 pub mod perl;
 pub mod project_info;
+pub mod rank;
 pub mod watch;
 
 use std::collections::HashSet;
@@ -206,6 +207,12 @@ impl PathResolver {
             }
         }
         roots
+    }
+
+    /// Whether a stored `root_path` belongs to the primary project root
+    /// rather than to an attached subtree.
+    pub fn is_primary_root(&self, root_path: Option<&str>) -> bool {
+        root_path.map_or(true, |root| root == self.primary_key)
     }
 
     pub fn subtree_name(&self, root_path: Option<&str>) -> Option<&str> {
