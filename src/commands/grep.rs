@@ -77,46 +77,94 @@ fn trailing_boundary(function_name: &str) -> &str {
     }
 }
 
+/// Call idioms recognised across languages, joined into one alternation.
+/// `{fn}` stands for the escaped function name and `{tb}` for its trailing
+/// boundary. Every idiom contains `{fn}`, so a line that matches always
+/// contains the name verbatim; the batched call-tree scan relies on that.
+const CALLER_IDIOMS: [&str; 13] = [
+    r"[.>]{fn}\s*\(",                // obj.func( or obj->func(
+    r"\b{fn}\s*\(",                  // bare func( anywhere in line
+    r"->{fn}\s*\(",                  // ->func(
+    r"&{fn}\s*\(",                   // &func(
+    r"this\.{fn}\s*\(",              // this.func(
+    r"super\.{fn}\s*\(",             // super.func(
+    r"\.{fn}(?:\s|$)",               // Ruby: obj.method (no parens)
+    r":{fn}{tb}",                    // Ruby: :method_name (symbol ref in callbacks)
+    r"\b{fn}\.",                     // Ruby: bare method.chain (e.g. scope.where)
+    r"\bawait\s+{fn}\s*\(",          // TS: await func(
+    r"\bawait\s+[\w.]+\.{fn}\s*\(",  // TS: await obj.func(
+    r"\breturn\s+{fn}\s*\(",         // TS: return func(
+    r"\breturn\s+[\w.]+\.{fn}\s*\(", // TS: return obj.func(
+];
+
+fn caller_pattern(fn_pattern: &str, trailing: &str) -> String {
+    CALLER_IDIOMS
+        .iter()
+        .map(|idiom| idiom.replace("{fn}", fn_pattern).replace("{tb}", trailing))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Build regex pattern that matches function/method calls across languages
 fn build_caller_pattern(function_name: &str) -> String {
-    let fn_escaped = regex::escape(function_name);
-    let tb = trailing_boundary(function_name);
-    format!(
-        concat!(
-            r"[.>]{fn}\s*\(",          // obj.func( or obj->func(
-            r"|\b{fn}\s*\(",           // bare func( anywhere in line
-            r"|->{fn}\s*\(",           // ->func(
-            r"|&{fn}\s*\(",            // &func(
-            r"|this\.{fn}\s*\(",       // this.func(
-            r"|super\.{fn}\s*\(",      // super.func(
-            r"|\.{fn}(?:\s|$)",        // Ruby: obj.method (no parens)
-            r"|:{fn}{tb}",             // Ruby: :method_name (symbol ref in callbacks)
-            r"|\b{fn}\.",             // Ruby: bare method.chain (e.g. scope.where)
-            r"|\bawait\s+{fn}\s*\(",               // TS: await func(
-            r"|\bawait\s+[\w.]+\.{fn}\s*\(",       // TS: await obj.func(
-            r"|\breturn\s+{fn}\s*\(",              // TS: return func(
-            r"|\breturn\s+[\w.]+\.{fn}\s*\(",      // TS: return obj.func(
-        ),
-        fn = fn_escaped,
-        tb = tb
+    caller_pattern(
+        &regex::escape(function_name),
+        trailing_boundary(function_name),
     )
 }
 
+/// A pattern matching every line that [`build_caller_pattern`] matches for
+/// at least one of `function_names`. Dropping the trailing boundary only
+/// widens the `:symbol` idiom, so the superset holds for every name.
+fn build_any_caller_pattern(function_names: &[String]) -> String {
+    let names: Vec<String> = function_names
+        .iter()
+        .map(|name| regex::escape(name))
+        .collect();
+    caller_pattern(&format!("(?:{})", names.join("|")), "")
+}
+
+/// Words the Java-style branch of [`build_def_skip_pattern`] would otherwise
+/// read as a return type. Standing right before a name they make the line a
+/// call, never a definition: `return foo(`, `await foo(`, `new Foo(`,
+/// `if foo(`, `for x in foo(`, `export default foo(`, `go foo(`, `puts foo(`.
+const KEYWORDS_BEFORE_CALL: [&str; 33] = [
+    "and", "assert", "await", "case", "default", "defer", "echo", "elif", "else", "elsif", "from",
+    "go", "if", "in", "match", "new", "not", "of", "or", "print", "puts", "raise", "range",
+    "return", "then", "throw", "try", "unless", "until", "when", "while", "with", "yield",
+];
+
+/// Lines that define one particular function, as opposed to calling it.
+struct DefinitionPattern(Regex);
+
+impl DefinitionPattern {
+    fn is_match(&self, line: &str) -> bool {
+        // `regex` has no lookaround, so the word in return-type position is
+        // captured and a keyword there is ruled out here instead.
+        self.0.captures_iter(line).any(|caps| {
+            caps.name("type")
+                .map_or(true, |word| !KEYWORDS_BEFORE_CALL.contains(&word.as_str()))
+        })
+    }
+}
+
 /// Build regex pattern that skips function/method definitions
-fn build_def_skip_pattern(function_name: &str) -> Regex {
+fn build_def_skip_pattern(function_name: &str) -> DefinitionPattern {
     let fn_escaped = regex::escape(function_name);
     let tb = trailing_boundary(function_name);
-    Regex::new(&format!(
-        concat!(
-            r"\b(?:fun|func|sub)\s+{fn}\s*[<({{\[]",           // Kotlin/Swift/Perl
-            r"|\bdef\s+(?:self\.)?{fn}{tb}",                    // Ruby: def method / def self.method
-            r"|\b(?:(?:public|private|protected|static|final|abstract|synchronized|override)\s+)*",
-            r"(?:void|int|long|boolean|char|byte|short|float|double|[\w.]+(?:<[^{{;]*>)?(?:\[\])*)\s+{fn}\s*\(", // Java
-        ),
-        fn = fn_escaped,
-        tb = tb
-    ))
-    .expect("Invalid def skip pattern")
+    DefinitionPattern(
+        Regex::new(&format!(
+            concat!(
+                r"\b(?:fun|func|sub)\s+{fn}\s*[<({{\[]",           // Kotlin/Swift/Perl
+                r"|\bdef\s+(?:self\.)?{fn}{tb}",                    // Ruby: def method / def self.method
+                r"|\b(?:(?:public|private|protected|static|final|abstract|synchronized|override)\s+)*",
+                r"(?:void|int|long|boolean|char|byte|short|float|double|(?P<type>[\w.]+)(?:<[^{{;]*>)?(?:\[\])*)\s+{fn}\s*\(", // Java
+            ),
+            fn = fn_escaped,
+            tb = tb
+        ))
+        .expect("Invalid def skip pattern"),
+    )
 }
 
 /// Find TODO/FIXME/HACK comments
@@ -271,81 +319,136 @@ pub fn cmd_call_tree(
     println!("{}", format!("Call tree for '{}':", function_name).bold());
     println!("  {}", function_name.cyan());
 
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    visited.insert(function_name.to_string());
-
     // A missing or unreadable index is not fatal here: attribution falls back
     // to the textual scan that predates the index.
     let conn = db::open_db_leased(root).ok();
 
-    build_call_tree(
+    let callers = collect_tree_callers(
         root,
         conn.as_deref(),
         function_name,
-        1,
         max_depth,
         limit_per_level,
         in_file,
-        &mut visited,
     )?;
+    walk_call_tree(
+        function_name,
+        max_depth,
+        &callers,
+        &mut |depth, caller, site| {
+            let indent = "  ".repeat(depth + 1);
+            match site {
+                Some((file_path, line_num)) => println!(
+                    "{}← {} ({}:{})",
+                    indent,
+                    caller.yellow(),
+                    file_path,
+                    line_num
+                ),
+                None => println!("{}← {} (recursive)", indent, caller.dimmed()),
+            }
+        },
+    );
 
     Ok(())
 }
 
-/// Recursively build call tree
-#[allow(clippy::too_many_arguments)]
-fn build_call_tree(
+/// Calling functions of one function: `(caller, file, line of the caller)`.
+type CallerSites = Vec<(String, String, usize)>;
+
+/// Callers of every function the printed tree expands.
+///
+/// Each function takes a scan of the whole repository to find its callers,
+/// and one scan per function made the cost grow with the tree's width. So the
+/// depth-first walk the tree is printed in is replayed against what is known
+/// so far, every function it still lacks is looked up in a single shared scan,
+/// and the replay repeats until nothing is missing — about one scan per level.
+/// A shared scan gives each function the lines a scan of its own would, so the
+/// tree comes out the same.
+fn collect_tree_callers(
     root: &Path,
     conn: Option<&rusqlite::Connection>,
     function_name: &str,
-    current_depth: usize,
     max_depth: usize,
     limit: usize,
     in_file: Option<&str>,
-    visited: &mut std::collections::HashSet<String>,
-) -> Result<()> {
-    if current_depth > max_depth {
-        return Ok(());
-    }
-
-    let indent = "  ".repeat(current_depth + 1);
-    let callers = find_caller_functions(root, conn, function_name, limit, in_file)?;
-
-    if callers.is_empty() {
-        return Ok(());
-    }
-
-    for (caller_func, file_path, line_num) in callers {
-        let is_new = visited.insert(caller_func.clone());
-
-        if is_new {
-            println!(
-                "{}← {} ({}:{})",
-                indent,
-                caller_func.yellow(),
-                file_path,
-                line_num
-            );
-            // Recursively find callers of this function
-            build_call_tree(
-                root,
-                conn,
-                &caller_func,
-                current_depth + 1,
-                max_depth,
-                limit,
-                in_file,
-                visited,
-            )?;
-        } else {
-            println!("{}← {} (recursive)", indent, caller_func.dimmed());
+) -> Result<HashMap<String, CallerSites>> {
+    let mut callers = HashMap::new();
+    loop {
+        let missing = walk_call_tree(function_name, max_depth, &callers, &mut |_, _, _| {});
+        if missing.is_empty() {
+            return Ok(callers);
         }
+        let found = find_caller_functions(root, conn, &missing, limit, in_file)?;
+        callers.extend(missing.into_iter().zip(found));
     }
-
-    Ok(())
 }
 
-/// Find functions that call the given function.
+/// Visit the call tree depth-first, in print order, handing every edge to
+/// `visit` as `(depth, caller, Some((file, line)))`, or `None` for a caller
+/// already shown.
+///
+/// Returns the functions whose callers the walk needed but `callers` lacks;
+/// their subtrees are skipped, so a walk with anything missing is only a
+/// draft of the final one.
+fn walk_call_tree(
+    function_name: &str,
+    max_depth: usize,
+    callers: &HashMap<String, CallerSites>,
+    visit: &mut dyn FnMut(usize, &str, Option<(&str, usize)>),
+) -> Vec<String> {
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(function_name.to_string());
+    let mut missing = Vec::new();
+    walk_callers_of(
+        function_name,
+        1,
+        max_depth,
+        callers,
+        &mut visited,
+        &mut missing,
+        visit,
+    );
+    missing
+}
+
+fn walk_callers_of(
+    function_name: &str,
+    depth: usize,
+    max_depth: usize,
+    callers: &HashMap<String, CallerSites>,
+    visited: &mut std::collections::HashSet<String>,
+    missing: &mut Vec<String>,
+    visit: &mut dyn FnMut(usize, &str, Option<(&str, usize)>),
+) {
+    if depth > max_depth {
+        return;
+    }
+    let Some(sites) = callers.get(function_name) else {
+        if !missing.iter().any(|name| name == function_name) {
+            missing.push(function_name.to_string());
+        }
+        return;
+    };
+    for (caller, file_path, line_num) in sites {
+        if visited.insert(caller.clone()) {
+            visit(depth, caller, Some((file_path, *line_num)));
+            walk_callers_of(
+                caller,
+                depth + 1,
+                max_depth,
+                callers,
+                visited,
+                missing,
+                visit,
+            );
+        } else {
+            visit(depth, caller, None);
+        }
+    }
+}
+
+/// Find the functions that call each of `function_names`, in one scan.
 ///
 /// Call sites are still located textually: the regex knows call idioms the
 /// `refs` table does not record (`obj.method` without parentheses, Ruby
@@ -356,12 +459,18 @@ fn build_call_tree(
 fn find_caller_functions(
     root: &Path,
     conn: Option<&rusqlite::Connection>,
-    function_name: &str,
+    function_names: &[String],
     limit: usize,
     in_file: Option<&str>,
-) -> Result<Vec<(String, String, usize)>> {
-    let pattern = build_caller_pattern(function_name);
-    let def_pattern = build_def_skip_pattern(function_name);
+) -> Result<Vec<CallerSites>> {
+    let patterns: Vec<(String, String)> = function_names
+        .iter()
+        .map(|name| (build_caller_pattern(name), name.clone()))
+        .collect();
+    let def_patterns: Vec<DefinitionPattern> = function_names
+        .iter()
+        .map(|name| build_def_skip_pattern(name))
+        .collect();
 
     // Pattern to find function definitions (for locating the containing function)
     // Group 1: fun/func/function/def/sub style, Group 2: Ruby def/def self., Group 3: Java return-type style, Group 4: TS arrow function
@@ -373,17 +482,18 @@ fn find_caller_functions(
         r"|(?:const|let)\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z_]\w*)\s*(?::\s*[^=]+)?\s*=>",
     ))?;
 
-    let mut results: Vec<(String, String, usize)> = vec![];
-    let mut files_with_calls: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    let mut files_with_calls: Vec<HashMap<PathBuf, Vec<usize>>> =
+        function_names.iter().map(|_| HashMap::new()).collect();
 
     // First pass: find all files and line numbers with calls
-    search_files_limited(
+    super::search_files_limited_each(
         root,
-        &pattern,
+        &build_any_caller_pattern(function_names),
+        &patterns,
         &ALL_SOURCE_EXTENSIONS,
         limit * 3,
-        |path, line_num, line| {
-            if def_pattern.is_match(line) {
+        |index, path, line_num, line| {
+            if def_patterns[index].is_match(line) {
                 return;
             }
 
@@ -393,14 +503,30 @@ fn find_caller_functions(
                 }
             }
 
-            files_with_calls
+            files_with_calls[index]
                 .entry(path.to_path_buf())
                 .or_default()
                 .push(line_num);
         },
     )?;
 
-    // Second pass: for each call location, find the containing function
+    Ok(files_with_calls
+        .into_iter()
+        .map(|files| attribute_call_lines(root, conn, files, limit, &func_def_re))
+        .collect())
+}
+
+/// Second pass of [`find_caller_functions`]: the function containing each
+/// call line, at most `limit` distinct ones.
+fn attribute_call_lines(
+    root: &Path,
+    conn: Option<&rusqlite::Connection>,
+    files_with_calls: HashMap<PathBuf, Vec<usize>>,
+    limit: usize,
+    func_def_re: &Regex,
+) -> CallerSites {
+    let mut results: CallerSites = vec![];
+
     for (file_path, call_lines) in files_with_calls {
         if results.len() >= limit {
             break;
@@ -437,7 +563,7 @@ fn find_caller_functions(
             let owner = match owner {
                 Some(owner) => Some(owner),
                 None if ranges_known => None,
-                None => find_containing_function(&lines, call_line, &func_def_re),
+                None => find_containing_function(&lines, call_line, func_def_re),
             };
 
             if let Some((func_name, func_line)) = owner {
@@ -452,7 +578,7 @@ fn find_caller_functions(
         }
     }
 
-    Ok(results)
+    results
 }
 
 /// Find the function that contains a given line number
@@ -1150,7 +1276,10 @@ fn find_ast_grep_binary() -> Option<String> {
 mod tests {
     fn inject_lines(src: &str, ty: &str) -> Vec<usize> {
         let re = Regex::new(&format!(r"\b{}\b", regex::escape(ty))).unwrap();
-        injection_lines(src, &re).into_iter().map(|l| l + 1).collect()
+        injection_lines(src, &re)
+            .into_iter()
+            .map(|l| l + 1)
+            .collect()
     }
 
     #[test]
@@ -1186,9 +1315,18 @@ mod tests {
     fn suspend_regex_skips_extension_receiver() {
         let re = Regex::new(SUSPEND_FUN_NAME_PATTERN).unwrap();
         let name = |l: &str| re.captures(l).map(|c| c[1].to_string());
-        assert_eq!(name("override suspend fun ScreenStackNavigator.handle(x: X)").as_deref(), Some("handle"));
-        assert_eq!(name("suspend fun <T> Flow<T>.firstOrNull(): T?").as_deref(), Some("firstOrNull"));
-        assert_eq!(name("suspend fun load(id: String)").as_deref(), Some("load"));
+        assert_eq!(
+            name("override suspend fun ScreenStackNavigator.handle(x: X)").as_deref(),
+            Some("handle")
+        );
+        assert_eq!(
+            name("suspend fun <T> Flow<T>.firstOrNull(): T?").as_deref(),
+            Some("firstOrNull")
+        );
+        assert_eq!(
+            name("suspend fun load(id: String)").as_deref(),
+            Some("load")
+        );
     }
 
     use super::*;
@@ -1313,6 +1451,125 @@ mod tests {
         assert!(matches(&pat, "    return loadFromDB()"));
     }
 
+    #[test]
+    fn every_caller_idiom_contains_the_function_name() {
+        // The batched call-tree scan skips a name's pattern on lines that do
+        // not contain the name; an idiom without `{fn}` would lose matches.
+        for idiom in CALLER_IDIOMS {
+            assert!(idiom.contains("{fn}"), "{idiom}");
+        }
+    }
+
+    #[test]
+    fn any_caller_pattern_matches_each_names_calls() {
+        let names = [
+            "perform".to_string(),
+            "save!".to_string(),
+            "valid?".to_string(),
+            "let(:fields)".to_string(),
+        ];
+        let any = Regex::new(&build_any_caller_pattern(&names)).unwrap();
+        let lines = [
+            "  Worker.new.perform",
+            "  before_action :perform",
+            "  record.save!",
+            "  skip_callback :save!, if: :x",
+            "  return valid?(record)",
+            "  await store.valid?(x)",
+            "  let(:fields).tap { }",
+        ];
+        for line in lines {
+            assert!(
+                names
+                    .iter()
+                    .any(|name| matches(&build_caller_pattern(name), line)),
+                "{line}"
+            );
+            assert!(any.is_match(line), "{line}");
+        }
+        assert!(!any.is_match("  preperform(data)"));
+    }
+
+    fn sites(entries: &[(&str, &str, usize)]) -> CallerSites {
+        entries
+            .iter()
+            .map(|(caller, file, line)| (caller.to_string(), file.to_string(), *line))
+            .collect()
+    }
+
+    fn walk(
+        function_name: &str,
+        max_depth: usize,
+        callers: &HashMap<String, CallerSites>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut edges = vec![];
+        let missing = walk_call_tree(
+            function_name,
+            max_depth,
+            callers,
+            &mut |depth, caller, site| {
+                edges.push(match site {
+                    Some((file, line)) => format!("{depth} {caller} {file}:{line}"),
+                    None => format!("{depth} {caller} recursive"),
+                });
+            },
+        );
+        (edges, missing)
+    }
+
+    #[test]
+    fn walk_call_tree_reports_what_it_lacks_without_descending() {
+        let mut callers = HashMap::new();
+        let (edges, missing) = walk("leaf", 3, &callers);
+        assert!(edges.is_empty());
+        assert_eq!(missing, ["leaf"]);
+
+        callers.insert(
+            "leaf".to_string(),
+            sites(&[("alpha", "a.rb", 2), ("beta", "b.rb", 6)]),
+        );
+        let (edges, missing) = walk("leaf", 3, &callers);
+        assert_eq!(edges, ["1 alpha a.rb:2", "1 beta b.rb:6"]);
+        assert_eq!(missing, ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn walk_call_tree_marks_callers_already_shown_as_recursive() {
+        let callers: HashMap<String, CallerSites> = [
+            ("leaf", sites(&[("alpha", "a.rb", 2), ("beta", "b.rb", 6)])),
+            ("alpha", sites(&[("top", "t.rb", 2), ("leaf", "a.rb", 9)])),
+            ("beta", sites(&[("top", "t.rb", 2)])),
+            ("top", sites(&[])),
+        ]
+        .into_iter()
+        .map(|(name, sites)| (name.to_string(), sites))
+        .collect();
+        let (edges, missing) = walk("leaf", 3, &callers);
+        assert_eq!(
+            edges,
+            [
+                "1 alpha a.rb:2",
+                "2 top t.rb:2",
+                "2 leaf recursive",
+                "1 beta b.rb:6",
+                "2 top recursive",
+            ]
+        );
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn walk_call_tree_needs_no_callers_below_the_depth_limit() {
+        let callers: HashMap<String, CallerSites> =
+            [("leaf".to_string(), sites(&[("alpha", "a.rb", 2)]))]
+                .into_iter()
+                .collect();
+        let (edges, missing) = walk("leaf", 1, &callers);
+        assert_eq!(edges, ["1 alpha a.rb:2"]);
+        assert!(missing.is_empty());
+        assert_eq!(walk("leaf", 0, &callers), (vec![], vec![]));
+    }
+
     // --- build_def_skip_pattern tests ---
 
     #[test]
@@ -1347,6 +1604,59 @@ mod tests {
     fn test_def_skip_kotlin_fun() {
         let pat = build_def_skip_pattern("calculate");
         assert!(pat.is_match("  fun calculate(x: Int)"));
+    }
+
+    #[test]
+    fn def_skip_keeps_calls_behind_a_keyword() {
+        let calls = [
+            ("foo", "    return foo(x)"),
+            ("foo", "  const y = await foo(x)"),
+            ("Foo", "    throw new Foo(message)"),
+            ("foo", "  } else foo(x)"),
+            ("foo", "    yield foo(x)"),
+            ("foo", "    puts foo(x)"),
+            ("Foo", "    raise Foo(message)"),
+            ("foo", "    if foo(x)"),
+            ("foo", "    elsif foo(x)"),
+            ("foo", "  for item in foo(items):"),
+            ("foo", "  for (const item of foo(items)) {"),
+            ("foo", "export default foo(App)"),
+            ("foo", "  go foo(ch)"),
+            ("foo", "  defer foo(conn)"),
+            ("foo", "  echo foo($x);"),
+            ("foo", "  with foo(path) as handle:"),
+            ("foo", "    assert foo(x)"),
+            ("foo", "  match foo(x) {"),
+            ("foo", "  return await foo(x)"),
+        ];
+        for (name, line) in calls {
+            assert!(matches(&build_caller_pattern(name), line), "{line}");
+            assert!(!build_def_skip_pattern(name).is_match(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn def_skip_still_recognises_typed_definitions() {
+        let definitions = [
+            "  public void foo(int x) {",
+            "  String foo(String x) {",
+            "  public static List<String> foo(Map<String, Integer> x) {",
+            "  int[] foo() {",
+            "  private override fun foo() {",
+            "export function foo(x) {",
+            "  async function foo(x) {",
+            "  public foo(x: number): void {",
+            "  static foo() {",
+            "  async foo() {",
+            "  private def foo(x)",
+            "  defp foo(x) do",
+            "pub fn foo(x: u32) -> u32 {",
+            "local function foo(x)",
+        ];
+        let pat = build_def_skip_pattern("foo");
+        for line in definitions {
+            assert!(pat.is_match(line), "{line}");
+        }
     }
 
     // --- find_containing_function tests ---
