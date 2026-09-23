@@ -757,3 +757,159 @@ fn dart_class_methods_and_function_get_ranges() {
     assert_encloses(top, span(&conn, "function", "local"));
     assert_all_ranges_filled(&conn);
 }
+
+#[test]
+fn lua_methods_and_local_function_get_ranges() {
+    let conn = index_single(
+        "lua/greeter.lua",
+        concat!(
+            "local M = {}\n",
+            "\n",
+            "function M:greet(name)\n",
+            "  return hello(name)\n",
+            "end\n",
+            "\n",
+            "function M.build()\n",
+            "  return {}\n",
+            "end\n",
+            "\n",
+            "local function helper()\n",
+            "  return 1\n",
+            "end\n",
+            "\n",
+            "return M\n",
+        ),
+    );
+
+    assert_eq!(span(&conn, "function", "greet"), (3, 5));
+    assert_eq!(span(&conn, "function", "build"), (7, 9));
+    assert_eq!(span(&conn, "function", "helper"), (11, 13));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn elixir_module_encloses_its_functions() {
+    let conn = index_single(
+        "lib/greeter.ex",
+        concat!(
+            "defmodule MyApp.Greeter do\n",
+            "  def hello(name) do\n",
+            "    greet(name)\n",
+            "  end\n",
+            "\n",
+            "  defp bye do\n",
+            "    :ok\n",
+            "  end\n",
+            "end\n",
+        ),
+    );
+
+    let module = span(&conn, "class", "MyApp.Greeter");
+    assert_eq!(module, (1, 9));
+    assert_eq!(span(&conn, "function", "hello"), (2, 4));
+    assert_eq!(span(&conn, "function", "bye"), (6, 8));
+    assert_encloses(module, span(&conn, "function", "hello"));
+    assert_encloses(module, span(&conn, "function", "bye"));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn zig_struct_encloses_its_functions() {
+    let conn = index_single(
+        "src/point.zig",
+        concat!(
+            "const std = @import(\"std\");\n",
+            "\n",
+            "pub const Point = struct {\n",
+            "    x: i32,\n",
+            "\n",
+            "    pub fn init(x: i32) Point {\n",
+            "        return .{ .x = x };\n",
+            "    }\n",
+            "};\n",
+            "\n",
+            "fn helper() void {\n",
+            "    return;\n",
+            "}\n",
+        ),
+    );
+
+    let point = span(&conn, "class", "Point");
+    assert_eq!(point, (3, 9));
+    assert_encloses(point, span(&conn, "function", "init"));
+    assert_eq!(span(&conn, "function", "init"), (6, 8));
+    assert_eq!(span(&conn, "function", "helper"), (11, 13));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn objc_interface_and_method_bodies_get_ranges() {
+    let conn = index_single(
+        "Sources/Greeter.m",
+        concat!(
+            "#import \"Foo.h\"\n",
+            "\n",
+            "@interface Greeter : NSObject\n",
+            "@property (nonatomic) NSString *name;\n",
+            "- (void)hello;\n",
+            "@end\n",
+            "\n",
+            "@implementation Greeter\n",
+            "- (void)hello {\n",
+            "    [self greet];\n",
+            "}\n",
+            "\n",
+            "- (void)bye {\n",
+            "    run();\n",
+            "}\n",
+            "@end\n",
+        ),
+    );
+
+    let interface = span(&conn, "class", "Greeter");
+    assert_eq!(interface, (3, 6));
+    assert_encloses(interface, span(&conn, "property", "name"));
+    let hellos: Vec<_> = symbol_ranges(&conn, "function")
+        .into_iter()
+        .filter(|(name, _, _)| name == "hello")
+        .map(|(_, line, end_line)| (line, end_line))
+        .collect();
+    assert_eq!(hellos, [(5, Some(5)), (9, Some(11))]);
+    assert_eq!(span(&conn, "function", "bye"), (13, 15));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn groovy_class_methods_and_statements_get_ranges() {
+    let conn = index_single(
+        "src/Greeter.groovy",
+        concat!(
+            "package x\n",
+            "\n",
+            "import a.b.C\n",
+            "\n",
+            "class Greeter {\n",
+            "    int count = 0\n",
+            "\n",
+            "    def hello() {\n",
+            "        greet()\n",
+            "    }\n",
+            "\n",
+            "    void bye() {\n",
+            "        run()\n",
+            "    }\n",
+            "}\n",
+        ),
+    );
+
+    // Groovy statements own the blank lines after them; ranges skip those.
+    assert_eq!(span(&conn, "package", "x"), (1, 1));
+    assert_eq!(span(&conn, "import", "C"), (3, 3));
+    let class = span(&conn, "class", "Greeter");
+    assert_eq!(class, (5, 15));
+    assert_eq!(span(&conn, "function", "hello"), (8, 10));
+    assert_eq!(span(&conn, "function", "bye"), (12, 14));
+    assert_encloses(class, span(&conn, "function", "hello"));
+    assert_encloses(class, span(&conn, "function", "bye"));
+    assert_all_ranges_filled(&conn);
+}

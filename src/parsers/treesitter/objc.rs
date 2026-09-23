@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_text, parse_tree, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -81,7 +81,7 @@ impl LanguageParser for ObjcParser {
                             line,
                             signature: sig,
                             parents: vec![(class_name, "extends".to_string())],
-                            end_line: None,
+                            end_line: Some(text_end_line(content, node)),
                         });
                     } else {
                         let mut parents = Vec::new();
@@ -102,7 +102,7 @@ impl LanguageParser for ObjcParser {
                             line,
                             signature: sig,
                             parents,
-                            end_line: None,
+                            end_line: Some(text_end_line(content, node)),
                         });
                     }
                 }
@@ -126,7 +126,7 @@ impl LanguageParser for ObjcParser {
                         line,
                         signature: sig,
                         parents,
-                        end_line: None,
+                        end_line: Some(text_end_line(content, node)),
                     });
                 }
                 continue;
@@ -147,7 +147,7 @@ impl LanguageParser for ObjcParser {
                             line,
                             signature: sig,
                             parents: vec![],
-                            end_line: None,
+                            end_line: Some(text_end_line(content, node)),
                         });
                     }
                 }
@@ -166,7 +166,7 @@ impl LanguageParser for ObjcParser {
                         line,
                         signature: sig,
                         parents: vec![],
-                        end_line: None,
+                        end_line: Some(text_end_line(content, node)),
                     });
                 }
                 continue;
@@ -184,7 +184,7 @@ impl LanguageParser for ObjcParser {
                         line,
                         signature: sig,
                         parents: vec![],
-                        end_line: None,
+                        end_line: Some(text_end_line(content, node)),
                     });
                 }
                 continue;
@@ -202,7 +202,7 @@ impl LanguageParser for ObjcParser {
                         line,
                         signature: sig,
                         parents: vec![],
-                        end_line: None,
+                        end_line: Some(text_end_line(content, node)),
                     });
                 }
                 continue;
@@ -221,7 +221,7 @@ impl LanguageParser for ObjcParser {
                             line,
                             signature: sig,
                             parents: vec![],
-                            end_line: None,
+                            end_line: Some(text_end_line(content, node)),
                         });
                     }
                 }
