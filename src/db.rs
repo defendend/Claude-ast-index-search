@@ -5565,18 +5565,32 @@ const FTS_KIND_FILTER: &str = " AND +s.kind = ?";
 const FTS_CLASS_ONLY_FILTER: &str =
     " AND +s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')";
 
-/// Whether an indexed path is third-party code: installed packages and type
-/// declarations. Rankers demote such hits below the project's own.
+/// Whether an indexed path belongs to an installed package: a `node_modules`
+/// path segment. The indexer adds such files on its own (type declarations
+/// for the imports of a JavaScript project); every other indexed file passed
+/// the project's ignore and exclude rules and is the project's code — a
+/// project's own `vendor/` directory included.
+///
+/// The symbol graph leaves these files out entirely; search ranking demotes
+/// them together with type declarations ([`is_vendor_path`]).
+pub fn is_third_party_path(path: &str) -> bool {
+    path.starts_with("node_modules/") || path.contains("/node_modules/")
+}
+
+/// Whether search rankers demote an indexed path below the project's own
+/// code: installed packages ([`is_third_party_path`]) and `.d.ts` type
+/// declarations, which describe code rather than implement it.
 ///
 /// A project's own `vendor/` directory is deliberately not vendor here: it is
 /// indexed and ranked like the rest of the project's source.
 pub fn is_vendor_path(path: &str) -> bool {
-    path.contains("node_modules") || path.ends_with(".d.ts")
+    is_third_party_path(path) || path.ends_with(".d.ts")
 }
 
 /// [`is_vendor_path`] over `f.path`, for ordering inside SQL. `instr` and
 /// `substr` rather than `LIKE`, which folds case and reads `_` as a wildcard.
-const VENDOR_PATH_SQL: &str = "(instr(f.path, 'node_modules') > 0 OR substr(f.path, -5) = '.d.ts')";
+const VENDOR_PATH_SQL: &str = "(substr(f.path, 1, 13) = 'node_modules/' \
+     OR instr(f.path, '/node_modules/') > 0 OR substr(f.path, -5) = '.d.ts')";
 
 /// Deterministic ordering for a query that matches `symbols_fts`.
 ///
@@ -9727,6 +9741,10 @@ mod tests {
         assert!(is_vendor_path("frontend/types/global.d.ts"));
         assert!(!is_vendor_path("app/services/applicant/merge_service.rb"));
         assert!(!is_vendor_path("vendor/lib.rs"));
+        assert!(is_third_party_path("app/node_modules/lodash/fp.js"));
+        assert!(!is_third_party_path("frontend/types/global.d.ts"));
+        assert!(!is_third_party_path("vendor/lib.rs"));
+        assert!(!is_third_party_path("src/node_modules_helper.ts"));
     }
 
     #[test]
@@ -9740,6 +9758,9 @@ mod tests {
             "vendor/lib.rs",
             "app/node-modules/x.rb",
             "app/nodeXmodules/x.rb",
+            "src/node_modules_helper.ts",
+            "node_modules",
+            "tools/node_modules/pkg/index.js",
             "Types/Global.D.TS",
             "d.ts",
         ];

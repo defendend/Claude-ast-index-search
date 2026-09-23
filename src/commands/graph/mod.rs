@@ -140,15 +140,6 @@ fn is_schema_kind(kind: &str) -> bool {
     matches!(kind, "table" | "column")
 }
 
-/// Third-party code: never an edge target, because resolving a project name
-/// against every copy vendored under `node_modules` only multiplies ambiguity.
-pub fn is_vendor_path(path: &str) -> bool {
-    path.starts_with("node_modules/")
-        || path.contains("/node_modules/")
-        || path.starts_with("vendor/")
-        || path.contains("/vendor/")
-}
-
 /// Languages that can reference each other's definitions. A Ruby constant
 /// never resolves to a TypeScript class of the same name.
 fn language_family(path: &str) -> &'static str {
@@ -350,7 +341,7 @@ pub fn resolve_symbol_spec(
         .into_iter()
         .filter(|info| {
             is_node_kind(&info.kind)
-                && !is_vendor_path(&info.path)
+                && !db::is_third_party_path(&info.path)
                 && filter
                     .in_file
                     .as_deref()

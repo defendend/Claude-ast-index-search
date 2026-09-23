@@ -15,8 +15,8 @@ use serde::Serialize;
 use super::metrics::compute_metrics;
 use super::schema::{column_candidates, link_models, underscore, ModelClass, SchemaLinkSummary};
 use super::{
-    is_container_kind, is_node_kind, is_path_suffix, is_schema_kind, is_test_path, is_vendor_path,
-    language_family, short_name, Confidence, AMBIGUITY_CAP, DEPENDENTS_DEPTH,
+    is_container_kind, is_node_kind, is_path_suffix, is_schema_kind, is_test_path, language_family,
+    short_name, Confidence, AMBIGUITY_CAP, DEPENDENTS_DEPTH,
 };
 use crate::db::{self, SymbolEdgeRow};
 
@@ -531,6 +531,9 @@ struct FileNode {
     path: String,
     stem: String,
     family: &'static str,
+    /// An installed package ([`db::is_third_party_path`]): neither the source
+    /// nor the target of an edge, because resolving a project name against
+    /// every copy under `node_modules` only multiplies ambiguity.
     vendor: bool,
     /// Under a test directory or named like a test (see [`is_test_path`]).
     test: bool,
@@ -610,7 +613,7 @@ impl Builder {
         let parsed: Vec<Option<(ModuleImports, Vec<ImportTarget>)>> = file_rows
             .par_iter()
             .map(|row| {
-                if language_family(&row.path) != "js" || is_vendor_path(&row.path) {
+                if language_family(&row.path) != "js" || db::is_third_party_path(&row.path) {
                     return None;
                 }
                 let content =
@@ -626,7 +629,7 @@ impl Builder {
         for (row, parsed) in file_rows.into_iter().zip(parsed) {
             file_index.insert(row.id, files.len() as u32);
             let family = language_family(&row.path);
-            let vendor = is_vendor_path(&row.path);
+            let vendor = db::is_third_party_path(&row.path);
             let (module, imports) = match parsed {
                 Some((module, imports)) => (Some(module), imports),
                 None => (None, Vec::new()),

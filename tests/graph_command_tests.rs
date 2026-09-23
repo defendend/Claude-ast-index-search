@@ -703,3 +703,32 @@ end
     let example = find_other(&helper, "it \"builds\"");
     assert_eq!(example["confidence"], "local");
 }
+
+#[test]
+fn a_project_vendor_directory_is_part_of_the_graph() {
+    let ws = workspace();
+    ws.write(
+        "vendor/billing_sdk/client.rb",
+        "class BillingClient\n  def self.charge(amount)\n    amount\n  end\nend\n",
+    );
+    ws.write(
+        "app/services/checkout.rb",
+        "class Checkout\n  def run\n    BillingClient.charge(1)\n  end\nend\n",
+    );
+    ws.write(
+        "node_modules/billing-sdk/index.d.ts",
+        "export declare class BillingClient {\n  static charge(amount: number): number;\n}\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+    let report = ws.json(&["graph", "dependents", "BillingClient"]);
+    let matched: Vec<&str> = report["matched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|symbol| symbol["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(matched, vec!["vendor/billing_sdk/client.rb"], "{report:#}");
+    let charge = ws.json(&["graph", "dependents", "BillingClient#charge"]);
+    assert_eq!(other_names(&charge), vec!["run"], "{charge:#}");
+}

@@ -485,8 +485,11 @@ ast-index graph top --sort pagerank --kind class
 
 Each edge records how its target was resolved: `local`, `scoped` (namespace,
 receiver type or inheritance), `import`, `unique`, or `ambiguous` with the
-number of candidates. Code outside test directories never resolves to a
-definition inside one (a spec helper that reopens a class to stub a method is
+number of candidates. Installed packages (files under `node_modules`) are
+never part of the graph; everything else in the index is project code,
+including a `vendor/` directory and the project's own `.d.ts` files — keep
+vendored third-party code out with `exclude` in `.ast-index.yaml`. Code
+outside test directories never resolves to a definition inside one (a spec helper that reopens a class to stub a method is
 not what production code calls). Metrics count resolved edges only;
 `--include-ambiguous` lists the rest. After `update` changes the index the graph reports itself as
 stale until `graph build` (or a query with `--refresh`) runs again.
