@@ -459,11 +459,18 @@ fn extract_type_name_from_specifier(
     None
 }
 
-/// Extract the first identifier (type name) from a node by walking its descendants.
-/// Used for constructor_invocation and other compound type nodes.
+/// Extract the type name from a compound type node (constructor_invocation,
+/// nullable_type, ...). Prefers the first nested user_type so qualified
+/// supertypes resolve to their simple name; falls back to the first identifier.
 fn extract_type_name_from_node(node: &tree_sitter::Node, content: &str) -> Option<String> {
     let mut found = None;
     walk_tree_preorder(node, |child| {
+        if child.kind() == "user_type" {
+            found = extract_user_type_name(&child, content);
+            if found.is_some() {
+                return WalkControl::Stop;
+            }
+        }
         if child.kind() == "identifier" {
             found = Some(node_text(content, &child).to_string());
             WalkControl::Stop
@@ -474,16 +481,15 @@ fn extract_type_name_from_node(node: &tree_sitter::Node, content: &str) -> Optio
     found
 }
 
-/// Extract the name from a user_type node.
-/// user_type -> identifier (possibly with type_arguments)
+/// Extract the simple name from a user_type node.
+/// A qualified type (`ru.yandex.Base<T>`) is a flat list of identifiers, so the
+/// last direct identifier is the type itself; type_arguments are not direct children.
 fn extract_user_type_name(node: &tree_sitter::Node, content: &str) -> Option<String> {
     let mut walker = node.walk();
-    for child in node.children(&mut walker) {
-        if child.kind() == "identifier" {
-            return Some(node_text(content, &child).to_string());
-        }
-    }
-    None
+    node.children(&mut walker)
+        .filter(|child| child.kind() == "identifier")
+        .last()
+        .map(|child| node_text(content, &child).to_string())
 }
 
 /// Find a capture by index in a match
@@ -498,6 +504,21 @@ fn find_capture<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualified_supertypes_resolve_to_simple_names() {
+        let content = "abstract class Base<V : View>(c: Class<V>) : ru.yandex.common.Base<V>(c), a.b.Listener<V>, Plain\n";
+        let symbols = KOTLIN_PARSER.parse_symbols(content).unwrap();
+        let base = symbols.iter().find(|s| s.name == "Base").unwrap();
+        assert_eq!(
+            base.parents,
+            [
+                ("Base".to_string(), "extends".to_string()),
+                ("Listener".to_string(), "implements".to_string()),
+                ("Plain".to_string(), "implements".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn suspend_lambda_recovery_preserves_enclosing_and_later_declarations() {

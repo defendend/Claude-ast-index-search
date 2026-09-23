@@ -4819,6 +4819,19 @@ pub fn open_staged_db(project_root: &Path, staged_db: &Path) -> Result<Connectio
     open_configured_connection(&normalized_root, staged_db)
 }
 
+/// Open a staged generation seeded with a consistent snapshot of the live
+/// index, for partial rebuilds (`--type modules|deps|files`) that must keep
+/// every table they do not rebuild themselves.
+pub fn open_seeded_staged_db(
+    project_root: &Path,
+    live_db: &Path,
+    staged_db: &Path,
+) -> Result<Connection> {
+    let normalized_root = normalize_root_for_storage(project_root);
+    stage_restore_snapshot(live_db, staged_db, &normalized_root)?;
+    open_configured_connection(&normalized_root, staged_db)
+}
+
 /// Consolidate a completed private generation into one durable main file.
 /// Consuming the connection makes it impossible for a caller to retain a
 /// SQLite handle across publication and deadlock its own exclusive guard.
@@ -8339,6 +8352,64 @@ pub fn get_module_name(conn: &Connection, id: i64) -> Result<Option<String>> {
     );
     match result {
         Ok(name) => Ok(Some(name)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Symbols of files under `dir` whose path ends with `file_suffix`, in file order.
+pub fn find_symbols_under(conn: &Connection, dir: &str, file_suffix: &str) -> Result<Vec<SearchResult>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
+         FROM symbols s
+         JOIN files f ON f.id = s.file_id
+         WHERE f.path LIKE ?1 AND f.path LIKE ?2
+         ORDER BY f.path, s.line",
+    )?;
+    let dir_pattern = format!("{}/%", dir.trim_end_matches('/'));
+    let suffix_pattern = format!("%{}", file_suffix);
+    let rows = stmt
+        .query_map(params![dir_pattern, suffix_pattern], |row| {
+            Ok(SearchResult {
+                name: row.get(0)?,
+                qualified_name: row.get(1)?,
+                kind: row.get(2)?,
+                line: row.get(3)?,
+                signature: row.get(4)?,
+                path: row.get(5)?,
+                root_path: None,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Distinct module names imported by the Swift files under `dir`.
+pub fn find_swift_imports_under(
+    conn: &Connection,
+    dir: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT s.name FROM symbols s
+         JOIN files f ON f.id = s.file_id
+         WHERE s.kind = 'import' AND f.path LIKE ?1 AND f.path LIKE '%.swift'",
+    )?;
+    let pattern = format!("{}/%", dir.trim_end_matches('/'));
+    let names = stmt
+        .query_map(params![pattern], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(names)
+}
+
+/// Return the directory path of a module by its id, or `None` when the id is absent.
+pub fn get_module_path(conn: &Connection, id: i64) -> Result<Option<String>> {
+    let result: Result<String, _> = conn.query_row(
+        "SELECT path FROM modules WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(path) => Ok(Some(path)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }

@@ -19,6 +19,8 @@ use crate::parsers::{self, ParsedRef, ParsedSymbol};
 /// minified bundles / generated proto bundles / vendor blobs.
 ///
 /// Configurable via `AST_INDEX_MAX_FILE_SIZE` (bytes). Default: 1 MB.
+mod swift_manifest;
+
 fn max_file_size_bytes() -> u64 {
     std::env::var("AST_INDEX_MAX_FILE_SIZE")
         .ok()
@@ -254,9 +256,12 @@ pub fn has_android_markers(root: &Path) -> bool {
         || root.join("pom.xml").exists()
 }
 
-/// Check if project has iOS markers (Xcode/SPM)
+/// Root files that mark a SwiftPM or Tuist project.
+const SWIFT_ROOT_MARKERS: &[&str] = &["Package.swift", "Project.swift", "Workspace.swift", "Tuist.swift"];
+
+/// Check if project has iOS markers (Xcode/SPM/Tuist)
 pub fn has_ios_markers(root: &Path) -> bool {
-    if root.join("Package.swift").exists() {
+    if SWIFT_ROOT_MARKERS.iter().any(|m| root.join(m).exists()) {
         return true;
     }
     // Check for .xcodeproj
@@ -354,7 +359,7 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
         || root.join("build.gradle").exists()
         || root.join("pom.xml").exists();
 
-    let has_swift = root.join("Package.swift").exists()
+    let has_swift = SWIFT_ROOT_MARKERS.iter().any(|m| root.join(m).exists())
         || fs::read_dir(root)
             .map(|entries| {
                 entries.filter_map(|e| e.ok()).any(|e| {
@@ -623,6 +628,9 @@ const ROOT_STACK_MARKER_NAMES: &[&str] = &[
     "libs.versions.toml",
     "pom.xml",
     "Package.swift",
+    "Project.swift",
+    "Workspace.swift",
+    "Tuist.swift",
     "Podfile",
     "package.json",
     "tsconfig.json",
@@ -948,7 +956,10 @@ fn detect_stacks_with_limits(
         });
     }
 
-    let mut ios_markers = collect_markers(entries, &["Package.swift", "Podfile"]);
+    let mut ios_markers = collect_markers(
+        entries,
+        &["Package.swift", "Project.swift", "Workspace.swift", "Tuist.swift", "Podfile"],
+    );
     ios_markers.extend(collect_ext_markers(entries, "xcodeproj", 3));
     ios_markers.extend(collect_ext_markers(entries, "xcworkspace", 3));
     if !ios_markers.is_empty() {
@@ -1388,7 +1399,7 @@ pub fn is_excluded_dir(entry: &ignore::DirEntry) -> bool {
 fn is_module_file(name: &str) -> bool {
     name == "build.gradle"
         || name == "build.gradle.kts"
-        || name == "Package.swift"
+        || swift_manifest_kind(name).is_some()
         || name.ends_with(".pm")
         || name == "pom.xml"
         || name == "pyproject.toml"
@@ -2464,7 +2475,81 @@ pub fn update_directory_incremental(
     Ok((updated_count, files_to_parse.len(), deleted_paths.len()))
 }
 
-/// Index modules from build.gradle files (Android) and Package.swift (iOS)
+/// Module `kind` for targets declared in a Swift manifest, keyed by file name.
+fn swift_manifest_kind(file_name: &str) -> Option<&'static str> {
+    match file_name {
+        "Package.swift" => Some("spm"),
+        "Project.swift" => Some("tuist"),
+        _ => None,
+    }
+}
+
+/// Target name of a Swift module row, the key its dependents refer to it by.
+/// Swift module names cannot contain `.`, so the last segment of a
+/// disambiguated `pkg.dir.Target` name is the target itself.
+fn swift_target_name(module_name: &str) -> &str {
+    module_name.rsplit('.').next().unwrap_or(module_name)
+}
+
+/// Declare modules for every target of the given Swift manifests. A module is
+/// named after its target — the Swift `import` name — unless that name is
+/// declared more than once or already taken, in which case every such target
+/// gets a manifest-qualified `dir.path.Target` name so none silently wins.
+fn index_swift_manifest_modules(conn: &Connection, root: &Path, manifests: &[&Path]) -> Result<usize> {
+    let mut declared = Vec::new();
+    for manifest in manifests {
+        let (Some(kind), Some(dir)) = (
+            manifest.file_name().and_then(|n| n.to_str()).and_then(swift_manifest_kind),
+            manifest.parent(),
+        ) else {
+            continue;
+        };
+        let Ok(content) = fs::read_to_string(manifest) else {
+            continue;
+        };
+        for target in swift_manifest::parse_manifest(&content) {
+            declared.push((kind, dir, target));
+        }
+    }
+
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for (_, _, target) in &declared {
+        *name_counts.entry(target.name.as_str()).or_default() += 1;
+    }
+
+    let mut count = 0;
+    for (kind, dir, target) in &declared {
+        let taken: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM modules WHERE name = ?1)",
+            rusqlite::params![target.name],
+            |row| row.get(0),
+        )?;
+        let module_name = if taken || name_counts[target.name.as_str()] > 1 {
+            let dir_rel = dir.strip_prefix(root).unwrap_or(dir).to_string_lossy();
+            if dir_rel.is_empty() {
+                target.name.clone()
+            } else {
+                format!("{}.{}", dir_rel.replace('/', "."), target.name)
+            }
+        } else {
+            target.name.clone()
+        };
+        let target_dir = swift_manifest::target_dir(dir, target);
+        let module_path = target_dir
+            .strip_prefix(root)
+            .unwrap_or(&target_dir)
+            .to_string_lossy()
+            .to_string();
+        conn.execute(
+            "INSERT OR IGNORE INTO modules (name, path, kind) VALUES (?1, ?2, ?3)",
+            rusqlite::params![module_name, module_path, kind],
+        )?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Index modules from build.gradle files (Android) and Package.swift / Tuist Project.swift (iOS)
 pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
     use ignore::WalkBuilder;
 
@@ -2508,13 +2593,7 @@ pub fn index_modules_from_files(
 ) -> Result<usize> {
     let mut count = 0;
 
-    // Regex to extract SPM targets from Package.swift
-    static SPM_TARGET_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"\.(?:target|testTarget|binaryTarget)\s*\(\s*name:\s*["']([^"']+)["']"#)
-            .unwrap()
-    });
-
-    let spm_target_re = &*SPM_TARGET_RE;
+    let mut swift_manifests: Vec<&Path> = Vec::new();
 
     // Outer repository root — used to normalize ya.make module paths so they match PEERDIR
     // entries, which are written relative to the outer repo root, not the rebuild root.
@@ -2546,40 +2625,10 @@ pub fn index_modules_from_files(
                 }
             }
 
-            // iOS/SPM modules (Package.swift)
-            if name_str == "Package.swift" {
-                if let Some(parent) = path.parent() {
-                    let package_path = parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .to_string();
-
-                    // Read Package.swift and extract targets
-                    if let Ok(content) = fs::read_to_string(path) {
-                        for caps in spm_target_re.captures_iter(&content) {
-                            let target_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            if !target_name.is_empty() {
-                                let module_name = if package_path.is_empty() {
-                                    target_name.to_string()
-                                } else {
-                                    format!("{}.{}", package_path.replace('/', "."), target_name)
-                                };
-                                let module_path = if package_path.is_empty() {
-                                    target_name.to_string()
-                                } else {
-                                    format!("{}/{}", package_path, target_name)
-                                };
-
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
-                                    rusqlite::params![module_name, module_path],
-                                )?;
-                                count += 1;
-                            }
-                        }
-                    }
-                }
+            // iOS modules (Package.swift / Tuist Project.swift) need a global view
+            // of target names for collision handling; declared after this loop.
+            if swift_manifest_kind(&name_str).is_some() {
+                swift_manifests.push(path.as_path());
             }
 
             // Perl modules (.pm files with package declarations)
@@ -2723,6 +2772,9 @@ pub fn index_modules_from_files(
         }
     }
 
+    swift_manifests.sort();
+    count += index_swift_manifest_modules(conn, root, &swift_manifests)?;
+
     Ok(count)
 }
 
@@ -2792,14 +2844,32 @@ fn extract_python_module_name(content: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
-/// Collect build files (Gradle, Maven, ya.make, Python) from module paths in DB (for standalone rebuild modules/deps)
+/// Collect build files (Gradle, Maven, ya.make, Python, Swift manifests) from module paths in DB (for standalone rebuild modules/deps)
 pub fn collect_build_files_from_db(conn: &Connection, root: &Path) -> Result<Vec<PathBuf>> {
-    let mut stmt = conn.prepare("SELECT path FROM modules")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut stmt = conn.prepare("SELECT path, kind FROM modules")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
     let mut files = Vec::new();
+    let mut seen_manifests = std::collections::HashSet::new();
     for row in rows {
-        let module_path = row?;
+        let (module_path, kind) = row?;
         let dir = root.join(&module_path);
+        if matches!(kind.as_deref(), Some("spm" | "tuist")) {
+            // A Swift module's path is its source directory; the manifest that
+            // declares it lives in an ancestor directory.
+            let manifest = dir
+                .ancestors()
+                .take_while(|d| d.starts_with(root))
+                .flat_map(|d| [d.join("Project.swift"), d.join("Package.swift")])
+                .find(|p| p.is_file());
+            if let Some(manifest) = manifest {
+                if seen_manifests.insert(manifest.clone()) {
+                    files.push(manifest);
+                }
+            }
+            continue;
+        }
         for name in &[
             "build.gradle.kts",
             "build.gradle",
@@ -3053,6 +3123,30 @@ pub fn index_module_dependencies(
         candidates.dedup_by_key(|(_, module_id)| *module_id);
     }
 
+    // Swift dependencies refer to targets by bare name, across manifests; a
+    // manifest's own targets are identified by their source directory.
+    let mut swift_modules = SwiftModuleIds::default();
+    {
+        let mut stmt =
+            conn.prepare("SELECT name, path, id FROM modules WHERE kind IN ('spm', 'tuist')")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (name, path, id) = row?;
+            swift_modules
+                .by_target
+                .entry(swift_target_name(&name).to_string())
+                .or_default()
+                .push(id);
+            swift_modules.by_path.entry(path).or_insert(id);
+        }
+    }
+
     if progress {
         eprintln!("Found {} modules in index", module_ids.len());
     }
@@ -3088,6 +3182,7 @@ pub fn index_module_dependencies(
             let mono_root = mono_root.clone();
             let module_ids = Arc::new(module_ids.clone());
             let gradle_accessor_candidates = Arc::new(gradle_accessor_candidates);
+            let swift_modules = Arc::new(swift_modules);
             let ambiguous_gradle_refs = Arc::new(Mutex::new(std::collections::BTreeMap::<
                 String,
                 Vec<String>,
@@ -3102,6 +3197,10 @@ pub fn index_module_dependencies(
                             Some(p) => p,
                             None => return Vec::new(),
                         };
+
+                        if swift_manifest_kind(file_name).is_some() {
+                            return swift_manifest_edges(path, parent, &root_buf, &swift_modules);
+                        }
 
                         let source_module_name: String = match file_name {
                             "ya.make" => {
@@ -3334,6 +3433,50 @@ pub fn index_module_dependencies(
     tx.commit()?;
 
     Ok(dep_count)
+}
+
+#[derive(Default)]
+struct SwiftModuleIds {
+    by_target: HashMap<String, Vec<i64>>,
+    by_path: HashMap<String, i64>,
+}
+
+/// Dependency edges declared by the targets of one Swift manifest. A
+/// dependency resolves to a target of the same manifest first, then to the
+/// only workspace target with that name; ambiguous or external names are skipped.
+fn swift_manifest_edges(
+    manifest: &Path,
+    manifest_dir: &Path,
+    root: &Path,
+    modules: &SwiftModuleIds,
+) -> Vec<(i64, i64, String)> {
+    let Ok(content) = fs::read_to_string(manifest) else {
+        return Vec::new();
+    };
+    let targets = swift_manifest::parse_manifest(&content);
+    let local_id = |target: &swift_manifest::ManifestTarget| {
+        let dir = swift_manifest::target_dir(manifest_dir, target);
+        let rel = dir.strip_prefix(root).unwrap_or(&dir).to_string_lossy();
+        modules.by_path.get(rel.as_ref()).copied()
+    };
+
+    let mut edges = Vec::new();
+    for target in &targets {
+        let Some(module_id) = local_id(target) else {
+            continue;
+        };
+        for dep in &target.dependencies {
+            let local = targets.iter().find(|t| t.name == dep.name).and_then(local_id);
+            let dep_id = local.or_else(|| match modules.by_target.get(&dep.name).map(Vec::as_slice) {
+                Some([only]) => Some(*only),
+                _ => None,
+            });
+            if let Some(dep_id) = dep_id.filter(|id| *id != module_id) {
+                edges.push((module_id, dep_id, dep.kind.clone()));
+            }
+        }
+    }
+    edges
 }
 
 /// Get dependencies of a module

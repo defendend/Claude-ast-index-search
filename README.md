@@ -1,4 +1,4 @@
-# ast-index v3.53.0
+# ast-index v3.54.0
 
 Structural, AST-aware code navigation CLI for large, multi-language
 repositories. It builds a local SQLite index of symbols, references, imports,
@@ -681,7 +681,7 @@ exclude:
 
 ## Changelog
 
-### 3.54.0
+### Unreleased
 
 - **Rank symbol searches by relevance** — FTS symbol queries used to come back
   in whatever order the engine produced, or sorted by name length, so a search
@@ -713,6 +713,45 @@ exclude:
   an ancestor of `HEAD` (branch switch, rebase, force-push, pruned object)
   the run reports why and recollects from scratch instead of serving stale
   numbers. Signals live in their own tables, so they survive a reindex.
+
+### 3.54.0
+
+- **Tuist projects get a module graph** — targets declared in `Project.swift`
+  (`.target(...)` or any project helper such as `.spmSwiftFolderTarget(name: .Foo, ...)`)
+  are indexed as modules with their `dependencies:` (`.target`, `.external`,
+  `.project`, `.product`), so `module`, `deps`, `dependents`, `module-route`
+  and `unused-deps` work on Tuist workspaces. Previously such a workspace had
+  no module dependencies at all.
+- **SwiftPM modules point at their sources and have dependencies** — targets
+  resolve to `Sources/<Target>` / `Tests/<Target>` (or `path:` / `sources:`)
+  instead of `<package>/<Target>`, `let targets = [...]` declarations are read,
+  and target dependencies are indexed. Swift modules are named after the
+  target — the `import` name — and only fall back to a package-qualified name
+  when two manifests declare the same target. Manifests are parsed with
+  tree-sitter.
+- **`unused-deps` understands Swift imports** — an `import Dep` in any file of
+  the module marks the dependency as used. Swift `import` declarations are now
+  indexed.
+- **`api` lists Swift public API** — declarations marked `public` / `open`.
+- **Swift local variables are no longer indexed as properties** — `let` / `var`
+  inside function bodies, closures and accessors are skipped, matching Kotlin.
+- **Module-qualified supertypes resolve** — `class A : ru.pkg.Base()`,
+  `extension Foo: Module.Proto` are recorded with the simple parent name, so
+  `hierarchy` and `implementations` find them (previously the parent became
+  `ru` / `Module`).
+- **`inject` finds constructor injection** — parameters of
+  `@Inject constructor(...)` and Java `@Inject` constructors, plus fields whose
+  annotation is on its own line.
+- **`--limit` with a filter no longer under-reports** — `flows`, `suspend`,
+  `deprecated`, `suppress`, `deeplinks` applied the query after the limit was
+  spent (e.g. `flows --limit 5` could return 1). `suspend` reports the function
+  name instead of an extension receiver.
+- **`provides` is an order of magnitude faster** — scans only files that
+  declare `@Provides` / `@Binds`.
+- **`unused-symbols --module` accepts a module name** — `features.surge.impl`
+  or `:core:utils`, not just a path prefix.
+- **`rebuild --type modules|deps|files` keeps the rest of the index** — a
+  partial rebuild used to publish an index without files and symbols.
 
 ### 3.53.0
 

@@ -416,7 +416,17 @@ pub fn cmd_rebuild(
         eprintln!("[verbose] opening new DB...");
     }
     let t = Instant::now();
-    let mut conn = db::open_staged_db(root, staged.db_path())?;
+    // A partial rebuild only refills its own tables; starting from an empty
+    // generation would publish an index with everything else missing.
+    let seed_from_live = index_type != "all" && db::db_exists(root);
+    let mut conn = if seed_from_live {
+        let conn = db::open_seeded_staged_db(root, &live_db, staged.db_path())?;
+        // Re-attached from `saved_subtrees` below.
+        conn.execute("DELETE FROM subtrees", [])?;
+        conn
+    } else {
+        db::open_staged_db(root, staged.db_path())?
+    };
     init_rebuild_schema(&conn)?;
     if verbose {
         eprintln!(
