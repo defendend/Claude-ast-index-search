@@ -193,13 +193,19 @@ impl LanguageParser for RubyParser {
                 continue;
             }
 
-            // Constant assignment: CONST_NAME = value
+            // Constant assignment: `LIMIT = 10`, `Types = Dry.Types()`,
+            // `Billing::Import = Container.injector`
             if let Some(cap) = find_capture(m, idx_assign_const_name) {
-                let name = node_text(content, &cap.node);
+                let text = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
-                if is_constant_name(name) {
+                if is_constant_path(text) {
+                    let name = if cap.node.kind() == "scope_resolution" {
+                        qualify_scoped_constant(content, &cap.node, text)
+                    } else {
+                        text.to_string()
+                    };
                     symbols.push(ParsedSymbol {
-                        name: name.to_string(),
+                        name,
                         kind: SymbolKind::Constant,
                         line,
                         end_line: end_line_of(m, idx_assign_const_node),
@@ -501,8 +507,6 @@ impl LanguageParser for RubyParser {
 /// Already-qualified names (e.g., `Admin::Dashboard` from `class Admin::Dashboard`) are preserved as-is
 /// and get parent scopes prepended if nested further.
 fn build_qualified_name(content: &str, name_node: &tree_sitter::Node, base_name: &str) -> String {
-    let mut scope_parts: Vec<String> = Vec::new();
-
     // The name_node is the captured name (constant or scope_resolution).
     // Its parent should be the class/module AST node.
     let container = match name_node.parent() {
@@ -510,8 +514,13 @@ fn build_qualified_name(content: &str, name_node: &tree_sitter::Node, base_name:
         _ => return base_name.to_string(),
     };
 
-    // Walk up from the container's parent, looking for enclosing class/module nodes
-    let mut current = container.parent();
+    prefix_enclosing_scopes(content, container, base_name)
+}
+
+/// Prepend the names of every class/module enclosing `node` (outermost first).
+fn prefix_enclosing_scopes(content: &str, node: tree_sitter::Node, base_name: &str) -> String {
+    let mut scope_parts: Vec<String> = Vec::new();
+    let mut current = node.parent();
     while let Some(node) = current {
         if node.kind() == "class" || node.kind() == "module" {
             if let Some(name_child) = node.child_by_field_name("name") {
@@ -530,13 +539,27 @@ fn build_qualified_name(content: &str, name_node: &tree_sitter::Node, base_name:
     }
 }
 
-/// Check if a name is an ALL_CAPS constant
-fn is_constant_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_uppercase() || c.is_ascii_digit() || c == '_')
-        && name.chars().any(|c| c.is_uppercase())
+/// Full name of a `Scope::Name = value` assignment, qualified like a class
+/// written `class Scope::Name` at the same place; `::Name = value` is top-level.
+fn qualify_scoped_constant(content: &str, name_node: &tree_sitter::Node, text: &str) -> String {
+    if let Some(absolute) = text.strip_prefix("::") {
+        return absolute.to_string();
+    }
+    match name_node.parent() {
+        Some(assignment) => prefix_enclosing_scopes(content, assignment, text),
+        None => text.to_string(),
+    }
+}
+
+/// `Name`, `Scope::Name` or `::Name`: every segment a constant. Excludes
+/// `Scope::method = value`, which is a setter call, not a constant.
+fn is_constant_path(text: &str) -> bool {
+    let text = text.strip_prefix("::").unwrap_or(text);
+    !text.is_empty()
+        && text.split("::").all(|segment| {
+            segment.chars().next().is_some_and(char::is_uppercase)
+                && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
+        })
 }
 
 /// Normalize a Ruby symbol argument: strip leading `:` from `:name`
@@ -1108,6 +1131,39 @@ end
         assert!(symbols
             .iter()
             .any(|s| s.name == "process" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_scoped_constant_assignment_is_qualified() {
+        let content = "Billing::Import = Billing::Container.injector\n\
+                       module Api\n  V2::Client = Struct.new(:token) do\n    def ping; end\n  end\nend\n\
+                       ::Root::Setting = 1\n\
+                       Config::timeout = 5\n";
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        let constant = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name && s.kind == SymbolKind::Constant)
+                .unwrap_or_else(|| panic!("no constant {name}: {symbols:?}"))
+        };
+        assert_eq!(constant("Billing::Import").line, 1);
+        assert_eq!(constant("Billing::Import").end_line, Some(1));
+        assert_eq!(constant("Api::V2::Client").line, 3);
+        assert_eq!(constant("Api::V2::Client").end_line, Some(5));
+        assert_eq!(constant("Root::Setting").line, 7);
+        assert!(
+            !symbols.iter().any(|s| s.name.contains("timeout")),
+            "a setter call is not a constant: {symbols:?}"
+        );
+    }
+
+    #[test]
+    fn test_camel_case_constant_assignment() {
+        let content = "module Types\n  Email = String.constrained(format: /@/)\nend\n";
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Email" && s.kind == SymbolKind::Constant && s.line == 2));
     }
 
     #[test]

@@ -16,9 +16,9 @@
   object: (_) @singleton_object
   name: (_) @singleton_method_name) @singleton_method_node
 
-; Assignment: CONSTANT = value (top-level or inside class/module)
+; Assignment: Name = value or Scope::Name = value (top-level or inside class/module)
 (assignment
-  left: (constant) @assign_const_name
+  left: [(constant) (scope_resolution)] @assign_const_name
   right: (_) @assign_const_value) @assign_const_node
 
 ; Call expressions (DSL methods like require, include, attr_reader, etc.)

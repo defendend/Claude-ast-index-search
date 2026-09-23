@@ -684,6 +684,7 @@ impl Builder {
             if file.vendor {
                 continue;
             }
+            let ruby = file.family == "ruby";
             let mut order = file.symbols.clone();
             order.sort_by_key(|&s| {
                 let sym = &self.syms[s as usize];
@@ -718,7 +719,11 @@ impl Builder {
                     } else {
                         short
                     };
-                    if is_container_kind(&sym.kind) && sym.name.contains("::") {
+                    // Ruby parsers qualify `class A::B` and `A::B = value`
+                    // with their enclosing scopes already.
+                    let qualified_by_parser =
+                        is_container_kind(&sym.kind) || (sym.kind == "constant" && ruby);
+                    if qualified_by_parser && sym.name.contains("::") {
                         sym.name.trim_start_matches("::").to_string()
                     } else if let Some(c) = container {
                         format!("{}::{}", self.syms[c as usize].qual, own)
@@ -1003,13 +1008,22 @@ impl Builder {
             return cands;
         }
         let family = node.family;
+        let ruby = family == "ruby";
         let found = self.lexical_match(namespace, absolute, rel, |c| {
-            is_container_kind(&self.syms[c as usize].kind)
+            let kind = self.syms[c as usize].kind.as_str();
+            (is_container_kind(kind) || (ruby && kind == "constant"))
                 && self.family_of(c) == family
                 && Some(c) != exclude
         });
         if !found.is_empty() || absolute {
-            return self.collapse_reopened(found);
+            // Ruby constant lookup stops at the nearest scope defining the
+            // name: `Billing::Import = injector` hides a top-level `module
+            // Import` from code inside `Billing`, and is itself no class.
+            let types: Vec<u32> = found
+                .into_iter()
+                .filter(|&c| is_container_kind(&self.syms[c as usize].kind))
+                .collect();
+            return self.collapse_reopened(types);
         }
         let found = self.suffix_match(rel, &cands);
         if !found.is_empty() {

@@ -11,7 +11,7 @@ ast-index supports parsing and indexing Ruby source files (`.rb`).
 | `def method_name` | Function | `initialize`, `valid?`, `save!` |
 | `def self.method_name` | Function | `self.call` |
 | `attr_reader/writer/accessor` | Property | `:name`, `:email` |
-| `CONSTANT` | Constant | `VERSION` |
+| `NAME = value`, `Scope::Name = value` | Constant | `VERSION`, `Types`, `Billing::Import` (compound names are qualified like classes) |
 | `require/require_relative` | Import | Imports |
 | `include/extend/prepend` | Import | Mixins |
 

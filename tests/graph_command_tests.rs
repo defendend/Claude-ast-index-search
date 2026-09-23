@@ -437,3 +437,42 @@ fn subtree_filters_are_rejected_for_build() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("graph build"));
 }
+
+#[test]
+fn scoped_constant_assignment_shadows_a_top_level_module() {
+    let ws = workspace();
+    ws.write(
+        "app/services/import/base.rb",
+        "module Import\n  def helper(value)\n    value\n  end\nend\n",
+    );
+    ws.write(
+        "lib/billing/import.rb",
+        "Billing::Import = Billing::Container.injector\n",
+    );
+    ws.write(
+        "app/services/billing/charge.rb",
+        r#"module Billing
+  class Charge
+    include Import[:repo]
+
+    def run
+      helper(1)
+    end
+  end
+end
+"#,
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+
+    let injector = ws.json(&["graph", "dependents", "Billing::Import"]);
+    assert_eq!(
+        find_other(&injector, "Billing::Charge")["confidence"],
+        "scoped"
+    );
+    let module = ws.json(&["graph", "dependents", "::Import"]);
+    assert!(items(&module).is_empty(), "{module:#}");
+    // The injector is not a mixin, so the module's methods are not inherited.
+    let helper = ws.json(&["graph", "dependents", "Import#helper"]);
+    assert_eq!(helper["resolved_edges"], 0, "{helper:#}");
+}
