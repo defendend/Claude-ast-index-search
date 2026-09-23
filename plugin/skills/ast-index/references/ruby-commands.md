@@ -233,8 +233,9 @@ Indexed as:
 (parameters, assignments, block parameters and `rescue => e` are locals).
 Core Ruby and Active Support methods of strings, numbers and collections
 (`each`, `map`, `to_s`, `count`, `merge`, ...) are not recorded when called
-without parentheses. RSpec `let(:name)` / `subject(:name)` helpers are graph
-targets named `name` inside their spec file.
+without parentheses. A lowercase `name(` inside a comment, a string or a
+heredoc is not a call and is not recorded. RSpec `let(:name)` /
+`subject(:name)` helpers are graph targets named `name` inside their spec file.
 
 ## Import Handling
 

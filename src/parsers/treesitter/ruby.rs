@@ -30,8 +30,18 @@ impl RubyParser {
         defined: &[ParsedSymbol],
         file_type: Option<super::super::FileType>,
     ) -> Result<Vec<super::super::ParsedRef>> {
-        // Start with the language-aware generic references
+        let tree = parse_tree(content, &RUBY_LANGUAGE)?;
+        let calls = method_call_refs(content, tree.root_node());
+        let called: std::collections::HashSet<(&str, usize)> = calls.iter().copied().collect();
+
+        // A lowercase `name(` the tree does not see as a call on that line
+        // sits in a comment, a string or SQL heredoc, or names the method on
+        // a `def self.name(` line.
         let mut refs = super::super::extract_references_for_lang(content, defined, file_type)?;
+        refs.retain(|r| {
+            r.name.starts_with(|c: char| c.is_ascii_uppercase())
+                || called.contains(&(r.name.as_str(), r.line))
+        });
 
         // Add Ruby-specific: bang methods (method!) and question methods (method?)
         // The generic extractor misses these because ! and ? are outside \w
@@ -65,13 +75,12 @@ impl RubyParser {
             }
         }
 
-        // The regexes above only see `name(` with a single-word name. Most
-        // Ruby calls are snake_case and written without parentheses.
-        let tree = parse_tree(content, &RUBY_LANGUAGE)?;
+        // Most Ruby calls are written without parentheses: `recv.name`,
+        // `name arg`, a bare `name`. The tree sees them all.
         let mut seen: std::collections::HashSet<(String, usize)> =
             refs.iter().map(|r| (r.name.clone(), r.line)).collect();
         let lines: Vec<&str> = content.lines().collect();
-        for (name, line) in method_call_refs(content, tree.root_node()) {
+        for (name, line) in calls {
             if name.len() <= 2 || UNTRACKED_RUBY_CALLS.contains(name) {
                 continue;
             }

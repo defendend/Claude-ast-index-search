@@ -500,12 +500,20 @@ not what production code calls). Metrics count resolved edges only;
 `--include-ambiguous` lists the rest. After `update` changes the index the graph reports itself as
 stale until `graph build` (or a query with `--refresh`) runs again.
 
+References are capitalized names and calls written `name(` — snake_case and
+`_private` names included (`update_profile(user)`, `self._compute()`). Reserved
+words of C/C++, Go, Python, Rust, Perl and JavaScript never count: `sizeof (x)`,
+`#if defined(X)`, Go's `func (r *T)`, Rust's `pub(crate)`, Python's
+`except (A, B):` and `None`. A reserved word used as a member
+(`map.delete(key)`) or called as a Perl `&name(...)` is still a reference.
+
 Ruby references include calls without parentheses (`recv.name`, `name arg`,
 a bare `name` that is not a local variable), so the graph also links a method
 to the instance methods and attribute readers it calls on `self`, and an RSpec
 example to the `let` helpers it uses. Calls on a receiver of unknown type stay
 `ambiguous`, and core Ruby collection/string methods called without
-parentheses are not recorded at all.
+parentheses are not recorded at all. A lowercase `name(` counts only where the
+syntax tree has a call: in a comment, a string or a heredoc it does not.
 
 In a Rails application `db/schema.rb` is indexed even when it is gitignored:
 each `create_table` becomes a `table` symbol and each column a `column` symbol
