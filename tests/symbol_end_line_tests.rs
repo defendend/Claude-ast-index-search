@@ -507,3 +507,64 @@ fn swift_class_extension_and_function_get_ranges() {
     assert_eq!(span(&conn, "function", "top"), (21, 23));
     assert_all_ranges_filled(&conn);
 }
+
+#[test]
+fn csharp_namespace_encloses_class_and_methods() {
+    let conn = index_single(
+        "src/Greeter.cs",
+        concat!(
+            "using System;\n",
+            "\n",
+            "namespace App.Services\n",
+            "{\n",
+            "    public class Greeter\n",
+            "    {\n",
+            "        public string Name { get; set; }\n",
+            "\n",
+            "        public string Hello()\n",
+            "        {\n",
+            "            return Greet();\n",
+            "        }\n",
+            "\n",
+            "        public void Bye()\n",
+            "        {\n",
+            "            Run();\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        ),
+    );
+
+    let namespace = span(&conn, "package", "App.Services");
+    assert_eq!(namespace, (3, 19));
+    let class = span(&conn, "class", "Greeter");
+    assert_eq!(class, (5, 18));
+    assert_encloses(namespace, class);
+    assert_eq!(span(&conn, "function", "Hello"), (9, 12));
+    assert_eq!(span(&conn, "function", "Bye"), (14, 17));
+    assert_encloses(class, span(&conn, "function", "Hello"));
+    assert_encloses(class, span(&conn, "function", "Bye"));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn csharp_file_scoped_namespace_spans_the_rest_of_the_file() {
+    let conn = index_single(
+        "src/Foo.cs",
+        concat!(
+            "namespace App.Other;\n",
+            "\n",
+            "public class Foo\n",
+            "{\n",
+            "    public void Bar()\n",
+            "    {\n",
+            "    }\n",
+            "}\n",
+        ),
+    );
+
+    let namespace = span(&conn, "package", "App.Other");
+    assert_eq!(namespace, (1, 8));
+    assert_encloses(namespace, span(&conn, "class", "Foo"));
+    assert_eq!(span(&conn, "function", "Bar"), (5, 7));
+}

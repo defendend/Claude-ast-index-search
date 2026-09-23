@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -257,21 +257,33 @@ impl LanguageParser for CSharpParser {
         let idx_event_name = idx("event_name");
         let idx_delegate_name = idx("delegate_name");
         let idx_attr_name = idx("attr_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Namespace
             if let Some(cap) = find_capture(m, idx_namespace_name) {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
+                // `namespace A.B;` scopes the rest of the file, but the grammar
+                // ends the node at the semicolon.
+                let end_line = match cap.node.parent() {
+                    Some(decl) if decl.kind() == "file_scoped_namespace_declaration" => decl
+                        .parent()
+                        .map(|unit| text_end_line(content, &unit))
+                        .or(end_line),
+                    _ => end_line,
+                };
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -285,7 +297,7 @@ impl LanguageParser for CSharpParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -305,7 +317,7 @@ impl LanguageParser for CSharpParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -324,7 +336,7 @@ impl LanguageParser for CSharpParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -339,7 +351,7 @@ impl LanguageParser for CSharpParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -358,7 +370,7 @@ impl LanguageParser for CSharpParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents,
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -373,7 +385,7 @@ impl LanguageParser for CSharpParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -388,7 +400,7 @@ impl LanguageParser for CSharpParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -403,7 +415,7 @@ impl LanguageParser for CSharpParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -418,7 +430,7 @@ impl LanguageParser for CSharpParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -438,7 +450,7 @@ impl LanguageParser for CSharpParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -454,7 +466,7 @@ impl LanguageParser for CSharpParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -470,7 +482,7 @@ impl LanguageParser for CSharpParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -485,7 +497,7 @@ impl LanguageParser for CSharpParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -503,7 +515,7 @@ impl LanguageParser for CSharpParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
