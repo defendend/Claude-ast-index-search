@@ -42,3 +42,7 @@
 ; Typealias declarations
 (typealias_declaration
   name: (type_identifier) @typealias_name)
+
+; Import declarations: `import Foo`, `@testable import Foo.Bar` -> module `Foo`
+(import_declaration
+  (identifier . (simple_identifier) @import_name))

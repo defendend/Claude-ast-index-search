@@ -414,6 +414,10 @@ pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
         },
     )?;
 
+    if items.len() < limit {
+        items.extend(swift_public_api(root, &module_dir, limit - items.len())?);
+    }
+
     println!(
         "{}",
         format!("Public API of '{}' ({}):", module_path, items.len()).bold()
@@ -429,6 +433,45 @@ pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Swift declarations explicitly marked `public`/`open`, from the index.
+/// Swift defaults to `internal`, so nothing else is visible outside the module.
+fn swift_public_api(
+    root: &Path,
+    module_dir: &Path,
+    limit: usize,
+) -> Result<Vec<(String, usize, String)>> {
+    let Some(_cache_lease) = crate::db::acquire_project_lease_if_initialized(root)? else {
+        return Ok(vec![]);
+    };
+    let conn = crate::db::open_db_leased(root)?;
+    let dir = module_dir.strip_prefix(root).unwrap_or(module_dir).to_string_lossy();
+    let mut items = vec![];
+    for sym in crate::db::find_symbols_under(&conn, &dir, ".swift")? {
+        if items.len() >= limit {
+            break;
+        }
+        let signature = sym.signature.unwrap_or_default();
+        if sym.kind != "import" && is_swift_public_declaration(&signature) {
+            items.push((sym.path, sym.line as usize, signature.chars().take(100).collect()));
+        }
+    }
+    Ok(items)
+}
+
+/// Whether the modifiers before the declaration keyword include `public`/`open`
+/// (`@MainActor public final class X`, `open override func f()`).
+fn is_swift_public_declaration(signature: &str) -> bool {
+    const DECLARATION_KEYWORDS: &[&str] = &[
+        "class", "struct", "enum", "protocol", "actor", "extension", "func", "init", "var",
+        "let", "typealias", "subscript", "case",
+    ];
+    signature
+        .split_whitespace()
+        .filter(|token| !token.starts_with('@'))
+        .take_while(|token| !DECLARATION_KEYWORDS.contains(token))
+        .any(|token| token == "public" || token == "open")
 }
 
 /// Compatibility entry point for the legacy changed command API.
@@ -447,4 +490,18 @@ pub fn detect_vcs(root: &Path) -> &'static str {
 #[deprecated(note = "omit --base to let commands::changed::cmd_changed detect the Git base")]
 pub fn detect_git_default_branch(root: &Path) -> &'static str {
     super::changed::detect_git_default_branch_compat(root)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn swift_public_declaration_needs_public_or_open_modifier() {
+        use super::is_swift_public_declaration as public;
+        assert!(public("public final class Router: NSObject {"));
+        assert!(public("@MainActor open func show()"));
+        assert!(public("public private(set) var state: State"));
+        assert!(!public("final class Internal {"));
+        assert!(!public("func open(url: URL)"));
+        assert!(!public("private let open = true"));
+    }
 }

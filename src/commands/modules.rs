@@ -285,6 +285,11 @@ pub fn cmd_unused_deps(
         resource_usages: Vec<(String, String)>, // (resource_name, usage_type)
     }
 
+    // Swift code imports a dependency by its module name, so `import Dep`
+    // in any source file of the module proves the dependency is used no matter
+    // which kinds of symbols (structs, extensions, free functions) it touches.
+    let module_imports = db::find_swift_imports_under(&conn, &module_path)?;
+
     let mut dep_usages: HashMap<String, DepUsage> = HashMap::new();
     let mut unused: Vec<(String, String, String)> = vec![];
     let mut exported: Vec<(String, String, String)> = vec![]; // api deps not directly used
@@ -296,12 +301,19 @@ pub fn cmd_unused_deps(
     for (dep_name, dep_path, dep_kind) in &deps {
         let mut usage = DepUsage::default();
 
-        // 1. Check direct usage via index (refs table)
-        let dep_symbols = get_module_public_symbols(&conn, root, dep_path)?;
-        let (direct_count, direct_names) =
-            count_symbols_used_in_module(&conn, &dep_symbols, &module_path)?;
-        usage.direct_count = direct_count;
-        usage.direct_symbols = direct_names;
+        // 1. Check direct usage: a Swift import, else references to the
+        //    dependency's symbols via the index (refs table)
+        let dep_module_name = dep_name.rsplit('.').next().unwrap_or(dep_name);
+        if module_imports.contains(dep_module_name) {
+            usage.direct_count = 1;
+            usage.direct_symbols = vec![format!("import {}", dep_module_name)];
+        } else {
+            let dep_symbols = get_module_public_symbols(&conn, root, dep_path)?;
+            let (direct_count, direct_names) =
+                count_symbols_used_in_module(&conn, &dep_symbols, &module_path)?;
+            usage.direct_count = direct_count;
+            usage.direct_symbols = direct_names;
+        }
 
         // 2. Check transitive usage (via api dependency chain in transitive_deps table)
         if check_transitive && usage.direct_count == 0 {

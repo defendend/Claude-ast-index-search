@@ -53,6 +53,21 @@ pub const ALL_SOURCE_EXTENSIONS: [&str; 58] = [
     "proto", "wsdl", "xsd", // Schema
 ];
 
+/// Combine a search pattern with a literal, case-insensitive line filter.
+///
+/// `search_files_limited` counts `limit` against raw pattern matches, so any
+/// filtering done afterwards in the handler silently under-reports. Folding
+/// the filter into the pattern keeps `--limit` honest.
+fn pattern_with_line_filter(pattern: &str, filter: Option<&str>) -> String {
+    match filter.filter(|f| !f.is_empty()) {
+        Some(f) => {
+            let f = regex::escape(f);
+            format!("(?:{pattern}).*(?i:{f})|(?i:{f}).*(?:{pattern})")
+        }
+        None => pattern.to_string(),
+    }
+}
+
 /// Trailing word boundary: `\b` for normal names, empty for Ruby bang/question methods
 fn trailing_boundary(function_name: &str) -> &str {
     if function_name.ends_with('!') || function_name.ends_with('?') {
@@ -415,82 +430,63 @@ fn find_containing_function(
 pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
     let mut results: Vec<(String, usize, String)> = vec![];
 
-    // Walk files and search with context
-    use ignore::WalkBuilder;
-    let is_git = crate::indexer::has_git_repo(root);
-    let arc_root = crate::indexer::find_arc_root(root);
-    let mut wb = WalkBuilder::new(root);
-    wb.hidden(true)
-        .git_ignore(is_git)
-        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry));
-    if let Some(ref arc) = arc_root {
-        wb.add_custom_ignore_filename(".gitignore");
-        wb.add_custom_ignore_filename(".arcignore");
-        let root_gitignore = arc.join(".gitignore");
-        if root_gitignore.exists() {
-            wb.add_ignore(root_gitignore);
-        }
-    }
-    let walker = wb.build();
+    // Parallel grep narrows the scan to files that declare providers at all;
+    // reading every .kt/.java file sequentially is prohibitively slow on large
+    // or network-backed checkouts.
+    let mut candidate_files: std::collections::BTreeSet<PathBuf> = Default::default();
+    search_files_limited(
+        root,
+        r"@Provides|@Binds",
+        &["kt", "java"],
+        100_000,
+        |path, _line_num, _line| {
+            candidate_files.insert(path.to_path_buf());
+        },
+    )?;
 
-    for entry in walker.filter_map(|e| e.ok()) {
+    let kotlin_re = Regex::new(&format!(r":\s*\w*{}\b", regex::escape(type_name)))?;
+    let java_re = Regex::new(&format!(r"\b\w*{}\s+\w+\s*\(", regex::escape(type_name)))?;
+
+    for path in &candidate_files {
         if results.len() >= limit {
             break;
         }
-        let path = entry.path();
-        if !path
-            .extension()
-            .map(|e| e == "kt" || e == "java")
-            .unwrap_or(false)
-        {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !content.contains(type_name) {
             continue;
         }
-
-        if let Ok(content) = std::fs::read_to_string(path) {
-            let lines: Vec<&str> = content.lines().collect();
-            let kotlin_re = Regex::new(&format!(r":\s*\w*{}\b", regex::escape(type_name))).ok();
-            let java_re =
-                Regex::new(&format!(r"\b\w*{}\s+\w+\s*\(", regex::escape(type_name))).ok();
-            for (i, line) in lines.iter().enumerate() {
-                if results.len() >= limit {
-                    break;
-                }
-                // Check if this line has @Provides or @Binds
-                if line.contains("@Provides") || line.contains("@Binds") {
-                    // Look at this line and next few lines for the return type
-                    let context: String = lines[i..std::cmp::min(i + 5, lines.len())].join(" ");
-                    // Check if return type matches (allow prefix like AppIconInteractor matches Interactor)
-                    // Kotlin pattern: `: ReturnType` (colon before type)
-                    // Java pattern: `ReturnType methodName(` (type before method name)
-                    let matches_kotlin = kotlin_re
-                        .as_ref()
-                        .map(|re| re.is_match(&context))
-                        .unwrap_or(false);
-                    let matches_java = java_re
-                        .as_ref()
-                        .map(|re| re.is_match(&context))
-                        .unwrap_or(false);
-                    if matches_kotlin || matches_java {
-                        let rel_path = relative_path(root, path);
-                        // Get the function line (usually next line after annotation)
-                        // Kotlin: `fun name()`, Java: method signature without `fun`
-                        let func_line = if i + 1 < lines.len() {
-                            let next_line = lines[i + 1].trim();
-                            if next_line.contains("fun ") || next_line.contains("(") {
-                                next_line.to_string()
-                            } else if i + 2 < lines.len() && lines[i + 2].trim().contains("(") {
-                                // Java: annotation -> modifiers -> method
-                                lines[i + 2].trim().to_string()
-                            } else {
-                                line.trim().to_string()
-                            }
-                        } else {
-                            line.trim().to_string()
-                        };
-                        results.push((rel_path, i + 1, func_line));
-                    }
-                }
+        let lines: Vec<&str> = content.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if results.len() >= limit {
+                break;
             }
+            if !(line.contains("@Provides") || line.contains("@Binds")) {
+                continue;
+            }
+            // Look at this line and the next few for the return type.
+            // Kotlin: `: ReturnType`; Java: `ReturnType methodName(`.
+            // A prefix is allowed so AppIconInteractor matches Interactor.
+            let context: String = lines[i..std::cmp::min(i + 5, lines.len())].join(" ");
+            if !(kotlin_re.is_match(&context) || java_re.is_match(&context)) {
+                continue;
+            }
+            let rel_path = relative_path(root, path);
+            // Kotlin: `fun name()` on the next line; Java: annotation -> modifiers -> method
+            let func_line = if i + 1 < lines.len() {
+                let next_line = lines[i + 1].trim();
+                if next_line.contains("fun ") || next_line.contains("(") {
+                    next_line.to_string()
+                } else if i + 2 < lines.len() && lines[i + 2].trim().contains("(") {
+                    lines[i + 2].trim().to_string()
+                } else {
+                    line.trim().to_string()
+                }
+            } else {
+                line.trim().to_string()
+            };
+            results.push((rel_path, i + 1, func_line));
         }
     }
 
@@ -508,14 +504,19 @@ pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// Captures a suspend function's name, skipping type parameters and an extension
+/// receiver (`suspend fun <T> Foo<T>.bar(`) so the receiver type isn't reported.
+const SUSPEND_FUN_NAME_PATTERN: &str =
+    r"suspend\s+fun\s+(?:<[^>]*>\s*)?(?:[\w.<>?,* ]+\.)?`?(\w+)`?\s*[(<]";
+
 /// Find suspend functions
 pub fn cmd_suspend(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    let pattern = r"suspend\s+fun\s+\w+";
-    let func_regex = Regex::new(r"suspend\s+fun\s+(\w+)")?;
+    let pattern = pattern_with_line_filter(r"suspend\s+fun\s", query);
+    let func_regex = Regex::new(SUSPEND_FUN_NAME_PATTERN)?;
 
     let mut suspends: Vec<(String, String, usize)> = vec![];
 
-    search_files_limited(root, pattern, &["kt"], limit, |path, line_num, line| {
+    search_files_limited(root, &pattern, &["kt"], limit, |path, line_num, line| {
         if let Some(caps) = func_regex.captures(line) {
             let func_name = caps.get(1).unwrap().as_str().to_string();
 
@@ -619,13 +620,16 @@ pub fn cmd_deprecated(root: &Path, query: Option<&str>, limit: usize) -> Result<
     // Kotlin/Java/C#: @Deprecated/@Obsolete, Swift: @available(*, deprecated)
     // Python: @deprecated, Perl: DEPRECATED, Rust: #[deprecated], Go: // Deprecated:
     // JS/TS: @deprecated (JSDoc), PHP: @deprecated (PHPDoc), C++: [[deprecated]]
-    let pattern = r"@Deprecated|@Obsolete|@available\s*\([^)]*deprecated|#\[deprecated|#.*DEPRECATED|=head.*DEPRECATED|@deprecated|\[\[deprecated";
+    let pattern = pattern_with_line_filter(
+        r"@Deprecated|@Obsolete|@available\s*\([^)]*deprecated|#\[deprecated|#.*DEPRECATED|=head.*DEPRECATED|@deprecated|\[\[deprecated",
+        query,
+    );
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
     search_files_limited(
         root,
-        pattern,
+        &pattern,
         &ALL_SOURCE_EXTENSIONS,
         limit,
         |path, line_num, line| {
@@ -653,11 +657,11 @@ pub fn cmd_deprecated(root: &Path, query: Option<&str>, limit: usize) -> Result<
 
 /// Find @Suppress annotations
 pub fn cmd_suppress(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    let pattern = r"@Suppress";
+    let pattern = pattern_with_line_filter(r"@Suppress", query);
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
-    search_files_limited(root, pattern, &["kt"], limit, |path, line_num, line| {
+    search_files_limited(root, &pattern, &["kt"], limit, |path, line_num, line| {
         if let Some(q) = query {
             if !line.to_lowercase().contains(&q.to_lowercase()) {
                 return;
@@ -682,47 +686,128 @@ pub fn cmd_suppress(root: &Path, query: Option<&str>, limit: usize) -> Result<()
     Ok(())
 }
 
-/// Find @Inject/@Autowired points for a type
+/// Find @Inject/@Autowired points for a type: field/setter injection and
+/// constructor parameters (`class Foo @Inject constructor(bar: Bar)`), where
+/// the type usually sits several lines below the annotation.
 pub fn cmd_inject(root: &Path, type_name: &str, limit: usize) -> Result<()> {
-    let pattern = r"@Inject|@Autowired";
+    let type_pattern = format!(r"\b{}\b", regex::escape(type_name));
+    let type_re = Regex::new(&type_pattern)?;
 
-    let mut items: Vec<(String, usize, String)> = vec![];
-
+    let mut candidate_files: std::collections::BTreeSet<PathBuf> = Default::default();
     search_files_limited(
         root,
-        pattern,
+        &type_pattern,
         &["kt", "java"],
-        limit,
-        |path, line_num, line| {
-            let has_di = line.contains("@Inject") || line.contains("@Autowired");
-            if !line.contains(type_name) && !has_di {
-                return;
-            }
-
-            let rel_path = relative_path(root, path);
-            let content: String = line.trim().chars().take(80).collect();
-            items.push((rel_path, line_num, content));
+        100_000,
+        |path, _line_num, _line| {
+            candidate_files.insert(path.to_path_buf());
         },
     )?;
 
-    // Filter to those containing type_name
-    let filtered: Vec<_> = items
-        .iter()
-        .filter(|(_, _, line)| line.contains(type_name))
-        .take(limit)
-        .collect();
+    let mut items: Vec<(String, usize, String)> = vec![];
+    for path in &candidate_files {
+        if items.len() >= limit {
+            break;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !content.contains("@Inject") && !content.contains("Autowired") {
+            continue;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        let rel_path = relative_path(root, path);
+        for line_idx in injection_lines(&content, &type_re) {
+            if items.len() >= limit {
+                break;
+            }
+            let text: String = lines
+                .get(line_idx)
+                .map(|l| l.trim().chars().take(80).collect())
+                .unwrap_or_default();
+            items.push((rel_path.clone(), line_idx + 1, text));
+        }
+    }
 
     println!(
         "{}",
-        format!("Injection points for '{}' ({}):", type_name, filtered.len()).bold()
+        format!("Injection points for '{}' ({}):", type_name, items.len()).bold()
     );
 
-    for (path, line_num, content) in &filtered {
+    for (path, line_num, content) in &items {
         println!("  {}:{}", path.cyan(), line_num);
         println!("    {}", content);
     }
 
     Ok(())
+}
+
+static DI_ANNOTATION_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"@(?:\w+:)?(?:Inject|Autowired)\b").expect("valid DI annotation regex")
+});
+
+static LEADING_ANNOTATION_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"^\s*@[\w.:]+(?:\s*\([^()]*\))?").expect("valid annotation regex")
+});
+
+/// 0-based line indices where `type_re` occurs inside an injection site:
+/// the parameter list following `@Inject` (constructor / method injection),
+/// or the declaration line of an injected field or property.
+fn injection_lines(content: &str, type_re: &Regex) -> Vec<usize> {
+    let mut lines = std::collections::BTreeSet::new();
+    for di in DI_ANNOTATION_RE.find_iter(content) {
+        let mut decl_start = di.end();
+        while let Some(a) = LEADING_ANNOTATION_RE.find(&content[decl_start..]) {
+            decl_start += a.end();
+        }
+        let rest = &content[decl_start..];
+        let stop = rest.find(['(', ';', '=', '{', '}']);
+        let head = &rest[..stop.unwrap_or(rest.len())];
+        let is_property = head.split_whitespace().any(|w| w == "var" || w == "val");
+
+        let span = match stop {
+            Some(i) if !is_property && rest.as_bytes()[i] == b'(' => {
+                let open = decl_start + i;
+                match matching_paren(content, open) {
+                    Some(close) => open..close,
+                    None => continue,
+                }
+            }
+            _ => {
+                let offset = rest.len() - rest.trim_start().len();
+                let line_start = decl_start + offset;
+                let line_end = content[line_start..]
+                    .find('\n')
+                    .map_or(content.len(), |n| line_start + n);
+                let decl_end = stop.map_or(content.len(), |i| decl_start + i);
+                line_start..line_end.min(decl_end).max(line_start)
+            }
+        };
+
+        for m in type_re.find_iter(&content[span.clone()]) {
+            let pos = span.start + m.start();
+            lines.insert(content[..pos].matches('\n').count());
+        }
+    }
+    lines.into_iter().collect()
+}
+
+/// Byte offset of the `)` that closes the `(` at `open`, if any.
+fn matching_paren(content: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, b) in content.as_bytes()[open..].iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Find uses of specific annotation
@@ -768,13 +853,16 @@ pub fn cmd_deeplinks(root: &Path, query: Option<&str>, limit: usize) -> Result<(
     // Search for specific deeplink patterns (NOT generic :// URLs)
     // Android: @DeepLink, DeepLinkHandler, @AppLink, NavDeepLink, intent-filter with android:scheme
     // iOS: openURL, application(_:open:, handleOpen, CFBundleURLSchemes, UniversalLink
-    let pattern = r#"[Dd]eep[Ll]ink|@DeepLink|DeepLinkHandler|@AppLink|NavDeepLink|android:scheme|openURL|application\([^)]*open:|handleOpen|CFBundleURLSchemes|UniversalLink|NSUserActivity"#;
+    let pattern = pattern_with_line_filter(
+        r#"[Dd]eep[Ll]ink|@DeepLink|DeepLinkHandler|@AppLink|NavDeepLink|android:scheme|openURL|application\([^)]*open:|handleOpen|CFBundleURLSchemes|UniversalLink|NSUserActivity"#,
+        query,
+    );
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
     search_files_limited(
         root,
-        pattern,
+        &pattern,
         &["kt", "java", "xml", "swift", "m", "h", "plist"],
         limit,
         |path, line_num, line| {
@@ -849,13 +937,15 @@ pub fn cmd_extensions(root: &Path, receiver_type: &str, limit: usize) -> Result<
 
 /// Find Flow declarations
 pub fn cmd_flows(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    let pattern = r"(StateFlow|SharedFlow|MutableStateFlow|MutableSharedFlow|Flow<)";
-    let flow_regex =
-        Regex::new(r"(StateFlow|SharedFlow|MutableStateFlow|MutableSharedFlow|Flow)<")?;
+    // The search pattern must be exactly the extraction regex: lines like
+    // `.asStateFlow()` would otherwise consume the limit without producing a result.
+    let flow_pattern = r"\b(MutableStateFlow|MutableSharedFlow|StateFlow|SharedFlow|Flow)<";
+    let pattern = pattern_with_line_filter(flow_pattern, query);
+    let flow_regex = Regex::new(flow_pattern)?;
 
     let mut items: Vec<(String, String, usize, String)> = vec![];
 
-    search_files_limited(root, pattern, &["kt"], limit, |path, line_num, line| {
+    search_files_limited(root, &pattern, &["kt"], limit, |path, line_num, line| {
         if let Some(caps) = flow_regex.captures(line) {
             let flow_type = caps.get(1).unwrap().as_str().to_string();
 
@@ -1002,6 +1092,49 @@ fn find_ast_grep_binary() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    fn inject_lines(src: &str, ty: &str) -> Vec<usize> {
+        let re = Regex::new(&format!(r"\b{}\b", regex::escape(ty))).unwrap();
+        injection_lines(src, &re).into_iter().map(|l| l + 1).collect()
+    }
+
+    #[test]
+    fn inject_finds_kotlin_constructor_parameters() {
+        let src = "class A @Inject constructor(\n    private val repo: Lazy<Repo>,\n    @Named(\"x\") private val other: Other,\n) {\n    val unrelated: Repo? = null\n}\n";
+        assert_eq!(inject_lines(src, "Repo"), vec![2]);
+        assert_eq!(inject_lines(src, "Other"), vec![3]);
+    }
+
+    #[test]
+    fn inject_finds_fields_with_annotation_on_previous_line() {
+        let src = "class A {\n    @Inject\n    lateinit var repo: Repo\n    @field:Inject lateinit var other: Other\n    fun f(r: Repo) {}\n}\n";
+        assert_eq!(inject_lines(src, "Repo"), vec![3]);
+        assert_eq!(inject_lines(src, "Other"), vec![4]);
+    }
+
+    #[test]
+    fn inject_finds_java_constructor_and_field() {
+        let src = "class A {\n  @Inject @Named(\"a\") Repo repo;\n  @Inject\n  public A(Other o,\n           Repo r) {\n  }\n}\n";
+        assert_eq!(inject_lines(src, "Repo"), vec![2, 5]);
+        assert_eq!(inject_lines(src, "Other"), vec![4]);
+    }
+
+    #[test]
+    fn pattern_with_line_filter_requires_both_parts() {
+        let re = Regex::new(&pattern_with_line_filter(r"@Suppress", Some("unchecked"))).unwrap();
+        assert!(re.is_match(r#"@Suppress("UNCHECKED_CAST")"#));
+        assert!(!re.is_match(r#"@Suppress("DEPRECATION")"#));
+        assert_eq!(pattern_with_line_filter("x", None), "x");
+    }
+
+    #[test]
+    fn suspend_regex_skips_extension_receiver() {
+        let re = Regex::new(SUSPEND_FUN_NAME_PATTERN).unwrap();
+        let name = |l: &str| re.captures(l).map(|c| c[1].to_string());
+        assert_eq!(name("override suspend fun ScreenStackNavigator.handle(x: X)").as_deref(), Some("handle"));
+        assert_eq!(name("suspend fun <T> Flow<T>.firstOrNull(): T?").as_deref(), Some("firstOrNull"));
+        assert_eq!(name("suspend fun load(id: String)").as_deref(), Some("load"));
+    }
+
     use super::*;
 
     // --- build_caller_pattern tests ---

@@ -690,7 +690,7 @@ enum Commands {
     Conventions,
     /// Find potentially unused symbols
     UnusedSymbols {
-        /// Filter by module path
+        /// Filter by module name or path prefix
         #[arg(long)]
         module: Option<String>,
         /// Only check exported (capitalized) symbols
