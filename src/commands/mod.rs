@@ -33,9 +33,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use crossbeam_channel as channel;
+use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_searcher::MmapChoice;
-use grep_searcher::{sinks::UTF8, SearcherBuilder};
+use grep_searcher::{
+    sinks::{Bytes, UTF8},
+    SearcherBuilder,
+};
 use ignore::WalkBuilder;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
@@ -575,29 +579,7 @@ where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
-    let no_ignore = try_is_no_ignore_enabled(root)?;
-    let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
-    let arc_root = if no_ignore {
-        None
-    } else {
-        crate::indexer::find_arc_root(root)
-    };
-
-    let mut wb = WalkBuilder::new(root);
-    wb.hidden(true)
-        .git_ignore(use_git)
-        .git_exclude(use_git)
-        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
-        .threads(num_cpus());
-    if let Some(ref arc) = arc_root {
-        wb.add_custom_ignore_filename(".gitignore");
-        wb.add_custom_ignore_filename(".arcignore");
-        let root_gitignore = arc.join(".gitignore");
-        if root_gitignore.exists() {
-            wb.add_ignore(root_gitignore);
-        }
-    }
-    let walker = wb.build_parallel();
+    let walker = project_walker(root)?;
 
     let (tx, rx) = channel::bounded::<(Arc<Path>, usize, String)>(limit.max(1000));
 
@@ -677,4 +659,173 @@ where
     }
 
     Ok(())
+}
+
+/// Several [`search_files_limited`] calls answered by one walk.
+///
+/// Each of `patterns` keeps its own budget of `limit` lines and the handler
+/// gets the pattern's index with every line, so each pattern sees the lines a
+/// call of its own would have delivered. The walk ends early only once every
+/// pattern has spent its budget.
+///
+/// The walk searches for `candidates`, which must match every line any of the
+/// patterns matches; each candidate line is then tested against the patterns
+/// one by one. A pattern comes with a literal that all of its matches contain,
+/// checked first because a substring test is far cheaper than the pattern.
+pub fn search_files_limited_each<F>(
+    root: &Path,
+    candidates: &str,
+    patterns: &[(String, String)],
+    extensions: &[&str],
+    limit: usize,
+    mut handler: F,
+) -> Result<()>
+where
+    F: FnMut(usize, &Path, usize, &str),
+{
+    let matcher = RegexMatcher::new(candidates).context("Invalid regex pattern")?;
+    let exact = patterns
+        .iter()
+        .map(|(pattern, _)| RegexMatcher::new(pattern).context("Invalid regex pattern"))
+        .collect::<Result<Vec<_>>>()?;
+    let required = patterns
+        .iter()
+        .map(|(_, literal)| regex::bytes::Regex::new(&regex::escape(literal)))
+        .collect::<Result<Vec<_>, _>>()?;
+    if patterns.is_empty() || limit == 0 {
+        return Ok(());
+    }
+    let walker = project_walker(root)?;
+
+    let extensions: Arc<HashSet<String>> =
+        Arc::new(extensions.iter().map(|s| s.to_string()).collect());
+    let spent: Arc<Vec<AtomicUsize>> =
+        Arc::new(patterns.iter().map(|_| AtomicUsize::new(0)).collect());
+    let exhausted = Arc::new(AtomicUsize::new(0));
+    let should_stop = Arc::new(AtomicBool::new(false));
+    let exact = Arc::new(exact);
+    let required = Arc::new(required);
+
+    let (tx, rx) = channel::bounded::<(usize, Arc<Path>, usize, String)>(10000);
+
+    std::thread::scope(|scope| -> Result<()> {
+        let worker = scope.spawn(move || {
+            walker.run(|| {
+                let tx = tx.clone();
+                let matcher = matcher.clone();
+                let exact = Arc::clone(&exact);
+                let required = Arc::clone(&required);
+                let extensions = Arc::clone(&extensions);
+                let spent = Arc::clone(&spent);
+                let exhausted = Arc::clone(&exhausted);
+                let should_stop = Arc::clone(&should_stop);
+
+                // SAFETY: memory-mapped files are safe when files aren't modified during search
+                let mut searcher = SearcherBuilder::new()
+                    .memory_map(unsafe { MmapChoice::auto() })
+                    .line_number(true)
+                    .build();
+
+                Box::new(move |entry| {
+                    if should_stop.load(Ordering::Relaxed) {
+                        return ignore::WalkState::Quit;
+                    }
+                    let Ok(entry) = entry else {
+                        return ignore::WalkState::Continue;
+                    };
+                    let path = entry.path();
+                    let wanted = path
+                        .extension()
+                        .is_some_and(|ext| extensions.contains(ext.to_str().unwrap_or("")));
+                    if !wanted {
+                        return ignore::WalkState::Continue;
+                    }
+                    let path_arc: Arc<Path> = Arc::from(path);
+                    // A separate search would abort the whole file at the first
+                    // non-UTF-8 line it matched; this marks the patterns that did.
+                    let mut abandoned = vec![false; exact.len()];
+
+                    let _ = searcher.search_path(
+                        &matcher,
+                        path,
+                        Bytes(|line_num, bytes| {
+                            let line = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+                            let text = std::str::from_utf8(bytes).ok();
+                            for index in 0..exact.len() {
+                                if abandoned[index] || spent[index].load(Ordering::Relaxed) >= limit
+                                {
+                                    continue;
+                                }
+                                if !required[index].is_match(line)
+                                    || !exact[index].is_match(line).unwrap_or(false)
+                                {
+                                    continue;
+                                }
+                                let Some(text) = text else {
+                                    abandoned[index] = true;
+                                    continue;
+                                };
+                                let ticket = spent[index].fetch_add(1, Ordering::Relaxed);
+                                if ticket >= limit {
+                                    continue;
+                                }
+                                if ticket + 1 == limit
+                                    && exhausted.fetch_add(1, Ordering::Relaxed) + 1 == exact.len()
+                                {
+                                    should_stop.store(true, Ordering::Relaxed);
+                                }
+                                let sent = tx.send((
+                                    index,
+                                    Arc::clone(&path_arc),
+                                    line_num as usize,
+                                    text.trim_end().to_string(),
+                                ));
+                                if sent.is_err() {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(!should_stop.load(Ordering::Relaxed))
+                        }),
+                    );
+                    ignore::WalkState::Continue
+                })
+            });
+        });
+
+        for (index, path, line_num, line) in rx {
+            handler(index, &path, line_num, &line);
+        }
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("parallel file search worker panicked"))?;
+        Ok(())
+    })
+}
+
+/// Parallel walker over the primary root with the ignore rules the indexer
+/// applies, or none when the index was built with `--no-ignore`.
+fn project_walker(root: &Path) -> Result<ignore::WalkParallel> {
+    let no_ignore = try_is_no_ignore_enabled(root)?;
+    let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
+    let arc_root = if no_ignore {
+        None
+    } else {
+        crate::indexer::find_arc_root(root)
+    };
+
+    let mut wb = WalkBuilder::new(root);
+    wb.hidden(true)
+        .git_ignore(use_git)
+        .git_exclude(use_git)
+        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
+        .threads(num_cpus());
+    if let Some(ref arc) = arc_root {
+        wb.add_custom_ignore_filename(".gitignore");
+        wb.add_custom_ignore_filename(".arcignore");
+        let root_gitignore = arc.join(".gitignore");
+        if root_gitignore.exists() {
+            wb.add_ignore(root_gitignore);
+        }
+    }
+    Ok(wb.build_parallel())
 }
