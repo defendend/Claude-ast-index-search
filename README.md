@@ -695,6 +695,24 @@ exclude:
   does not inflate a symbol's centrality. The graph is opt-in: `rebuild` and
   `update` never build it, and queries flag a stale graph after the index
   changes and accept `--refresh`.
+- **`call-tree` prints the same tree on every run** — which callers made it
+  under `--limit` depended on the files the parallel scan happened to reach
+  first and on hash-map iteration order, so repeating a query could print a
+  different tree. Call lines are now taken in path order and attributed in
+  that order; files are still searched in parallel. Definition lines and files
+  outside `--in-file` no longer use up a function's match budget, so every
+  Sidekiq worker defining `perform` no longer crowds out the calls, and
+  `--in-file` no longer prints an empty tree while matching calls exist. The
+  repository is walked once per command rather than once per level: deep
+  trees got faster, while a single frequent name at `--depth 1` now pays for
+  the full walk up front.
+- **`call-tree` stops expanding callers nothing can call** — a call inside an
+  RSpec block or a Rails DSL call is owned by a symbol named after that block
+  (`it "does nothing"`, `let(:fields)`, `attributes :id`). Such an owner is
+  still printed as a caller, but its name never occurs in code as a call, so
+  looking up its callers cost a scan of the whole repository and never found
+  any. Only callers whose name is an identifier — `Foo::Bar`, `save!`,
+  `valid?` and `name=` included — are expanded now.
 - **`call-tree` scans once per level** — every function in the tree took a
   scan of the whole repository to find its callers, so a level with nine
   callers meant nine scans. Since calls resolve to the symbol that really
