@@ -683,6 +683,19 @@ exclude:
 
 ### Unreleased
 
+- **`search --rank` — re-rank results by history and structure** — four
+  presets re-order the Files and Symbols sections of a search: `proven` (calm,
+  old, idle and actually used — safe to copy), `hotspots` (the file's hotspot
+  score), `risky` (transitive dependents × hotspot score) and `central`
+  (PageRank). Every result carries its dossier: the score and its terms, raw
+  history and graph numbers with repository percentiles and labels, and the
+  relevance position it came from. Relevance stays in charge: exact name
+  matches stay above partial ones, the pool is the head of the plain order, and
+  the preset only weighs in inside a tier. History is labelled as per-file,
+  third-party code is never scored and goes last, and a preset whose data is
+  missing is not applied — the output names `hotspots --collect` or
+  `graph build` instead of ranking by zeros. Formulas were chosen by
+  backtesting next-year bugfixes on a 40k-file monorepo.
 - **`graph` — a symbol dependency graph** — `graph build` resolves indexed
   references into symbol-to-symbol edges and stores them with per-edge
   resolution confidence (`local`, `scoped`, `import`, `unique`, `ambiguous`).
