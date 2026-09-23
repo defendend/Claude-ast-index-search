@@ -568,3 +568,57 @@ fn csharp_file_scoped_namespace_spans_the_rest_of_the_file() {
     assert_encloses(namespace, span(&conn, "class", "Foo"));
     assert_eq!(span(&conn, "function", "Bar"), (5, 7));
 }
+
+#[test]
+fn cpp_namespace_encloses_class_and_functions() {
+    let conn = index_single(
+        "src/greeter.cpp",
+        concat!(
+            "#include <vector>\n",
+            "\n",
+            "#define TWICE(x) \\\n",
+            "    ((x) * 2)\n",
+            "\n",
+            "namespace app {\n",
+            "\n",
+            "class Greeter : public Base {\n",
+            "public:\n",
+            "    int count;\n",
+            "};\n",
+            "\n",
+            "void Greeter::hello() {\n",
+            "    greet();\n",
+            "}\n",
+            "\n",
+            "void Greeter::bye() {\n",
+            "    run();\n",
+            "}\n",
+            "\n",
+            "static int helper(int a) {\n",
+            "    return a + 1;\n",
+            "}\n",
+            "\n",
+            "}  // namespace app\n",
+        ),
+    );
+
+    assert_eq!(span(&conn, "import", "vector"), (1, 1));
+    // A directive owns its newline; the range stops at the last text line.
+    assert_eq!(span(&conn, "constant", "TWICE"), (3, 4));
+    let namespace = span(&conn, "package", "app");
+    assert_eq!(namespace, (6, 25));
+    assert_eq!(span(&conn, "class", "Greeter"), (8, 11));
+    // Out-of-line member definitions sit beside the class, not inside it.
+    assert_eq!(span(&conn, "function", "hello"), (13, 15));
+    assert_eq!(span(&conn, "function", "bye"), (17, 19));
+    assert_eq!(span(&conn, "function", "helper"), (21, 23));
+    for symbol in [
+        span(&conn, "class", "Greeter"),
+        span(&conn, "function", "hello"),
+        span(&conn, "function", "bye"),
+        span(&conn, "function", "helper"),
+    ] {
+        assert_encloses(namespace, symbol);
+    }
+    assert_all_ranges_filled(&conn);
+}

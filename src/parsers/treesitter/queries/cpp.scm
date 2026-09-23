@@ -3,43 +3,43 @@
 ; class Name { ... }
 (class_specifier
   name: (type_identifier) @class_name
-  body: (field_declaration_list)) @class_node
+  body: (field_declaration_list)) @class_node @definition
 
 ; struct Name { ... }
 (struct_specifier
   name: (type_identifier) @struct_name
-  body: (field_declaration_list)) @struct_node
+  body: (field_declaration_list)) @struct_node @definition
 
 ; template<...> class/struct Name { ... }
 (template_declaration
   (class_specifier
     name: (type_identifier) @template_class_name
-    body: (field_declaration_list)) @template_class_node)
+    body: (field_declaration_list)) @template_class_node @definition)
 
 (template_declaration
   (struct_specifier
     name: (type_identifier) @template_struct_name
-    body: (field_declaration_list)) @template_struct_node)
+    body: (field_declaration_list)) @template_struct_node @definition)
 
 ; === Functions ===
 
 ; Regular function definition at file/namespace scope
 (function_definition
   declarator: (function_declarator
-    declarator: (identifier) @func_name))
+    declarator: (identifier) @func_name)) @definition
 
 ; Template function
 (template_declaration
   (function_definition
     declarator: (function_declarator
-      declarator: (identifier) @template_func_name)))
+      declarator: (identifier) @template_func_name)) @definition)
 
 ; Method definition outside class: ReturnType ClassName::MethodName(...)
 (function_definition
   declarator: (function_declarator
     declarator: (qualified_identifier
       scope: (namespace_identifier) @method_class
-      name: (identifier) @method_name)))
+      name: (identifier) @method_name))) @definition
 
 ; Template method definition outside class
 (template_declaration
@@ -47,59 +47,59 @@
     declarator: (function_declarator
       declarator: (qualified_identifier
         scope: (namespace_identifier) @template_method_class
-        name: (identifier) @template_method_name))))
+        name: (identifier) @template_method_name))) @definition)
 
 ; Destructor definition outside class: ClassName::~ClassName()
 (function_definition
   declarator: (function_declarator
     declarator: (qualified_identifier
       scope: (namespace_identifier) @destructor_class
-      name: (destructor_name) @destructor_name)))
+      name: (destructor_name) @destructor_name))) @definition
 
 ; === Namespaces ===
 
 ; namespace Name { ... }
 (namespace_definition
-  name: (namespace_identifier) @namespace_name)
+  name: (namespace_identifier) @namespace_name) @definition
 
 ; === Enums ===
 
 ; enum Name { ... } or enum class Name { ... }
 (enum_specifier
-  name: (type_identifier) @enum_name)
+  name: (type_identifier) @enum_name) @definition
 
 ; enum values
 (enum_specifier
   name: (type_identifier) @enum_name
   body: (enumerator_list
     (enumerator
-      name: (identifier) @enum_value)))
+      name: (identifier) @enum_value) @enum_value_node)) @definition
 
 ; === Type Aliases ===
 
 ; typedef ... TypeName; (simple)
 (type_definition
-  declarator: (type_identifier) @typedef_name)
+  declarator: (type_identifier) @typedef_name) @definition
 
 ; typedef with function pointer: typedef void (*Callback)(int, int);
 ; Capture the whole type_definition node for complex declarators
-(type_definition) @typedef_node
+(type_definition) @typedef_node @definition
 
 ; using TypeName = ...;
 (alias_declaration
-  name: (type_identifier) @using_alias_name)
+  name: (type_identifier) @using_alias_name) @definition
 
 ; === Macros ===
 
 ; #define MACRO(...) — function-like macro
 (preproc_function_def
-  name: (identifier) @macro_name)
+  name: (identifier) @macro_name) @definition
 
 ; === Includes ===
 
 ; #include <path> or #include "path"
 (preproc_include
-  path: (_) @include_path)
+  path: (_) @include_path) @definition
 
 ; === Functions whose return type is a pointer or a reference (added 2026-09-04) ===
 ; tree-sitter-cpp wraps the function_declarator of `T* f()` in a pointer_declarator and of
@@ -114,20 +114,20 @@
 (function_definition
   declarator: (pointer_declarator
     declarator: (function_declarator
-      declarator: (identifier) @func_name)))
+      declarator: (identifier) @func_name))) @definition
 
 ; T** f(...)
 (function_definition
   declarator: (pointer_declarator
     declarator: (pointer_declarator
       declarator: (function_declarator
-        declarator: (identifier) @func_name))))
+        declarator: (identifier) @func_name)))) @definition
 
 ; T& f(...)
 (function_definition
   declarator: (reference_declarator
     (function_declarator
-      declarator: (identifier) @func_name)))
+      declarator: (identifier) @func_name))) @definition
 
 ; T* Class::Method(...)
 (function_definition
@@ -135,7 +135,7 @@
     declarator: (function_declarator
       declarator: (qualified_identifier
         scope: (_) @method_class
-        name: (identifier) @method_name))))
+        name: (identifier) @method_name)))) @definition
 
 ; T** Class::Method(...)
 (function_definition
@@ -144,7 +144,7 @@
       declarator: (function_declarator
         declarator: (qualified_identifier
           scope: (_) @method_class
-          name: (identifier) @method_name)))))
+          name: (identifier) @method_name))))) @definition
 
 ; T& Class::Method(...)
 (function_definition
@@ -152,7 +152,7 @@
     (function_declarator
       declarator: (qualified_identifier
         scope: (_) @method_class
-        name: (identifier) @method_name))))
+        name: (identifier) @method_name)))) @definition
 
 ; T* Class::operator...(...) and T& Class::operator...(...)
 (function_definition
@@ -160,11 +160,11 @@
     declarator: (function_declarator
       declarator: (qualified_identifier
         scope: (_) @method_class
-        name: (operator_name) @method_name))))
+        name: (operator_name) @method_name)))) @definition
 
 (function_definition
   declarator: (reference_declarator
     (function_declarator
       declarator: (qualified_identifier
         scope: (_) @method_class
-        name: (operator_name) @method_name))))
+        name: (operator_name) @method_name)))) @definition
