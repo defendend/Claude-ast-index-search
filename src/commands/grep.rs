@@ -386,7 +386,8 @@ fn collect_tree_callers(
 
 /// Visit the call tree depth-first, in print order, handing every edge to
 /// `visit` as `(depth, caller, Some((file, line)))`, or `None` for a caller
-/// already shown.
+/// already shown. A caller whose name no code can call is shown but not
+/// expanded; see [`is_callable_name`].
 ///
 /// Returns the functions whose callers the walk needed but `callers` lacks;
 /// their subtrees are skipped, so a walk with anything missing is only a
@@ -433,19 +434,49 @@ fn walk_callers_of(
     for (caller, file_path, line_num) in sites {
         if visited.insert(caller.clone()) {
             visit(depth, caller, Some((file_path, *line_num)));
-            walk_callers_of(
-                caller,
-                depth + 1,
-                max_depth,
-                callers,
-                visited,
-                missing,
-                visit,
-            );
+            if is_callable_name(caller) {
+                walk_callers_of(
+                    caller,
+                    depth + 1,
+                    max_depth,
+                    callers,
+                    visited,
+                    missing,
+                    visit,
+                );
+            }
         } else {
             visit(depth, caller, None);
         }
     }
+}
+
+/// Whether source code can call `name`, i.e. whether it is an identifier:
+/// word characters and the `$`, `#`, `-` some languages allow in names,
+/// joined by `::` or `.` (`Applicant::MergeService`, `self.call`), with an
+/// optional trailing `!`, `?` or `=` (Ruby `save!`, `valid?`, `name=`).
+///
+/// The index also names blocks that nothing calls by name — `it "works"`,
+/// `let(:user)`, `describe "Foo"`, `attributes :id`. Such a block does own
+/// the call lines inside it, so it is a caller worth showing, but looking
+/// for calls to it would cost a scan of the whole repository and find none.
+fn is_callable_name(name: &str) -> bool {
+    let body = name.strip_suffix(&['!', '?', '='][..]).unwrap_or(name);
+    let mut has_word = false;
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ':' => {
+                if chars.next() != Some(':') {
+                    return false;
+                }
+            }
+            '.' | '$' | '#' | '-' => {}
+            c if c.is_alphanumeric() || c == '_' => has_word = true,
+            _ => return false,
+        }
+    }
+    has_word
 }
 
 /// Find the functions that call each of `function_names`, in one scan.
@@ -1568,6 +1599,77 @@ mod tests {
         assert_eq!(edges, ["1 alpha a.rb:2"]);
         assert!(missing.is_empty());
         assert_eq!(walk("leaf", 0, &callers), (vec![], vec![]));
+    }
+
+    #[test]
+    fn walk_call_tree_shows_uncallable_callers_without_expanding_them() {
+        let callers: HashMap<String, CallerSites> = [(
+            "leaf",
+            sites(&[
+                ("it \"works\"", "leaf_spec.rb", 2),
+                ("let(:user)", "leaf_spec.rb", 5),
+                ("save!", "record.rb", 3),
+            ]),
+        )]
+        .into_iter()
+        .map(|(name, sites)| (name.to_string(), sites))
+        .collect();
+        let (edges, missing) = walk("leaf", 3, &callers);
+        assert_eq!(
+            edges,
+            [
+                "1 it \"works\" leaf_spec.rb:2",
+                "1 let(:user) leaf_spec.rb:5",
+                "1 save! record.rb:3",
+            ]
+        );
+        assert_eq!(missing, ["save!"]);
+    }
+
+    #[test]
+    fn callable_names_are_identifiers() {
+        for name in [
+            "perform",
+            "save!",
+            "valid?",
+            "name=",
+            "Applicant::MergeService",
+            "::TopLevel",
+            "self.call",
+            "React.memo",
+            "$onChange",
+            "#secret",
+            "button-variant",
+            "ПолучитьДанные",
+            "_private",
+        ] {
+            assert!(is_callable_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn dsl_block_names_are_not_callable() {
+        for name in [
+            "it \"does nothing\"",
+            "let(:fields)",
+            "let!(:company)",
+            "subject(:perform)",
+            "describe \"Applicant::MergeService\"",
+            "attributes :ext_id",
+            "include first_name: [:presence]",
+            "scope :active",
+            ":result",
+            "default(firebase)",
+            "`backticked name`",
+            "[]",
+            "==",
+            "a:b",
+            "save!!",
+            "valid?x",
+            "",
+        ] {
+            assert!(!is_callable_name(name), "{name}");
+        }
     }
 
     // --- build_def_skip_pattern tests ---
