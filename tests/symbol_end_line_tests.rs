@@ -622,3 +622,58 @@ fn cpp_namespace_encloses_class_and_functions() {
     }
     assert_all_ranges_filled(&conn);
 }
+
+#[test]
+fn php_namespace_class_methods_and_function_get_ranges() {
+    let conn = index_single(
+        "src/Models/User.php",
+        concat!(
+            "<?php\n",
+            "namespace App\\Models;\n",
+            "\n",
+            "use Illuminate\\Support\\Str;\n",
+            "\n",
+            "class User extends Model\n",
+            "{\n",
+            "    public function greet()\n",
+            "    {\n",
+            "        return greet();\n",
+            "    }\n",
+            "\n",
+            "    public function bye()\n",
+            "    {\n",
+            "        run();\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "function helper()\n",
+            "{\n",
+            "    return 1;\n",
+            "}\n",
+        ),
+    );
+
+    // `namespace X;` has no braces but scopes the rest of the file.
+    let namespace = span(&conn, "package", "App\\Models");
+    assert_eq!(namespace, (2, 22));
+    let class = span(&conn, "class", "User");
+    assert_eq!(class, (6, 17));
+    assert_encloses(namespace, class);
+    assert_eq!(span(&conn, "function", "greet"), (8, 11));
+    assert_eq!(span(&conn, "function", "bye"), (13, 16));
+    assert_encloses(class, span(&conn, "function", "greet"));
+    assert_encloses(class, span(&conn, "function", "bye"));
+    assert_eq!(span(&conn, "function", "helper"), (19, 22));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn php_statement_namespace_ends_before_the_next_one() {
+    let conn = index_single(
+        "src/two.php",
+        "<?php\nnamespace A;\nclass X {}\nnamespace B;\nclass Y {\n}\n",
+    );
+
+    assert_eq!(span(&conn, "package", "A"), (2, 3));
+    assert_eq!(span(&conn, "package", "B"), (4, 6));
+}
