@@ -6760,19 +6760,44 @@ pub fn count_references_scoped(
     Ok(count as usize)
 }
 
-/// All symbols defined in a file, ordered by line.
-pub fn get_file_symbols(conn: &Connection, path: &str) -> Result<Vec<SearchResult>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE f.path = ?1
-        ORDER BY s.line
-        "#,
-    )?;
+/// SQL condition: file `f` is stored under the root whose `files.root_path`
+/// is bound to the placeholder (`''` for none), so that a relative path shared
+/// by two roots resolves to the file of the root that was asked for.
+///
+/// The primary root has two spellings: current indexers store its normalized
+/// path, and indexes created before `root_path` existed keep `''`. Either one
+/// finds a file stored under the other, going by the primary root recorded in
+/// `metadata`.
+macro_rules! file_under_root_sql {
+    ($root:literal) => {
+        concat!(
+            "(f.root_path = ",
+            $root,
+            " OR (f.root_path IN ('', (SELECT value FROM metadata WHERE key = 'project_root'))",
+            " AND ",
+            $root,
+            " IN ('', (SELECT value FROM metadata WHERE key = 'project_root'))))"
+        )
+    };
+}
+
+/// All symbols defined in a file, ordered by line. `root_path` is the owning
+/// root as stored in `files.root_path`, `None` for `''`.
+pub fn get_file_symbols(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+) -> Result<Vec<SearchResult>> {
+    let mut stmt = conn.prepare(concat!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1 AND ",
+        file_under_root_sql!("?2"),
+        " ORDER BY s.line"
+    ))?;
     let results = stmt
-        .query_map(params![path], row_to_search_result)?
+        .query_map(params![path, root_path.unwrap_or("")], row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }
@@ -6784,18 +6809,23 @@ pub fn get_file_symbols(conn: &Connection, path: &str) -> Result<Vec<SearchResul
 /// "this file has no symbols". Callers use it to tell a genuine
 /// "the line belongs to no symbol" answer from [`find_owning_symbol`] apart
 /// from "the index cannot answer" — only the latter deserves a fallback.
-pub fn file_has_symbol_ranges(conn: &Connection, path: &str) -> Result<bool> {
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT EXISTS(
+/// `root_path` is read as in [`get_file_symbols`].
+pub fn file_has_symbol_ranges(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT EXISTS(
             SELECT 1
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE f.path = ?1 AND s.end_line IS NOT NULL
-        )
-        "#,
-    )?;
-    let has_ranges: bool = stmt.query_row(params![path], |row| row.get(0))?;
+            WHERE f.path = ?1 AND s.end_line IS NOT NULL AND ",
+        file_under_root_sql!("?2"),
+        ")"
+    ))?;
+    let has_ranges: bool =
+        stmt.query_row(params![path, root_path.unwrap_or("")], |row| row.get(0))?;
     Ok(has_ranges)
 }
 
@@ -6812,48 +6842,52 @@ pub fn file_has_symbol_ranges(conn: &Connection, path: &str) -> Result<bool> {
 /// last symbol declared at or before `line`. That fallback is scoped to those
 /// files on purpose: applying it everywhere is what made module-level
 /// references get attributed to the preceding method.
+///
+/// `root_path` is read as in [`get_file_symbols`].
 pub fn find_owning_symbol(
     conn: &Connection,
+    root_path: Option<&str>,
     path: &str,
     line: i64,
 ) -> Result<Option<SearchResult>> {
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE f.path = ?1
-          AND s.line <= ?2
-          AND COALESCE(s.end_line, s.line) >= ?2
-        ORDER BY COALESCE(s.end_line, s.line) - s.line ASC, s.line DESC
-        LIMIT 1
-        "#,
-    )?;
+    let root_path = root_path.unwrap_or("");
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1
+           AND s.line <= ?2
+           AND COALESCE(s.end_line, s.line) >= ?2
+           AND ",
+        file_under_root_sql!("?3"),
+        " ORDER BY COALESCE(s.end_line, s.line) - s.line ASC, s.line DESC
+         LIMIT 1"
+    ))?;
     let owner = stmt
-        .query_row(params![path, line], row_to_search_result)
+        .query_row(params![path, line, root_path], row_to_search_result)
         .optional()?;
     drop(stmt);
     if owner.is_some() {
         return Ok(owner);
     }
 
-    let mut fallback = conn.prepare_cached(
-        r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE f.path = ?1
-          AND s.line <= ?2
-          AND NOT EXISTS (
-              SELECT 1 FROM symbols r
-              WHERE r.file_id = s.file_id AND r.end_line IS NOT NULL
-          )
-        ORDER BY s.line DESC
-        LIMIT 1
-        "#,
-    )?;
+    let mut fallback = conn.prepare_cached(concat!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1
+           AND s.line <= ?2
+           AND NOT EXISTS (
+               SELECT 1 FROM symbols r
+               WHERE r.file_id = s.file_id AND r.end_line IS NOT NULL
+           )
+           AND ",
+        file_under_root_sql!("?3"),
+        " ORDER BY s.line DESC
+         LIMIT 1"
+    ))?;
     Ok(fallback
-        .query_row(params![path, line], row_to_search_result)
+        .query_row(params![path, line, root_path], row_to_search_result)
         .optional()?)
 }
 

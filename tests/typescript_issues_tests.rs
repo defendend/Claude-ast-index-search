@@ -164,7 +164,8 @@ fn anonymous_default_export_is_indexed_under_its_module_name() {
         vec![("useNamed".to_string(), "function".to_string(), 1, Some(3))]
     );
 
-    let owner = db::find_owning_symbol(&conn, "src/hooks/useMap.js", 6)
+    let root_key = db::normalize_root_for_storage(root);
+    let owner = db::find_owning_symbol(&conn, Some(&root_key), "src/hooks/useMap.js", 6)
         .unwrap()
         .expect("the searchPath call sits inside the default export");
     assert_eq!(owner.name, "useMap");

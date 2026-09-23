@@ -77,7 +77,11 @@ unchanged only when both values still match.
 
 The empty-string default on `root_path` remains for compatibility with older
 databases and direct compatibility helpers. Current indexing writes an owning
-root. Attached roots are registered in `subtrees`; `original_path` preserves
+root. Per-file lookups (`find_owning_symbol`, `get_file_symbols`,
+`file_has_symbol_ranges`) take the owning root along with the path, so a path
+shared by two roots never answers from the wrong one; for the primary root,
+`''` and the normalized path recorded as metadata `project_root` are treated
+as the same root. Attached roots are registered in `subtrees`; `original_path` preserves
 what the user entered, while `canonical_path` is the normalized value used in
 `files.root_path`.
 

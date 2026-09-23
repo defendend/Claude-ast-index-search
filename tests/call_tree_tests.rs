@@ -273,3 +273,41 @@ fn call_tree_spends_the_limit_on_calls_inside_the_file_filter() {
         )
     );
 }
+
+/// An attached subtree holds a file under the same relative path as the
+/// primary caller, with a one-line method on the very line of the call.
+#[test]
+fn call_tree_attributes_a_call_within_its_own_root() {
+    let (project, cache) = fixture();
+    let workspace = TempDir::new().unwrap();
+    let shared = workspace.path().join("shared");
+    fs::create_dir_all(shared.join("lib")).unwrap();
+    fs::write(
+        shared.join("lib/callers.rb"),
+        "module Other\n  LIMIT = 1\n  def shadow; end\nend\n",
+    )
+    .unwrap();
+    let shared_arg = shared.to_string_lossy().into_owned();
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    stdout(&run(
+        project.path(),
+        cache.path(),
+        &["subtree", "add", "shared", &shared_arg],
+    ));
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+
+    let output = run(
+        project.path(),
+        cache.path(),
+        &["call-tree", "leaf", "--depth", "1"],
+    );
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "Call tree for 'leaf':\n",
+            "  leaf\n",
+            "    ← alpha (lib/callers.rb:2)\n",
+            "    ← beta (lib/callers.rb:6)\n",
+        )
+    );
+}

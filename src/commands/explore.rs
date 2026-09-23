@@ -810,7 +810,10 @@ fn apply_rwr(
             if !resolver.matches_filter(r.root_path.as_deref()) {
                 continue;
             }
-            if let Some(owner) = db::find_owning_symbol(conn, &r.path, r.line).unwrap_or(None) {
+            if let Some(owner) =
+                db::find_owning_symbol(conn, r.root_path.as_deref(), &r.path, r.line)
+                    .unwrap_or(None)
+            {
                 link_role
                     .entry((owner.path.clone(), owner.line))
                     .or_insert("caller");

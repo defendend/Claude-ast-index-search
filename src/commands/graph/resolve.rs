@@ -1871,19 +1871,21 @@ mod tests {
     fn owner_fixture() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         db::init_db(&conn).unwrap();
+        // File 4 shares file 1's relative path under an attached root.
         let files = [
-            (1, "app/ranged.rb"),
-            (2, "lib/rangeless.kt"),
-            (3, "app/ties.rb"),
+            (1, "app/ranged.rb", ""),
+            (2, "lib/rangeless.kt", ""),
+            (3, "app/ties.rb", ""),
+            (4, "app/ranged.rb", "/elsewhere/shared"),
         ];
-        for (id, path) in files {
+        for (id, path, root_path) in files {
             conn.execute(
-                "INSERT INTO files (id, path, root_path, mtime, size) VALUES (?1, ?2, '', 0, 0)",
-                rusqlite::params![id, path],
+                "INSERT INTO files (id, path, root_path, mtime, size) VALUES (?1, ?2, ?3, 0, 0)",
+                rusqlite::params![id, path, root_path],
             )
             .unwrap();
         }
-        let symbols: [(i64, &str, &str, i64, Option<i64>); 11] = [
+        let symbols: [(i64, &str, &str, i64, Option<i64>); 13] = [
             (1, "Outer", "class", 1, Some(30)),
             (1, "first", "function", 3, Some(9)),
             (1, "Inner", "class", 11, Some(25)),
@@ -1895,6 +1897,8 @@ mod tests {
             (3, "Twins", "class", 1, Some(12)),
             (3, "left", "function", 3, Some(6)),
             (3, "right", "function", 3, Some(6)),
+            (4, "Shadow", "class", 1, Some(35)),
+            (4, "shadowed", "function", 10, Some(12)),
         ];
         for (file, name, kind, line, end_line) in symbols {
             conn.execute(
@@ -1910,21 +1914,23 @@ mod tests {
     fn owner_matches_find_owning_symbol_line_for_line() {
         let conn = owner_fixture();
         let builder = Builder::load(&conn, Path::new("/nonexistent")).unwrap();
-        for file in &builder.files {
+        for row in db::load_graph_files(&conn).unwrap() {
+            let file = &builder.files[builder.file_index[&row.id] as usize];
             for line in 0..=35 {
                 let ours = builder
                     .owner(file, line)
                     .map(|s| builder.syms[s as usize].name.clone());
-                let expected = db::find_owning_symbol(&conn, &file.path, line)
-                    .unwrap()
-                    .map(|symbol| symbol.name);
+                let expected =
+                    db::find_owning_symbol(&conn, Some(row.root_path.as_str()), &row.path, line)
+                        .unwrap()
+                        .map(|symbol| symbol.name);
                 if file.path == "app/ties.rb" && (3..=6).contains(&line) {
                     // Equal ranges: SQLite breaks the tie arbitrarily, the
                     // builder deterministically takes the first definition.
                     assert!(matches!(ours.as_deref(), Some("left" | "right")));
                     continue;
                 }
-                assert_eq!(ours, expected, "{}:{line}", file.path);
+                assert_eq!(ours, expected, "{}{}:{line}", row.root_path, file.path);
             }
         }
     }

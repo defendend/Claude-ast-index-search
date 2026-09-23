@@ -550,16 +550,20 @@ fn find_caller_functions(
         },
     )?;
 
+    let root_key = db::normalize_root_for_storage(root);
     Ok(files_with_calls
         .into_iter()
-        .map(|files| attribute_call_lines(root, conn, files, limit, &func_def_re))
+        .map(|files| attribute_call_lines(root, &root_key, conn, files, limit, &func_def_re))
         .collect())
 }
 
 /// Second pass of [`find_caller_functions`]: the function containing each
 /// call line, at most `limit` distinct ones, the first in path order.
+///
+/// Every file lies under the primary root `root`, stored as `root_key`.
 fn attribute_call_lines(
     root: &Path,
+    root_key: &str,
     conn: Option<&rusqlite::Connection>,
     files_with_calls: BTreeMap<PathBuf, Vec<usize>>,
     limit: usize,
@@ -578,7 +582,9 @@ fn attribute_call_lines(
         // function. Only a file the index cannot speak for gets the scan,
         // and only such a file has to be read off disk at all.
         let ranges_known = conn
-            .map(|conn| db::file_has_symbol_ranges(conn, &rel_path).unwrap_or(false))
+            .map(|conn| {
+                db::file_has_symbol_ranges(conn, Some(root_key), &rel_path).unwrap_or(false)
+            })
             .unwrap_or(false);
         let content = if ranges_known {
             String::new()
@@ -597,7 +603,8 @@ fn attribute_call_lines(
 
             let owner = conn
                 .and_then(|conn| {
-                    db::find_owning_symbol(conn, &rel_path, call_line as i64).unwrap_or(None)
+                    db::find_owning_symbol(conn, Some(root_key), &rel_path, call_line as i64)
+                        .unwrap_or(None)
                 })
                 .map(|symbol| (symbol.name, symbol.line as usize));
             let owner = match owner {
