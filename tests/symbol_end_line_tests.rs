@@ -677,3 +677,43 @@ fn php_statement_namespace_ends_before_the_next_one() {
     assert_eq!(span(&conn, "package", "A"), (2, 3));
     assert_eq!(span(&conn, "package", "B"), (4, 6));
 }
+
+#[test]
+fn scala_class_object_and_methods_get_ranges() {
+    let conn = index_single(
+        "src/main/scala/x/Greeter.scala",
+        concat!(
+            "package x\n",
+            "\n",
+            "class Greeter(name: String) extends Base {\n",
+            "  val count = 0\n",
+            "\n",
+            "  def hello(): String = {\n",
+            "    greet()\n",
+            "  }\n",
+            "\n",
+            "  def bye(): Unit =\n",
+            "    run()\n",
+            "}\n",
+            "\n",
+            "object Greeter {\n",
+            "  def apply(): Greeter = new Greeter(\"x\")\n",
+            "}\n",
+            "\n",
+            "def top(): Int =\n",
+            "  1\n",
+        ),
+    );
+
+    let class = span(&conn, "class", "Greeter");
+    assert_eq!(class, (3, 12));
+    assert_eq!(span(&conn, "function", "hello"), (6, 8));
+    assert_eq!(span(&conn, "function", "bye"), (10, 11));
+    assert_encloses(class, span(&conn, "function", "hello"));
+    assert_encloses(class, span(&conn, "function", "bye"));
+    let object = span(&conn, "object", "Greeter");
+    assert_eq!(object, (14, 16));
+    assert_encloses(object, span(&conn, "function", "apply"));
+    assert_eq!(span(&conn, "function", "top"), (18, 19));
+    assert_all_ranges_filled(&conn);
+}
