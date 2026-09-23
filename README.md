@@ -683,6 +683,23 @@ exclude:
 
 ### Unreleased
 
+- **Index anonymous `export default` functions and classes** —
+  `export default () => {}`, `export default function () {}` and
+  `export default class {}` produced no symbol, so the function could not be
+  found and every call inside it had no owner in `call-tree` and
+  `explore --rwr`. Such a value is now indexed with its range under the name it
+  is imported by: the file name (`hooks/useMap.js` → `useMap`), or the
+  directory for an `index` file (`Button/index.jsx` → `Button`). A function is
+  classified like a declaration of that name, so a PascalCase component indexes
+  as a class; `outline` shows the same name. Named default exports are
+  unchanged.
+- **Rank project code above dependencies in `search`** — within a ranking
+  tier, hits in `node_modules` or `.d.ts` files were ordered against project
+  hits by path alone, so `node_modules/…` came ahead of `spec/` or `system/`.
+  Project hits now lead within each tier. The tier still decides first, so a
+  library's exact `useState` stays above a project's partial `useStateModal`.
+  A project-owned `vendor/` directory still counts as project code; `explore`
+  shares the same definition.
 - **Rank symbol searches by relevance** — FTS symbol queries used to come back
   in whatever order the engine produced, or sorted by name length, so a search
   for `ApplicationService` listed every shorter sibling and never the class
