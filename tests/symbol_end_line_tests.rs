@@ -463,3 +463,47 @@ fn kotlin_class_methods_and_function_get_ranges() {
     assert_encloses(top, span(&conn, "function", "local"));
     assert_all_ranges_filled(&conn);
 }
+
+#[test]
+fn swift_class_extension_and_function_get_ranges() {
+    let conn = index_single(
+        "Sources/App/Greeter.swift",
+        concat!(
+            "import Foundation\n",
+            "\n",
+            "class Greeter: Base {\n",
+            "    var count = 0\n",
+            "\n",
+            "    init(x: Int) {\n",
+            "        self.count = x\n",
+            "    }\n",
+            "\n",
+            "    func hello() -> String {\n",
+            "        return greet()\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "extension Greeter {\n",
+            "    func bye() {\n",
+            "        run()\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "func top() {\n",
+            "    print(1)\n",
+            "}\n",
+        ),
+    );
+
+    let class = span(&conn, "class", "Greeter");
+    assert_eq!(class, (3, 13));
+    assert_eq!(span(&conn, "function", "init"), (6, 8));
+    assert_eq!(span(&conn, "function", "hello"), (10, 12));
+    assert_encloses(class, span(&conn, "function", "init"));
+    assert_encloses(class, span(&conn, "function", "hello"));
+    let extension = span(&conn, "object", "Greeter+Extension");
+    assert_eq!(extension, (15, 19));
+    assert_encloses(extension, span(&conn, "function", "bye"));
+    assert_eq!(span(&conn, "function", "top"), (21, 23));
+    assert_all_ranges_filled(&conn);
+}
