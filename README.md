@@ -683,6 +683,24 @@ exclude:
 
 ### Unreleased
 
+- **`search --type` no longer takes a minute on a large index** — with a kind
+  filter the bundled SQLite drove the query from the index on `kind`, scanning
+  every symbol of that kind and re-running the full-text match for each one:
+  `search Job --type class` took about a minute on a 320k-symbol index. The
+  full-text match now leads and the kind filters its hits, about a second, with
+  the same results.
+- **MCP exposes the symbol graph, Git hotspots and ranked search** — seven new
+  tools: `graph_dependents` (direct dependents, or the transitive blast radius
+  with `depth` ≥ 2), `graph_dependencies`, `graph_path`, `graph_metrics` (the
+  most central symbols, or metrics of given ones), `graph_cycles`,
+  `graph_build` and `hotspots`; `search` takes `rank` (`proven`, `hotspots`,
+  `risky`, `central`). Descriptions tell the agent when to reach for each one —
+  before changing a symbol, when choosing which match to copy — and what has to
+  be collected first; graph queries accept `refresh: true` to build a missing or
+  stale graph in place. History collection stays a CLI command, since its first
+  run outlasts common MCP client timeouts, and the tools name it when history is
+  missing. Output is compact text: a ranked search prints each file's history
+  and each symbol's graph numbers once, about a quarter of the JSON size.
 - **`search --rank` — re-rank results by history and structure** — four
   presets re-order the Files and Symbols sections of a search: `proven` (calm,
   old, idle and actually used — safe to copy), `hotspots` (the file's hotspot
