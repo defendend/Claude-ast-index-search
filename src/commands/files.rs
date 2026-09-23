@@ -265,12 +265,16 @@ pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
     let is_python = ext == "py";
     let is_go = ext == "go";
     let is_cpp = ext == "cpp" || ext == "cc" || ext == "c" || ext == "hpp" || ext == "h";
+    let is_typescript =
+        crate::parsers::FileType::from_extension(ext) == Some(crate::parsers::FileType::TypeScript);
 
     println!("{}", format!("Imports in {}:", file).bold());
 
     let mut imports: Vec<String> = vec![];
 
-    if is_perl {
+    if is_typescript {
+        imports = crate::parsers::treesitter::typescript::import_declarations(&content)?;
+    } else if is_perl {
         // Perl: use Module; or require Module;
         let use_re = Regex::new(r"^\s*(use|require)\s+([A-Za-z][A-Za-z0-9_:]*)")?;
         for line in content.lines() {

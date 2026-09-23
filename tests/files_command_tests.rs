@@ -176,3 +176,49 @@ fn cmd_imports_handles_file_with_no_imports() {
 
     cmd_imports(dir.path(), "Bare.kt").expect("file with no imports must succeed");
 }
+
+#[test]
+fn imports_lists_every_typescript_import_on_one_line() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src/Invoice.tsx");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    fs::write(
+        &src,
+        concat!(
+            "import React from 'react';\n",
+            "import debounce from 'lodash/debounce';\n",
+            "import {\n",
+            "  Button,\n",
+            "  Icon,\n",
+            "} from 'shared/components';\n",
+            "import { total } from './total';\n",
+            "export * from './types';\n",
+            "\n",
+            "export default () => <Button>{total()}</Button>;\n",
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ast-index"))
+        .current_dir(dir.path())
+        .env("NO_COLOR", "1")
+        .args(["imports", "src/Invoice.tsx"])
+        .output()
+        .expect("ast-index binary must run");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout={stdout}");
+    assert_eq!(
+        stdout,
+        concat!(
+            "Imports in src/Invoice.tsx:\n",
+            "  React from 'react';\n",
+            "  debounce from 'lodash/debounce';\n",
+            "  { Button, Icon } from 'shared/components';\n",
+            "  { total } from './total';\n",
+            "  export * from './types';\n",
+            "\n",
+            "  Total: 5 imports\n",
+        )
+    );
+}

@@ -1258,6 +1258,62 @@ fn is_build_directory(name: &str) -> bool {
         })
 }
 
+/// A module's import declarations in source order, one line each: every
+/// top-level `import` statement without its keyword (`{ a, b } from 'pkg';`,
+/// `'./polyfill';`) and every re-export in full (`export * from './a';`). A
+/// statement written over several lines is joined onto one, without comments.
+///
+/// This lists what the file reads, packages included; the index keeps an
+/// import symbol only for a project-local specifier (`./a`, `@/a`, `~/a`).
+pub fn import_declarations(content: &str) -> Result<Vec<String>> {
+    let tree = parse_tree(content, &TS_LANGUAGE)?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let declarations = root
+        .named_children(&mut cursor)
+        .filter_map(|statement| match statement.kind() {
+            "import_statement" => one_line(content, &statement)
+                .strip_prefix("import")
+                .map(|rest| rest.trim_start().to_string()),
+            "export_statement" if statement.child_by_field_name("source").is_some() => {
+                Some(one_line(content, &statement))
+            }
+            _ => None,
+        })
+        .collect();
+    Ok(declarations)
+}
+
+/// `node`'s text with its comments dropped, every run of whitespace turned
+/// into one space, and the trailing comma of a multi-line `{ a, b, }` removed.
+fn one_line(content: &str, node: &tree_sitter::Node) -> String {
+    let mut comments = Vec::new();
+    collect_comments(node, &mut comments);
+    let mut text = String::new();
+    let mut at = node.start_byte();
+    for comment in comments {
+        text.push_str(&content[at..comment.start_byte()]);
+        text.push(' ');
+        at = comment.end_byte();
+    }
+    text.push_str(&content[at..node.end_byte()]);
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(", }", " }")
+}
+
+fn collect_comments<'a>(node: &tree_sitter::Node<'a>, comments: &mut Vec<tree_sitter::Node<'a>>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "comment" {
+            comments.push(child);
+        } else {
+            collect_comments(&child, comments);
+        }
+    }
+}
+
 fn find_capture<'a>(
     m: &'a tree_sitter::QueryMatch<'a, 'a>,
     idx: Option<u32>,
@@ -2034,6 +2090,43 @@ declare function internalHelper(): void;
             name_default_export(&mut symbols, path);
             assert_eq!(symbols[0].name, expected, "{path}");
         }
+    }
+
+    #[test]
+    fn import_declarations_list_every_import_on_one_line() {
+        let content = r#"import React from 'react';
+import 'shared/polyfills';
+import type {
+  Invoice,
+  // the draft is typed separately
+  Draft,
+} from '@/billing/types';
+import * as api from '../api';
+import {
+  Button,
+  Icon as Glyph,
+} from "shared/components";
+export * from './store';
+export { default as Table } from './Table';
+export const local = 1;
+export default api;
+
+function lazy() {
+  return import('./Lazy');
+}
+"#;
+        assert_eq!(
+            import_declarations(content).unwrap(),
+            vec![
+                "React from 'react';",
+                "'shared/polyfills';",
+                "type { Invoice, Draft } from '@/billing/types';",
+                "* as api from '../api';",
+                "{ Button, Icon as Glyph } from \"shared/components\";",
+                "export * from './store';",
+                "export { default as Table } from './Table';",
+            ]
+        );
     }
 
     #[test]

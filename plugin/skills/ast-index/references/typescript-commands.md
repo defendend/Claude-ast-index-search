@@ -77,6 +77,13 @@ ast-index imports "component.tsx"   # Show all imports
 ast-index exports "index.ts"        # Show all exports
 ```
 
+`imports` reads the file itself and lists every `import` statement —
+relative, alias (`shared/...`, `@/...`) and package (`react`,
+`lodash/debounce`) alike — plus re-exports (`export * from './a'`), one line
+each, a multi-line `import { … }` joined onto one. The index keeps an import
+symbol only for a project-local specifier (`./a`, `@/a`, `~/a`), so `refs`
+lists those imports and `search` is not flooded with a row per `import React`.
+
 ## Framework-Specific Patterns
 
 ### React
