@@ -157,6 +157,130 @@ fn a_capitalised_query_prefers_the_type_over_the_accessor() {
 }
 
 // ----------------------------------------------------------------------
+// Project code before third-party code
+// ----------------------------------------------------------------------
+
+fn insert_at(conn: &rusqlite::Connection, path: &str, name: &str, kind: SymbolKind) {
+    let file = db::upsert_file(conn, path, 0, 100).unwrap();
+    db::insert_symbol(conn, file, name, kind, 3, Some(&format!("class {name}"))).unwrap();
+}
+
+#[test]
+fn project_hits_lead_vendor_hits_of_the_same_tier() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // `node_modules/` sorts before `system/` and `vendor/`, so the path
+    // tie-break alone put the library copy first.
+    insert_at(
+        &conn,
+        "node_modules/react-hot-loader/index.d.ts",
+        "AppContainer",
+        SymbolKind::Class,
+    );
+    insert_at(
+        &conn,
+        "node_modules/react-hot-loader/props.d.ts",
+        "AppContainerProps",
+        SymbolKind::Interface,
+    );
+    insert_at(
+        &conn,
+        "system/container.rb",
+        "AppContainer",
+        SymbolKind::Class,
+    );
+    insert_at(
+        &conn,
+        "system/container_factory.rb",
+        "AppContainerFactory",
+        SymbolKind::Class,
+    );
+    // A project-owned `vendor/` directory is project code, not a dependency.
+    insert_at(
+        &conn,
+        "vendor/container.rb",
+        "AppContainer",
+        SymbolKind::Class,
+    );
+
+    let exact = [
+        "AppContainer:system/container.rb:3",
+        "AppContainer:vendor/container.rb:3",
+        "AppContainer:node_modules/react-hot-loader/index.d.ts:3",
+    ];
+    // The CLI searches by prefix, so it also reaches the partial hits, where the
+    // exact vendor hit stays above the project's partial one.
+    let none = SearchScope::none();
+    assert_eq!(
+        located(
+            &db::search_symbol_terms_scoped(&conn, &["AppContainer"], None, 10, &none, false)
+                .unwrap()
+        ),
+        [
+            &exact[..],
+            &[
+                "AppContainerFactory:system/container_factory.rb:3",
+                "AppContainerProps:node_modules/react-hot-loader/props.d.ts:3",
+            ],
+        ]
+        .concat()
+    );
+    let token_pages = [
+        db::search_symbols(&conn, "AppContainer", 10).unwrap(),
+        db::search_symbols_scoped(&conn, "AppContainer", 10, &module_scope("")).unwrap(),
+        db::search_symbols_for_command(&conn, "AppContainer", None, 10, &none, false, false)
+            .unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["AppContainer"], None, 3, &none, true).unwrap(),
+    ];
+    for page in &token_pages {
+        assert_eq!(located(page), exact);
+    }
+}
+
+#[test]
+fn a_library_only_name_keeps_its_exact_hit_first() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // The project never defines `useState`; its own hits only contain it.
+    for i in 0..5 {
+        insert_at(
+            &conn,
+            &format!("frontend/hooks/use_state_{i}.js"),
+            &format!("useStateModal{i}"),
+            SymbolKind::Function,
+        );
+    }
+    insert_at(
+        &conn,
+        "node_modules/react-use/lib/useStateList.d.ts",
+        "useStateList",
+        SymbolKind::Function,
+    );
+    insert_at(
+        &conn,
+        "node_modules/@types/react/index.d.ts",
+        "useState",
+        SymbolKind::Function,
+    );
+
+    let results =
+        db::search_symbol_terms_scoped(&conn, &["useState"], None, 10, &SearchScope::none(), false)
+            .unwrap();
+    assert_eq!(
+        names(&results),
+        vec![
+            "useState",
+            "useStateModal0",
+            "useStateModal1",
+            "useStateModal2",
+            "useStateModal3",
+            "useStateModal4",
+            "useStateList",
+        ]
+    );
+}
+
+// ----------------------------------------------------------------------
 // bm25 column weights
 // ----------------------------------------------------------------------
 

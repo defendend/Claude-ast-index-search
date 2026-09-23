@@ -5511,6 +5511,19 @@ fn escape_fts5_query(query: &str) -> String {
 /// that only name it in their `class X < ApplicationService` signature.
 const FTS_RANK: &str = "bm25(symbols_fts, 10.0, 1.0)";
 
+/// Whether an indexed path is third-party code: installed packages and type
+/// declarations. Rankers demote such hits below the project's own.
+///
+/// A project's own `vendor/` directory is deliberately not vendor here: it is
+/// indexed and ranked like the rest of the project's source.
+pub fn is_vendor_path(path: &str) -> bool {
+    path.contains("node_modules") || path.ends_with(".d.ts")
+}
+
+/// [`is_vendor_path`] over `f.path`, for ordering inside SQL. `instr` and
+/// `substr` rather than `LIKE`, which folds case and reads `_` as a wildcard.
+const VENDOR_PATH_SQL: &str = "(instr(f.path, 'node_modules') > 0 OR substr(f.path, -5) = '.d.ts')";
+
 /// Deterministic ordering for a query that matches `symbols_fts`.
 ///
 /// `exact_name_placeholders` bind the raw query terms, and each one is read
@@ -5528,10 +5541,16 @@ const FTS_RANK: &str = "bm25(symbols_fts, 10.0, 1.0)";
 /// because the model has a longer `class … < ApplicationRecord` line is noise,
 /// not relevance. Name length and `f.path, s.line` decide instead, which also
 /// makes repeated runs return the same page.
+///
+/// Inside each tier the project's own code leads third-party code
+/// ([`is_vendor_path`]). Without that, the path tie-break decided, and
+/// `node_modules/…` sorts ahead of `spec/` or `system/`. The tier still comes
+/// first: a library's exact `useState` stays above a project's partial
+/// `useStateModal`, because the library name is what was typed.
 fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
     let tail = "length(COALESCE(s.qualified_name, s.name)), f.path, s.line";
     if exact_name_placeholders.is_empty() {
-        return format!(" ORDER BY {FTS_RANK}, {tail}");
+        return format!(" ORDER BY {VENDOR_PATH_SQL}, {FTS_RANK}, {tail}");
     }
     let cased = exact_name_placeholders.join(", ");
     let folded = exact_name_placeholders
@@ -5543,6 +5562,7 @@ fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
         " ORDER BY \
          CASE WHEN s.name IN ({cased}) THEN 0 \
          WHEN lower(s.name) IN ({folded}) THEN 1 ELSE 2 END, \
+         {VENDOR_PATH_SQL}, \
          CASE WHEN lower(s.name) IN ({folded}) THEN 0.0 ELSE {FTS_RANK} END, \
          {tail}"
     )
@@ -7511,7 +7531,9 @@ pub fn search_symbol_terms_scoped(
         values.push(kind.to_string());
     }
     if fuzzy {
-        sql.push_str(" ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), f.path, s.line");
+        sql.push_str(&format!(
+            " ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), {VENDOR_PATH_SQL}, f.path, s.line"
+        ));
     } else {
         let first = values.len() + 1;
         let placeholders = (0..terms.len())
@@ -8868,6 +8890,41 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn vendor_path_covers_packages_and_declarations_only() {
+        assert!(is_vendor_path("node_modules/@types/react/index.d.ts"));
+        assert!(is_vendor_path("frontend/node_modules/lodash/debounce.js"));
+        assert!(is_vendor_path("frontend/types/global.d.ts"));
+        assert!(!is_vendor_path("app/services/applicant/merge_service.rb"));
+        assert!(!is_vendor_path("vendor/lib.rs"));
+    }
+
+    #[test]
+    fn vendor_path_sql_agrees_with_rust() {
+        let conn = Connection::open_in_memory().unwrap();
+        let paths = [
+            "node_modules/@types/react/index.d.ts",
+            "frontend/node_modules/lodash/debounce.js",
+            "frontend/types/global.d.ts",
+            "app/services/applicant/merge_service.rb",
+            "vendor/lib.rs",
+            "app/node-modules/x.rb",
+            "app/nodeXmodules/x.rb",
+            "Types/Global.D.TS",
+            "d.ts",
+        ];
+        for path in paths {
+            let in_sql: bool = conn
+                .query_row(
+                    &format!("SELECT {VENDOR_PATH_SQL} FROM (SELECT ?1 AS path) f"),
+                    params![path],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(in_sql, is_vendor_path(path), "{path}");
+        }
     }
 
     #[test]

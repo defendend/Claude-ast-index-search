@@ -96,7 +96,7 @@ fn run_explore(
             if !seen.insert((s.path.clone(), s.line)) {
                 continue;
             }
-            let vendor = is_vendor(&s.path);
+            let vendor = db::is_vendor_path(&s.path);
             cands.push(Cand {
                 sym: s,
                 score: 0.0,
@@ -699,10 +699,6 @@ fn path_stem(path: &str) -> String {
         .to_string()
 }
 
-fn is_vendor(path: &str) -> bool {
-    path.contains("node_modules") || path.ends_with(".d.ts")
-}
-
 fn is_test_path(path: &str) -> bool {
     let p = path.to_lowercase();
     let dir_or_infix = p.contains("/spec/")
@@ -898,7 +894,7 @@ fn apply_rwr(
     for sym in &g.syms {
         let key = (sym.path.clone(), sym.line);
         if !existing.contains(&key) {
-            let vendor = is_vendor(&sym.path);
+            let vendor = db::is_vendor_path(&sym.path);
             let link = link_role.get(&key).copied();
             cands.push(Cand {
                 sym: sym.clone(),
@@ -941,7 +937,7 @@ mod tests {
     }
 
     fn cand(name: &str, kind: &str, path: &str) -> Cand {
-        let vendor = is_vendor(path);
+        let vendor = db::is_vendor_path(path);
         Cand {
             sym: sym(name, kind, path, 1),
             score: 0.0,
@@ -956,13 +952,6 @@ mod tests {
         assert_eq!(t, vec!["applicant", "merge", "mergeservice"]);
         // "a"/"of" dropped (<3 chars); dedup keeps first occurrence.
         assert_eq!(tokenize("Foo foo FOO"), vec!["foo"]);
-    }
-
-    #[test]
-    fn vendor_detection() {
-        assert!(is_vendor("node_modules/@types/react/index.d.ts"));
-        assert!(is_vendor("frontend/types/global.d.ts"));
-        assert!(!is_vendor("app/services/applicant/merge_service.rb"));
     }
 
     #[test]
