@@ -87,6 +87,11 @@ compact text format reliably.
 shared by every symbol in it, so a symbol whose file was already described
 says `history and graph: as above` instead of repeating the numbers.
 
+A multi-word `search` without literal matches answers with `explore` results.
+The text starts with `fallback: explore — <reason>` and carries the same
+report `explore` returns: source of the best definitions, the ranked symbols,
+graph neighbours and tests found by path convention.
+
 ## Install
 
 ### Prerequisites
