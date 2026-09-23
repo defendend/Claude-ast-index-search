@@ -683,6 +683,103 @@ exclude:
 
 ### Unreleased
 
+- **Symbol ranges for every tree-sitter language** — `end_line` used to be
+  filled only for Ruby and TypeScript/JavaScript, so `call-tree`,
+  `explore --rwr` and `graph` fell back to "the last definition above the
+  line" everywhere else. Python, Go, Rust, Java, Kotlin, Swift, C#, C/C++, PHP,
+  Scala, Dart, Lua, Elixir, Zig, Objective-C, Groovy, Bash, SQL, R, MATLAB,
+  GDScript, Common Lisp, BSL and Protobuf now store the last line of every
+  definition, with classes, modules and namespaces enclosing their members.
+  The fallback had blamed the wrong definition for 3.6% of references in a Rust
+  codebase, 11% in a Go checkout and 18–42% in C++; module-level code no longer
+  gets an invented caller. Decorators and annotations stay outside the
+  definition they decorate, since they run in the enclosing scope. The graph
+  treats Rust `impl` blocks and Swift/Objective-C extensions as the namespace of
+  the type they extend, so `Type::new(…)` and `Self::helper(…)` resolve. CSS,
+  SCSS, Less and the regex-based parsers still report no ranges. Run
+  `ast-index rebuild` to fill ranges in an existing index.
+- **Rails schema tables and columns** — `db/schema.rb` (indexed even when
+  gitignored) yields `table` and `column` symbols (`users.email`;
+  `search email -t column`, `outline db/schema.rb`). `graph build` matches
+  tables to models by Active Record's rules — `self.table_name`, single-table
+  inheritance, nested models, `table_name_prefix` / `isolate_namespace`, the
+  pluralized class name — reports tables without a model and models without a
+  table, and resolves column readers and attribute methods called inside a
+  model (`email`, `self.email`, `email?`, `saved_change_to_email?`) as scoped
+  edges to the column (`graph dependents users.email`).
+- **Ruby calls without parentheses are references** — `usages` and the graph
+  now see `recv.name`, `name arg`, snake_case `name(...)` and bare `name` calls
+  that are not local variables; core collection and string methods called
+  without parentheses are skipped. RSpec `let` / `subject` helpers resolve
+  within their spec file. On a Rails monorepo resolved graph edges grew from
+  66k to 186k at +29% index size.
+- **Compound Ruby constants are indexed** — `Billing::Import = Container.injector`
+  and CamelCase assignments (`Types = Dry.Types()`) become constants, named
+  with their enclosing scopes like classes. In the graph a constant defined in
+  an inner scope shadows an outer module of the same name, so
+  `include Import[...]` inside `module Billing` no longer links every such
+  class to an unrelated top-level `module Import`.
+- **Production code never resolves into test trees** — a spec helper that
+  reopens a class to stub a method is no longer the target of production calls.
+- **One definition of third-party code** — only `node_modules` is left out of
+  the graph; a project's `vendor/` directory and its own `.d.ts` files are
+  graph nodes, while search ranking still demotes every `.d.ts`.
+- **`hotspots --collect` survives branch switches, rebases and resets** —
+  history is kept per commit, so moving HEAD subtracts the commits it no longer
+  reaches and adds new ones, reusing diffs already read. A switch on a
+  25k-commit monorepo takes under a second instead of a ~1-minute rescan, and
+  the numbers equal a fresh full collection. The git tables are ~40% smaller.
+  The first `--collect` after upgrading recollects once.
+- **Hotspot scores no longer collapse into ties** — `hotspots --sort score` and
+  `search --rank hotspots|risky|proven` order by unrounded percentiles
+  (`score_exact` in JSON).
+- **`--exclude-tests` for `hotspots` and ranked search** — `hotspots
+  --exclude-tests` and `search --rank … --exclude-tests` (MCP: `exclude_tests`)
+  hide spec/test files; percentiles still rank every file.
+- **`rewritten-often` only for files of 10+ lines** — relative churn is
+  computed only for such files, so one-line bundles, fixtures and gutted files
+  no longer read as "3000x file".
+- **Namespaced definitions lead `search`** — `search MergeService` had no exact
+  hit for `class A::B::MergeService`, and bm25 put the shorter
+  `describe "A::B::MergeService"` spec above the class. Names whose last `::`
+  segment equals the query (case-sensitive) now rank right below exact names;
+  statements such as `include A::B::MergeService` do not count. `search --rank`
+  uses the same tier (`exact_last_segment`).
+- **Owning-symbol lookups stay within the file's root** — with an attached
+  subtree holding a file under the same relative path, `call-tree` and
+  `explore --rwr` could attribute a call to a method of the other root.
+- **Drop the redundant `idx_symbols_file` index** — it is the leftmost prefix
+  of `idx_symbols_file_line_end`; new databases no longer create it and
+  existing ones drop it on open. `restore` accepts backups with and without it;
+  a backup made by this version cannot be restored by older releases.
+- **MCP `search` keeps its explore fallback** — a multi-word query without
+  literal matches now renders `fallback: explore — <reason>` followed by
+  source, ranked symbols, graph neighbours and tests instead of an empty
+  `Files:` heading.
+- **`callers` and `call-tree` find bare Ruby predicate and bang calls** —
+  `if next_page? && …` and `save!` without receiver or parentheses were
+  missed; definitions, `#name?` in documentation and `!=`/`!~` are still
+  skipped.
+- **Tests no longer write to the user's index cache** — `.cargo/config.toml`
+  points `AST_INDEX_CACHE_DIR` at `target/ast-index-cache` for everything cargo
+  starts; an explicitly set variable still wins.
+- **Name a wrapped default export after what it wraps** —
+  `export default injectIntl(Header)`, `memo(Button)` or
+  `connect(mapState)(Page)` was indexed under the wrapper's name, so every file
+  applying `injectIntl` claimed a definition of it. Such an export is now
+  indexed as `default(Header)`, like `export default Header`. A wrapped inline
+  function or class is indexed like an anonymous default export, under the
+  module name. A call that builds a value from its configuration
+  (`createRouter({ … })`) keeps the callee's name.
+- **Name an `index` default export after its package, not its build
+  directory** — `node_modules/pkg/dist/index.d.ts` was named `dist`; the name
+  now comes from the nearest directory above build and source directories.
+- **`imports` lists every TypeScript/JavaScript import** — files were read
+  with a line pattern meant for Kotlin, so a multi-line `import {` printed as a
+  bare `{`, re-exports were not listed and a barrel `index.ts` reported
+  "No imports found". Imports and re-exports are now read from the syntax
+  tree, one declaration per line. Import symbols in the index stay limited to
+  project-local specifiers.
 - **`search --type` no longer takes a minute on a large index** — with a kind
   filter the bundled SQLite drove the query from the index on `kind`, scanning
   every symbol of that kind and re-running the full-text match for each one:
