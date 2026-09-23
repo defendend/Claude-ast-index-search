@@ -609,3 +609,37 @@ fn model_code_resolves_to_the_columns_of_its_table() {
     let lines = ws.json(&["graph", "dependents", "order_lines.quantity"]);
     assert_eq!(other_names(&lines), vec!["total"], "{lines:#}");
 }
+
+#[test]
+fn production_code_never_resolves_into_test_trees() {
+    let ws = workspace();
+    ws.write(
+        "app/workers/application_worker.rb",
+        "class ApplicationWorker\nend\n",
+    );
+    ws.write(
+        "app/workers/sync_worker.rb",
+        "class SyncWorker < ApplicationWorker\nend\n",
+    );
+    ws.write(
+        "spec/support/stubs.rb",
+        "class ApplicationWorker\n  def self.enqueue(*args)\n    args\n  end\nend\n",
+    );
+    ws.write(
+        "app/services/sync_service.rb",
+        "class SyncService\n  def run\n    SyncWorker.enqueue(1)\n  end\nend\n",
+    );
+    ws.write(
+        "spec/services/sync_service_spec.rb",
+        "class SyncServiceProbe\n  def run\n    SyncWorker.enqueue(2)\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+    let report = ws.json(&["graph", "dependents", "self.enqueue"]);
+    let names = other_names(&report);
+    assert_eq!(names, vec!["run"], "{report:#}");
+    assert!(items(&report)[0]["other"]["path"]
+        .as_str()
+        .unwrap()
+        .starts_with("spec/"));
+}

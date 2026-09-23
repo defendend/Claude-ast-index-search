@@ -531,6 +531,8 @@ struct FileNode {
     stem: String,
     family: &'static str,
     vendor: bool,
+    /// Under a test directory or named like a test (see [`is_test_path`]).
+    test: bool,
     has_ranges: bool,
     symbols: Vec<u32>,
     imports: Vec<ImportTarget>,
@@ -632,6 +634,7 @@ impl Builder {
                 stem: strip_source_extension(&row.path).to_string(),
                 family,
                 vendor,
+                test: is_test_path(&row.path),
                 path: row.path,
                 has_ranges: false,
                 symbols: Vec::new(),
@@ -985,11 +988,21 @@ impl Builder {
                     .copied()
                     .filter(|&c| {
                         let sym = &self.syms[c as usize];
-                        self.family_of(c) == family && (sym.file == file || !sym.file_private)
+                        self.family_of(c) == family
+                            && (sym.file == file || !sym.file_private)
+                            && self.visible_from(file, c)
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Production code never depends on a definition under a test tree: a
+    /// spec support file that reopens `ApplicationWorker` to stub
+    /// `perform_async` is not what `Worker.perform_async` calls.
+    fn visible_from(&self, file: u32, candidate: u32) -> bool {
+        self.files[file as usize].test
+            || !self.files[self.syms[candidate as usize].file as usize].test
     }
 
     /// Namespace a reference inside `scope` is looked up from.
@@ -1018,6 +1031,7 @@ impl Builder {
     /// from the innermost outwards, then at the top level.
     fn lexical_match(
         &self,
+        from: u32,
         namespace: &str,
         absolute: bool,
         rel: &str,
@@ -1031,7 +1045,13 @@ impl Builder {
             };
             self.by_qual
                 .get(&key)
-                .map(|found| found.iter().copied().filter(|&c| accept(c)).collect())
+                .map(|found| {
+                    found
+                        .iter()
+                        .copied()
+                        .filter(|&c| self.visible_from(from, c) && accept(c))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         if absolute {
@@ -1146,7 +1166,7 @@ impl Builder {
         }
         let family = node.family;
         let ruby = family == "ruby";
-        let found = self.lexical_match(namespace, absolute, rel, |c| {
+        let found = self.lexical_match(file, namespace, absolute, rel, |c| {
             let kind = self.syms[c as usize].kind.as_str();
             (is_container_kind(kind) || (ruby && kind == "constant"))
                 && self.family_of(c) == family
@@ -1333,6 +1353,7 @@ impl Builder {
 
     fn walk_hierarchy(&self, class: u32, source: u32, member: &str) -> Option<Resolution> {
         let family = self.family_of(source);
+        let file = self.syms[source as usize].file;
         let mut queue = VecDeque::from([(class, 0usize)]);
         let mut seen: HashSet<u32> = HashSet::from([class]);
         while let Some((current, depth)) = queue.pop_front() {
@@ -1344,7 +1365,9 @@ impl Builder {
                     found
                         .iter()
                         .copied()
-                        .filter(|&c| self.family_of(c) == family && c != source)
+                        .filter(|&c| {
+                            self.family_of(c) == family && c != source && self.visible_from(file, c)
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -1521,8 +1544,9 @@ impl Builder {
                 };
                 let namespace = self.namespace_of(source);
                 let family = node.family;
-                let mut found =
-                    self.lexical_match(namespace, absolute, &rel, |c| self.family_of(c) == family);
+                let mut found = self.lexical_match(file, namespace, absolute, &rel, |c| {
+                    self.family_of(c) == family
+                });
                 if found.is_empty() && !absolute {
                     found = self.suffix_match(&rel, &cands);
                 }
@@ -1554,7 +1578,8 @@ impl Builder {
                     // is how Rails names polymorphic and association types;
                     // a string that happens to spell a module is just data.
                     let family = node.family;
-                    let found = self.lexical_match(self.namespace_of(source), false, name, |c| {
+                    let namespace = self.namespace_of(source);
+                    let found = self.lexical_match(file, namespace, false, name, |c| {
                         self.family_of(c) == family
                             && (!literal || self.syms[c as usize].kind == "class")
                     });

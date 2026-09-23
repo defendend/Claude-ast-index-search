@@ -485,8 +485,10 @@ ast-index graph top --sort pagerank --kind class
 
 Each edge records how its target was resolved: `local`, `scoped` (namespace,
 receiver type or inheritance), `import`, `unique`, or `ambiguous` with the
-number of candidates. Metrics count resolved edges only; `--include-ambiguous`
-lists the rest. After `update` changes the index the graph reports itself as
+number of candidates. Code outside test directories never resolves to a
+definition inside one (a spec helper that reopens a class to stub a method is
+not what production code calls). Metrics count resolved edges only;
+`--include-ambiguous` lists the rest. After `update` changes the index the graph reports itself as
 stale until `graph build` (or a query with `--refresh`) runs again.
 
 In a Rails application `db/schema.rb` is indexed even when it is gitignored:
