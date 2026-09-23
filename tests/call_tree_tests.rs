@@ -174,33 +174,102 @@ fn dsl_fixture() -> (TempDir, TempDir) {
     (project, cache)
 }
 
-fn sorted_lines(text: &str) -> Vec<&str> {
-    let mut lines: Vec<&str> = text.lines().collect();
-    lines.sort_unstable();
-    lines
-}
-
 #[test]
 fn call_tree_shows_dsl_blocks_but_expands_only_identifiers() {
     let (project, cache) = dsl_fixture();
     stdout(&run(project.path(), cache.path(), &["rebuild"]));
     let output = run(project.path(), cache.path(), &["call-tree", "leaf"]);
-    let tree = stdout(&output);
     assert_eq!(
-        sorted_lines(&tree),
-        sorted_lines(concat!(
+        stdout(&output),
+        concat!(
             "Call tree for 'leaf':\n",
             "  leaf\n",
-            "    ← let(:fields) (spec/leaf_spec.rb:2)\n",
+            "    ← Billing::Invoice (lib/billing/invoice.rb:1)\n",
+            "      ← bill (lib/app.rb:14)\n",
             "    ← save! (lib/record.rb:2)\n",
             "      ← persist (lib/app.rb:2)\n",
             "    ← valid? (lib/record.rb:6)\n",
             "      ← check (lib/app.rb:6)\n",
             "    ← name= (lib/record.rb:10)\n",
             "      ← rename (lib/app.rb:10)\n",
-            "    ← Billing::Invoice (lib/billing/invoice.rb:1)\n",
-            "      ← bill (lib/app.rb:14)\n",
-        )),
-        "{tree}"
+            "    ← let(:fields) (spec/leaf_spec.rb:2)\n",
+        )
+    );
+}
+
+/// Twelve files with three callers of `leaf` each, after a file that defines
+/// `leaf` ten times over and before a spec file that calls it too.
+fn wide_fixture() -> (TempDir, TempDir) {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let lib = project.path().join("lib");
+    let spec = project.path().join("spec");
+    fs::create_dir(&lib).unwrap();
+    fs::create_dir(&spec).unwrap();
+    let definitions: String = (0..10)
+        .map(|index| format!("class Leaf{index}\n  def leaf\n    {index}\n  end\nend\n"))
+        .collect();
+    fs::write(lib.join("a_definitions.rb"), definitions).unwrap();
+    for file in 0..12 {
+        let methods: String = (0..3)
+            .map(|method| format!("  def c{file:02}_{method}\n    Leaf0.new.leaf\n  end\n"))
+            .collect();
+        fs::write(
+            lib.join(format!("callers_{file:02}.rb")),
+            format!("class Callers{file:02}\n{methods}end\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        spec.join("leaf_spec.rb"),
+        "class LeafSpec\n  def check_leaf\n    Leaf0.new.leaf\n  end\nend\n",
+    )
+    .unwrap();
+    (project, cache)
+}
+
+#[test]
+fn call_tree_takes_the_first_callers_in_path_order_every_time() {
+    let (project, cache) = wide_fixture();
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    let args = ["call-tree", "leaf", "--depth", "1", "--limit", "4"];
+    let expected = concat!(
+        "Call tree for 'leaf':\n",
+        "  leaf\n",
+        "    ← c00_0 (lib/callers_00.rb:2)\n",
+        "    ← c00_1 (lib/callers_00.rb:5)\n",
+        "    ← c00_2 (lib/callers_00.rb:8)\n",
+        "    ← c01_0 (lib/callers_01.rb:2)\n",
+    );
+    for _ in 0..5 {
+        assert_eq!(stdout(&run(project.path(), cache.path(), &args)), expected);
+    }
+}
+
+#[test]
+fn call_tree_spends_the_limit_on_calls_inside_the_file_filter() {
+    let (project, cache) = wide_fixture();
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    let output = run(
+        project.path(),
+        cache.path(),
+        &[
+            "call-tree",
+            "leaf",
+            "--depth",
+            "1",
+            "--limit",
+            "1",
+            "--in-file",
+            "spec/",
+        ],
+    );
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "Call tree for 'leaf':\n",
+            "  leaf\n",
+            "    ← check_leaf (spec/leaf_spec.rb:2)\n",
+        )
     );
 }

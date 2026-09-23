@@ -15,7 +15,7 @@
 //! - flows: Find Flow declarations
 //! - previews: Find @Preview functions
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -364,7 +364,8 @@ type CallerSites = Vec<(String, String, usize)>;
 /// so far, every function it still lacks is looked up in a single shared scan,
 /// and the replay repeats until nothing is missing — about one scan per level.
 /// A shared scan gives each function the lines a scan of its own would, so the
-/// tree comes out the same.
+/// tree comes out the same. The repository is walked once, on the first scan,
+/// and every scan goes over the same list of files.
 fn collect_tree_callers(
     root: &Path,
     conn: Option<&rusqlite::Connection>,
@@ -374,12 +375,20 @@ fn collect_tree_callers(
     in_file: Option<&str>,
 ) -> Result<HashMap<String, CallerSites>> {
     let mut callers = HashMap::new();
+    if limit == 0 {
+        return Ok(callers);
+    }
+    let mut files: Option<Vec<PathBuf>> = None;
     loop {
         let missing = walk_call_tree(function_name, max_depth, &callers, &mut |_, _, _| {});
         if missing.is_empty() {
             return Ok(callers);
         }
-        let found = find_caller_functions(root, conn, &missing, limit, in_file)?;
+        let files = match files {
+            Some(ref files) => files,
+            None => files.insert(super::project_source_files(root, &ALL_SOURCE_EXTENSIONS)?),
+        };
+        let found = find_caller_functions(root, conn, files, &missing, limit, in_file)?;
         callers.extend(missing.into_iter().zip(found));
     }
 }
@@ -479,7 +488,8 @@ fn is_callable_name(name: &str) -> bool {
     has_word
 }
 
-/// Find the functions that call each of `function_names`, in one scan.
+/// Find the functions that call each of `function_names`, in one scan of
+/// `files`.
 ///
 /// Call sites are still located textually: the regex knows call idioms the
 /// `refs` table does not record (`obj.method` without parentheses, Ruby
@@ -487,9 +497,15 @@ fn is_callable_name(name: &str) -> bool {
 /// Only the "which function is this line inside" step consults the index,
 /// which knows real symbol ranges instead of guessing from the nearest
 /// definition line above.
+///
+/// Each function gets the first `limit * 3` call lines in path order. A
+/// definition line or a file outside `in_file` does not count against that:
+/// in path order definitions cluster (every worker in `app/workers` defines
+/// `perform`) and would leave no budget for the calls.
 fn find_caller_functions(
     root: &Path,
     conn: Option<&rusqlite::Connection>,
+    files: &[PathBuf],
     function_names: &[String],
     limit: usize,
     in_file: Option<&str>,
@@ -513,27 +529,20 @@ fn find_caller_functions(
         r"|(?:const|let)\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z_]\w*)\s*(?::\s*[^=]+)?\s*=>",
     ))?;
 
-    let mut files_with_calls: Vec<HashMap<PathBuf, Vec<usize>>> =
-        function_names.iter().map(|_| HashMap::new()).collect();
+    let mut files_with_calls: Vec<BTreeMap<PathBuf, Vec<usize>>> =
+        function_names.iter().map(|_| BTreeMap::new()).collect();
 
     // First pass: find all files and line numbers with calls
     super::search_files_limited_each(
-        root,
+        files,
         &build_any_caller_pattern(function_names),
         &patterns,
-        &ALL_SOURCE_EXTENSIONS,
         limit * 3,
-        |index, path, line_num, line| {
-            if def_patterns[index].is_match(line) {
-                return;
-            }
-
-            if let Some(filter) = in_file {
-                if !relative_path(root, path).contains(filter) {
-                    return;
-                }
-            }
-
+        |index, path, line| {
+            !def_patterns[index].is_match(line)
+                && in_file.map_or(true, |filter| relative_path(root, path).contains(filter))
+        },
+        |index, path, line_num, _line| {
             files_with_calls[index]
                 .entry(path.to_path_buf())
                 .or_default()
@@ -548,11 +557,11 @@ fn find_caller_functions(
 }
 
 /// Second pass of [`find_caller_functions`]: the function containing each
-/// call line, at most `limit` distinct ones.
+/// call line, at most `limit` distinct ones, the first in path order.
 fn attribute_call_lines(
     root: &Path,
     conn: Option<&rusqlite::Connection>,
-    files_with_calls: HashMap<PathBuf, Vec<usize>>,
+    files_with_calls: BTreeMap<PathBuf, Vec<usize>>,
     limit: usize,
     func_def_re: &Regex,
 ) -> CallerSites {

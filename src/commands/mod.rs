@@ -26,7 +26,7 @@ pub mod perl;
 pub mod project_info;
 pub mod watch;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -662,26 +662,71 @@ where
     Ok(())
 }
 
-/// Several [`search_files_limited`] calls answered by one walk.
+/// Every file under `root` with one of `extensions`, in path order, under the
+/// ignore rules the indexer applies.
 ///
-/// Each of `patterns` keeps its own budget of `limit` lines and the handler
-/// gets the pattern's index with every line, so each pattern sees the lines a
-/// call of its own would have delivered. The walk ends early only once every
-/// pattern has spent its budget.
+/// The tree is walked in parallel and sorted afterwards, so the order does not
+/// depend on which thread reached a file first.
+pub fn project_source_files(root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
+    let walker = project_walker(root)?;
+    let extensions: HashSet<&str> = extensions.iter().copied().collect();
+    let (tx, rx) = channel::unbounded::<PathBuf>();
+    walker.run(|| {
+        let tx = tx.clone();
+        let extensions = &extensions;
+        Box::new(move |entry| {
+            if let Ok(entry) = entry {
+                let wanted = entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| extensions.contains(ext.to_str().unwrap_or("")));
+                if wanted {
+                    let _ = tx.send(entry.into_path());
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    drop(tx);
+    let mut files: Vec<PathBuf> = rx.into_iter().collect();
+    files.sort_unstable();
+    Ok(files)
+}
+
+/// A line one of the [`search_files_limited_each`] patterns matched.
+struct PatternHit {
+    pattern: usize,
+    line_num: usize,
+    text: String,
+}
+
+/// Several searches over `files` answered by one pass, with a fixed outcome.
 ///
-/// The walk searches for `candidates`, which must match every line any of the
+/// Each of `patterns` gets the first `limit` lines that it matches and `keep`
+/// accepts, taking `files` in the given order and lines in file order, and
+/// `handler` receives them in that order with the pattern's index. Filtering
+/// through `keep` rather than in `handler` makes `limit` count only the lines
+/// the caller wants.
+///
+/// Files are searched in parallel, but a file's lines are handed over only
+/// once every file before it has been searched, so the outcome does not depend
+/// on which thread finished first. Files stop being searched once every
+/// pattern has its lines.
+///
+/// The search is for `candidates`, which must match every line any of the
 /// patterns matches; each candidate line is then tested against the patterns
 /// one by one. A pattern comes with a literal that all of its matches contain,
 /// checked first because a substring test is far cheaper than the pattern.
-pub fn search_files_limited_each<F>(
-    root: &Path,
+pub fn search_files_limited_each<K, F>(
+    files: &[PathBuf],
     candidates: &str,
     patterns: &[(String, String)],
-    extensions: &[&str],
     limit: usize,
+    keep: K,
     mut handler: F,
 ) -> Result<()>
 where
+    K: Fn(usize, &Path, &str) -> bool + Sync,
     F: FnMut(usize, &Path, usize, &str),
 {
     let matcher = RegexMatcher::new(candidates).context("Invalid regex pattern")?;
@@ -693,70 +738,57 @@ where
         .iter()
         .map(|(_, literal)| regex::bytes::Regex::new(&regex::escape(literal)))
         .collect::<Result<Vec<_>, _>>()?;
-    if patterns.is_empty() || limit == 0 {
+    if patterns.is_empty() || limit == 0 || files.is_empty() {
         return Ok(());
     }
-    let walker = project_walker(root)?;
 
-    let extensions: Arc<HashSet<String>> =
-        Arc::new(extensions.iter().map(|s| s.to_string()).collect());
-    let spent: Arc<Vec<AtomicUsize>> =
-        Arc::new(patterns.iter().map(|_| AtomicUsize::new(0)).collect());
-    let exhausted = Arc::new(AtomicUsize::new(0));
-    let should_stop = Arc::new(AtomicBool::new(false));
-    let exact = Arc::new(exact);
-    let required = Arc::new(required);
-
-    let (tx, rx) = channel::bounded::<(usize, Arc<Path>, usize, String)>(10000);
+    let satisfied: Vec<AtomicBool> = patterns.iter().map(|_| AtomicBool::new(false)).collect();
+    let stop = AtomicBool::new(false);
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = channel::bounded::<(usize, Vec<PatternHit>)>(1024);
 
     std::thread::scope(|scope| -> Result<()> {
-        let worker = scope.spawn(move || {
-            walker.run(|| {
-                let tx = tx.clone();
-                let matcher = matcher.clone();
-                let exact = Arc::clone(&exact);
-                let required = Arc::clone(&required);
-                let extensions = Arc::clone(&extensions);
-                let spent = Arc::clone(&spent);
-                let exhausted = Arc::clone(&exhausted);
-                let should_stop = Arc::clone(&should_stop);
-
+        let mut workers = Vec::new();
+        for _ in 0..num_cpus().min(files.len()) {
+            let tx = tx.clone();
+            let (matcher, exact, required) = (&matcher, &exact, &required);
+            let (satisfied, stop, next, keep) = (&satisfied, &stop, &next, &keep);
+            workers.push(scope.spawn(move || {
                 // SAFETY: memory-mapped files are safe when files aren't modified during search
                 let mut searcher = SearcherBuilder::new()
                     .memory_map(unsafe { MmapChoice::auto() })
                     .line_number(true)
                     .build();
-
-                Box::new(move |entry| {
-                    if should_stop.load(Ordering::Relaxed) {
-                        return ignore::WalkState::Quit;
-                    }
-                    let Ok(entry) = entry else {
-                        return ignore::WalkState::Continue;
+                while !stop.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = files.get(index) else {
+                        break;
                     };
-                    let path = entry.path();
-                    let wanted = path
-                        .extension()
-                        .is_some_and(|ext| extensions.contains(ext.to_str().unwrap_or("")));
-                    if !wanted {
-                        return ignore::WalkState::Continue;
-                    }
-                    let path_arc: Arc<Path> = Arc::from(path);
-                    // A separate search would abort the whole file at the first
-                    // non-UTF-8 line it matched; this marks the patterns that did.
+                    let mut hits = Vec::new();
+                    // Lines past a pattern's `limit` in one file can never be
+                    // taken. A pattern already satisfied by earlier files is
+                    // skipped too: every file before this one had been
+                    // searched when that was decided.
+                    let mut taken = vec![0usize; exact.len()];
+                    // A separate search would abort the whole file at the
+                    // first non-UTF-8 line it matched; this marks the patterns
+                    // that did.
                     let mut abandoned = vec![false; exact.len()];
-
                     let _ = searcher.search_path(
-                        &matcher,
+                        matcher,
                         path,
                         Bytes(|line_num, bytes| {
                             let line = bytes.strip_suffix(b"\n").unwrap_or(bytes);
                             let text = std::str::from_utf8(bytes).ok();
+                            let mut open = false;
                             for index in 0..exact.len() {
-                                if abandoned[index] || spent[index].load(Ordering::Relaxed) >= limit
+                                if abandoned[index]
+                                    || taken[index] >= limit
+                                    || satisfied[index].load(Ordering::Relaxed)
                                 {
                                     continue;
                                 }
+                                open = true;
                                 if !required[index].is_match(line)
                                     || !exact[index].is_match(line).unwrap_or(false)
                                 {
@@ -766,39 +798,60 @@ where
                                     abandoned[index] = true;
                                     continue;
                                 };
-                                let ticket = spent[index].fetch_add(1, Ordering::Relaxed);
-                                if ticket >= limit {
+                                let text = text.trim_end();
+                                if !keep(index, path, text) {
                                     continue;
                                 }
-                                if ticket + 1 == limit
-                                    && exhausted.fetch_add(1, Ordering::Relaxed) + 1 == exact.len()
-                                {
-                                    should_stop.store(true, Ordering::Relaxed);
-                                }
-                                let sent = tx.send((
-                                    index,
-                                    Arc::clone(&path_arc),
-                                    line_num as usize,
-                                    text.trim_end().to_string(),
-                                ));
-                                if sent.is_err() {
-                                    return Ok(false);
-                                }
+                                taken[index] += 1;
+                                hits.push(PatternHit {
+                                    pattern: index,
+                                    line_num: line_num as usize,
+                                    text: text.to_string(),
+                                });
                             }
-                            Ok(!should_stop.load(Ordering::Relaxed))
+                            Ok(open && !stop.load(Ordering::Relaxed))
                         }),
                     );
-                    ignore::WalkState::Continue
-                })
-            });
-        });
-
-        for (index, path, line_num, line) in rx {
-            handler(index, &path, line_num, &line);
+                    if tx.send((index, hits)).is_err() {
+                        break;
+                    }
+                }
+            }));
         }
-        worker
-            .join()
-            .map_err(|_| anyhow::anyhow!("parallel file search worker panicked"))?;
+        drop(tx);
+
+        let mut taken = vec![0usize; patterns.len()];
+        let mut open = patterns.len();
+        let mut pending = HashMap::new();
+        let mut frontier = 0usize;
+        'files: for (index, hits) in &rx {
+            pending.insert(index, hits);
+            while let Some(hits) = pending.remove(&frontier) {
+                let path = &files[frontier];
+                frontier += 1;
+                for hit in hits {
+                    if taken[hit.pattern] == limit {
+                        continue;
+                    }
+                    handler(hit.pattern, path, hit.line_num, &hit.text);
+                    taken[hit.pattern] += 1;
+                    if taken[hit.pattern] == limit {
+                        satisfied[hit.pattern].store(true, Ordering::Relaxed);
+                        open -= 1;
+                    }
+                }
+                if open == 0 {
+                    stop.store(true, Ordering::Relaxed);
+                    break 'files;
+                }
+            }
+        }
+        drop(rx);
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("parallel file search worker panicked"))?;
+        }
         Ok(())
     })
 }
