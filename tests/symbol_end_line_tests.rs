@@ -380,3 +380,86 @@ fn rust_impl_block_encloses_its_methods() {
     assert_encloses(module, span(&conn, "function", "works"));
     assert_all_ranges_filled(&conn);
 }
+
+#[test]
+fn java_class_encloses_methods_and_nested_class() {
+    let conn = index_single(
+        "src/main/java/x/Greeter.java",
+        concat!(
+            "package x;\n",
+            "\n",
+            "@Service\n",
+            "public class Greeter {\n",
+            "    private int count = 0;\n",
+            "\n",
+            "    @Override\n",
+            "    public String hello() {\n",
+            "        return greet();\n",
+            "    }\n",
+            "\n",
+            "    public void bye() {\n",
+            "        run();\n",
+            "    }\n",
+            "\n",
+            "    static class Inner {\n",
+            "        void deep() {}\n",
+            "    }\n",
+            "}\n",
+        ),
+    );
+
+    let class = span(&conn, "class", "Greeter");
+    assert_eq!(class, (4, 19));
+    assert_eq!(span(&conn, "function", "hello"), (8, 10));
+    assert_eq!(span(&conn, "annotation", "@Override"), (7, 7));
+    assert_eq!(span(&conn, "function", "bye"), (12, 14));
+    assert_eq!(span(&conn, "property", "count"), (5, 5));
+    let inner = span(&conn, "class", "Inner");
+    assert_eq!(inner, (16, 18));
+    for member in [
+        span(&conn, "function", "hello"),
+        span(&conn, "function", "bye"),
+        inner,
+    ] {
+        assert_encloses(class, member);
+    }
+    assert_encloses(inner, span(&conn, "function", "deep"));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn kotlin_class_methods_and_function_get_ranges() {
+    let conn = index_single(
+        "src/main/kotlin/x/Greeter.kt",
+        concat!(
+            "package x\n",
+            "\n",
+            "class Greeter(private val repo: Repo) {\n",
+            "    val name: String\n",
+            "        get() = compute()\n",
+            "\n",
+            "    fun hello(): String {\n",
+            "        return greet()\n",
+            "    }\n",
+            "\n",
+            "    fun bye() = run()\n",
+            "}\n",
+            "\n",
+            "fun top() {\n",
+            "    fun local() = 1\n",
+            "}\n",
+        ),
+    );
+
+    let class = span(&conn, "class", "Greeter");
+    assert_eq!(class, (3, 12));
+    assert_eq!(span(&conn, "property", "name"), (4, 5));
+    assert_eq!(span(&conn, "function", "hello"), (7, 9));
+    assert_eq!(span(&conn, "function", "bye"), (11, 11));
+    assert_encloses(class, span(&conn, "function", "hello"));
+    assert_encloses(class, span(&conn, "function", "bye"));
+    let top = span(&conn, "function", "top");
+    assert_eq!(top, (14, 16));
+    assert_encloses(top, span(&conn, "function", "local"));
+    assert_all_ranges_filled(&conn);
+}
