@@ -615,6 +615,12 @@ references point at it). In JSON, `files` become objects `{path, rank}` and
 symbols gain a `rank` object; the top-level `rank` object carries the preset,
 formula, evidence summary, pool sizes and weight.
 
+`rewritten-often` (churn relative to the file's current size, top 10%) is only
+computed for files of 10 lines or more. Below that a line count stops measuring
+content: a one-line minified bundle or fixture, or a view gutted to a mount
+point, would read as "3000x file", and a routine one-line edit already moves a
+three-line file by a third. Such files keep their absolute churn labels.
+
 **Known limits.** When a query's exact-name tier fills the page (`search
 Policy` in a code base full of `POLICY` constants), a preset can only re-order
 that tier; the files section usually answers better. `proven` favours code that

@@ -62,6 +62,12 @@ pub(crate) const PERCENTILE_HIGH: f64 = 90.0;
 pub(crate) const PERCENTILE_ELEVATED: f64 = 75.0;
 /// Below this many commits a fix ratio is noise (1 of 1 is not "100% bugs").
 const MIN_COMMITS_FOR_FIX_LABEL: i64 = 4;
+/// Relative churn (churn per current line) is only defined for files at least
+/// this long. Below it the line count stops measuring content: a one-line
+/// minified bundle or fixture, or a view gutted to a mount point, turns a
+/// history of ordinary edits into "3488x file", and a routine one-line change
+/// already moves a three-line file by a third.
+const MIN_LINES_FOR_RELATIVE_CHURN: i64 = 10;
 const SECONDS_PER_DAY: f64 = 86_400.0;
 
 // ---------------------------------------------------------------------------
@@ -1529,7 +1535,7 @@ fn labels_for(hotspot: &Hotspot) -> Vec<String> {
     } else if pct(hotspot.churn_pct) >= PERCENTILE_ELEVATED {
         labels.push("churn:elevated".to_string());
     }
-    if pct(hotspot.relative_churn_pct) >= PERCENTILE_HIGH && hotspot.current_lines.is_some() {
+    if pct(hotspot.relative_churn_pct) >= PERCENTILE_HIGH && hotspot.relative_churn.is_some() {
         labels.push("rewritten-often".to_string());
     }
     if hotspot.commits >= MIN_COMMITS_FOR_FIX_LABEL {
@@ -1562,11 +1568,13 @@ fn build_hotspots(rows: Vec<GitFileSignalRow>, now_seconds: i64) -> Vec<Hotspot>
         .iter()
         .map(|row| (row.lines_added + row.lines_deleted) as f64)
         .collect();
-    let relative_churn: Vec<f64> = rows
+    let relative_churn: Vec<Option<f64>> = rows
         .iter()
         .map(|row| match row.current_lines {
-            Some(lines) if lines > 0 => (row.lines_added + row.lines_deleted) as f64 / lines as f64,
-            _ => 0.0,
+            Some(lines) if lines >= MIN_LINES_FOR_RELATIVE_CHURN => {
+                Some((row.lines_added + row.lines_deleted) as f64 / lines as f64)
+            }
+            _ => None,
         })
         .collect();
     let fix_ratio: Vec<f64> = rows
@@ -1590,7 +1598,17 @@ fn build_hotspots(rows: Vec<GitFileSignalRow>, now_seconds: i64) -> Vec<Hotspot>
 
     let commits_pct = percentile_ranks(&commits);
     let churn_pct = percentile_ranks(&churn);
-    let relative_churn_pct = percentile_ranks(&relative_churn);
+    // Ranked among the files the ratio is defined for; the rest sit at 0.
+    let mut defined_relative_churn: Vec<f64> = relative_churn.iter().flatten().copied().collect();
+    defined_relative_churn.sort_by(f64::total_cmp);
+    let relative_churn_pct: Vec<f64> = relative_churn
+        .iter()
+        .map(|value| {
+            value
+                .map(|value| midrank_percentile(&defined_relative_churn, value))
+                .unwrap_or(0.0)
+        })
+        .collect();
     let fix_ratio_pct = percentile_ranks(&fix_ratio);
     let authors_pct = percentile_ranks(&authors);
     let age_pct = percentile_ranks(&age);
@@ -1615,10 +1633,7 @@ fn build_hotspots(rows: Vec<GitFileSignalRow>, now_seconds: i64) -> Vec<Hotspot>
                 lines_deleted: row.lines_deleted,
                 churn: row.lines_added + row.lines_deleted,
                 churn_pct: churn_pct[position].round() as u32,
-                relative_churn: row
-                    .current_lines
-                    .filter(|lines| *lines > 0)
-                    .map(|_| round2(relative_churn[position])),
+                relative_churn: relative_churn[position].map(round2),
                 relative_churn_pct: relative_churn_pct[position].round() as u32,
                 authors: row.authors,
                 authors_pct: authors_pct[position].round() as u32,
@@ -1953,10 +1968,11 @@ fn render_text(report: &HotspotsReport) {
 
     for hotspot in &report.page.items {
         println!("  {}", hotspot.path.cyan());
-        let relative = hotspot
-            .relative_churn
-            .map(|value| format!("{value:.1}x file"))
-            .unwrap_or_else(|| "n/a".to_string());
+        let relative = match (hotspot.relative_churn, hotspot.current_lines) {
+            (Some(value), _) => format!("{value:.1}x file"),
+            (None, Some(_)) => format!("file under {MIN_LINES_FOR_RELATIVE_CHURN} lines"),
+            (None, None) => "n/a".to_string(),
+        };
         println!(
             "    score {} · commits {} (p{}) · fixes {}/{} = {:.0}% (p{}) · churn +{}/-{} (p{}, {})",
             hotspot.score,
@@ -2045,6 +2061,38 @@ mod tests {
             current_lines: Some(100),
             ..GitFileSignalRow::default()
         }
+    }
+
+    #[test]
+    fn relative_churn_needs_a_file_big_enough_to_measure() {
+        let mut rows: Vec<GitFileSignalRow> = (0..50)
+            .map(|index| signal_row(&format!("steady{index}.rs"), 2, 0, 100))
+            .collect();
+        let mut gutted = signal_row("gutted.erb", 23, 0, 3488);
+        gutted.current_lines = Some(1);
+        let mut rewritten = signal_row("rewritten.rb", 30, 0, 2000);
+        rewritten.current_lines = Some(MIN_LINES_FOR_RELATIVE_CHURN);
+        rows.push(gutted);
+        rows.push(rewritten);
+        let hotspots = build_hotspots(rows, 0);
+        let find = |path: &str| {
+            hotspots
+                .iter()
+                .find(|hotspot| hotspot.path == path)
+                .unwrap()
+        };
+
+        let gutted = find("gutted.erb");
+        assert_eq!(gutted.relative_churn, None);
+        assert_eq!(gutted.relative_churn_pct, 0);
+        assert!(!gutted.labels.contains(&"rewritten-often".to_string()));
+        // Still the biggest churn in absolute terms.
+        assert!(gutted.labels.contains(&"churn:high".to_string()));
+
+        let rewritten = find("rewritten.rb");
+        assert_eq!(rewritten.relative_churn, Some(200.0));
+        assert_eq!(rewritten.relative_churn_pct, 99);
+        assert!(rewritten.labels.contains(&"rewritten-often".to_string()));
     }
 
     #[test]

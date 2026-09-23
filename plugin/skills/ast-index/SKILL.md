@@ -371,7 +371,8 @@ report changed symbols or include staged/unstaged working-tree-only edits.
 
 **`hotspots`** - Rank files by what their Git history says about them: commit
 count, churn (added + deleted lines, and churn relative to the file's current
-size), bugfix share, distinct authors, age, and time since the last change.
+size for files of 10+ lines), bugfix share, distinct authors, age, and time
+since the last change.
 Use it when choosing which of several similar files to copy a pattern from, or
 when scoping a refactor: a file with 28 commits and 54% bugfixes is not the
 same as one written once and untouched for 86 days.
@@ -398,7 +399,9 @@ switching back re-reads nothing. The numbers always equal a full recollection
 at that `HEAD`. Only a garbage-collected cursor commit, a changed project root
 or `--full` rebuild from scratch.
 
-Labels: `churn:high` / `churn:elevated`, `rewritten-often`, `fixes:high` /
+Labels: `churn:high` / `churn:elevated`, `rewritten-often` (relative churn,
+only for files of 10+ lines: below that a line count no longer measures
+content — one-line bundles, fixtures, gutted views), `fixes:high` /
 `fixes:elevated` (only for files with 4+ commits), `authors:many`, `veteran`.
 `--sort` takes `score` (default), `commits`, `churn`, `relative-churn`,
 `fixes`, `authors`, `recent`. `score` is printed rounded; the order (and
