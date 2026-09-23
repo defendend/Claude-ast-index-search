@@ -746,13 +746,20 @@ fn order<T>(candidates: &mut [Candidate<T>], grading: Grading) {
 // Tiers
 // ---------------------------------------------------------------------------
 
-const SYMBOL_TIERS: [&str; 4] = ["exact_name", "exact_name_folded", "name", "signature"];
+const SYMBOL_TIERS: [&str; 5] = [
+    "exact_name",
+    "exact_name_folded",
+    "exact_last_segment",
+    "name",
+    "signature",
+];
 const FILE_TIERS: [&str; 3] = ["file_stem", "file_name", "directory"];
 
 /// Relevance tier of a symbol hit, mirroring what the plain order ranks
 /// first: the name is a term (case-sensitively, then folded; fuzzy search
-/// does not tell case apart), a word of the name starts with a term (what
-/// FTS prefix matching found; a substring under `--fuzzy`), or only the
+/// does not tell case apart), the last `::` segment of the name is a term
+/// (not under `--fuzzy`), a word of the name starts with a term (what FTS
+/// prefix matching found; a substring under `--fuzzy`), or only the
 /// signature matched.
 fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
     let name = result.name.as_str();
@@ -764,6 +771,13 @@ fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
     let folded_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
     if folded_terms.contains(&folded) {
         return if fuzzy { 0 } else { 1 };
+    }
+    if !fuzzy
+        && terms
+            .iter()
+            .any(|term| db::is_last_name_segment(name, term))
+    {
+        return 2;
     }
     let named = if fuzzy {
         let display = result.display_name().to_lowercase();
@@ -778,9 +792,9 @@ fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
         })
     };
     if named {
-        2
-    } else {
         3
+    } else {
+        4
     }
 }
 
@@ -1213,13 +1227,19 @@ mod tests {
         let terms = ["Merge"];
         assert_eq!(symbol_tier(&symbol("Merge"), &terms, false), 0);
         assert_eq!(symbol_tier(&symbol("merge"), &terms, false), 1);
+        assert_eq!(symbol_tier(&symbol("Applicant::Merge"), &terms, false), 2);
+        assert_eq!(symbol_tier(&symbol("Applicant::Merge"), &terms, true), 3);
+        assert_eq!(
+            symbol_tier(&symbol("include Applicant::Merge"), &terms, false),
+            3
+        );
         assert_eq!(
             symbol_tier(&symbol("Applicant::MergeService"), &terms, false),
-            2
+            3
         );
-        assert_eq!(symbol_tier(&symbol("merge_data"), &terms, false), 2);
-        assert_eq!(symbol_tier(&symbol("AutoMerge"), &terms, false), 3);
-        assert_eq!(symbol_tier(&symbol("AutoMerge"), &terms, true), 2);
+        assert_eq!(symbol_tier(&symbol("merge_data"), &terms, false), 3);
+        assert_eq!(symbol_tier(&symbol("AutoMerge"), &terms, false), 4);
+        assert_eq!(symbol_tier(&symbol("AutoMerge"), &terms, true), 3);
         assert_eq!(symbol_tier(&symbol("MERGE"), &terms, true), 0);
     }
 

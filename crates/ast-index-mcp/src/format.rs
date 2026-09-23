@@ -65,10 +65,18 @@ fn render_search(v: &Value, out: &mut String) -> bool {
     if let Some(rank) = obj.get("rank").and_then(Value::as_object) {
         return render_ranked_search(obj, rank, out);
     }
+    if obj.get("fallback").and_then(Value::as_str) == Some("explore") {
+        return render_explore_fallback(obj, out);
+    }
 
     let mut any_section = false;
 
     if let Some(files) = obj.get("files").and_then(Value::as_array) {
+        // A files section of any other shape would be printed as a bare
+        // heading; compact JSON keeps what this renderer does not know.
+        if !files.iter().all(Value::is_string) {
+            return false;
+        }
         if !files.is_empty() {
             any_section = true;
             writeln!(out, "Files:").ok();
@@ -144,6 +152,90 @@ fn write_search_content(
         }
     }
     write_named_pagination_notice(obj, "content_matches", out);
+    true
+}
+
+// ---------------------------------------------------------------------------
+// search falling back to explore
+// ---------------------------------------------------------------------------
+
+/// A multi-word `search` without literal matches answers with the `explore`
+/// report instead, marked `fallback: "explore"`: source of the best
+/// definitions, the ranked symbols, graph neighbours and tests found by path
+/// convention.
+fn render_explore_fallback(obj: &serde_json::Map<String, Value>, out: &mut String) -> bool {
+    let reason = obj
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("no literal matches");
+    writeln!(out, "fallback: explore — {reason}").ok();
+
+    if let Some(files) = obj.get("files").and_then(Value::as_array) {
+        if !files.is_empty() {
+            writeln!(out, "\nSource:").ok();
+        }
+        for file in files {
+            let path = file.get("path").and_then(Value::as_str).unwrap_or("?");
+            let line = file.get("line").and_then(Value::as_i64).unwrap_or(0);
+            let symbol = file.get("symbol").and_then(Value::as_str).unwrap_or("?");
+            writeln!(out, "  {path}:{line} {symbol}").ok();
+            let source = file.get("source").and_then(Value::as_str).unwrap_or("");
+            for code in source.lines() {
+                writeln!(out, "    {code}").ok();
+            }
+        }
+    }
+
+    if let Some(symbols) = obj.get("symbols").and_then(Value::as_array) {
+        if !symbols.is_empty() {
+            writeln!(out, "\nSymbols (by relevance):").ok();
+        }
+        for symbol in symbols {
+            let name = symbol.get("name").and_then(Value::as_str).unwrap_or("?");
+            let kind = symbol.get("kind").and_then(Value::as_str).unwrap_or("?");
+            let path = symbol.get("path").and_then(Value::as_str).unwrap_or("?");
+            let line = symbol.get("line").and_then(Value::as_i64).unwrap_or(0);
+            let vendor = if symbol.get("vendor").and_then(Value::as_bool) == Some(true) {
+                " (third-party)"
+            } else {
+                ""
+            };
+            writeln!(out, "  {name} [{kind}] {path}:{line}{vendor}").ok();
+        }
+    }
+
+    if let Some(neighbours) = obj.get("neighbours").and_then(Value::as_array) {
+        if !neighbours.is_empty() {
+            writeln!(out, "\nGraph neighbours:").ok();
+        }
+        for neighbour in neighbours {
+            let link = neighbour.get("link").and_then(Value::as_str).unwrap_or("?");
+            let name = neighbour.get("name").and_then(Value::as_str).unwrap_or("?");
+            let kind = neighbour.get("kind").and_then(Value::as_str).unwrap_or("?");
+            let path = neighbour.get("path").and_then(Value::as_str).unwrap_or("?");
+            let line = neighbour.get("line").and_then(Value::as_i64).unwrap_or(0);
+            writeln!(out, "  [{link}] {name} [{kind}] {path}:{line}").ok();
+        }
+    }
+
+    if let Some(tests) = obj.get("tests").and_then(Value::as_array) {
+        if !tests.is_empty() {
+            writeln!(out, "\nTests:").ok();
+        }
+        for entry in tests {
+            let source = entry.get("source").and_then(Value::as_str).unwrap_or("?");
+            let found: Vec<&str> = entry
+                .get("tests")
+                .and_then(Value::as_array)
+                .map(|tests| tests.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if found.is_empty() {
+                writeln!(out, "  {source} ← no test file found by convention").ok();
+            } else {
+                writeln!(out, "  {source} ← {}", found.join(", ")).ok();
+            }
+        }
+    }
     true
 }
 
@@ -1664,7 +1756,9 @@ mod tests {
     // Ruby repository with a scripted Git history (symbol graph + collected
     // history), `graph_dependents_ambiguous.json` from this repository's own
     // index, and the `*_not_*` files from the same Ruby index before
-    // `graph build` / `hotspots --collect` ran.
+    // `graph build` / `hotspots --collect` ran. `search_explore_fallback.json`
+    // is a multi-word `search` without literal matches over a small Ruby
+    // billing repository.
 
     macro_rules! fixture {
         ($name:literal) => {
@@ -1959,6 +2053,49 @@ mod tests {
                 "  … truncated: showing 3 of 9; raise limit to 9"
             )
         );
+    }
+
+    #[test]
+    fn search_falling_back_to_explore_keeps_source_symbols_and_tests() {
+        let json = fixture!("search_explore_fallback");
+        let out = to_compact("search", json);
+        assert!(
+            out.starts_with(
+                "fallback: explore — no literal matches for a multi-word query; \
+                 results are ranked by relevance\n\nSource:\n"
+            ),
+            "{out}"
+        );
+        assert!(out.contains(concat!(
+            "  app/services/billing/charge_service.rb:12 gateway\n",
+            "       12\t    def gateway\n",
+            "       13\t      @gateway ||= PaymentGateway.new\n",
+            "       14\t    end\n",
+        )));
+        let value: Value = serde_json::from_str(json).unwrap();
+        for symbol in value["symbols"].as_array().unwrap() {
+            let line = format!(
+                "  {} [{}] {}:{}\n",
+                symbol["name"].as_str().unwrap(),
+                symbol["kind"].as_str().unwrap(),
+                symbol["path"].as_str().unwrap(),
+                symbol["line"]
+            );
+            assert!(out.contains(&line), "missing {line:?} in {out}");
+        }
+        assert!(out.contains(
+            "  app/services/billing/charge_service.rb ← spec/services/billing/charge_service_spec.rb\n"
+        ));
+        assert!(out.contains("  app/models/invoice.rb ← no test file found by convention"));
+        assert!(out.len() < json.len(), "not compact: {out}");
+    }
+
+    #[test]
+    fn search_files_of_an_unknown_shape_fall_back_to_compact_json() {
+        let json = r#"{"files":[{"path":"a.rb","line":1}],"symbols":[]}"#;
+        let rendered: Value = serde_json::from_str(&to_compact("search", json)).unwrap();
+        let original: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(rendered, original);
     }
 
     // --- fall-through behaviour ---

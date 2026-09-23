@@ -97,6 +97,24 @@ const CALLER_IDIOMS: [&str; 13] = [
     r"\breturn\s+[\w.]+\.{fn}\s*\(", // TS: return obj.func(
 ];
 
+/// The call idiom of a Ruby predicate or bang method alone: the bare name,
+/// with neither receiver nor parentheses (`if next_page? && …`, `save!`). No
+/// local variable can end in `?` or `!`, so the word itself is a call. Not
+/// after `#`, which marks a method in documentation (`describe "#valid?"`),
+/// and not before `=` or `~`: `save!=` and `save!~` apply `!=` and `!~` to
+/// `save`.
+const BARE_PREDICATE_CALL_IDIOM: &str = r"(?:^|[^#\w]){fn}(?:[^=~]|$)";
+
+/// Whether [`BARE_PREDICATE_CALL_IDIOM`] applies: a plain identifier ending in
+/// `?` or `!`.
+fn is_predicate_or_bang_name(function_name: &str) -> bool {
+    function_name
+        .strip_suffix(&['?', '!'][..])
+        .is_some_and(|body| {
+            !body.is_empty() && body.chars().all(|c| c.is_alphanumeric() || c == '_')
+        })
+}
+
 fn caller_pattern(fn_pattern: &str, trailing: &str) -> String {
     CALLER_IDIOMS
         .iter()
@@ -107,21 +125,34 @@ fn caller_pattern(fn_pattern: &str, trailing: &str) -> String {
 
 /// Build regex pattern that matches function/method calls across languages
 fn build_caller_pattern(function_name: &str) -> String {
-    caller_pattern(
-        &regex::escape(function_name),
-        trailing_boundary(function_name),
-    )
+    let escaped = regex::escape(function_name);
+    let mut pattern = caller_pattern(&escaped, trailing_boundary(function_name));
+    if is_predicate_or_bang_name(function_name) {
+        pattern.push('|');
+        pattern.push_str(&BARE_PREDICATE_CALL_IDIOM.replace("{fn}", &escaped));
+    }
+    pattern
 }
 
 /// A pattern matching every line that [`build_caller_pattern`] matches for
 /// at least one of `function_names`. Dropping the trailing boundary only
-/// widens the `:symbol` idiom, so the superset holds for every name.
+/// widens the `:symbol` idiom, and the bare name at a word boundary widens
+/// the bare predicate idiom, so the superset holds for every name.
 fn build_any_caller_pattern(function_names: &[String]) -> String {
     let names: Vec<String> = function_names
         .iter()
         .map(|name| regex::escape(name))
         .collect();
-    caller_pattern(&format!("(?:{})", names.join("|")), "")
+    let mut pattern = caller_pattern(&format!("(?:{})", names.join("|")), "");
+    let predicates: Vec<String> = function_names
+        .iter()
+        .filter(|name| is_predicate_or_bang_name(name))
+        .map(|name| regex::escape(name))
+        .collect();
+    if !predicates.is_empty() {
+        pattern.push_str(&format!(r"|\b(?:{})", predicates.join("|")));
+    }
+    pattern
 }
 
 /// Words the Java-style branch of [`build_def_skip_pattern`] would otherwise
@@ -550,16 +581,20 @@ fn find_caller_functions(
         },
     )?;
 
+    let root_key = db::normalize_root_for_storage(root);
     Ok(files_with_calls
         .into_iter()
-        .map(|files| attribute_call_lines(root, conn, files, limit, &func_def_re))
+        .map(|files| attribute_call_lines(root, &root_key, conn, files, limit, &func_def_re))
         .collect())
 }
 
 /// Second pass of [`find_caller_functions`]: the function containing each
 /// call line, at most `limit` distinct ones, the first in path order.
+///
+/// Every file lies under the primary root `root`, stored as `root_key`.
 fn attribute_call_lines(
     root: &Path,
+    root_key: &str,
     conn: Option<&rusqlite::Connection>,
     files_with_calls: BTreeMap<PathBuf, Vec<usize>>,
     limit: usize,
@@ -578,7 +613,9 @@ fn attribute_call_lines(
         // function. Only a file the index cannot speak for gets the scan,
         // and only such a file has to be read off disk at all.
         let ranges_known = conn
-            .map(|conn| db::file_has_symbol_ranges(conn, &rel_path).unwrap_or(false))
+            .map(|conn| {
+                db::file_has_symbol_ranges(conn, Some(root_key), &rel_path).unwrap_or(false)
+            })
             .unwrap_or(false);
         let content = if ranges_known {
             String::new()
@@ -597,7 +634,8 @@ fn attribute_call_lines(
 
             let owner = conn
                 .and_then(|conn| {
-                    db::find_owning_symbol(conn, &rel_path, call_line as i64).unwrap_or(None)
+                    db::find_owning_symbol(conn, Some(root_key), &rel_path, call_line as i64)
+                        .unwrap_or(None)
                 })
                 .map(|symbol| (symbol.name, symbol.line as usize));
             let owner = match owner {
@@ -1446,6 +1484,29 @@ mod tests {
     }
 
     #[test]
+    fn bare_predicate_and_bang_calls_are_calls() {
+        let pat = build_caller_pattern("next_page?");
+        assert!(matches(&pat, "    break unless next_page?"));
+        assert!(matches(&pat, "    if next_page? && more"));
+        assert!(matches(&pat, "next_page?"));
+        assert!(matches(&pat, "  \"page #{next_page?}\""));
+        assert!(matches(&pat, "  (response.next_page?)"));
+        assert!(!matches(&pat, "  has_next_page?"));
+        assert!(!matches(&pat, "  describe \"#next_page?\" do"));
+        assert!(build_def_skip_pattern("next_page?").is_match("  def next_page?"));
+
+        let pat = build_caller_pattern("save!");
+        assert!(matches(&pat, "    save!"));
+        assert!(matches(&pat, "    save! if dirty"));
+        assert!(!matches(&pat, "    save!= other"));
+        assert!(!matches(&pat, "    save!~ /x/"));
+
+        // Any other word, bare, may be a local variable.
+        assert!(!matches(&build_caller_pattern("perform"), "    perform"));
+        assert!(!matches(&build_caller_pattern("a::b?"), "    a::b?"));
+    }
+
+    #[test]
     fn test_caller_pattern_await_bare_call() {
         let pat = build_caller_pattern("fetchCategories");
         assert!(matches(&pat, "  await fetchCategories()"));
@@ -1498,6 +1559,7 @@ mod tests {
         for idiom in CALLER_IDIOMS {
             assert!(idiom.contains("{fn}"), "{idiom}");
         }
+        assert!(BARE_PREDICATE_CALL_IDIOM.contains("{fn}"));
     }
 
     #[test]
@@ -1517,6 +1579,8 @@ mod tests {
             "  return valid?(record)",
             "  await store.valid?(x)",
             "  let(:fields).tap { }",
+            "  save!",
+            "  return if valid? && ready",
         ];
         for line in lines {
             assert!(

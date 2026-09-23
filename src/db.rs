@@ -4237,11 +4237,11 @@ fn create_secondary_indexes(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
             ON symbols(qualified_name) WHERE qualified_name IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
-        CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
         -- Covering index for find_owning_symbol: seeks straight to one file's
         -- symbols ordered by start line and reads end_line without touching
         -- the table, so "which symbol contains this line" stays a range scan
-        -- over a handful of index rows.
+        -- over a handful of index rows. Its file_id prefix also serves every
+        -- per-file lookup and the ON DELETE CASCADE from files.
         CREATE INDEX IF NOT EXISTS idx_symbols_file_line_end
             ON symbols(file_id, line, end_line);
         CREATE INDEX IF NOT EXISTS idx_module_deps_module ON module_deps(module_id);
@@ -4549,6 +4549,7 @@ struct OptionalIndexMigrations {
     drop_refs_name: bool,
     rewrite_qualified_name: bool,
     create_symbols_file_line_end: bool,
+    drop_symbols_file: bool,
 }
 
 impl OptionalIndexMigrations {
@@ -4558,8 +4559,14 @@ impl OptionalIndexMigrations {
             || self.drop_refs_name
             || self.rewrite_qualified_name
             || self.create_symbols_file_line_end
+            || self.drop_symbols_file
     }
 }
+
+/// `idx_symbols_file (file_id)` is the leftmost prefix of
+/// `idx_symbols_file_line_end`, so it only costs space. Dropped once its
+/// replacement exists, never before.
+const DROP_SYMBOLS_FILE_INDEX_SQL: &str = "DROP INDEX IF EXISTS idx_symbols_file";
 
 struct OpenMigrationPreflight {
     functional_migration_required: bool,
@@ -4624,6 +4631,7 @@ fn inspect_open_migrations(
         create_symbols_file_line_end: symbols_exists
             && symbols_current
             && !index_exists(conn, "idx_symbols_file_line_end")?,
+        drop_symbols_file: symbols_current && index_exists(conn, "idx_symbols_file")?,
     };
 
     Ok(OpenMigrationPreflight {
@@ -4663,6 +4671,10 @@ fn apply_optional_index_migrations(
     }
     if migrations.create_symbols_file_line_end {
         conn.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])?;
+    }
+    if migrations.drop_symbols_file {
+        conn.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])?;
+        conn.execute(DROP_SYMBOLS_FILE_INDEX_SQL, [])?;
     }
     Ok(())
 }
@@ -4737,6 +4749,8 @@ fn apply_open_migrations_transaction(
             .context("failed to create idx_symbols_qualified_name")?;
         tx.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])
             .context("failed to create idx_symbols_file_line_end")?;
+        tx.execute(DROP_SYMBOLS_FILE_INDEX_SQL, [])
+            .context("failed to drop idx_symbols_file")?;
     }
 
     tx.execute("DROP INDEX IF EXISTS idx_files_root_path_path", [])
@@ -5046,12 +5060,16 @@ fn cleanup_restore_staging(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Checked after the snapshot has been migrated, so an index a migration
+/// installs (`idx_symbols_file_line_end`) is required even of a backup taken
+/// before it existed, and one a migration drops (`idx_symbols_file`) must not
+/// be listed.
 const REQUIRED_RESTORE_INDEXES: &[&str] = &[
     "idx_files_path",
     "idx_symbols_name",
     "idx_symbols_qualified_name",
     "idx_symbols_kind",
-    "idx_symbols_file",
+    "idx_symbols_file_line_end",
     "idx_module_deps_module",
     "idx_module_deps_dep",
     "idx_inheritance_child",
@@ -5573,10 +5591,44 @@ pub fn is_vendor_path(path: &str) -> bool {
 /// `substr` rather than `LIKE`, which folds case and reads `_` as a wildcard.
 const VENDOR_PATH_SQL: &str = "(instr(f.path, 'node_modules') > 0 OR substr(f.path, -5) = '.d.ts')";
 
+const NAME_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
+
+/// Whether `name` is a namespaced name whose last `::` segment is `term`, as
+/// `Billing::Importers::LedgerImporter` is for `LedgerImporter`.
+///
+/// Statements the index records as symbols — `include Foo::Bar`,
+/// `extend ActiveSupport::Concern` — contain whitespace and are not a name
+/// under a namespace, so they never qualify.
+pub fn is_last_name_segment(name: &str, term: &str) -> bool {
+    !name.contains(NAME_WHITESPACE)
+        && name
+            .strip_suffix(term)
+            .is_some_and(|namespace| namespace.ends_with("::"))
+}
+
+/// [`is_last_name_segment`] over `s.name` for any of `placeholders`. `substr`
+/// and `instr` rather than `LIKE`, which folds case and reads `_` as a
+/// wildcard (`pg_search_scope` is an ordinary name).
+fn last_name_segment_sql(placeholders: &[&str]) -> String {
+    let suffixes = placeholders
+        .iter()
+        .map(|placeholder| {
+            format!("substr(s.name, -length({placeholder}) - 2) = '::' || {placeholder}")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let no_whitespace = NAME_WHITESPACE
+        .iter()
+        .map(|c| format!("instr(s.name, char({})) = 0", u32::from(*c)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!("({no_whitespace} AND ({suffixes}))")
+}
+
 /// Deterministic ordering for a query that matches `symbols_fts`.
 ///
 /// `exact_name_placeholders` bind the raw query terms, and each one is read
-/// twice, so every caller must pass numbered placeholders.
+/// several times, so every caller must pass numbered placeholders.
 ///
 /// A symbol whose own name equals a term is pinned to the front: bm25 alone
 /// can rank a long symbol with several term occurrences above the short exact
@@ -5584,12 +5636,19 @@ const VENDOR_PATH_SQL: &str = "(instr(f.path, 'node_modules') > 0 OR substr(f.pa
 /// `Applicant` the class lands above `applicant` the accessor for a
 /// capitalised query.
 ///
-/// bm25 is then suppressed for those exact rows. They all carry the same name,
-/// so the only thing left for the score to measure is signature length —
-/// ranking `User` in `app/models/user.rb` below `User` in a spec fixture
-/// because the model has a longer `class … < ApplicationRecord` line is noise,
-/// not relevance. Name length and `f.path, s.line` decide instead, which also
-/// makes repeated runs return the same page.
+/// Right below come names whose last `::` segment equals a term
+/// ([`is_last_name_segment`]): Ruby indexes `class A::B::MergeService` under
+/// its full name, so `MergeService` has no exact row, and bm25 alone put a
+/// spec's `describe "A::B::MergeService"` — a shorter document — above the
+/// class itself.
+///
+/// bm25 is then suppressed for the rows of those tiers. They all carry the
+/// same name or last segment, so what is left for the score to measure is
+/// document length — ranking `User` in `app/models/user.rb` below `User`
+/// in a spec fixture because the model has a longer `class … <
+/// ApplicationRecord` line is noise, not relevance. Name length and `f.path,
+/// s.line` decide instead, which also makes repeated runs return the same
+/// page.
 ///
 /// Inside each tier the project's own code leads third-party code
 /// ([`is_vendor_path`]). Without that, the path tie-break decided, and
@@ -5607,12 +5666,14 @@ fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
         .map(|placeholder| format!("lower({placeholder})"))
         .collect::<Vec<_>>()
         .join(", ");
+    let last_segment = last_name_segment_sql(exact_name_placeholders);
     format!(
         " ORDER BY \
          CASE WHEN s.name IN ({cased}) THEN 0 \
-         WHEN lower(s.name) IN ({folded}) THEN 1 ELSE 2 END, \
+         WHEN lower(s.name) IN ({folded}) THEN 1 \
+         WHEN {last_segment} THEN 2 ELSE 3 END, \
          {VENDOR_PATH_SQL}, \
-         CASE WHEN lower(s.name) IN ({folded}) THEN 0.0 ELSE {FTS_RANK} END, \
+         CASE WHEN lower(s.name) IN ({folded}) OR {last_segment} THEN 0.0 ELSE {FTS_RANK} END, \
          {tail}"
     )
 }
@@ -6717,19 +6778,44 @@ pub fn count_references_scoped(
     Ok(count as usize)
 }
 
-/// All symbols defined in a file, ordered by line.
-pub fn get_file_symbols(conn: &Connection, path: &str) -> Result<Vec<SearchResult>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE f.path = ?1
-        ORDER BY s.line
-        "#,
-    )?;
+/// SQL condition: file `f` is stored under the root whose `files.root_path`
+/// is bound to the placeholder (`''` for none), so that a relative path shared
+/// by two roots resolves to the file of the root that was asked for.
+///
+/// The primary root has two spellings: current indexers store its normalized
+/// path, and indexes created before `root_path` existed keep `''`. Either one
+/// finds a file stored under the other, going by the primary root recorded in
+/// `metadata`.
+macro_rules! file_under_root_sql {
+    ($root:literal) => {
+        concat!(
+            "(f.root_path = ",
+            $root,
+            " OR (f.root_path IN ('', (SELECT value FROM metadata WHERE key = 'project_root'))",
+            " AND ",
+            $root,
+            " IN ('', (SELECT value FROM metadata WHERE key = 'project_root'))))"
+        )
+    };
+}
+
+/// All symbols defined in a file, ordered by line. `root_path` is the owning
+/// root as stored in `files.root_path`, `None` for `''`.
+pub fn get_file_symbols(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+) -> Result<Vec<SearchResult>> {
+    let mut stmt = conn.prepare(concat!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1 AND ",
+        file_under_root_sql!("?2"),
+        " ORDER BY s.line"
+    ))?;
     let results = stmt
-        .query_map(params![path], row_to_search_result)?
+        .query_map(params![path, root_path.unwrap_or("")], row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }
@@ -6741,18 +6827,23 @@ pub fn get_file_symbols(conn: &Connection, path: &str) -> Result<Vec<SearchResul
 /// "this file has no symbols". Callers use it to tell a genuine
 /// "the line belongs to no symbol" answer from [`find_owning_symbol`] apart
 /// from "the index cannot answer" — only the latter deserves a fallback.
-pub fn file_has_symbol_ranges(conn: &Connection, path: &str) -> Result<bool> {
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT EXISTS(
+/// `root_path` is read as in [`get_file_symbols`].
+pub fn file_has_symbol_ranges(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT EXISTS(
             SELECT 1
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE f.path = ?1 AND s.end_line IS NOT NULL
-        )
-        "#,
-    )?;
-    let has_ranges: bool = stmt.query_row(params![path], |row| row.get(0))?;
+            WHERE f.path = ?1 AND s.end_line IS NOT NULL AND ",
+        file_under_root_sql!("?2"),
+        ")"
+    ))?;
+    let has_ranges: bool =
+        stmt.query_row(params![path, root_path.unwrap_or("")], |row| row.get(0))?;
     Ok(has_ranges)
 }
 
@@ -6769,48 +6860,52 @@ pub fn file_has_symbol_ranges(conn: &Connection, path: &str) -> Result<bool> {
 /// last symbol declared at or before `line`. That fallback is scoped to those
 /// files on purpose: applying it everywhere is what made module-level
 /// references get attributed to the preceding method.
+///
+/// `root_path` is read as in [`get_file_symbols`].
 pub fn find_owning_symbol(
     conn: &Connection,
+    root_path: Option<&str>,
     path: &str,
     line: i64,
 ) -> Result<Option<SearchResult>> {
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE f.path = ?1
-          AND s.line <= ?2
-          AND COALESCE(s.end_line, s.line) >= ?2
-        ORDER BY COALESCE(s.end_line, s.line) - s.line ASC, s.line DESC
-        LIMIT 1
-        "#,
-    )?;
+    let root_path = root_path.unwrap_or("");
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1
+           AND s.line <= ?2
+           AND COALESCE(s.end_line, s.line) >= ?2
+           AND ",
+        file_under_root_sql!("?3"),
+        " ORDER BY COALESCE(s.end_line, s.line) - s.line ASC, s.line DESC
+         LIMIT 1"
+    ))?;
     let owner = stmt
-        .query_row(params![path, line], row_to_search_result)
+        .query_row(params![path, line, root_path], row_to_search_result)
         .optional()?;
     drop(stmt);
     if owner.is_some() {
         return Ok(owner);
     }
 
-    let mut fallback = conn.prepare_cached(
-        r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE f.path = ?1
-          AND s.line <= ?2
-          AND NOT EXISTS (
-              SELECT 1 FROM symbols r
-              WHERE r.file_id = s.file_id AND r.end_line IS NOT NULL
-          )
-        ORDER BY s.line DESC
-        LIMIT 1
-        "#,
-    )?;
+    let mut fallback = conn.prepare_cached(concat!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1
+           AND s.line <= ?2
+           AND NOT EXISTS (
+               SELECT 1 FROM symbols r
+               WHERE r.file_id = s.file_id AND r.end_line IS NOT NULL
+           )
+           AND ",
+        file_under_root_sql!("?3"),
+        " ORDER BY s.line DESC
+         LIMIT 1"
+    ))?;
     Ok(fallback
-        .query_row(params![path, line], row_to_search_result)
+        .query_row(params![path, line, root_path], row_to_search_result)
         .optional()?)
 }
 
@@ -9746,6 +9841,52 @@ mod tests {
                 .unwrap();
             assert_eq!(in_sql, is_vendor_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn last_name_segment_sql_agrees_with_rust() {
+        let conn = Connection::open_in_memory().unwrap();
+        let cases = [
+            ("Billing::Importers::LedgerImporter", "LedgerImporter"),
+            ("::LedgerImporter", "LedgerImporter"),
+            ("LedgerImporter", "LedgerImporter"),
+            ("Billing::Importers::LedgerImporter", "Importer"),
+            ("Billing::Importers::ledgerimporter", "LedgerImporter"),
+            (
+                "describe \"Billing::Importers::LedgerImporter\"",
+                "LedgerImporter",
+            ),
+            (
+                "include Billing::Importers::LedgerImporter",
+                "LedgerImporter",
+            ),
+            ("Billing::Importers::\n  LedgerImporter", "LedgerImporter"),
+            ("Scopes::pg_search_scope", "pg_search_scope"),
+            ("Scopes::pgXsearchXscope", "pg_search_scope"),
+            ("Scopes::Größe", "Größe"),
+            ("A::B", "A::B"),
+            ("X::A::B", "A::B"),
+        ];
+        for (name, term) in cases {
+            let in_sql: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM (SELECT ?1 AS name) s",
+                        last_name_segment_sql(&["?2"])
+                    ),
+                    params![name, term],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                in_sql,
+                is_last_name_segment(name, term),
+                "{name:?} / {term:?}"
+            );
+        }
+        assert!(is_last_name_segment("A::B::Merge", "Merge"));
+        assert!(!is_last_name_segment("A::B::AutoMerge", "Merge"));
+        assert!(!is_last_name_segment("include A::Merge", "Merge"));
     }
 
     #[test]

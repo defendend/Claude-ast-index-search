@@ -157,6 +157,155 @@ fn a_capitalised_query_prefers_the_type_over_the_accessor() {
 }
 
 // ----------------------------------------------------------------------
+// Namespaced names
+// ----------------------------------------------------------------------
+
+fn insert_with_signature(
+    conn: &rusqlite::Connection,
+    path: &str,
+    name: &str,
+    kind: SymbolKind,
+    signature: &str,
+) {
+    let file = db::upsert_file(conn, path, 0, 100).unwrap();
+    db::insert_symbol(conn, file, name, kind, 3, Some(signature)).unwrap();
+}
+
+/// Ruby records `class Billing::Importers::LedgerImporter` under its full
+/// name, so `LedgerImporter` has no exact row. The specs describing the class
+/// are shorter documents and led on bm25 alone.
+fn seed_namespaced_class(conn: &rusqlite::Connection) {
+    insert_with_signature(
+        conn,
+        "spec/billing/importers/ledger_importer_spec.rb",
+        "describe \"Billing::Importers::LedgerImporter\"",
+        SymbolKind::Class,
+        "describe \"Billing::Importers::LedgerImporter\"",
+    );
+    insert_with_signature(
+        conn,
+        "spec/billing/importers/ledger_importer_queries_spec.rb",
+        "describe \"Billing::Importers::LedgerImporter queries\"",
+        SymbolKind::Class,
+        "describe \"Billing::Importers::LedgerImporter queries\"",
+    );
+    insert_with_signature(
+        conn,
+        "app/models/ledger.rb",
+        "include Billing::Importers::LedgerImporter",
+        SymbolKind::Annotation,
+        "include Billing::Importers::LedgerImporter",
+    );
+    insert_with_signature(
+        conn,
+        "app/services/billing/importers/ledger_importer_job.rb",
+        "Billing::Importers::LedgerImporterJob",
+        SymbolKind::Class,
+        "class Billing::Importers::LedgerImporterJob < ApplicationJob",
+    );
+    insert_with_signature(
+        conn,
+        "app/services/billing/importers/ledger_importer.rb",
+        "Billing::Importers::LedgerImporter",
+        SymbolKind::Class,
+        "class Billing::Importers::LedgerImporter < Billing::Importers::BaseImporter",
+    );
+}
+
+#[test]
+fn a_namespaced_definition_leads_every_fts_entry_point() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_namespaced_class(&conn);
+
+    let none = SearchScope::none();
+    let scoped = module_scope("");
+    let pages = [
+        db::search_symbols(&conn, "LedgerImporter", 10).unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["LedgerImporter"], None, 10, &none, false).unwrap(),
+        db::search_symbol_terms_scoped(
+            &conn,
+            &["Unrelated", "LedgerImporter"],
+            None,
+            10,
+            &none,
+            false,
+        )
+        .unwrap(),
+        db::search_symbols_scoped(&conn, "LedgerImporter", 10, &scoped).unwrap(),
+        db::search_symbols_for_command(&conn, "LedgerImporter", None, 10, &none, false, false)
+            .unwrap(),
+        db::search_symbol_terms_scoped(
+            &conn,
+            &["LedgerImporter"],
+            Some("class"),
+            10,
+            &scoped,
+            false,
+        )
+        .unwrap(),
+        db::search_symbols_for_command(
+            &conn,
+            "LedgerImporter",
+            Some("class"),
+            10,
+            &scoped,
+            false,
+            true,
+        )
+        .unwrap(),
+    ];
+    for page in &pages {
+        assert_eq!(
+            names(page).first(),
+            Some(&"Billing::Importers::LedgerImporter"),
+            "{:?}",
+            names(page)
+        );
+    }
+}
+
+#[test]
+fn an_exact_name_still_leads_a_namespaced_one() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_namespaced_class(&conn);
+    insert_with_signature(
+        &conn,
+        "lib/ledger_importer.rb",
+        "LedgerImporter",
+        SymbolKind::Class,
+        "class LedgerImporter",
+    );
+    insert_with_signature(
+        &conn,
+        "lib/archive/ledger_importer.rb",
+        "Archive::LedgerImporter",
+        SymbolKind::Class,
+        "class Archive::LedgerImporter",
+    );
+
+    let results = db::search_symbol_terms_scoped(
+        &conn,
+        &["LedgerImporter"],
+        None,
+        10,
+        &SearchScope::none(),
+        false,
+    )
+    .unwrap();
+    // The namespaced tier is ordered by name length, like the exact tier.
+    assert_eq!(
+        names(&results)[..3],
+        [
+            "LedgerImporter",
+            "Archive::LedgerImporter",
+            "Billing::Importers::LedgerImporter",
+        ]
+    );
+}
+
+// ----------------------------------------------------------------------
 // Project code before third-party code
 // ----------------------------------------------------------------------
 

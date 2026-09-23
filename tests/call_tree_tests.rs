@@ -317,3 +317,108 @@ fn call_tree_names_a_wrapped_default_export_after_what_it_wraps() {
         )
     );
 }
+
+/// An attached subtree holds a file under the same relative path as the
+/// primary caller, with a one-line method on the very line of the call.
+#[test]
+fn call_tree_attributes_a_call_within_its_own_root() {
+    let (project, cache) = fixture();
+    let workspace = TempDir::new().unwrap();
+    let shared = workspace.path().join("shared");
+    fs::create_dir_all(shared.join("lib")).unwrap();
+    fs::write(
+        shared.join("lib/callers.rb"),
+        "module Other\n  LIMIT = 1\n  def shadow; end\nend\n",
+    )
+    .unwrap();
+    let shared_arg = shared.to_string_lossy().into_owned();
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    stdout(&run(
+        project.path(),
+        cache.path(),
+        &["subtree", "add", "shared", &shared_arg],
+    ));
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+
+    let output = run(
+        project.path(),
+        cache.path(),
+        &["call-tree", "leaf", "--depth", "1"],
+    );
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "Call tree for 'leaf':\n",
+            "  leaf\n",
+            "    ← alpha (lib/callers.rb:2)\n",
+            "    ← beta (lib/callers.rb:6)\n",
+        )
+    );
+}
+
+/// Ruby predicate and bang methods called bare: no receiver, no parentheses.
+fn predicate_fixture() -> (TempDir, TempDir) {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let lib = project.path().join("lib");
+    fs::create_dir(&lib).unwrap();
+    fs::write(
+        lib.join("pager.rb"),
+        concat!(
+            "class Pager\n",
+            "  def next_page?\n",
+            "    @cursor.present?\n",
+            "  end\n",
+            "\n",
+            "  def each_page\n",
+            "    loop do\n",
+            "      yield fetch!\n",
+            "      break unless next_page?\n",
+            "    end\n",
+            "  end\n",
+            "\n",
+            "  def fetch!\n",
+            "    @cursor = nil\n",
+            "  end\n",
+            "end\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        lib.join("pager_doc.rb"),
+        "# Pager#next_page? tells whether another page exists.\nclass PagerDoc\nend\n",
+    )
+    .unwrap();
+    (project, cache)
+}
+
+#[test]
+fn callers_find_bare_predicate_and_bang_calls_but_not_definitions() {
+    let (project, cache) = predicate_fixture();
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    for (name, line) in [("next_page?", 9), ("fetch!", 8)] {
+        let output = stdout(&run(
+            project.path(),
+            cache.path(),
+            &["--format", "json", "callers", name],
+        ));
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let lines: Vec<i64> = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["line"].as_i64().unwrap())
+            .collect();
+        assert_eq!(lines, [line], "{name}: {output}");
+    }
+
+    let output = run(project.path(), cache.path(), &["call-tree", "next_page?"]);
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "Call tree for 'next_page?':\n",
+            "  next_page?\n",
+            "    ← each_page (lib/pager.rb:6)\n",
+        )
+    );
+}

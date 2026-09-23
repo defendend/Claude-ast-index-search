@@ -1,0 +1,8 @@
+# Processes cargo starts in this checkout (`cargo test`, `cargo run`) keep
+# their indexes under target/ instead of the per-user cache
+# (~/Library/Caches/ast-index, $XDG_CACHE_HOME/ast-index). Integration tests
+# open indexes for throwaway temporary projects, and every one of them used to
+# stay behind in the user's cache. An AST_INDEX_CACHE_DIR already set in the
+# environment takes precedence; binaries started directly are not affected.
+[env]
+AST_INDEX_CACHE_DIR = { value = "target/ast-index-cache", relative = true }
