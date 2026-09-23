@@ -46,6 +46,54 @@ fn range_of(ranges: &[(String, i64, Option<i64>)], name: &str) -> (i64, i64) {
     )
 }
 
+/// Index `contents` as the only file of a fresh project.
+fn index_single(relative_path: &str, contents: &str) -> Connection {
+    let project = TempDir::new().unwrap();
+    write_file(&project.path().join(relative_path), contents);
+    let mut conn = fresh_db();
+    indexer::index_directory(&mut conn, project.path(), false, false).unwrap();
+    conn
+}
+
+/// Start and end line of the symbol with this kind and name.
+fn span(conn: &Connection, kind: &str, name: &str) -> (i64, i64) {
+    range_of(&symbol_ranges(conn, kind), name)
+}
+
+fn assert_encloses(outer: (i64, i64), inner: (i64, i64)) {
+    assert!(
+        outer.0 <= inner.0 && inner.1 <= outer.1 && outer != inner,
+        "{inner:?} must nest strictly inside {outer:?}"
+    );
+}
+
+/// Every symbol of the file reports a range that does not end before it starts.
+fn assert_all_ranges_filled(conn: &Connection) {
+    let mut stmt = conn
+        .prepare("SELECT kind, name, line, end_line FROM symbols ORDER BY line")
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(!rows.is_empty(), "the file must yield symbols");
+    for (kind, name, line, end_line) in rows {
+        let end_line = end_line.unwrap_or_else(|| panic!("{kind} {name} has no end_line"));
+        assert!(
+            end_line >= line,
+            "{kind} {name} ends at {end_line} before {line}"
+        );
+    }
+}
+
 #[test]
 fn ruby_class_range_encloses_its_methods() {
     let project = TempDir::new().unwrap();
@@ -217,4 +265,36 @@ fn parsers_without_range_support_store_null() {
         .find(|(n, _, _)| n == "Run")
         .expect("go function must be indexed");
     assert_eq!(run.2, None, "go parser does not report ranges yet");
+}
+
+#[test]
+fn python_class_methods_and_function_get_ranges() {
+    let conn = index_single(
+        "app/greeter.py",
+        concat!(
+            "import os\n",
+            "\n",
+            "class Greeter(Base):\n",
+            "    def hello(self):\n",
+            "        return greet()\n",
+            "\n",
+            "    @property\n",
+            "    def name(self):\n",
+            "        return \"g\"\n",
+            "\n",
+            "def build():\n",
+            "    return Greeter()\n",
+        ),
+    );
+
+    let class = span(&conn, "class", "Greeter");
+    assert_eq!(class, (3, 9));
+    assert_eq!(span(&conn, "function", "hello"), (4, 5));
+    // The decorator sits outside the method: it runs in the class body.
+    assert_eq!(span(&conn, "function", "name"), (8, 9));
+    assert_eq!(span(&conn, "annotation", "@property"), (7, 7));
+    assert_encloses(class, span(&conn, "function", "hello"));
+    assert_encloses(class, span(&conn, "function", "name"));
+    assert_eq!(span(&conn, "function", "build"), (11, 12));
+    assert_all_ranges_filled(&conn);
 }

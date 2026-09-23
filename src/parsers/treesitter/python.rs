@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -51,6 +51,7 @@ impl LanguageParser for PythonParser {
         let idx_decorated_method_name = idx("decorated_method_name");
         let idx_assignment_name = idx("assignment_name");
         let idx_assignment_value = idx("assignment_value");
+        let idx_definition = idx("definition");
 
         let mut emitted_classes = std::collections::HashSet::new();
         let mut emitted_funcs = std::collections::HashSet::new();
@@ -58,6 +59,8 @@ impl LanguageParser for PythonParser {
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Import: import X
             if let Some(cap) = find_capture(m, idx_import_name) {
                 let name = node_text(content, &cap.node);
@@ -68,7 +71,7 @@ impl LanguageParser for PythonParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -85,7 +88,7 @@ impl LanguageParser for PythonParser {
                     line,
                     signature: sig.clone(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
 
                 if let Some(alias_cap) = find_capture(m, idx_import_alias_name) {
@@ -96,7 +99,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: sig,
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -114,7 +117,7 @@ impl LanguageParser for PythonParser {
                     line,
                     signature: sig.clone(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
 
                 for cap in m
@@ -130,7 +133,7 @@ impl LanguageParser for PythonParser {
                             line,
                             signature: sig.clone(),
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                     }
                 }
@@ -149,7 +152,7 @@ impl LanguageParser for PythonParser {
                     line,
                     signature: sig.clone(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
 
                 if let Some(name_cap) = find_capture(m, idx_import_from_aliased_name) {
@@ -160,7 +163,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: sig,
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -180,7 +183,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -198,7 +201,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -217,7 +220,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -234,7 +237,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -251,7 +254,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
@@ -267,7 +270,7 @@ impl LanguageParser for PythonParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -282,7 +285,7 @@ impl LanguageParser for PythonParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -308,7 +311,7 @@ impl LanguageParser for PythonParser {
                             line,
                             signature: sig,
                             parents: vec![],
-                            end_line: None,
+                            end_line,
                         });
                         continue;
                     }
@@ -321,7 +324,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: sig,
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;

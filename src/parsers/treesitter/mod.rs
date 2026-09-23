@@ -130,6 +130,24 @@ fn node_end_line(node: &tree_sitter::Node) -> usize {
     node.end_position().row + 1
 }
 
+/// Last line (1-based, inclusive) that holds text of `node`.
+///
+/// Some grammars end a node after the whitespace that terminates it: a C
+/// preprocessor directive owns its newline, a Groovy statement the blank lines
+/// after it. The end position then points at a line the definition does not
+/// reach, which would let it claim the next definition's first line.
+fn text_end_line(content: &str, node: &tree_sitter::Node) -> usize {
+    let text = &content.as_bytes()[node.byte_range()];
+    let text_end = text
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |last| last + 1);
+    let trailing_newlines = text[text_end..].iter().filter(|&&b| b == b'\n').count();
+    (node.end_position().row + 1)
+        .saturating_sub(trailing_newlines)
+        .max(node_line(node))
+}
+
 /// Helper to get the full line text for a node (for signature)
 fn line_text(content: &str, line: usize) -> &str {
     content.lines().nth(line - 1).unwrap_or("")
@@ -172,5 +190,24 @@ where
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_end_line_skips_trailing_whitespace_the_node_owns() {
+        let language: Language = tree_sitter_cpp::LANGUAGE.into();
+        let content = concat!("#define TWICE(x) \\\n", "    ((x) * 2)\n", "int y;\n");
+        let tree = parse_tree(content, &language).unwrap();
+        let define = tree.root_node().child(0).unwrap();
+        assert_eq!(define.kind(), "preproc_function_def");
+        assert_eq!(node_end_line(&define), 3);
+        assert_eq!(text_end_line(content, &define), 2);
+
+        let declaration = tree.root_node().child(1).unwrap();
+        assert_eq!(text_end_line(content, &declaration), 3);
     }
 }
