@@ -88,6 +88,7 @@ Project Insights:
   map                    Show compact project map (key types per directory)
   conventions            Detect project conventions (architecture, frameworks, naming)
   hotspots               Rank files by Git history (churn, bugfix ratio, authors, age)
+  graph                  Symbol dependency graph: dependents, impact, path, cycles, top
 
 Project Configuration:
   add-root               Add additional source root
@@ -619,6 +620,11 @@ enum Commands {
         #[arg(long)]
         verbose: bool,
     },
+    /// Symbol dependency graph: dependents, dependencies, impact, paths, cycles, centrality
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
+    },
     // === iOS Commands ===
     /// Find class usages in storyboards/xibs (iOS)
     StoryboardUsages {
@@ -841,6 +847,172 @@ enum SubtreeAction {
     List,
 }
 
+#[derive(clap::Args)]
+struct GraphSymbolArgs {
+    /// Only symbols whose file path contains this substring
+    #[arg(long)]
+    in_file: Option<String>,
+    /// Only symbols of this kind (class, function, property, ...)
+    #[arg(long)]
+    kind: Option<String>,
+}
+
+impl GraphSymbolArgs {
+    fn filter(self) -> commands::graph::SymbolFilter {
+        commands::graph::SymbolFilter {
+            in_file: self.in_file,
+            kind: self.kind,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum GraphAction {
+    /// Build (or rebuild) the symbol graph from the current index
+    Build {
+        /// Print build phases and timings to stderr
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Show whether the graph is built and fresh, with edge counts per confidence level
+    Status,
+    /// Symbols that depend on SYMBOL (incoming edges), with resolution confidence
+    Dependents {
+        /// Symbol name, `Outer::Name`, or `Class#member`
+        symbol: String,
+        #[command(flatten)]
+        filter: GraphSymbolArgs,
+        /// Also list edges whose target name is ambiguous
+        #[arg(long)]
+        include_ambiguous: bool,
+        /// For a class, also cover every definition inside it
+        #[arg(long)]
+        members: bool,
+        /// Max edges to list
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Symbols SYMBOL depends on (outgoing edges), with resolution confidence
+    Dependencies {
+        /// Symbol name, `Outer::Name`, or `Class#member`
+        symbol: String,
+        #[command(flatten)]
+        filter: GraphSymbolArgs,
+        /// Also list edges whose target name is ambiguous
+        #[arg(long)]
+        include_ambiguous: bool,
+        /// For a class, also cover every definition inside it
+        #[arg(long)]
+        members: bool,
+        /// Max edges to list
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Blast radius: transitive dependents of SYMBOL per depth, symbols and files
+    Impact {
+        /// Symbol name, `Outer::Name`, or `Class#member`
+        symbol: String,
+        #[command(flatten)]
+        filter: GraphSymbolArgs,
+        /// How many hops of dependents to follow
+        #[arg(short, long, default_value = "3")]
+        depth: usize,
+        /// Also follow ambiguous edges (upper bound)
+        #[arg(long)]
+        include_ambiguous: bool,
+        /// For a class, also seed with every definition inside it
+        #[arg(long)]
+        members: bool,
+        /// Max affected symbols to list
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Shortest dependency path(s) from FROM to TO; a class stands for itself and its members
+    Path {
+        /// Starting symbol (e.g. an entry point)
+        from: String,
+        /// Destination symbol
+        to: String,
+        /// Restrict FROM to files whose path contains this substring
+        #[arg(long)]
+        from_file: Option<String>,
+        /// Restrict TO to files whose path contains this substring
+        #[arg(long)]
+        to_file: Option<String>,
+        /// Give up beyond this many hops
+        #[arg(long, default_value = "8")]
+        max_depth: usize,
+        /// Max shortest paths to list
+        #[arg(long, default_value = "3")]
+        max_paths: usize,
+        /// Also follow ambiguous edges
+        #[arg(long)]
+        include_ambiguous: bool,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Dependency cycles (strongly connected components over resolved edges)
+    Cycles {
+        /// Max components to list
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+        /// Smallest component size to report
+        #[arg(long, default_value = "2")]
+        min_size: usize,
+        /// Only components with a member under this path prefix
+        #[arg(long)]
+        path: Option<String>,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Most central symbols (PageRank, fan-in, fan-out or transitive dependents)
+    Top {
+        /// Ranking key: pagerank, fan-in, fan-out, dependents
+        #[arg(long, default_value = "pagerank")]
+        sort: String,
+        /// Max symbols to list
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+        /// Only symbols of this kind (class, function, ...)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only symbols under this path prefix
+        #[arg(long)]
+        path: Option<String>,
+        /// Skip symbols defined in test files
+        #[arg(long)]
+        exclude_tests: bool,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Graph metrics (fan-in/out, dependents, PageRank) for one or more symbols
+    Metrics {
+        /// Symbol names, `Outer::Name`, or `Class#member`
+        #[arg(required = true, num_args = 1..)]
+        symbols: Vec<String>,
+        #[command(flatten)]
+        filter: GraphSymbolArgs,
+        /// Max symbols to list
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Rebuild the graph first when it is missing or stale
+        #[arg(long)]
+        refresh: bool,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // Export the chosen output format so deeply-nested helpers (PathResolver,
@@ -859,6 +1031,19 @@ fn main() -> Result<()> {
                 "--subtree is not supported by '{name}'; invoke it from the desired directory"
             ));
         }
+    }
+    if (cli.subtree.is_some() || cli.local)
+        && matches!(
+            &cli.command,
+            Commands::Graph {
+                action: GraphAction::Build { .. } | GraphAction::Status
+            }
+        )
+    {
+        return Err(anyhow::anyhow!(
+            "--subtree/--local do not apply to 'graph build' or 'graph status': \
+             the graph always spans every indexed root; pass them to graph queries instead"
+        ));
     }
     // Conflict guard: --subtree and --local both narrow the workspace, but
     // they narrow it differently, so combining them is meaningless.
@@ -1327,6 +1512,137 @@ fn main() -> Result<()> {
             verbose,
             format,
         ),
+        Commands::Graph { action } => match action {
+            GraphAction::Build { verbose } => {
+                commands::graph::cmd_graph_build(&root, verbose, format)
+            }
+            GraphAction::Status => commands::graph::cmd_graph_status(&root, format),
+            GraphAction::Dependents {
+                symbol,
+                filter,
+                include_ambiguous,
+                members,
+                limit,
+                refresh,
+            } => commands::graph::cmd_graph_edges(
+                &root,
+                &symbol,
+                commands::graph::Direction::Dependents,
+                include_ambiguous,
+                members,
+                &filter.filter(),
+                limit,
+                refresh,
+                format,
+            ),
+            GraphAction::Dependencies {
+                symbol,
+                filter,
+                include_ambiguous,
+                members,
+                limit,
+                refresh,
+            } => commands::graph::cmd_graph_edges(
+                &root,
+                &symbol,
+                commands::graph::Direction::Dependencies,
+                include_ambiguous,
+                members,
+                &filter.filter(),
+                limit,
+                refresh,
+                format,
+            ),
+            GraphAction::Impact {
+                symbol,
+                filter,
+                depth,
+                include_ambiguous,
+                members,
+                limit,
+                refresh,
+            } => commands::graph::cmd_graph_impact(
+                &root,
+                &symbol,
+                depth,
+                include_ambiguous,
+                members,
+                &filter.filter(),
+                limit,
+                refresh,
+                format,
+            ),
+            GraphAction::Path {
+                from,
+                to,
+                from_file,
+                to_file,
+                max_depth,
+                max_paths,
+                include_ambiguous,
+                refresh,
+            } => commands::graph::cmd_graph_path(
+                &root,
+                &from,
+                &to,
+                max_depth,
+                max_paths,
+                include_ambiguous,
+                &commands::graph::SymbolFilter {
+                    in_file: from_file,
+                    kind: None,
+                },
+                &commands::graph::SymbolFilter {
+                    in_file: to_file,
+                    kind: None,
+                },
+                refresh,
+                format,
+            ),
+            GraphAction::Cycles {
+                limit,
+                min_size,
+                path,
+                refresh,
+            } => commands::graph::cmd_graph_cycles(
+                &root,
+                limit,
+                min_size,
+                path.as_deref(),
+                refresh,
+                format,
+            ),
+            GraphAction::Top {
+                sort,
+                limit,
+                kind,
+                path,
+                exclude_tests,
+                refresh,
+            } => commands::graph::cmd_graph_top(
+                &root,
+                &sort,
+                limit,
+                kind.as_deref(),
+                path.as_deref(),
+                exclude_tests,
+                refresh,
+                format,
+            ),
+            GraphAction::Metrics {
+                symbols,
+                filter,
+                limit,
+                refresh,
+            } => commands::graph::cmd_graph_metrics(
+                &root,
+                &symbols,
+                &filter.filter(),
+                limit,
+                refresh,
+                format,
+            ),
+        },
         // Android commands
         Commands::XmlUsages { class_name, module } => {
             commands::android::cmd_xml_usages(&root, &class_name, module.as_deref())

@@ -4225,6 +4225,7 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
         "#,
     )?;
     conn.execute_batch(CREATE_GIT_SIGNALS_SQL)?;
+    conn.execute_batch(CREATE_SYMBOL_GRAPH_SQL)?;
     Ok(())
 }
 
@@ -4366,6 +4367,41 @@ pub(crate) const CREATE_GIT_SIGNALS_SQL: &str = r#"
         path TEXT NOT NULL,
         author TEXT NOT NULL,
         PRIMARY KEY (path, author)
+    );
+"#;
+/// Symbol-to-symbol dependency graph, built on demand by `graph build`.
+///
+/// Both tables key on `symbols.id` without a foreign key on purpose: a
+/// cascading delete would tax every incremental `update`, and a graph that
+/// silently lost rows would look fresh when it is not. Staleness is detected
+/// instead through the `symbol_graph_fingerprint` metadata key.
+///
+/// `symbol_edges.confidence` is the resolution level of the edge target
+/// (0 local, 1 scoped, 2 import, 3 unique, 4 ambiguous); `candidates` is how
+/// many definitions shared the referenced name when the edge is ambiguous.
+/// `symbol_metrics` only holds symbols that touch at least one edge.
+pub(crate) const CREATE_SYMBOL_GRAPH_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS symbol_edges (
+        source_id INTEGER NOT NULL,
+        target_id INTEGER NOT NULL,
+        confidence INTEGER NOT NULL,
+        candidates INTEGER NOT NULL,
+        ref_count INTEGER NOT NULL,
+        line INTEGER NOT NULL,
+        PRIMARY KEY (source_id, target_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS idx_symbol_edges_target
+        ON symbol_edges(target_id, confidence);
+    CREATE TABLE IF NOT EXISTS symbol_metrics (
+        symbol_id INTEGER PRIMARY KEY,
+        fan_in INTEGER NOT NULL,
+        fan_in_files INTEGER NOT NULL,
+        fan_in_ambiguous INTEGER NOT NULL,
+        fan_out INTEGER NOT NULL,
+        fan_out_ambiguous INTEGER NOT NULL,
+        dependents INTEGER NOT NULL,
+        pagerank REAL NOT NULL,
+        pagerank_pct REAL NOT NULL
     );
 "#;
 const CREATE_QUALIFIED_NAME_INDEX_SQL: &str = r#"
@@ -4541,6 +4577,8 @@ fn inspect_open_migrations(
     let subtrees_exists = table_exists(conn, "subtrees")?;
     let git_signals_exist =
         table_exists(conn, "git_file_stats")? && table_exists(conn, "git_file_authors")?;
+    let symbol_graph_exists =
+        table_exists(conn, "symbol_edges")? && table_exists(conn, "symbol_metrics")?;
     let files_exists = table_exists(conn, "files")?;
     let symbols_exists = table_exists(conn, "symbols")?;
     let files_current = !files_exists || column_exists(conn, "files", "root_path")?;
@@ -4592,6 +4630,7 @@ fn inspect_open_migrations(
         functional_migration_required: !metadata_exists
             || !subtrees_exists
             || !git_signals_exist
+            || !symbol_graph_exists
             || !files_current
             || !files_uniqueness_current
             || !symbols_current
@@ -4669,6 +4708,8 @@ fn apply_open_migrations_transaction(
         .context("failed to create subtrees table")?;
     tx.execute_batch(CREATE_GIT_SIGNALS_SQL)
         .context("failed to create git signal tables")?;
+    tx.execute_batch(CREATE_SYMBOL_GRAPH_SQL)
+        .context("failed to create symbol graph tables")?;
 
     if table_exists(&tx, "files")? && !column_exists(&tx, "files", "root_path")? {
         tx.execute(
@@ -8812,6 +8853,565 @@ pub fn delete_git_file_stats(conn: &Connection, path: &str) -> Result<()> {
         params![path],
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Symbol graph
+// ---------------------------------------------------------------------------
+
+const SYMBOL_GRAPH_FINGERPRINT_KEY: &str = "symbol_graph_fingerprint";
+const SYMBOL_GRAPH_BUILT_AT_KEY: &str = "symbol_graph_built_at";
+const SYMBOL_GRAPH_SUMMARY_KEY: &str = "symbol_graph_summary";
+/// SQLite's default host-parameter ceiling is 32766 on current builds but 999
+/// on old ones; staying well under the old limit keeps chunked `IN` lists safe.
+const GRAPH_ID_CHUNK: usize = 500;
+
+/// One indexed file as the graph builder sees it.
+#[derive(Clone, Debug)]
+pub struct GraphFileRow {
+    pub id: i64,
+    pub path: String,
+    pub root_path: String,
+}
+
+/// One indexed symbol as the graph builder sees it.
+#[derive(Clone, Debug)]
+pub struct GraphSymbolRow {
+    pub id: i64,
+    pub file_id: i64,
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+    pub end_line: Option<i64>,
+}
+
+/// A stored `symbol_edges` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SymbolEdgeRow {
+    pub source_id: i64,
+    pub target_id: i64,
+    pub confidence: u8,
+    pub candidates: u32,
+    pub ref_count: u32,
+    pub line: i64,
+}
+
+/// Per-symbol graph metrics, one `symbol_metrics` row.
+///
+/// `fan_in` / `fan_out` / `fan_in_files` / `dependents` / `pagerank` count
+/// resolved edges only; ambiguous edges are reported separately in the
+/// `*_ambiguous` counters and never mixed into the other numbers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct SymbolGraphMetrics {
+    pub symbol_id: i64,
+    pub fan_in: u32,
+    pub fan_in_files: u32,
+    pub fan_in_ambiguous: u32,
+    pub fan_out: u32,
+    pub fan_out_ambiguous: u32,
+    pub dependents: u32,
+    pub pagerank: f64,
+    pub pagerank_pct: f64,
+}
+
+/// Symbol identity joined with its file, for graph output.
+#[derive(Clone, Debug, Serialize)]
+pub struct GraphSymbolInfo {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+    pub end_line: Option<i64>,
+    pub path: String,
+    #[serde(skip_serializing)]
+    pub root_path: Option<String>,
+}
+
+/// Whether a graph was built, and whether the index moved on since.
+#[derive(Clone, Debug)]
+pub struct SymbolGraphState {
+    pub built: bool,
+    pub stale: bool,
+    pub built_at: Option<i64>,
+    pub summary: Option<String>,
+}
+
+pub fn load_graph_files(conn: &Connection) -> Result<Vec<GraphFileRow>> {
+    let mut stmt = conn.prepare("SELECT id, path, root_path FROM files ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(GraphFileRow {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                root_path: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every symbol, grouped by file and ordered by start line.
+pub fn load_graph_symbols(conn: &Connection) -> Result<Vec<GraphSymbolRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_id, name, kind, line, end_line FROM symbols ORDER BY file_id, line, id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(GraphSymbolRow {
+                id: row.get(0)?,
+                file_id: row.get(1)?,
+                name: row.get(2)?,
+                kind: row.get(3)?,
+                line: row.get(4)?,
+                end_line: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Stream every reference grouped by file, without materializing the table.
+pub fn for_each_graph_ref<F>(conn: &Connection, mut visit: F) -> Result<()>
+where
+    F: FnMut(i64, &str, i64, Option<&str>) -> Result<()>,
+{
+    let mut stmt =
+        conn.prepare("SELECT file_id, name, line, context FROM refs ORDER BY file_id")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let file_id: i64 = row.get(0)?;
+        let name = row.get_ref(1)?.as_str()?;
+        let line: i64 = row.get(2)?;
+        let context = row.get_ref(3)?.as_str_or_null()?;
+        visit(file_id, name, line, context)?;
+    }
+    Ok(())
+}
+
+/// `(child symbol id, parent name as written)` for every inheritance row.
+pub fn load_inheritance_rows(conn: &Connection) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT child_id, parent_name FROM inheritance")?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Cheap digest of the indexed content the graph was derived from.
+///
+/// Incremental updates delete and re-insert the rows of every changed file,
+/// so row counts, the highest row ids and the summed file mtimes/sizes all
+/// move when anything the graph depends on changes, while an update that
+/// found nothing to do leaves the digest untouched.
+pub fn index_fingerprint(conn: &Connection) -> Result<String> {
+    let (files, file_max, mtimes, sizes): (i64, i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(mtime), 0), COALESCE(SUM(size), 0)
+         FROM files",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let (symbols, symbol_max): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM symbols",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let (refs, ref_max): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM refs",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let inheritance: i64 =
+        conn.query_row("SELECT COUNT(*) FROM inheritance", [], |row| row.get(0))?;
+    Ok(format!(
+        "f{files}:{file_max}:{mtimes}:{sizes}/s{symbols}:{symbol_max}/r{refs}:{ref_max}/i{inheritance}"
+    ))
+}
+
+/// Replace the whole stored graph in one transaction.
+pub fn store_symbol_graph(
+    conn: &mut Connection,
+    edges: &[SymbolEdgeRow],
+    metrics: &[SymbolGraphMetrics],
+    fingerprint: &str,
+    summary_json: &str,
+) -> Result<()> {
+    let built_at = current_unix_millis()?;
+    let tx = conn
+        .transaction()
+        .context("failed to start symbol graph write")?;
+    tx.execute_batch(CREATE_SYMBOL_GRAPH_SQL)?;
+    tx.execute("DELETE FROM symbol_edges", [])?;
+    tx.execute("DELETE FROM symbol_metrics", [])?;
+    // Bulk-loading into the primary key order and indexing afterwards is
+    // several times faster than maintaining the target index row by row.
+    tx.execute("DROP INDEX IF EXISTS idx_symbol_edges_target", [])?;
+    {
+        let mut insert_edge = tx.prepare(
+            "INSERT INTO symbol_edges
+                 (source_id, target_id, confidence, candidates, ref_count, line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for edge in edges {
+            insert_edge.execute(params![
+                edge.source_id,
+                edge.target_id,
+                edge.confidence,
+                edge.candidates,
+                edge.ref_count,
+                edge.line,
+            ])?;
+        }
+        let mut insert_metrics = tx.prepare(
+            "INSERT INTO symbol_metrics
+                 (symbol_id, fan_in, fan_in_files, fan_in_ambiguous, fan_out,
+                  fan_out_ambiguous, dependents, pagerank, pagerank_pct)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for row in metrics {
+            insert_metrics.execute(params![
+                row.symbol_id,
+                row.fan_in,
+                row.fan_in_files,
+                row.fan_in_ambiguous,
+                row.fan_out,
+                row.fan_out_ambiguous,
+                row.dependents,
+                row.pagerank,
+                row.pagerank_pct,
+            ])?;
+        }
+    }
+    tx.execute_batch(CREATE_SYMBOL_GRAPH_SQL)?;
+    for (key, value) in [
+        (SYMBOL_GRAPH_FINGERPRINT_KEY, fingerprint.to_string()),
+        (SYMBOL_GRAPH_BUILT_AT_KEY, built_at.to_string()),
+        (SYMBOL_GRAPH_SUMMARY_KEY, summary_json.to_string()),
+    ] {
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+    }
+    tx.commit().context("failed to commit symbol graph write")?;
+    Ok(())
+}
+
+/// Report whether a graph exists and whether it still matches the index.
+///
+/// An unresolved incremental-update dirty marker counts as stale even when
+/// the fingerprint happens to match: the index may be half-applied.
+pub fn symbol_graph_state(conn: &Connection) -> Result<SymbolGraphState> {
+    let fingerprint = get_metadata_value(conn, SYMBOL_GRAPH_FINGERPRINT_KEY)?;
+    let built_at = get_metadata_value(conn, SYMBOL_GRAPH_BUILT_AT_KEY)?
+        .and_then(|value| value.parse::<i64>().ok());
+    let summary = get_metadata_value(conn, SYMBOL_GRAPH_SUMMARY_KEY)?;
+    let Some(fingerprint) = fingerprint else {
+        return Ok(SymbolGraphState {
+            built: false,
+            stale: false,
+            built_at,
+            summary,
+        });
+    };
+    let stale = has_index_update_dirty(conn)? || index_fingerprint(conn)? != fingerprint;
+    Ok(SymbolGraphState {
+        built: true,
+        stale,
+        built_at,
+        summary,
+    })
+}
+
+fn row_to_symbol_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolEdgeRow> {
+    Ok(SymbolEdgeRow {
+        source_id: row.get(0)?,
+        target_id: row.get(1)?,
+        confidence: row.get(2)?,
+        candidates: row.get(3)?,
+        ref_count: row.get(4)?,
+        line: row.get(5)?,
+    })
+}
+
+fn load_symbol_edges_by(
+    conn: &Connection,
+    column: &str,
+    ids: &[i64],
+    max_confidence: u8,
+) -> Result<Vec<SymbolEdgeRow>> {
+    let mut edges = Vec::new();
+    for chunk in ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT source_id, target_id, confidence, candidates, ref_count, line
+             FROM symbol_edges WHERE {column} IN ({placeholders}) AND confidence <= ?"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        values.push(&max_confidence);
+        let rows = stmt.query_map(values.as_slice(), row_to_symbol_edge)?;
+        for row in rows {
+            edges.push(row?);
+        }
+    }
+    Ok(edges)
+}
+
+/// Edges pointing at any of `target_ids` (who depends on them), with
+/// confidence up to and including `max_confidence`.
+pub fn load_symbol_edges_to(
+    conn: &Connection,
+    target_ids: &[i64],
+    max_confidence: u8,
+) -> Result<Vec<SymbolEdgeRow>> {
+    load_symbol_edges_by(conn, "target_id", target_ids, max_confidence)
+}
+
+/// Edges leaving any of `source_ids` (what they depend on).
+pub fn load_symbol_edges_from(
+    conn: &Connection,
+    source_ids: &[i64],
+    max_confidence: u8,
+) -> Result<Vec<SymbolEdgeRow>> {
+    load_symbol_edges_by(conn, "source_id", source_ids, max_confidence)
+}
+
+/// Every stored edge up to `max_confidence`, in primary-key order.
+pub fn load_all_symbol_edges(conn: &Connection, max_confidence: u8) -> Result<Vec<SymbolEdgeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT source_id, target_id, confidence, candidates, ref_count, line
+         FROM symbol_edges WHERE confidence <= ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![max_confidence], row_to_symbol_edge)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Stored edge counts per confidence level.
+pub fn count_symbol_edges_by_confidence(conn: &Connection) -> Result<Vec<(u8, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT confidence, COUNT(*) FROM symbol_edges GROUP BY confidence ORDER BY confidence",
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn row_to_symbol_metrics(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolGraphMetrics> {
+    Ok(SymbolGraphMetrics {
+        symbol_id: row.get(0)?,
+        fan_in: row.get(1)?,
+        fan_in_files: row.get(2)?,
+        fan_in_ambiguous: row.get(3)?,
+        fan_out: row.get(4)?,
+        fan_out_ambiguous: row.get(5)?,
+        dependents: row.get(6)?,
+        pagerank: row.get(7)?,
+        pagerank_pct: row.get(8)?,
+    })
+}
+
+/// Graph metrics for a batch of symbols in one round trip per 500 ids.
+///
+/// This is the entry point for rankers that need structural signals for a
+/// whole result list. Ids absent from the map touch no edge at all (or the
+/// graph was never built — check [`symbol_graph_state`]); callers should treat
+/// them as zero rather than unknown when the graph is built.
+pub fn load_symbol_graph_metrics(
+    conn: &Connection,
+    symbol_ids: &[i64],
+) -> Result<HashMap<i64, SymbolGraphMetrics>> {
+    let mut metrics = HashMap::with_capacity(symbol_ids.len());
+    if !table_exists(conn, "symbol_metrics")? {
+        return Ok(metrics);
+    }
+    for chunk in symbol_ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT symbol_id, fan_in, fan_in_files, fan_in_ambiguous, fan_out,
+                    fan_out_ambiguous, dependents, pagerank, pagerank_pct
+             FROM symbol_metrics WHERE symbol_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(values.as_slice(), row_to_symbol_metrics)?;
+        for row in rows {
+            let row = row?;
+            metrics.insert(row.symbol_id, row);
+        }
+    }
+    Ok(metrics)
+}
+
+/// Every stored metrics row (symbols touching at least one edge).
+pub fn load_all_symbol_graph_metrics(conn: &Connection) -> Result<Vec<SymbolGraphMetrics>> {
+    let mut stmt = conn.prepare(
+        "SELECT symbol_id, fan_in, fan_in_files, fan_in_ambiguous, fan_out,
+                fan_out_ambiguous, dependents, pagerank, pagerank_pct
+         FROM symbol_metrics",
+    )?;
+    let rows = stmt
+        .query_map([], row_to_symbol_metrics)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn row_to_graph_symbol_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphSymbolInfo> {
+    Ok(GraphSymbolInfo {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        line: row.get(3)?,
+        end_line: row.get(4)?,
+        path: row.get(5)?,
+        root_path: row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
+    })
+}
+
+/// Symbol and file details for a batch of symbol ids.
+pub fn load_graph_symbol_infos(
+    conn: &Connection,
+    symbol_ids: &[i64],
+) -> Result<HashMap<i64, GraphSymbolInfo>> {
+    let mut infos = HashMap::with_capacity(symbol_ids.len());
+    for chunk in symbol_ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT s.id, s.name, s.kind, s.line, s.end_line, f.path, f.root_path
+             FROM symbols s JOIN files f ON f.id = s.file_id
+             WHERE s.id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(values.as_slice(), row_to_graph_symbol_info)?;
+        for row in rows {
+            let row = row?;
+            infos.insert(row.id, row);
+        }
+    }
+    Ok(infos)
+}
+
+/// Symbols a user-supplied name may denote: an exact `name` match plus the
+/// qualified spellings the parsers produce for the same short name
+/// (`Outer::Name`, `self.name`, `:name`).
+pub fn find_graph_symbols_by_name(conn: &Connection, name: &str) -> Result<Vec<GraphSymbolInfo>> {
+    let escaped = name
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.id, s.name, s.kind, s.line, s.end_line, f.path, f.root_path
+        FROM symbols s JOIN files f ON f.id = s.file_id
+        WHERE s.name = ?1
+           OR s.name = 'self.' || ?1
+           OR s.name = ':' || ?1
+           OR s.name LIKE ?2 ESCAPE '\'
+        ORDER BY f.path, s.line
+        "#,
+    )?;
+    let rows = stmt
+        .query_map(
+            params![name, format!("%::{escaped}")],
+            row_to_graph_symbol_info,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Definitions nested inside a class-like symbol's range in its own file.
+pub fn find_member_symbols(conn: &Connection, container_id: i64) -> Result<Vec<GraphSymbolInfo>> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT m.id, m.name, m.kind, m.line, m.end_line, f.path, f.root_path
+        FROM symbols c
+        JOIN symbols m ON m.file_id = c.file_id
+        JOIN files f ON f.id = m.file_id
+        WHERE c.id = ?1
+          AND m.id <> c.id
+          AND c.end_line IS NOT NULL
+          AND c.kind IN ('class', 'interface', 'object', 'enum', 'package')
+          AND m.kind NOT IN ('import', 'annotation')
+          AND m.line >= c.line
+          AND COALESCE(m.end_line, m.line) <= c.end_line
+        ORDER BY m.line
+        "#,
+    )?;
+    let rows = stmt
+        .query_map(params![container_id], row_to_graph_symbol_info)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// `(container id, member id)` for every definition nested inside any of the
+/// class-like symbols in `container_ids`; other ids contribute nothing.
+pub fn load_member_links(conn: &Connection, container_ids: &[i64]) -> Result<Vec<(i64, i64)>> {
+    let mut links = Vec::new();
+    for chunk in container_ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT c.id, m.id
+             FROM symbols c
+             JOIN symbols m ON m.file_id = c.file_id
+             WHERE c.id IN ({placeholders})
+               AND c.kind IN ('class', 'interface', 'object', 'enum', 'package')
+               AND c.end_line IS NOT NULL
+               AND m.id <> c.id
+               AND m.kind NOT IN ('import', 'annotation')
+               AND m.line >= c.line
+               AND COALESCE(m.end_line, m.line) <= c.end_line"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(values.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))?;
+        for row in rows {
+            links.push(row?);
+        }
+    }
+    Ok(links)
+}
+
+/// Narrowest class-like symbol whose range encloses `line` in the file that
+/// holds `symbol_id`, excluding the symbol itself.
+pub fn find_enclosing_container(
+    conn: &Connection,
+    symbol_id: i64,
+) -> Result<Option<GraphSymbolInfo>> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT c.id, c.name, c.kind, c.line, c.end_line, f.path, f.root_path
+        FROM symbols s
+        JOIN symbols c ON c.file_id = s.file_id
+        JOIN files f ON f.id = c.file_id
+        WHERE s.id = ?1
+          AND c.id <> s.id
+          AND c.kind IN ('class', 'interface', 'object', 'enum', 'package')
+          AND c.end_line IS NOT NULL
+          AND c.line <= s.line
+          AND c.end_line >= COALESCE(s.end_line, s.line)
+        ORDER BY c.end_line - c.line ASC, c.line DESC
+        LIMIT 1
+        "#,
+    )?;
+    Ok(stmt
+        .query_row(params![symbol_id], row_to_graph_symbol_info)
+        .optional()?)
 }
 
 /// Returns module indexing time and the effective file-update time.

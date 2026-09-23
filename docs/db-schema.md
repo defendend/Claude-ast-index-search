@@ -5,7 +5,7 @@ ast-index stores each project's code graph in a SQLite database under
 `$XDG_CACHE_HOME/ast-index/<hash>/index.db` on Linux. `<hash>` is derived from
 the normalized project root.
 
-The authoritative DDL lives in `src/db.rs`. The current schema has 15 base
+The authoritative DDL lives in `src/db.rs`. The current schema has 19 base
 tables plus the `symbols_fts` FTS5 virtual table. Fresh rebuilds create the
 base tables first, bulk-load data, and add secondary indexes and FTS only
 afterward.
@@ -30,6 +30,8 @@ modules ── module_deps
    └────── storyboard_usages
 
 metadata                         symbols ── external content ── symbols_fts
+                                 symbols ── id match ── symbol_edges / symbol_metrics
+git_file_stats ── git_file_authors
 ```
 
 The line between `subtrees.canonical_path` and `files.root_path` is a value
@@ -57,6 +59,10 @@ Every declared foreign key below uses `ON DELETE CASCADE`.
 | `ios_asset_usages` | `id INTEGER PK`, `asset_id INTEGER`, `usage_file TEXT NN`, `usage_line INTEGER NN`, `usage_type TEXT` | `asset_id → ios_assets.id` |
 | `metadata` | `key TEXT PK`, `value TEXT NN` | — |
 | `subtrees` | `id INTEGER PK`, `name TEXT NN UQ`, `canonical_path TEXT NN UQ`, `original_path TEXT NN` | — |
+| `git_file_stats` | `path TEXT PK`, `commits`, `fix_commits`, `lines_added`, `lines_deleted` (`INTEGER NN DEFAULT 0`), `first_commit_at INTEGER`, `last_commit_at INTEGER`, `current_lines INTEGER` | — |
+| `git_file_authors` | `path TEXT NN`, `author TEXT NN` | `PRIMARY KEY(path, author)` |
+| `symbol_edges` | `source_id INTEGER NN`, `target_id INTEGER NN`, `confidence INTEGER NN`, `candidates INTEGER NN`, `ref_count INTEGER NN`, `line INTEGER NN` | `PRIMARY KEY(source_id, target_id)`, `WITHOUT ROWID` |
+| `symbol_metrics` | `symbol_id INTEGER PK`, `fan_in`, `fan_in_files`, `fan_in_ambiguous`, `fan_out`, `fan_out_ambiguous`, `dependents` (`INTEGER NN`), `pagerank REAL NN`, `pagerank_pct REAL NN` | — |
 
 ### File identity and roots
 
@@ -98,6 +104,40 @@ neither points to a specific `symbols` row. References therefore remain
 language-agnostic, and an inheritance parent may live outside the index.
 `inheritance.child_id` is the resolved side of an inheritance edge.
 
+### VCS history signals
+
+`git_file_stats` and `git_file_authors` hold per-file Git history collected
+on demand by `hotspots --collect`. `path` is relative to the project root, the
+same key space as `files.path`, but rows also exist for paths the indexer
+never parses and for deleted files (`current_lines IS NULL`).
+
+### Symbol graph
+
+`symbol_edges` and `symbol_metrics` are filled only by `graph build`; `rebuild`
+starts a database with both tables empty and `update` never writes them.
+
+An edge `source_id -> target_id` means the symbol that owns a reference (the
+narrowest definition containing its line, as `find_owning_symbol` computes it;
+import and annotation lines count for the definition around them) depends on
+the definition that reference names. `refs` rows are folded per pair:
+`ref_count` is how many references, `line` the first one. `confidence` records
+how the target was chosen among same-named definitions: `0` local (same file),
+`1` scoped (namespace path, lexical nesting, constant receiver, inheritance),
+`2` import, `3` unique, `4` ambiguous. An ambiguous reference is stored as one
+edge per candidate, each with `candidates = k` (up to 8; references with more
+candidates are not stored). Resolved edges have `candidates = 1`.
+
+`symbol_metrics` has one row per symbol that touches any edge. `fan_in`,
+`fan_out`, `fan_in_files`, `dependents` (distinct symbols reaching this one
+within 3 hops) and `pagerank` count resolved edges only; `fan_in_ambiguous`
+and `fan_out_ambiguous` count the ambiguous ones. `pagerank` is scaled so the
+average node scores 1.0; `pagerank_pct` is its midrank percentile.
+
+Neither table declares a foreign key: a cascading delete would slow every
+incremental update, and rows that silently disappeared would make an outdated
+graph look current. Instead `graph build` stores a digest of the index
+(`symbol_graph_fingerprint`) and queries compare it with the live index.
+
 ### Platform-specific data
 
 The Android tables are `resources`, `resource_usages`, and `xml_usages`.
@@ -120,6 +160,10 @@ keys:
 | `last_update_at` | Unix timestamp in milliseconds for the last completed file-index update. |
 | `index_update_dirty_at` | Unix timestamp in milliseconds marking an incremental update that may be partial; removed when completion is published. |
 | `last_modules_indexed_at` | Unix timestamp in milliseconds for completed module indexing. |
+| `git_signals_head`, `git_signals_repo_root`, `git_signals_scope`, `git_signals_collected_at`, `git_signals_commits` | Commit cursor and bookkeeping of the last `hotspots --collect`. |
+| `symbol_graph_fingerprint` | Digest of `files`, `symbols`, `refs` and `inheritance` row counts, highest ids and summed file mtimes/sizes when the graph was built; a mismatch marks the graph stale. |
+| `symbol_graph_built_at` | Unix timestamp in milliseconds of the last `graph build`. |
+| `symbol_graph_summary` | JSON summary of the last build: edges and references per confidence level, references not linked per reason. |
 
 `extra_roots` is a legacy migration input only. On open, its JSON array is
 moved into `subtrees` and the metadata row is deleted. There is no
@@ -146,6 +190,10 @@ The current explicit secondary indexes are:
   `idx_inheritance_parent`,
   `idx_refs_file`, and
   `idx_refs_name_file_line` on `(name, file_id, line)`.
+- Symbol graph:
+  `idx_symbol_edges_target` on `(target_id, confidence)` for incoming-edge
+  lookups (outgoing ones use the primary key). It is created with the table
+  and dropped/recreated around each `graph build` bulk load.
 - Android data:
   `idx_xml_usages_class`,
   `idx_xml_usages_module`,
@@ -176,7 +224,7 @@ Older databases drop those indexes when opened. The qualified-name index is
 also migrated to its current partial definition, a missing
 `symbols.end_line` column is added, and a missing
 `idx_symbols_file_line_end` is created. This optimization changes
-index structures only: all 15 base tables and their raw columns remain
+index structures only: all base tables and their raw columns remain
 available to `ast-index query` and `ast-index schema` for compatibility.
 
 ## Full-text search

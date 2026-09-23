@@ -354,6 +354,7 @@ slice via offset/limit. Never bulk-read large files.
 
 - **Search:** `search`, `file`, `symbol`, `class` — find files and symbols by name
 - **Usages:** `usages`, `callers`, `call-tree`, `refs` — find where symbols are used
+- **Graph:** `graph dependents|dependencies|impact|path|cycles|top|metrics` — symbol dependency graph (`graph build` first)
 - **Hierarchy:** `implementations`, `hierarchy`, `extensions` — class hierarchy
 - **Modules:** `module`, `deps`, `dependents`, `api` — module dependencies
 - **Files:** `outline`, `imports`, `changed` — file analysis
@@ -371,6 +372,7 @@ slice via offset/limit. Never bulk-read large files.
 - `ast-index dependents "NetworkKit"` — what depends on this module?
 - `ast-index changed` — what changed in my branch?
 - `ast-index hotspots --collect` — which files churn most and attract the most bugfixes?
+- `ast-index graph impact "PaymentGateway" --depth 3` — what breaks if I change this, transitively?
 - `ast-index todo` — find all TODOs
 ````
 
@@ -430,6 +432,11 @@ ast-index outline src/main.rs           # file structure
 ast-index imports src/main.rs           # imports/includes
 ast-index changed                       # files changed on the current branch
 ast-index hotspots --collect            # rank files by Git history (churn, fixes, authors)
+ast-index graph build                   # precompute the symbol dependency graph
+ast-index graph dependents "Invoice"    # who depends on it, with resolution confidence
+ast-index graph impact "Invoice" -d 3   # transitive dependents per depth
+ast-index graph path "OrdersController" "Invoice"  # how one reaches the other
+ast-index graph top --kind class        # most central symbols (PageRank)
 ast-index map                           # compact project map
 ast-index conventions                   # detected frameworks and patterns
 ```
@@ -460,6 +467,25 @@ ast-index query "
   ORDER BY f.path, s.line
 "
 ```
+
+Build the symbol dependency graph when you need to know who really depends on
+a definition, how central it is, or what a change would reach transitively:
+
+```bash
+ast-index graph build                         # explicit; rebuild/update never run it
+ast-index graph dependents "Invoice"          # incoming edges with confidence
+ast-index graph dependencies "OrdersController" --members
+ast-index graph impact "Invoice" --depth 3    # blast radius per depth (symbols, files)
+ast-index graph path "OrdersController" "Invoice"
+ast-index graph cycles
+ast-index graph top --sort pagerank --kind class
+```
+
+Each edge records how its target was resolved: `local`, `scoped` (namespace,
+receiver type or inheritance), `import`, `unique`, or `ambiguous` with the
+number of candidates. Metrics count resolved edges only; `--include-ambiguous`
+lists the rest. After `update` changes the index the graph reports itself as
+stale until `graph build` (or a query with `--refresh`) runs again.
 
 Use structural search through ast-grep when `sg` is installed:
 

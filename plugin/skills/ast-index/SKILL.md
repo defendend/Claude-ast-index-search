@@ -198,6 +198,46 @@ ast-index call-tree "processPayment" --depth 3 --limit 10
 ast-index call-tree "getUsers"       # Java: finds callers of getUsers() method
 ```
 
+### Symbol Dependency Graph
+
+**`graph`** - A directed symbol-to-symbol graph built from the index: an edge
+means "the definition containing a reference" -> "the definition that
+reference names". Unlike `callers` / `call-tree` (text search at query time)
+it answers from precomputed edges and says how sure it is about each target.
+
+```bash
+ast-index graph build                                 # Build/refresh the graph (explicit, ~seconds)
+ast-index graph status                                # Built? Stale? Edge counts per confidence
+ast-index graph dependents ApplicationService         # Who depends on it (incoming edges)
+ast-index graph dependents "Billing::Invoice#total"   # A member of one class
+ast-index graph dependencies CheckoutController --members  # What a class and its methods use
+ast-index graph impact PaymentGateway --depth 3       # Blast radius: dependents per depth, files
+ast-index graph path OrdersController Invoice         # Shortest dependency path(s) between two symbols
+ast-index graph cycles --path app/models              # Strongly connected components
+ast-index graph top --kind class --exclude-tests      # Most central symbols (PageRank)
+ast-index graph metrics Invoice Payment               # fan-in/out, dependents, PageRank per symbol
+```
+
+Every edge carries the level at which its target was resolved:
+`local` (same file), `scoped` (explicit namespace `A::B::Name`, lexical
+nesting, a constant receiver `Type.method`, or inheritance/mixins), `import`
+(the source file imports the target's module), `unique` (only definition of
+that name in the language), `ambiguous` (several candidates, or a call on a
+receiver of unknown type — `candidates` says how many). Fan-in, fan-out,
+dependents and PageRank count **resolved edges only**; ambiguous edges are
+counted separately and listed with `--include-ambiguous` (on `impact` that
+gives an upper bound next to the resolved-only number).
+
+A class symbol only owns its class-level references (superclass, mixins);
+pass `--members` to `dependents` / `dependencies` / `impact` to cover the
+definitions inside it. `path` always treats a class as itself plus its
+members and may step from a class into a member (shown as `contains`),
+because dispatch like `Service.call` -> `process` is not statically visible.
+
+The graph is not rebuilt by `rebuild` / `update`. After an update changes the
+index, queries print a stale warning (`"stale": true` in JSON); rerun
+`graph build` or add `--refresh` to a query to rebuild first.
+
 ### File Analysis
 
 **`imports`** - List all imports in a specific file.
