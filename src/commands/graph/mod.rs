@@ -32,6 +32,7 @@
 
 mod metrics;
 mod resolve;
+mod schema;
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -46,7 +47,10 @@ use super::{Page, PathResolver};
 use crate::db::{self, GraphSymbolInfo, SymbolEdgeRow, SymbolGraphMetrics};
 use crate::parsers::FileType;
 
-pub use resolve::{build_symbol_graph, ConfidenceCount, DropCount, DropReason, GraphBuildSummary};
+pub use resolve::{
+    build_symbol_graph, ConfidenceCount, DropCount, DropReason, GraphBuildSummary, SchemaSummary,
+};
+pub use schema::SchemaLinkSummary;
 
 /// References whose name matches more definitions than this are not stored
 /// at all: an edge to each of 681 `call` methods is noise, not information.
@@ -131,13 +135,9 @@ fn is_container_kind(kind: &str) -> bool {
     matches!(kind, "class" | "interface" | "object" | "enum" | "package")
 }
 
-/// Third-party code: never an edge target, because resolving a project name
-/// against every copy vendored under `node_modules` only multiplies ambiguity.
-pub fn is_vendor_path(path: &str) -> bool {
-    path.starts_with("node_modules/")
-        || path.contains("/node_modules/")
-        || path.starts_with("vendor/")
-        || path.contains("/vendor/")
+/// Tables and columns of a database schema dump (Rails `db/schema.rb`).
+fn is_schema_kind(kind: &str) -> bool {
+    matches!(kind, "table" | "column")
 }
 
 /// Languages that can reference each other's definitions. A Ruby constant
@@ -175,6 +175,9 @@ fn language_family(path: &str) -> &'static str {
 /// carry the last segment. Names with whitespace are DSL blocks (`it "..."`,
 /// `scope :active`) that no reference can name.
 pub fn short_name(name: &str) -> Option<&str> {
+    if let Some(helper) = rspec_helper_name(name) {
+        return Some(helper);
+    }
     if name.chars().any(char::is_whitespace) {
         return None;
     }
@@ -183,6 +186,19 @@ pub fn short_name(name: &str) -> Option<&str> {
     let name = name.strip_prefix("self.").unwrap_or(name);
     let name = name.rsplit('.').next().unwrap_or(name);
     (!name.is_empty()).then_some(name)
+}
+
+/// `let(:user)`, `let!(:user)` and `subject(:user)` define a helper method
+/// `user` for the examples of their block.
+fn rspec_helper_name(name: &str) -> Option<&str> {
+    let args = ["let(:", "let!(:", "subject(:"]
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))?;
+    let helper = args.strip_suffix(')')?;
+    let mut chars = helper.chars();
+    let valid = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '?' || c == '!');
+    valid.then_some(helper)
 }
 
 /// `qual` equals `rel` or ends with `::rel`.
@@ -325,7 +341,7 @@ pub fn resolve_symbol_spec(
         .into_iter()
         .filter(|info| {
             is_node_kind(&info.kind)
-                && !is_vendor_path(&info.path)
+                && !db::is_third_party_path(&info.path)
                 && filter
                     .in_file
                     .as_deref()
@@ -373,7 +389,7 @@ fn with_members(conn: &Connection, matched: &[GraphSymbolInfo]) -> Result<Vec<Gr
     let mut seen: HashSet<i64> = matched.iter().map(|info| info.id).collect();
     let mut all = matched.to_vec();
     for info in matched {
-        if !is_container_kind(&info.kind) {
+        if !is_container_kind(&info.kind) && info.kind != "table" {
             continue;
         }
         for member in db::find_member_symbols(conn, info.id)? {
@@ -519,6 +535,9 @@ fn summary_from_json(value: &serde_json::Value) -> Option<GraphBuildSummary> {
         ambiguity_cap: number("ambiguity_cap") as usize,
         dependents_depth: number("dependents_depth") as usize,
         elapsed_ms: u128::from(number("elapsed_ms")),
+        schema: value
+            .get("schema")
+            .and_then(|schema| serde_json::from_value(schema.clone()).ok()),
     })
 }
 
@@ -566,6 +585,9 @@ fn render_summary(summary: &GraphBuildSummary) {
             );
         }
     }
+    if let Some(schema) = &summary.schema {
+        render_schema(schema);
+    }
     println!(
         "  {}",
         format!(
@@ -573,6 +595,39 @@ fn render_summary(summary: &GraphBuildSummary) {
             summary.ambiguity_cap
         )
         .dimmed()
+    );
+}
+
+fn render_schema(schema: &SchemaSummary) {
+    let link = &schema.link;
+    let rules: Vec<String> = link
+        .by_rule
+        .iter()
+        .map(|(rule, models)| {
+            let name = serde_json::to_value(rule)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default();
+            format!("{name} {models}")
+        })
+        .collect();
+    println!(
+        "  Schema: {} tables, {} columns; {} tables read by {} models ({}).",
+        link.tables,
+        link.columns,
+        link.tables_linked,
+        link.models_linked,
+        rules.join(", ")
+    );
+    println!(
+        "    Unmatched: {} tables without a model, {} models without a table, {} models with two candidate tables (--format json lists them).",
+        link.tables_without_model.len(),
+        link.models_without_table.len(),
+        link.ambiguous_models.len()
+    );
+    println!(
+        "    Column edges: {} ({} references).",
+        schema.column_edges, schema.column_references
     );
 }
 
@@ -1843,6 +1898,9 @@ mod tests {
         assert_eq!(short_name(":result"), Some("result"));
         assert_eq!(short_name("valid?"), Some("valid?"));
         assert_eq!(short_name("it \"works\""), None);
+        assert_eq!(short_name("let(:invoice)"), Some("invoice"));
+        assert_eq!(short_name("let!(:paid?)"), Some("paid?"));
+        assert_eq!(short_name("subject(:service)"), Some("service"));
     }
 
     #[test]

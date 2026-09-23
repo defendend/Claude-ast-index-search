@@ -168,6 +168,19 @@ how the target was chosen among same-named definitions: `0` local (same file),
 edge per candidate, each with `candidates = k` (up to 8; references with more
 candidates are not stored). Resolved edges have `candidates = 1`.
 
+Files under a `node_modules` path segment (`db::is_third_party_path`) are
+neither sources nor targets of edges; a project's `vendor/` directory and its
+own `.d.ts` files are ordinary nodes. Search ranking demotes a wider set
+(`db::is_vendor_path`: packages plus every `.d.ts`), because a declaration
+should rank below the implementation it describes, while a graph edge into
+the project's own declaration file is still a real dependency.
+
+Rails schema dumps add two symbol kinds: `table` (one per `create_table`) and
+`column` (named `table.column`). They are never matched by name: a column is
+an edge target only for code inside a model whose table declares it (the
+model-to-table match follows Active Record's naming rules; `graph build`
+stores what it matched in `symbol_graph_summary.schema`).
+
 `symbol_metrics` has one row per symbol that touches any edge. `fan_in`,
 `fan_out`, `fan_in_files`, `dependents` (distinct symbols reaching this one
 within 3 hops) and `pagerank` count resolved edges only; `fan_in_ambiguous`

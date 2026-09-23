@@ -437,3 +437,298 @@ fn subtree_filters_are_rejected_for_build() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("graph build"));
 }
+
+#[test]
+fn scoped_constant_assignment_shadows_a_top_level_module() {
+    let ws = workspace();
+    ws.write(
+        "app/services/import/base.rb",
+        "module Import\n  def helper(value)\n    value\n  end\nend\n",
+    );
+    ws.write(
+        "lib/billing/import.rb",
+        "Billing::Import = Billing::Container.injector\n",
+    );
+    ws.write(
+        "app/services/billing/charge.rb",
+        r#"module Billing
+  class Charge
+    include Import[:repo]
+
+    def run
+      helper(1)
+    end
+  end
+end
+"#,
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+
+    let injector = ws.json(&["graph", "dependents", "Billing::Import"]);
+    assert_eq!(
+        find_other(&injector, "Billing::Charge")["confidence"],
+        "scoped"
+    );
+    let module = ws.json(&["graph", "dependents", "::Import"]);
+    assert!(items(&module).is_empty(), "{module:#}");
+    // The injector is not a mixin, so the module's methods are not inherited.
+    let helper = ws.json(&["graph", "dependents", "Import#helper"]);
+    assert_eq!(helper["resolved_edges"], 0, "{helper:#}");
+}
+
+/// A Rails app whose `db/schema.rb` is gitignored, with models linked to
+/// tables by convention, `self.table_name`, single-table inheritance and
+/// nesting.
+fn rails_schema_project() -> Workspace {
+    let ws = workspace();
+    ws.write(".gitignore", "db/schema.rb\n");
+    fs::create_dir_all(ws.root.join(".git")).unwrap();
+    ws.write(
+        "db/schema.rb",
+        r#"ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do
+  create_table "people", force: :cascade do |t|
+    t.string "first_name"
+    t.boolean "archived", default: false
+    t.string "type"
+  end
+
+  create_table "clients" do |t|
+    t.string "first_name"
+  end
+
+  create_table "orders" do |t|
+    t.string "number"
+  end
+
+  create_table "order_lines" do |t|
+    t.integer "quantity"
+  end
+
+  create_table "audits" do |t|
+    t.string "action"
+  end
+end
+"#,
+    );
+    ws.write(
+        "app/models/application_record.rb",
+        "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+    );
+    ws.write(
+        "app/models/person.rb",
+        r#"class Person < ApplicationRecord
+  def display_name
+    first_name
+  end
+
+  def hidden
+    archived? || self.first_name.nil?
+  end
+
+  def self.lookup(value)
+    first_name
+  end
+end
+"#,
+    );
+    ws.write(
+        "app/models/admin.rb",
+        "class Admin < Person\n  def label\n    first_name_changed? && first_name\n  end\nend\n",
+    );
+    ws.write(
+        "app/models/customer.rb",
+        "class Customer < ApplicationRecord\n  self.table_name = \"clients\"\n\n  def greeting\n    first_name\n  end\nend\n",
+    );
+    ws.write(
+        "app/models/order.rb",
+        "class Order < ApplicationRecord\n  class Line < ApplicationRecord\n    def total\n      quantity * 2\n    end\n  end\nend\n",
+    );
+    ws.write(
+        "app/models/invoice.rb",
+        "class Invoice < ApplicationRecord\nend\n",
+    );
+    ws.write(
+        "app/services/greeter.rb",
+        "class Greeter\n  def run(person)\n    person.first_name\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws
+}
+
+#[test]
+fn schema_columns_are_indexed_even_when_the_dump_is_gitignored() {
+    let ws = rails_schema_project();
+    let columns = ws.run(&["search", "first_name", "-t", "column"]);
+    assert!(columns.contains("people.first_name"), "{columns}");
+    assert!(columns.contains("clients.first_name"), "{columns}");
+    let outline = ws.run(&["outline", "db/schema.rb"]);
+    assert!(outline.contains("people [table]"), "{outline}");
+    assert!(outline.contains("people.archived [column]"), "{outline}");
+
+    ws.write(
+        "db/schema.rb",
+        "ActiveRecord::Schema[7.1].define(version: 2) do\n  create_table \"people\" do |t|\n    t.string \"nickname\"\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["update"]));
+    let updated = ws.run(&["search", "nickname", "-t", "column"]);
+    assert!(updated.contains("people.nickname"), "{updated}");
+    let gone = ws.run(&["search", "archived", "-t", "column"]);
+    assert!(!gone.contains("people.archived"), "{gone}");
+}
+
+#[test]
+fn model_code_resolves_to_the_columns_of_its_table() {
+    let ws = rails_schema_project();
+    let summary = ws.json(&["graph", "build"]);
+    let schema = &summary["schema"];
+    assert_eq!(schema["tables"], 5, "{schema:#}");
+    assert_eq!(schema["columns"], 7, "{schema:#}");
+    assert_eq!(schema["by_rule"]["explicit"], 1, "{schema:#}");
+    assert_eq!(schema["by_rule"]["inherited"], 1, "{schema:#}");
+    assert_eq!(schema["by_rule"]["nested"], 1, "{schema:#}");
+    assert_eq!(schema["by_rule"]["convention"], 2, "{schema:#}");
+    assert!(schema["by_rule"].get("prefixed").is_none(), "{schema:#}");
+    assert_eq!(schema["tables_without_model"][0], "audits");
+    assert_eq!(schema["models_without_table"][0]["model"], "Invoice");
+    assert_eq!(schema["models_without_table"][0]["table"], "invoices");
+
+    let people = ws.json(&["graph", "dependents", "people.first_name"]);
+    let mut sources = other_names(&people);
+    sources.sort();
+    // Readers and attribute methods in the model and its STI subclass; not
+    // the class method, not a call on another receiver, not the other table.
+    assert_eq!(
+        sources,
+        vec!["display_name", "hidden", "label"],
+        "{people:#}"
+    );
+    for item in items(&people) {
+        assert_eq!(item["confidence"], "scoped");
+    }
+    let archived = ws.json(&["graph", "dependents", "people#archived"]);
+    assert_eq!(other_names(&archived), vec!["hidden"], "{archived:#}");
+    let clients = ws.json(&["graph", "dependents", "clients.first_name"]);
+    assert_eq!(other_names(&clients), vec!["greeting"], "{clients:#}");
+    let lines = ws.json(&["graph", "dependents", "order_lines.quantity"]);
+    assert_eq!(other_names(&lines), vec!["total"], "{lines:#}");
+}
+
+#[test]
+fn production_code_never_resolves_into_test_trees() {
+    let ws = workspace();
+    ws.write(
+        "app/workers/application_worker.rb",
+        "class ApplicationWorker\nend\n",
+    );
+    ws.write(
+        "app/workers/sync_worker.rb",
+        "class SyncWorker < ApplicationWorker\nend\n",
+    );
+    ws.write(
+        "spec/support/stubs.rb",
+        "class ApplicationWorker\n  def self.enqueue(*args)\n    args\n  end\nend\n",
+    );
+    ws.write(
+        "app/services/sync_service.rb",
+        "class SyncService\n  def run\n    SyncWorker.enqueue(1)\n  end\nend\n",
+    );
+    ws.write(
+        "spec/services/sync_service_spec.rb",
+        "class SyncServiceProbe\n  def run\n    SyncWorker.enqueue(2)\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+    let report = ws.json(&["graph", "dependents", "self.enqueue"]);
+    let names = other_names(&report);
+    assert_eq!(names, vec!["run"], "{report:#}");
+    assert!(items(&report)[0]["other"]["path"]
+        .as_str()
+        .unwrap()
+        .starts_with("spec/"));
+}
+
+#[test]
+fn ruby_calls_without_parentheses_are_references() {
+    let ws = workspace();
+    ws.write(
+        "app/services/report.rb",
+        r#"class Report
+  def build(rows)
+    total = 0
+    rows.each { |row| total += row.amount }
+    header_line
+    self.footer_line
+    total.to_s
+  end
+
+  def header_line
+    1
+  end
+
+  def footer_line
+    2
+  end
+end
+"#,
+    );
+    ws.write(
+        "spec/services/report_spec.rb",
+        r#"RSpec.describe Report do
+  let(:report) { Report.new }
+
+  it "builds" do
+    expect(report.build([])).to eq("0")
+  end
+end
+"#,
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    let usages = ws.run(&["usages", "header_line"]);
+    assert!(usages.contains("app/services/report.rb:5"), "{usages}");
+    let footer = ws.run(&["usages", "footer_line"]);
+    assert!(footer.contains("app/services/report.rb:6"), "{footer}");
+    for local in ["total", "row", "rows"] {
+        let text = ws.run(&["usages", local]);
+        assert!(!text.contains("report.rb"), "{local} is a local: {text}");
+    }
+
+    ws.run(&["graph", "build"]);
+    let report = ws.json(&["graph", "dependencies", "build"]);
+    let mut names = other_names(&report);
+    names.sort();
+    assert_eq!(names, vec!["footer_line", "header_line"], "{report:#}");
+    let helper = ws.json(&["graph", "dependents", "report", "--in-file", "report_spec"]);
+    assert_eq!(items(&helper).len(), 1, "{helper:#}");
+    let example = find_other(&helper, "it \"builds\"");
+    assert_eq!(example["confidence"], "local");
+}
+
+#[test]
+fn a_project_vendor_directory_is_part_of_the_graph() {
+    let ws = workspace();
+    ws.write(
+        "vendor/billing_sdk/client.rb",
+        "class BillingClient\n  def self.charge(amount)\n    amount\n  end\nend\n",
+    );
+    ws.write(
+        "app/services/checkout.rb",
+        "class Checkout\n  def run\n    BillingClient.charge(1)\n  end\nend\n",
+    );
+    ws.write(
+        "node_modules/billing-sdk/index.d.ts",
+        "export declare class BillingClient {\n  static charge(amount: number): number;\n}\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+    let report = ws.json(&["graph", "dependents", "BillingClient"]);
+    let matched: Vec<&str> = report["matched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|symbol| symbol["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(matched, vec!["vendor/billing_sdk/client.rb"], "{report:#}");
+    let charge = ws.json(&["graph", "dependents", "BillingClient#charge"]);
+    assert_eq!(other_names(&charge), vec!["run"], "{charge:#}");
+}

@@ -13,8 +13,9 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use super::metrics::compute_metrics;
+use super::schema::{column_candidates, link_models, underscore, ModelClass, SchemaLinkSummary};
 use super::{
-    is_container_kind, is_node_kind, is_path_suffix, is_test_path, is_vendor_path, language_family,
+    is_container_kind, is_node_kind, is_path_suffix, is_schema_kind, is_test_path, language_family,
     short_name, Confidence, AMBIGUITY_CAP, DEPENDENTS_DEPTH,
 };
 use crate::db::{self, SymbolEdgeRow};
@@ -350,9 +351,10 @@ fn classify_usage<'a>(context: Option<&'a str>, name: &str, ruby: bool) -> Usage
     let Some(context) = context else {
         return Usage::Bare;
     };
-    // The reference extractor only records a lowercase name when it is
-    // called (`name(`); other occurrences on the line (`:name`, `name:`) are
-    // not the one that produced the row.
+    // The reference extractor records a lowercase name when it is called:
+    // `name(` in every language, and in Ruby also `recv.name` and a bare
+    // `name` that is not a local. A call with parentheses on the line is the
+    // likeliest producer of the row; `:name` and `name:` never are.
     let call_only = name.chars().next().is_some_and(char::is_lowercase)
         && !name.ends_with('?')
         && !name.ends_with('!');
@@ -534,7 +536,12 @@ struct FileNode {
     path: String,
     stem: String,
     family: &'static str,
+    /// An installed package ([`db::is_third_party_path`]): neither the source
+    /// nor the target of an edge, because resolving a project name against
+    /// every copy under `node_modules` only multiplies ambiguity.
     vendor: bool,
+    /// Under a test directory or named like a test (see [`is_test_path`]).
+    test: bool,
     has_ranges: bool,
     symbols: Vec<u32>,
     imports: Vec<ImportTarget>,
@@ -587,6 +594,14 @@ struct Builder {
     /// rather than by definition because Ruby classes are reopened across
     /// files and every reopening shares the same ancestors.
     parents: HashMap<String, Vec<u32>>,
+    /// Namespace path of a class -> its superclass as written and, when the
+    /// graph resolved it, the superclass's namespace path.
+    superclasses: HashMap<String, (String, Option<String>)>,
+    /// Namespace path of a Rails model -> the `db/schema.rb` tables it reads.
+    model_tables: HashMap<String, Vec<u32>>,
+    /// Table definition -> its columns by column name.
+    table_columns: HashMap<u32, HashMap<String, u32>>,
+    schema: Option<SchemaLinkSummary>,
 }
 
 fn absolute_file_path(root: &Path, root_path: &str, path: &str) -> std::path::PathBuf {
@@ -603,7 +618,7 @@ impl Builder {
         let parsed: Vec<Option<(ModuleImports, Vec<ImportTarget>)>> = file_rows
             .par_iter()
             .map(|row| {
-                if language_family(&row.path) != "js" || is_vendor_path(&row.path) {
+                if language_family(&row.path) != "js" || db::is_third_party_path(&row.path) {
                     return None;
                 }
                 let content =
@@ -619,7 +634,7 @@ impl Builder {
         for (row, parsed) in file_rows.into_iter().zip(parsed) {
             file_index.insert(row.id, files.len() as u32);
             let family = language_family(&row.path);
-            let vendor = is_vendor_path(&row.path);
+            let vendor = db::is_third_party_path(&row.path);
             let (module, imports) = match parsed {
                 Some((module, imports)) => (Some(module), imports),
                 None => (None, Vec::new()),
@@ -628,6 +643,7 @@ impl Builder {
                 stem: strip_source_extension(&row.path).to_string(),
                 family,
                 vendor,
+                test: is_test_path(&row.path),
                 path: row.path,
                 has_ranges: false,
                 symbols: Vec::new(),
@@ -674,10 +690,15 @@ impl Builder {
             by_short: HashMap::new(),
             by_qual: HashMap::new(),
             parents: HashMap::new(),
+            superclasses: HashMap::new(),
+            model_tables: HashMap::new(),
+            table_columns: HashMap::new(),
+            schema: None,
         };
         builder.assign_containers();
         builder.index_short_names();
         builder.resolve_parents(conn)?;
+        builder.link_schema();
         Ok(builder)
     }
 
@@ -689,6 +710,7 @@ impl Builder {
             if file.vendor {
                 continue;
             }
+            let ruby = file.family == "ruby";
             let mut order = file.symbols.clone();
             order.sort_by_key(|&s| {
                 let sym = &self.syms[s as usize];
@@ -728,8 +750,12 @@ impl Builder {
                     } else {
                         short
                     };
-                    if reopened.is_none() && is_container_kind(&sym.kind) && sym.name.contains("::")
-                    {
+                    // Ruby parsers qualify `class A::B` and `A::B = value`
+                    // with their enclosing scopes already.
+                    let qualified_by_parser = (is_container_kind(&sym.kind)
+                        && reopened.is_none())
+                        || (sym.kind == "constant" && ruby);
+                    if qualified_by_parser && sym.name.contains("::") {
                         sym.name.trim_start_matches("::").to_string()
                     } else if let Some(c) = container {
                         format!("{}::{}", self.syms[c as usize].qual, own)
@@ -754,9 +780,15 @@ impl Builder {
         }
     }
 
+    /// Schema tables and columns are left out: a column is only reachable
+    /// through the model that reads its table (see [`Builder::link_schema`]),
+    /// never by name alone.
     fn index_short_names(&mut self) {
         for (index, sym) in self.syms.iter().enumerate() {
-            if self.files[sym.file as usize].vendor || !is_node_kind(&sym.kind) {
+            if self.files[sym.file as usize].vendor
+                || !is_node_kind(&sym.kind)
+                || is_schema_kind(&sym.kind)
+            {
                 continue;
             }
             if let Some(short) = short_name(&sym.name) {
@@ -781,8 +813,8 @@ impl Builder {
             .enumerate()
             .map(|(index, sym)| (sym.id, index as u32))
             .collect();
-        // (class, parent name, namespace the name is written in)
-        let mut links: Vec<(u32, String, String)> = Vec::new();
+        // (class, parent name, namespace the name is written in, superclass?)
+        let mut links: Vec<(u32, String, String, bool)> = Vec::new();
         for (child_id, parent_name) in db::load_inheritance_rows(conn)? {
             let Some(&child) = id_index.get(&child_id) else {
                 continue;
@@ -793,7 +825,7 @@ impl Builder {
                 .container
                 .map(|c| self.syms[c as usize].qual.clone())
                 .unwrap_or_default();
-            links.push((child, parent_name, namespace));
+            links.push((child, parent_name, namespace, true));
         }
         for sym in &self.syms {
             if sym.kind != "annotation" {
@@ -805,11 +837,11 @@ impl Builder {
             for keyword in ["include ", "extend ", "prepend "] {
                 if let Some(rest) = sym.name.strip_prefix(keyword) {
                     let namespace = self.syms[container as usize].qual.clone();
-                    links.push((container, rest.to_string(), namespace));
+                    links.push((container, rest.to_string(), namespace, false));
                 }
             }
         }
-        for (child, parent_name, namespace) in links {
+        for (child, parent_name, namespace, superclass) in links {
             let path = parent_name
                 .trim()
                 .split(|c: char| c == '[' || c == '(' || c == '<' || c.is_whitespace() || c == ',')
@@ -824,6 +856,15 @@ impl Builder {
                 continue;
             }
             let types = self.resolve_type(child, &namespace, path, Some(child));
+            if superclass && self.family_of(child) == "ruby" {
+                let resolved = match types.as_slice() {
+                    [parent] => Some(self.syms[*parent as usize].qual.clone()),
+                    _ => None,
+                };
+                self.superclasses
+                    .entry(self.syms[child as usize].qual.clone())
+                    .or_insert((path.to_string(), resolved));
+            }
             if let [parent] = types.as_slice() {
                 let child_qual = self.syms[child as usize].qual.clone();
                 if self.syms[*parent as usize].qual != child_qual {
@@ -835,6 +876,114 @@ impl Builder {
             }
         }
         Ok(())
+    }
+
+    /// Match Rails models to the tables of `db/schema.rb` (see
+    /// [`super::schema`]) and index each table's columns by name.
+    fn link_schema(&mut self) {
+        let mut tables: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut table_at: HashMap<(u32, &str), u32> = HashMap::new();
+        let mut classes: HashMap<String, ModelClass> = HashMap::new();
+        for (index, sym) in self.syms.iter().enumerate() {
+            let file = &self.files[sym.file as usize];
+            if file.vendor || file.family != "ruby" {
+                continue;
+            }
+            let index = index as u32;
+            match sym.kind.as_str() {
+                "table" => {
+                    tables.entry(sym.name.clone()).or_default().push(index);
+                    table_at.insert((sym.file, sym.name.as_str()), index);
+                }
+                "class" if !sym.file_private => {
+                    let test = is_test_path(&file.path);
+                    let class = classes.entry(sym.qual.clone()).or_insert(ModelClass {
+                        test_only: true,
+                        ..ModelClass::default()
+                    });
+                    class.test_only &= test;
+                }
+                _ => {}
+            }
+        }
+        if tables.is_empty() {
+            return;
+        }
+        for (qual, (written, resolved)) in &self.superclasses {
+            if let Some(class) = classes.get_mut(qual) {
+                class.superclass_written = Some(written.clone());
+                class.superclass = resolved.clone();
+            }
+        }
+        let mut column_entries: Vec<(u32, String, u32)> = Vec::new();
+        let mut prefixes: HashMap<String, String> = HashMap::new();
+        for (index, sym) in self.syms.iter().enumerate() {
+            match sym.kind.as_str() {
+                "annotation" => {
+                    if let Some(module) = sym.name.strip_prefix("isolate_namespace ") {
+                        let module = module.trim().trim_start_matches("::");
+                        let engine: Vec<String> = module.split("::").map(underscore).collect();
+                        prefixes
+                            .entry(module.to_string())
+                            .or_insert(format!("{}_", engine.join("_")));
+                        continue;
+                    }
+                    if let Some(prefix) = sym
+                        .name
+                        .strip_prefix("table_name_prefix \"")
+                        .and_then(|rest| rest.strip_suffix('"'))
+                    {
+                        if let Some(container) = sym.container {
+                            prefixes.insert(
+                                self.syms[container as usize].qual.clone(),
+                                prefix.to_string(),
+                            );
+                        }
+                        continue;
+                    }
+                    let Some(class) = sym
+                        .container
+                        .and_then(|c| classes.get_mut(&self.syms[c as usize].qual))
+                    else {
+                        continue;
+                    };
+                    if sym.name == "abstract_class" {
+                        class.abstract_class = true;
+                    } else if let Some(table) = sym
+                        .name
+                        .strip_prefix("table_name \"")
+                        .and_then(|rest| rest.strip_suffix('"'))
+                    {
+                        class.explicit_table = Some(table.to_string());
+                    }
+                }
+                "column" => {
+                    let Some((table, column)) = sym.name.split_once('.') else {
+                        continue;
+                    };
+                    let Some(&table) = table_at.get(&(sym.file, table)) else {
+                        continue;
+                    };
+                    column_entries.push((table, column.to_string(), index as u32));
+                }
+                _ => {}
+            }
+        }
+        let columns = column_entries.len() as u64;
+        for (table, column, index) in column_entries {
+            self.table_columns
+                .entry(table)
+                .or_default()
+                .insert(column, index);
+        }
+        let names: std::collections::HashSet<String> = tables.keys().cloned().collect();
+        let (links, summary) = link_models(&classes, &names, &prefixes, columns);
+        for (qual, table) in links {
+            if let Some(defs) = tables.get(&table) {
+                self.model_tables.insert(qual, defs.clone());
+            }
+        }
+        self.schema = Some(summary);
     }
 
     fn family_of(&self, sym: u32) -> &'static str {
@@ -856,11 +1005,21 @@ impl Builder {
                     .copied()
                     .filter(|&c| {
                         let sym = &self.syms[c as usize];
-                        self.family_of(c) == family && (sym.file == file || !sym.file_private)
+                        self.family_of(c) == family
+                            && (sym.file == file || !sym.file_private)
+                            && self.visible_from(file, c)
                     })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Production code never depends on a definition under a test tree: a
+    /// spec support file that reopens `ApplicationWorker` to stub
+    /// `perform_async` is not what `Worker.perform_async` calls.
+    fn visible_from(&self, file: u32, candidate: u32) -> bool {
+        self.files[file as usize].test
+            || !self.files[self.syms[candidate as usize].file as usize].test
     }
 
     /// Namespace a reference inside `scope` is looked up from.
@@ -889,6 +1048,7 @@ impl Builder {
     /// from the innermost outwards, then at the top level.
     fn lexical_match(
         &self,
+        from: u32,
         namespace: &str,
         absolute: bool,
         rel: &str,
@@ -902,7 +1062,13 @@ impl Builder {
             };
             self.by_qual
                 .get(&key)
-                .map(|found| found.iter().copied().filter(|&c| accept(c)).collect())
+                .map(|found| {
+                    found
+                        .iter()
+                        .copied()
+                        .filter(|&c| self.visible_from(from, c) && accept(c))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         if absolute {
@@ -1016,13 +1182,22 @@ impl Builder {
             return cands;
         }
         let family = node.family;
-        let found = self.lexical_match(namespace, absolute, rel, |c| {
-            is_container_kind(&self.syms[c as usize].kind)
+        let ruby = family == "ruby";
+        let found = self.lexical_match(file, namespace, absolute, rel, |c| {
+            let kind = self.syms[c as usize].kind.as_str();
+            (is_container_kind(kind) || (ruby && kind == "constant"))
                 && self.family_of(c) == family
                 && Some(c) != exclude
         });
         if !found.is_empty() || absolute {
-            return self.collapse_reopened(found);
+            // Ruby constant lookup stops at the nearest scope defining the
+            // name: `Billing::Import = injector` hides a top-level `module
+            // Import` from code inside `Billing`, and is itself no class.
+            let types: Vec<u32> = found
+                .into_iter()
+                .filter(|&c| is_container_kind(&self.syms[c as usize].kind))
+                .collect();
+            return self.collapse_reopened(types);
         }
         let found = self.suffix_match(rel, &cands);
         if !found.is_empty() {
@@ -1195,6 +1370,7 @@ impl Builder {
 
     fn walk_hierarchy(&self, class: u32, source: u32, member: &str) -> Option<Resolution> {
         let family = self.family_of(source);
+        let file = self.syms[source as usize].file;
         let mut queue = VecDeque::from([(class, 0usize)]);
         let mut seen: HashSet<u32> = HashSet::from([class]);
         while let Some((current, depth)) = queue.pop_front() {
@@ -1206,7 +1382,9 @@ impl Builder {
                     found
                         .iter()
                         .copied()
-                        .filter(|&c| self.family_of(c) == family && c != source)
+                        .filter(|&c| {
+                            self.family_of(c) == family && c != source && self.visible_from(file, c)
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -1234,10 +1412,36 @@ impl Builder {
         sym.name.starts_with("self.") || is_container_kind(&sym.kind)
     }
 
+    /// Methods of the enclosing class and its ancestors first; a Rails
+    /// model's columns only when no code in the chain defines the name.
     fn resolve_in_class_scope(&self, source: u32, name: &str) -> Option<Resolution> {
         let singleton = self.in_singleton_context(source);
-        self.class_scope(source)
-            .and_then(|class| self.resolve_in_hierarchy(class, source, name, singleton))
+        let class = self.class_scope(source)?;
+        self.resolve_in_hierarchy(class, source, name, singleton)
+            .or_else(|| self.resolve_column(class, source, name))
+    }
+
+    /// A column of the table the model `class` reads, for a reader or an
+    /// attribute method (`status`, `status?`, `saved_change_to_status?`)
+    /// called on an instance. Code in `def self.x` runs on the class, where
+    /// column readers do not exist.
+    fn resolve_column(&self, class: u32, source: u32, name: &str) -> Option<Resolution> {
+        if self.syms[source as usize].name.starts_with("self.") {
+            return None;
+        }
+        let tables = self.model_tables.get(&self.syms[class as usize].qual)?;
+        for column in column_candidates(name) {
+            let hits: Vec<u32> = tables
+                .iter()
+                .filter_map(|table| self.table_columns.get(table)?.get(column).copied())
+                .collect();
+            match hits.len() {
+                0 => continue,
+                1 => return Some(Resolution::new(Confidence::Scoped, hits)),
+                _ => return Some(Resolution::new(Confidence::Ambiguous, hits)),
+            }
+        }
+        None
     }
 
     /// Last resort by name alone. `weak` references (a receiver of unknown
@@ -1328,7 +1532,17 @@ impl Builder {
             return self.resolve_in_module(file, source, name, usage, &cands, module);
         }
         if cands.is_empty() {
-            return Err(DropReason::External);
+            // Column readers exist only at runtime: no code definition shares
+            // the name, yet the model's table declares it.
+            let on_instance = matches!(
+                usage,
+                Usage::Bare | Usage::Unseen | Usage::SelfReceiver | Usage::Symbol
+            );
+            return self
+                .class_scope(source)
+                .filter(|_| ruby && on_instance)
+                .and_then(|class| self.resolve_column(class, source, name))
+                .ok_or(DropReason::External);
         }
         let constant = name.chars().next().is_some_and(char::is_uppercase);
         match usage {
@@ -1347,8 +1561,9 @@ impl Builder {
                 };
                 let namespace = self.namespace_of(source);
                 let family = node.family;
-                let mut found =
-                    self.lexical_match(namespace, absolute, &rel, |c| self.family_of(c) == family);
+                let mut found = self.lexical_match(file, namespace, absolute, &rel, |c| {
+                    self.family_of(c) == family
+                });
                 if found.is_empty() && !absolute {
                     found = self.suffix_match(&rel, &cands);
                 }
@@ -1380,7 +1595,8 @@ impl Builder {
                     // is how Rails names polymorphic and association types;
                     // a string that happens to spell a module is just data.
                     let family = node.family;
-                    let found = self.lexical_match(self.namespace_of(source), false, name, |c| {
+                    let namespace = self.namespace_of(source);
+                    let found = self.lexical_match(file, namespace, false, name, |c| {
                         self.family_of(c) == family
                             && (!literal || self.syms[c as usize].kind == "class")
                     });
@@ -1593,6 +1809,18 @@ pub struct GraphBuildSummary {
     pub ambiguity_cap: usize,
     pub dependents_depth: usize,
     pub elapsed_ms: u128,
+    /// Rails `db/schema.rb` tables matched to models; absent without tables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<SchemaSummary>,
+}
+
+/// Schema linking plus how much of the graph it resolved.
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+pub struct SchemaSummary {
+    #[serde(flatten)]
+    pub link: SchemaLinkSummary,
+    pub column_edges: u64,
+    pub column_references: u64,
 }
 
 /// Build (or rebuild) the stored symbol graph from the current index.
@@ -1618,6 +1846,7 @@ pub fn build_symbol_graph(
     let mut refs_by_level: HashMap<Confidence, u64> = HashMap::new();
     let mut dropped: HashMap<DropReason, u64> = HashMap::new();
     let mut references_seen = 0u64;
+    let mut column_references = 0u64;
     let mut pending: Vec<(String, i64, Option<String>)> = Vec::new();
     let mut pending_file: Option<i64> = None;
 
@@ -1657,6 +1886,11 @@ pub fn build_symbol_graph(
                 Err(reason) => *dropped.entry(reason).or_default() += 1,
                 Ok(resolution) => {
                     *refs_by_level.entry(resolution.confidence).or_default() += 1;
+                    if resolution.confidence.is_resolved()
+                        && builder.syms[resolution.targets[0] as usize].kind == "column"
+                    {
+                        column_references += 1;
+                    }
                     let candidates = if resolution.confidence.is_resolved() {
                         1
                     } else {
@@ -1727,6 +1961,12 @@ pub fn build_symbol_graph(
         );
     }
 
+    let column_ids: HashSet<i64> = builder
+        .syms
+        .iter()
+        .filter(|sym| sym.kind == "column")
+        .map(|sym| sym.id)
+        .collect();
     let mut edges_by_level: HashMap<Confidence, u64> = HashMap::new();
     for row in &rows {
         *edges_by_level
@@ -1764,6 +2004,17 @@ pub fn build_symbol_graph(
         ambiguity_cap: AMBIGUITY_CAP,
         dependents_depth: DEPENDENTS_DEPTH,
         elapsed_ms: 0,
+        schema: builder.schema.clone().map(|link| SchemaSummary {
+            link,
+            column_edges: rows
+                .iter()
+                .filter(|row| {
+                    Confidence::from_code(row.confidence).is_resolved()
+                        && column_ids.contains(&row.target_id)
+                })
+                .count() as u64,
+            column_references,
+        }),
     };
     summary.elapsed_ms = started.elapsed().as_millis();
     let summary_json = serde_json::to_string(&summary)?;

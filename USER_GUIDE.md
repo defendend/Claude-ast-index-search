@@ -491,9 +491,39 @@ ast-index graph top --sort pagerank --kind class
 
 Each edge records how its target was resolved: `local`, `scoped` (namespace,
 receiver type or inheritance), `import`, `unique`, or `ambiguous` with the
-number of candidates. Metrics count resolved edges only; `--include-ambiguous`
-lists the rest. After `update` changes the index the graph reports itself as
+number of candidates. Installed packages (files under `node_modules`) are
+never part of the graph; everything else in the index is project code,
+including a `vendor/` directory and the project's own `.d.ts` files — keep
+vendored third-party code out with `exclude` in `.ast-index.yaml`. Code
+outside test directories never resolves to a definition inside one (a spec helper that reopens a class to stub a method is
+not what production code calls). Metrics count resolved edges only;
+`--include-ambiguous` lists the rest. After `update` changes the index the graph reports itself as
 stale until `graph build` (or a query with `--refresh`) runs again.
+
+Ruby references include calls without parentheses (`recv.name`, `name arg`,
+a bare `name` that is not a local variable), so the graph also links a method
+to the instance methods and attribute readers it calls on `self`, and an RSpec
+example to the `let` helpers it uses. Calls on a receiver of unknown type stay
+`ambiguous`, and core Ruby collection/string methods called without
+parentheses are not recorded at all.
+
+In a Rails application `db/schema.rb` is indexed even when it is gitignored:
+each `create_table` becomes a `table` symbol and each column a `column` symbol
+named `table.column` (`ast-index search email -t column`). `graph build`
+matches tables to models by Active Record's rules — `self.table_name`,
+single-table inheritance, a model nested in another model, a namespace's
+`table_name_prefix` or engine `isolate_namespace`, then the pluralized class
+name — and prints what it could not match (`--format json` lists the tables
+without a model, the models without a table, and models for which both a
+plain and a namespaced table exist). Inside a model, a column reader or
+attribute method (`email`, `self.email`, `email?`, `email_changed?`,
+`saved_change_to_email?`) that no method in the class chain defines resolves
+as a `scoped` edge to the column; a call on any other receiver
+(`user.email`) is never guessed:
+
+```bash
+ast-index graph dependents users.email       # or users#email
+```
 
 ### Ranking search results by history and structure
 
