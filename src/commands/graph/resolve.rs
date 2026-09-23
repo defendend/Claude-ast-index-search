@@ -351,9 +351,10 @@ fn classify_usage<'a>(context: Option<&'a str>, name: &str, ruby: bool) -> Usage
     let Some(context) = context else {
         return Usage::Bare;
     };
-    // The reference extractor only records a lowercase name when it is
-    // called (`name(`); other occurrences on the line (`:name`, `name:`) are
-    // not the one that produced the row.
+    // The reference extractor records a lowercase name when it is called:
+    // `name(` in every language, and in Ruby also `recv.name` and a bare
+    // `name` that is not a local. A call with parentheses on the line is the
+    // likeliest producer of the row; `:name` and `name:` never are.
     let call_only = name.chars().next().is_some_and(char::is_lowercase)
         && !name.ends_with('?')
         && !name.ends_with('!');

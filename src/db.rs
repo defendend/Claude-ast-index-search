@@ -9517,6 +9517,7 @@ pub fn find_graph_symbols_by_name(conn: &Connection, name: &str) -> Result<Vec<G
            OR s.name = ':' || ?1
            OR s.name LIKE ?2 ESCAPE '\'
            OR s.name LIKE ?3 ESCAPE '\'
+           OR s.name IN ('let(:' || ?1 || ')', 'let!(:' || ?1 || ')', 'subject(:' || ?1 || ')')
         ORDER BY f.path, s.line
         "#,
     )?;

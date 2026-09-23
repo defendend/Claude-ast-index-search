@@ -226,6 +226,16 @@ Indexed as:
 - `initialize` [function]
 - `call` [function]
 
+## References
+
+`usages` / `refs` see Ruby calls in every form: `name(args)`, `recv.name`,
+`name arg` and a bare `name` that is not a local variable of the method
+(parameters, assignments, block parameters and `rescue => e` are locals).
+Core Ruby and Active Support methods of strings, numbers and collections
+(`each`, `map`, `to_s`, `count`, `merge`, ...) are not recorded when called
+without parentheses. RSpec `let(:name)` / `subject(:name)` helpers are graph
+targets named `name` inside their spec file.
+
 ## Import Handling
 
 Both `require` and `require_relative` are tracked:

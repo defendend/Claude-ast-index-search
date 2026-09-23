@@ -491,6 +491,13 @@ not what production code calls). Metrics count resolved edges only;
 `--include-ambiguous` lists the rest. After `update` changes the index the graph reports itself as
 stale until `graph build` (or a query with `--refresh`) runs again.
 
+Ruby references include calls without parentheses (`recv.name`, `name arg`,
+a bare `name` that is not a local variable), so the graph also links a method
+to the instance methods and attribute readers it calls on `self`, and an RSpec
+example to the `let` helpers it uses. Calls on a receiver of unknown type stay
+`ambiguous`, and core Ruby collection/string methods called without
+parentheses are not recorded at all.
+
 In a Rails application `db/schema.rb` is indexed even when it is gitignored:
 each `create_table` becomes a `table` symbol and each column a `column` symbol
 named `table.column` (`ast-index search email -t column`). `graph build`

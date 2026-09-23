@@ -519,30 +519,30 @@ end
         "app/models/person.rb",
         r#"class Person < ApplicationRecord
   def display_name
-    first_name? ? 1 : 0
+    first_name
   end
 
   def hidden
-    archived? || saved_change_to_archived?
+    archived? || self.first_name.nil?
   end
 
   def self.lookup(value)
-    first_name?(value)
+    first_name
   end
 end
 "#,
     );
     ws.write(
         "app/models/admin.rb",
-        "class Admin < Person\n  def label\n    first_name_changed?\n  end\nend\n",
+        "class Admin < Person\n  def label\n    first_name_changed? && first_name\n  end\nend\n",
     );
     ws.write(
         "app/models/customer.rb",
-        "class Customer < ApplicationRecord\n  self.table_name = \"clients\"\n\n  def greeting\n    first_name?\n  end\nend\n",
+        "class Customer < ApplicationRecord\n  self.table_name = \"clients\"\n\n  def greeting\n    first_name\n  end\nend\n",
     );
     ws.write(
         "app/models/order.rb",
-        "class Order < ApplicationRecord\n  class Line < ApplicationRecord\n    def total\n      quantity?\n    end\n  end\nend\n",
+        "class Order < ApplicationRecord\n  class Line < ApplicationRecord\n    def total\n      quantity * 2\n    end\n  end\nend\n",
     );
     ws.write(
         "app/models/invoice.rb",
@@ -550,7 +550,7 @@ end
     );
     ws.write(
         "app/services/greeter.rb",
-        "class Greeter\n  def run(person)\n    first_name?\n  end\nend\n",
+        "class Greeter\n  def run(person)\n    person.first_name\n  end\nend\n",
     );
     assert_success(&ws.ast_index(&["rebuild"]));
     ws
@@ -596,9 +596,13 @@ fn model_code_resolves_to_the_columns_of_its_table() {
     let people = ws.json(&["graph", "dependents", "people.first_name"]);
     let mut sources = other_names(&people);
     sources.sort();
-    // Attribute methods of the model and of its STI subclass; not the class
-    // method, not an unrelated class, not the other table's column.
-    assert_eq!(sources, vec!["display_name", "label"], "{people:#}");
+    // Readers and attribute methods in the model and its STI subclass; not
+    // the class method, not a call on another receiver, not the other table.
+    assert_eq!(
+        sources,
+        vec!["display_name", "hidden", "label"],
+        "{people:#}"
+    );
     for item in items(&people) {
         assert_eq!(item["confidence"], "scoped");
     }
@@ -642,4 +646,60 @@ fn production_code_never_resolves_into_test_trees() {
         .as_str()
         .unwrap()
         .starts_with("spec/"));
+}
+
+#[test]
+fn ruby_calls_without_parentheses_are_references() {
+    let ws = workspace();
+    ws.write(
+        "app/services/report.rb",
+        r#"class Report
+  def build(rows)
+    total = 0
+    rows.each { |row| total += row.amount }
+    header_line
+    self.footer_line
+    total.to_s
+  end
+
+  def header_line
+    1
+  end
+
+  def footer_line
+    2
+  end
+end
+"#,
+    );
+    ws.write(
+        "spec/services/report_spec.rb",
+        r#"RSpec.describe Report do
+  let(:report) { Report.new }
+
+  it "builds" do
+    expect(report.build([])).to eq("0")
+  end
+end
+"#,
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    let usages = ws.run(&["usages", "header_line"]);
+    assert!(usages.contains("app/services/report.rb:5"), "{usages}");
+    let footer = ws.run(&["usages", "footer_line"]);
+    assert!(footer.contains("app/services/report.rb:6"), "{footer}");
+    for local in ["total", "row", "rows"] {
+        let text = ws.run(&["usages", local]);
+        assert!(!text.contains("report.rb"), "{local} is a local: {text}");
+    }
+
+    ws.run(&["graph", "build"]);
+    let report = ws.json(&["graph", "dependencies", "build"]);
+    let mut names = other_names(&report);
+    names.sort();
+    assert_eq!(names, vec!["footer_line", "header_line"], "{report:#}");
+    let helper = ws.json(&["graph", "dependents", "report", "--in-file", "report_spec"]);
+    assert_eq!(items(&helper).len(), 1, "{helper:#}");
+    let example = find_other(&helper, "it \"builds\"");
+    assert_eq!(example["confidence"], "local");
 }

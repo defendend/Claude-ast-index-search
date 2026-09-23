@@ -184,6 +184,9 @@ fn language_family(path: &str) -> &'static str {
 /// carry the last segment. Names with whitespace are DSL blocks (`it "..."`,
 /// `scope :active`) that no reference can name.
 pub fn short_name(name: &str) -> Option<&str> {
+    if let Some(helper) = rspec_helper_name(name) {
+        return Some(helper);
+    }
     if name.chars().any(char::is_whitespace) {
         return None;
     }
@@ -192,6 +195,19 @@ pub fn short_name(name: &str) -> Option<&str> {
     let name = name.strip_prefix("self.").unwrap_or(name);
     let name = name.rsplit('.').next().unwrap_or(name);
     (!name.is_empty()).then_some(name)
+}
+
+/// `let(:user)`, `let!(:user)` and `subject(:user)` define a helper method
+/// `user` for the examples of their block.
+fn rspec_helper_name(name: &str) -> Option<&str> {
+    let args = ["let(:", "let!(:", "subject(:"]
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))?;
+    let helper = args.strip_suffix(')')?;
+    let mut chars = helper.chars();
+    let valid = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '?' || c == '!');
+    valid.then_some(helper)
 }
 
 /// `qual` equals `rel` or ends with `::rel`.
@@ -1891,6 +1907,9 @@ mod tests {
         assert_eq!(short_name(":result"), Some("result"));
         assert_eq!(short_name("valid?"), Some("valid?"));
         assert_eq!(short_name("it \"works\""), None);
+        assert_eq!(short_name("let(:invoice)"), Some("invoice"));
+        assert_eq!(short_name("let!(:paid?)"), Some("paid?"));
+        assert_eq!(short_name("subject(:service)"), Some("service"));
     }
 
     #[test]
