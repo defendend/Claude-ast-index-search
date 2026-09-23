@@ -169,3 +169,36 @@ fn anonymous_default_export_is_indexed_under_its_module_name() {
         .expect("the searchPath call sits inside the default export");
     assert_eq!(owner.name, "useMap");
 }
+
+#[test]
+fn default_export_of_a_package_build_index_is_named_after_the_package() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let write = |rel: &str, body: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    };
+    write("package.json", "{ \"name\": \"build-index\" }\n");
+    let declaration = "export default class {\n  mount(node: Element): void;\n}\n";
+    write("node_modules/stylish/dist/index.d.ts", declaration);
+    write(
+        "node_modules/@scope/toaster/lib/esm/index.d.ts",
+        declaration,
+    );
+
+    let mut conn = Connection::open_in_memory().unwrap();
+    db::init_db(&conn).unwrap();
+    indexer::index_node_modules_dts(&mut conn, root, false).unwrap();
+
+    for (path, package) in [
+        ("node_modules/stylish/dist/index.d.ts", "stylish"),
+        ("node_modules/@scope/toaster/lib/esm/index.d.ts", "toaster"),
+    ] {
+        assert_eq!(
+            symbols_in(&conn, path),
+            vec![(package.to_string(), "class".to_string(), 1, Some(3))],
+            "{path}"
+        );
+    }
+}

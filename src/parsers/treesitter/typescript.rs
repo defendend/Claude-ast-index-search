@@ -1192,13 +1192,70 @@ fn default_export_name(path: &str) -> Option<String> {
     let module = path.file_name()?.to_str()?.split('.').next()?;
     let name = if module == "index" {
         path.parent()
-            .and_then(|dir| dir.file_name())
-            .and_then(|dir| dir.to_str())
+            .and_then(index_directory_name)
             .unwrap_or(module)
     } else {
         module
     };
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The directory an `index` file in `dir` stands for. A build or source
+/// directory only says where a package keeps the file — `pkg/dist/index.d.ts`
+/// is what `import x from 'pkg'` loads — so the name comes from the nearest
+/// directory above it. A package root in `node_modules` keeps its own name
+/// even when it looks like one of them.
+fn index_directory_name(dir: &std::path::Path) -> Option<&str> {
+    let dirs: Vec<&str> = dir.iter().filter_map(|d| d.to_str()).collect();
+    for (at, name) in dirs.iter().enumerate().rev() {
+        let package_root = match at.checked_sub(1).map(|parent| dirs[parent]) {
+            Some("node_modules") => true,
+            Some(parent) if parent.starts_with('@') => at >= 2 && dirs[at - 2] == "node_modules",
+            _ => false,
+        };
+        if package_root || !is_build_directory(name) {
+            return Some(name);
+        }
+    }
+    dirs.last().copied()
+}
+
+/// Directories named after a build output, module format or source layout
+/// rather than after what they hold: `dist`, `lib`, `esm`, `src`, `types` and
+/// variants such as `dist-types`, `lib.esm`, `types-ts3.8`, `es2015`, and the
+/// `typesVersions` directories `ts3.4`, `ts4.0`.
+fn is_build_directory(name: &str) -> bool {
+    const DIRECTORIES: &[&str] = &[
+        "build",
+        "dist",
+        "out",
+        "lib",
+        "src",
+        "esm",
+        "cjs",
+        "es",
+        "umd",
+        "amd",
+        "commonjs",
+        "module",
+        "esnext",
+        "types",
+        "typings",
+        "declarations",
+    ];
+    const VARIANT_OF: &[&str] = &["build", "dist", "lib", "esm", "cjs", "types"];
+    const VERSIONED: &[&str] = &["es", "esm", "fesm", "ts"];
+    DIRECTORIES.contains(&name)
+        || VARIANT_OF.iter().any(|base| {
+            name.strip_prefix(base)
+                .is_some_and(|rest| rest.starts_with(['-', '.', '_']))
+        })
+        || VERSIONED.iter().any(|base| {
+            name.strip_prefix(base).is_some_and(|version| {
+                version.starts_with(|c: char| c.is_ascii_digit())
+                    && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+            })
+        })
 }
 
 fn find_capture<'a>(
@@ -1948,6 +2005,35 @@ declare function internalHelper(): void;
             rename(arrow, "src/.hidden.js"),
             vec![("default".to_string(), SymbolKind::Function)]
         );
+    }
+
+    #[test]
+    fn index_default_export_is_named_past_build_directories() {
+        for (path, expected) in [
+            ("node_modules/stylish/dist/index.d.ts", "stylish"),
+            ("node_modules/stylish/lib/index.d.ts", "stylish"),
+            ("node_modules/@scope/stylish/dist/esm/index.d.ts", "stylish"),
+            ("node_modules/stylish/dist-types/index.d.ts", "stylish"),
+            ("node_modules/stylish/types-ts3.8/index.d.ts", "stylish"),
+            ("node_modules/stylish/ts3.4/index.d.ts", "stylish"),
+            ("node_modules/stylish/dist.es2015/index.d.ts", "stylish"),
+            ("node_modules/stylish/lib/es5/index.d.ts", "stylish"),
+            ("packages/button/src/index.ts", "button"),
+            // An entry point is not a build directory.
+            ("node_modules/stylish/compat/index.d.ts", "compat"),
+            // A package keeps its name even when it reads like a build directory.
+            ("node_modules/@scope/types/index.d.ts", "types"),
+            ("node_modules/lib/dist/index.d.ts", "lib"),
+            // With nothing above it, the build directory is still better than `index`.
+            ("src/index.js", "src"),
+            ("src/components/Button/index.jsx", "Button"),
+        ] {
+            let mut symbols = TYPESCRIPT_PARSER
+                .parse_symbols("export default () => {};\n")
+                .unwrap();
+            name_default_export(&mut symbols, path);
+            assert_eq!(symbols[0].name, expected, "{path}");
+        }
     }
 
     #[test]

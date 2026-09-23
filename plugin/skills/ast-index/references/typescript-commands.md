@@ -251,6 +251,14 @@ A default export is indexed under the name the module's code goes by:
 The symbol spans the whole exported expression, so the wrapper call and the
 calls inside an inline component are attributed to it in `call-tree`.
 
+An `index` file under a build or source directory takes the name of the
+directory above it: `node_modules/pkg/dist/index.d.ts` and
+`packages/pkg/src/index.ts` → `pkg`. Skipped are `dist`, `build`, `out`,
+`lib`, `src`, `esm`, `cjs`, `es`, `umd`, `amd`, `commonjs`, `module`,
+`esnext`, `types`, `typings`, `declarations`, their variants (`dist-types`,
+`lib.esm`, `types-ts3.8`) and versioned directories (`es2015`, `esm5`,
+`ts3.4`); a package root in `node_modules` keeps its own name.
+
 ## TypeScript-Specific
 
 ### Type Aliases
