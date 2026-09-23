@@ -269,6 +269,16 @@ definitions inside it. `path` always treats a class as itself plus its
 members and may step from a class into a member (shown as `contains`),
 because dispatch like `Service.call` -> `process` is not statically visible.
 
+In a Rails app the tables of `db/schema.rb` are matched to models
+(`self.table_name`, single-table inheritance, `table_name_prefix` /
+`isolate_namespace`, nesting, the pluralized class name), and a column reader
+or attribute method called inside the model (`status`, `self.status`,
+`status?`, `saved_change_to_status?`) resolves as a `scoped` edge to the
+column: `ast-index graph dependents applicants.first_name` (or
+`applicants#first_name`). A call on another receiver (`applicant.first_name`)
+never guesses a column. `graph build` reports tables without a model and
+models without a table.
+
 The graph is not rebuilt by `rebuild` / `update`. After an update changes the
 index, queries print a stale warning (`"stale": true` in JSON); rerun
 `graph build` or add `--refresh` to a query to rebuild first.
@@ -697,8 +707,10 @@ Consult: `references/rust-commands.md`
 
 Consult: `references/ruby-commands.md`
 
-- Index: `class`, `module`, `def`, Rails DSL
+- Index: `class`, `module`, `def`, constants (`A::B = ...`), Rails DSL
 - Supports: RSpec (`describe`, `it`, `let`), Rails (associations, validations)
+- `db/schema.rb` (indexed even when gitignored): tables as `table`, columns as
+  `column` named `table.column` — `ast-index search first_name -t column`
 - `outline` and `imports` work with Ruby files
 
 ### C#/.NET

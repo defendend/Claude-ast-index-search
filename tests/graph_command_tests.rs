@@ -476,3 +476,136 @@ end
     let helper = ws.json(&["graph", "dependents", "Import#helper"]);
     assert_eq!(helper["resolved_edges"], 0, "{helper:#}");
 }
+
+/// A Rails app whose `db/schema.rb` is gitignored, with models linked to
+/// tables by convention, `self.table_name`, single-table inheritance and
+/// nesting.
+fn rails_schema_project() -> Workspace {
+    let ws = workspace();
+    ws.write(".gitignore", "db/schema.rb\n");
+    fs::create_dir_all(ws.root.join(".git")).unwrap();
+    ws.write(
+        "db/schema.rb",
+        r#"ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do
+  create_table "people", force: :cascade do |t|
+    t.string "first_name"
+    t.boolean "archived", default: false
+    t.string "type"
+  end
+
+  create_table "clients" do |t|
+    t.string "first_name"
+  end
+
+  create_table "orders" do |t|
+    t.string "number"
+  end
+
+  create_table "order_lines" do |t|
+    t.integer "quantity"
+  end
+
+  create_table "audits" do |t|
+    t.string "action"
+  end
+end
+"#,
+    );
+    ws.write(
+        "app/models/application_record.rb",
+        "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+    );
+    ws.write(
+        "app/models/person.rb",
+        r#"class Person < ApplicationRecord
+  def display_name
+    first_name? ? 1 : 0
+  end
+
+  def hidden
+    archived? || saved_change_to_archived?
+  end
+
+  def self.lookup(value)
+    first_name?(value)
+  end
+end
+"#,
+    );
+    ws.write(
+        "app/models/admin.rb",
+        "class Admin < Person\n  def label\n    first_name_changed?\n  end\nend\n",
+    );
+    ws.write(
+        "app/models/customer.rb",
+        "class Customer < ApplicationRecord\n  self.table_name = \"clients\"\n\n  def greeting\n    first_name?\n  end\nend\n",
+    );
+    ws.write(
+        "app/models/order.rb",
+        "class Order < ApplicationRecord\n  class Line < ApplicationRecord\n    def total\n      quantity?\n    end\n  end\nend\n",
+    );
+    ws.write(
+        "app/models/invoice.rb",
+        "class Invoice < ApplicationRecord\nend\n",
+    );
+    ws.write(
+        "app/services/greeter.rb",
+        "class Greeter\n  def run(person)\n    first_name?\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws
+}
+
+#[test]
+fn schema_columns_are_indexed_even_when_the_dump_is_gitignored() {
+    let ws = rails_schema_project();
+    let columns = ws.run(&["search", "first_name", "-t", "column"]);
+    assert!(columns.contains("people.first_name"), "{columns}");
+    assert!(columns.contains("clients.first_name"), "{columns}");
+    let outline = ws.run(&["outline", "db/schema.rb"]);
+    assert!(outline.contains("people [table]"), "{outline}");
+    assert!(outline.contains("people.archived [column]"), "{outline}");
+
+    ws.write(
+        "db/schema.rb",
+        "ActiveRecord::Schema[7.1].define(version: 2) do\n  create_table \"people\" do |t|\n    t.string \"nickname\"\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["update"]));
+    let updated = ws.run(&["search", "nickname", "-t", "column"]);
+    assert!(updated.contains("people.nickname"), "{updated}");
+    let gone = ws.run(&["search", "archived", "-t", "column"]);
+    assert!(!gone.contains("people.archived"), "{gone}");
+}
+
+#[test]
+fn model_code_resolves_to_the_columns_of_its_table() {
+    let ws = rails_schema_project();
+    let summary = ws.json(&["graph", "build"]);
+    let schema = &summary["schema"];
+    assert_eq!(schema["tables"], 5, "{schema:#}");
+    assert_eq!(schema["columns"], 7, "{schema:#}");
+    assert_eq!(schema["by_rule"]["explicit"], 1, "{schema:#}");
+    assert_eq!(schema["by_rule"]["inherited"], 1, "{schema:#}");
+    assert_eq!(schema["by_rule"]["nested"], 1, "{schema:#}");
+    assert_eq!(schema["by_rule"]["convention"], 2, "{schema:#}");
+    assert!(schema["by_rule"].get("prefixed").is_none(), "{schema:#}");
+    assert_eq!(schema["tables_without_model"][0], "audits");
+    assert_eq!(schema["models_without_table"][0]["model"], "Invoice");
+    assert_eq!(schema["models_without_table"][0]["table"], "invoices");
+
+    let people = ws.json(&["graph", "dependents", "people.first_name"]);
+    let mut sources = other_names(&people);
+    sources.sort();
+    // Attribute methods of the model and of its STI subclass; not the class
+    // method, not an unrelated class, not the other table's column.
+    assert_eq!(sources, vec!["display_name", "label"], "{people:#}");
+    for item in items(&people) {
+        assert_eq!(item["confidence"], "scoped");
+    }
+    let archived = ws.json(&["graph", "dependents", "people#archived"]);
+    assert_eq!(other_names(&archived), vec!["hidden"], "{archived:#}");
+    let clients = ws.json(&["graph", "dependents", "clients.first_name"]);
+    assert_eq!(other_names(&clients), vec!["greeting"], "{clients:#}");
+    let lines = ws.json(&["graph", "dependents", "order_lines.quantity"]);
+    assert_eq!(other_names(&lines), vec!["total"], "{lines:#}");
+}

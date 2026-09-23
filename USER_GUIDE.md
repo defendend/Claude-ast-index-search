@@ -489,6 +489,24 @@ number of candidates. Metrics count resolved edges only; `--include-ambiguous`
 lists the rest. After `update` changes the index the graph reports itself as
 stale until `graph build` (or a query with `--refresh`) runs again.
 
+In a Rails application `db/schema.rb` is indexed even when it is gitignored:
+each `create_table` becomes a `table` symbol and each column a `column` symbol
+named `table.column` (`ast-index search email -t column`). `graph build`
+matches tables to models by Active Record's rules — `self.table_name`,
+single-table inheritance, a model nested in another model, a namespace's
+`table_name_prefix` or engine `isolate_namespace`, then the pluralized class
+name — and prints what it could not match (`--format json` lists the tables
+without a model, the models without a table, and models for which both a
+plain and a namespaced table exist). Inside a model, a column reader or
+attribute method (`email`, `self.email`, `email?`, `email_changed?`,
+`saved_change_to_email?`) that no method in the class chain defines resolves
+as a `scoped` edge to the column; a call on any other receiver
+(`user.email`) is never guessed:
+
+```bash
+ast-index graph dependents users.email       # or users#email
+```
+
 ### Ranking search results by history and structure
 
 `search --rank <preset>` re-orders the **Files** and **Symbols** sections of a

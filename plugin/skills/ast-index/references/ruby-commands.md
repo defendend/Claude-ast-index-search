@@ -23,6 +23,21 @@ ast-index supports parsing and indexing Ruby source files (`.rb`).
 | `scope :name` | Function | Scopes |
 | `validates :field` | Annotation | Validations |
 | `before_action :method` | Annotation | Callbacks |
+| `self.table_name = "x"`, `self.abstract_class = true` | Annotation | `table_name "x"`, `abstract_class` |
+| `def self.table_name_prefix` returning a string, `isolate_namespace Mod` | Annotation | `table_name_prefix "x_"`, `isolate_namespace Mod` |
+| `create_table "users"` in `db/schema.rb` | Table | `users` |
+| `t.string "email"` in a `create_table` block | Column | `users.email` |
+
+`db/schema.rb` (and `db/<name>_schema.rb`) is indexed even when `.gitignore`
+lists it: it is the only place that declares a model's columns. Only
+`create_table` blocks inside `ActiveRecord::Schema.define` count; migrations
+do not produce tables or columns.
+
+```bash
+ast-index search first_name -t column       # every table with that column
+ast-index outline db/schema.rb              # tables and their columns
+ast-index graph dependents users.email      # model code reading the column (after graph build)
+```
 
 ## RSpec-Specific Elements
 

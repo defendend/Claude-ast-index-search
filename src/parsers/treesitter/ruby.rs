@@ -5,7 +5,10 @@ use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_end_line, node_line, node_text, parse_tree, LanguageParser};
+use super::{
+    line_text, node_end_line, node_line, node_text, parse_tree, walk_tree_preorder, LanguageParser,
+    WalkControl,
+};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -110,6 +113,8 @@ impl LanguageParser for RubyParser {
         let idx_singleton_method_node = idx("singleton_method_node");
         let idx_assign_const_name = idx("assign_const_name");
         let idx_assign_const_node = idx("assign_const_node");
+        let idx_self_setting_name = idx("self_setting_name");
+        let idx_self_setting_value = idx("self_setting_value");
         let idx_call_method = idx("call_method");
         let idx_call_first_arg = idx("call_first_arg");
 
@@ -174,6 +179,22 @@ impl LanguageParser for RubyParser {
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
                     });
+                    // `def self.table_name_prefix; "billing_"; end` on a namespace
+                    // module prefixes the tables of the models inside it.
+                    let prefix = (obj == "self" && method_name == "table_name_prefix")
+                        .then(|| find_capture(m, idx_singleton_method_node))
+                        .flatten()
+                        .and_then(|def| returned_literal(content, def.node));
+                    if let Some(prefix) = prefix {
+                        symbols.push(ParsedSymbol {
+                            name: format!("table_name_prefix \"{prefix}\""),
+                            kind: SymbolKind::Annotation,
+                            line,
+                            end_line: Some(line),
+                            signature: line_text(content, line).trim().to_string(),
+                            parents: vec![],
+                        });
+                    }
                 }
                 continue;
             }
@@ -216,6 +237,33 @@ impl LanguageParser for RubyParser {
                 continue;
             }
 
+            // `self.table_name = "legacy_users"` binds a model to its table;
+            // `self.abstract_class = true` says it has none.
+            if let Some(cap) = find_capture(m, idx_self_setting_name) {
+                let value = find_capture(m, idx_self_setting_value)
+                    .map(|value| node_text(content, &value.node))
+                    .unwrap_or("");
+                let name = match node_text(content, &cap.node) {
+                    "table_name" => {
+                        literal_name(value).map(|table| format!("table_name \"{table}\""))
+                    }
+                    "abstract_class" if value == "true" => Some("abstract_class".to_string()),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    let line = node_line(&cap.node);
+                    symbols.push(ParsedSymbol {
+                        name,
+                        kind: SymbolKind::Annotation,
+                        line,
+                        end_line: Some(line),
+                        signature: line_text(content, line).trim().to_string(),
+                        parents: vec![],
+                    });
+                }
+                continue;
+            }
+
             // Call expressions (DSL patterns)
             if let Some(method_cap) = find_capture(m, idx_call_method) {
                 let method = node_text(content, &method_cap.node);
@@ -248,7 +296,8 @@ impl LanguageParser for RubyParser {
                     }
 
                     // include / extend / prepend — Annotation (not Import) so outline shows them
-                    "include" | "extend" | "prepend" if !has_receiver => {
+                    // Rails engines: `isolate_namespace Billing` prefixes its tables
+                    "include" | "extend" | "prepend" | "isolate_namespace" if !has_receiver => {
                         if let Some(arg) = first_arg {
                             symbols.push(ParsedSymbol {
                                 name: format!("{} {}", method, arg),
@@ -485,6 +534,15 @@ impl LanguageParser for RubyParser {
                         }
                     }
 
+                    // Rails schema dump: `create_table "users" do |t| t.string "email" end`
+                    "create_table" if !has_receiver => {
+                        if let (Some(call), Some(arg)) = (call_node, first_arg) {
+                            if is_schema_definition(content, call) {
+                                push_schema_table(content, call, arg, &mut symbols);
+                            }
+                        }
+                    }
+
                     _ => {}
                 }
                 continue;
@@ -560,6 +618,130 @@ fn is_constant_path(text: &str) -> bool {
             segment.chars().next().is_some_and(char::is_uppercase)
                 && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
         })
+}
+
+/// Table-block methods of a schema dump that declare no column of their own.
+const NON_COLUMN_TABLE_METHODS: &[&str] = &[
+    "index",
+    "check_constraint",
+    "exclusion_constraint",
+    "unique_constraint",
+    "foreign_key",
+    "timestamps",
+    "references",
+    "belongs_to",
+];
+
+/// `"users"`, `'users'` or `:users` without interpolation.
+fn literal_name(text: &str) -> Option<&str> {
+    let name = text
+        .strip_prefix(':')
+        .or_else(|| {
+            text.strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+        })
+        .or_else(|| {
+            text.strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })?;
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.'))
+    .then_some(name)
+}
+
+/// The string a method body consists of (`def self.x; "value"; end`).
+fn returned_literal<'a>(content: &'a str, method: tree_sitter::Node) -> Option<&'a str> {
+    let body = method.child_by_field_name("body")?;
+    let only = (body.named_child_count() == 1)
+        .then(|| body.named_child(0))
+        .flatten()?;
+    (only.kind() == "string")
+        .then(|| literal_name(node_text(content, &only)))
+        .flatten()
+}
+
+/// Whether `call` sits inside `ActiveRecord::Schema.define` (or the versioned
+/// `ActiveRecord::Schema[7.1].define`): the schema dump, not a migration.
+fn is_schema_definition(content: &str, call: tree_sitter::Node) -> bool {
+    let mut current = call.parent();
+    while let Some(node) = current {
+        if node.kind() == "call" {
+            if let Some(receiver) = node.child_by_field_name("receiver") {
+                if node_text(content, &receiver).starts_with("ActiveRecord::Schema") {
+                    return true;
+                }
+            }
+        }
+        current = node.parent();
+    }
+    false
+}
+
+/// A `create_table` block: the table and one `table.column` symbol per
+/// `t.<type> "column"` line.
+fn push_schema_table(
+    content: &str,
+    call: tree_sitter::Node,
+    first_arg: &str,
+    symbols: &mut Vec<ParsedSymbol>,
+) {
+    let Some(table) = literal_name(first_arg) else {
+        return;
+    };
+    let line = node_line(&call);
+    symbols.push(ParsedSymbol {
+        name: table.to_string(),
+        kind: SymbolKind::Table,
+        line,
+        end_line: Some(node_end_line(&call)),
+        signature: line_text(content, line).trim().to_string(),
+        parents: vec![],
+    });
+    let Some(block) = call.child_by_field_name("block") else {
+        return;
+    };
+    let mut block_cursor = block.walk();
+    let variable = block
+        .named_children(&mut block_cursor)
+        .find(|child| child.kind() == "block_parameters")
+        .and_then(|params| params.named_child(0))
+        .map(|param| node_text(content, &param));
+    let Some(variable) = variable else {
+        return;
+    };
+    walk_tree_preorder(&block, |node| {
+        if node.kind() != "call" {
+            return WalkControl::Continue;
+        }
+        let on_table = node
+            .child_by_field_name("receiver")
+            .is_some_and(|receiver| node_text(content, &receiver) == variable);
+        if !on_table {
+            return WalkControl::Continue;
+        }
+        let method = node
+            .child_by_field_name("method")
+            .map(|method| node_text(content, &method))
+            .unwrap_or("");
+        let column = node
+            .child_by_field_name("arguments")
+            .and_then(|args| args.named_child(0))
+            .and_then(|arg| literal_name(node_text(content, &arg)));
+        if let (Some(column), false) = (column, NON_COLUMN_TABLE_METHODS.contains(&method)) {
+            let line = node_line(&node);
+            symbols.push(ParsedSymbol {
+                name: format!("{table}.{column}"),
+                kind: SymbolKind::Column,
+                line,
+                end_line: Some(node_end_line(&node)),
+                signature: line_text(content, line).trim().to_string(),
+                parents: vec![],
+            });
+        }
+        WalkControl::SkipChildren
+    });
 }
 
 /// Normalize a Ruby symbol argument: strip leading `:` from `:name`
@@ -1154,6 +1336,89 @@ end
         assert!(
             !symbols.iter().any(|s| s.name.contains("timeout")),
             "a setter call is not a constant: {symbols:?}"
+        );
+    }
+
+    #[test]
+    fn test_schema_dump_tables_and_columns() {
+        let content = r#"ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do
+  enable_extension "plpgsql"
+
+  create_table "invoices", force: :cascade do |t|
+    t.bigint "customer_id", null: false
+    t.string "number"
+    t.decimal "total", precision: 10, scale: 2
+    t.datetime "created_at", null: false
+    t.index ["customer_id"], name: "index_invoices_on_customer_id"
+  end
+
+  create_table :people do |table|
+    table.column "full_name", :string
+  end
+
+  add_foreign_key "invoices", "people", column: "customer_id"
+end
+"#;
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        let of_kind = |kind: SymbolKind| -> Vec<(&str, usize, Option<usize>)> {
+            symbols
+                .iter()
+                .filter(|s| s.kind == kind)
+                .map(|s| (s.name.as_str(), s.line, s.end_line))
+                .collect()
+        };
+        assert_eq!(
+            of_kind(SymbolKind::Table),
+            vec![("invoices", 4, Some(10)), ("people", 12, Some(14))]
+        );
+        assert_eq!(
+            of_kind(SymbolKind::Column),
+            vec![
+                ("invoices.customer_id", 5, Some(5)),
+                ("invoices.number", 6, Some(6)),
+                ("invoices.total", 7, Some(7)),
+                ("invoices.created_at", 8, Some(8)),
+                ("people.full_name", 13, Some(13)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_create_table_in_a_migration_is_not_a_schema() {
+        let content = r#"class CreateInvoices < ActiveRecord::Migration[7.1]
+  def change
+    create_table :invoices do |t|
+      t.string :number
+    end
+  end
+end
+"#;
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        assert!(!symbols
+            .iter()
+            .any(|s| matches!(s.kind, SymbolKind::Table | SymbolKind::Column)));
+    }
+
+    #[test]
+    fn test_explicit_table_name() {
+        let content = "class Customer < ApplicationRecord\n  self.table_name = \"people\"\n  self.primary_key = :uuid\nend\n\
+                       class BaseRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n\
+                       module Billing\n  def self.table_name_prefix\n    'billing_'\n  end\nend\n\
+                       module Shop\n  class Engine < Rails::Engine\n    isolate_namespace Shop\n  end\nend\n";
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        let settings: Vec<(&str, usize)> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Annotation)
+            .map(|s| (s.name.as_str(), s.line))
+            .collect();
+        assert_eq!(
+            settings,
+            vec![
+                ("table_name \"people\"", 2),
+                ("abstract_class", 6),
+                ("table_name_prefix \"billing_\"", 9),
+                ("isolate_namespace Shop", 15),
+            ]
         );
     }
 

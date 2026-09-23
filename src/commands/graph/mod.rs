@@ -32,6 +32,7 @@
 
 mod metrics;
 mod resolve;
+mod schema;
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -46,7 +47,10 @@ use super::{Page, PathResolver};
 use crate::db::{self, GraphSymbolInfo, SymbolEdgeRow, SymbolGraphMetrics};
 use crate::parsers::FileType;
 
-pub use resolve::{build_symbol_graph, ConfidenceCount, DropCount, DropReason, GraphBuildSummary};
+pub use resolve::{
+    build_symbol_graph, ConfidenceCount, DropCount, DropReason, GraphBuildSummary, SchemaSummary,
+};
+pub use schema::SchemaLinkSummary;
 
 /// References whose name matches more definitions than this are not stored
 /// at all: an edge to each of 681 `call` methods is noise, not information.
@@ -129,6 +133,11 @@ fn is_node_kind(kind: &str) -> bool {
 
 fn is_container_kind(kind: &str) -> bool {
     matches!(kind, "class" | "interface" | "object" | "enum" | "package")
+}
+
+/// Tables and columns of a database schema dump (Rails `db/schema.rb`).
+fn is_schema_kind(kind: &str) -> bool {
+    matches!(kind, "table" | "column")
 }
 
 /// Third-party code: never an edge target, because resolving a project name
@@ -373,7 +382,7 @@ fn with_members(conn: &Connection, matched: &[GraphSymbolInfo]) -> Result<Vec<Gr
     let mut seen: HashSet<i64> = matched.iter().map(|info| info.id).collect();
     let mut all = matched.to_vec();
     for info in matched {
-        if !is_container_kind(&info.kind) {
+        if !is_container_kind(&info.kind) && info.kind != "table" {
             continue;
         }
         for member in db::find_member_symbols(conn, info.id)? {
@@ -519,6 +528,9 @@ fn summary_from_json(value: &serde_json::Value) -> Option<GraphBuildSummary> {
         ambiguity_cap: number("ambiguity_cap") as usize,
         dependents_depth: number("dependents_depth") as usize,
         elapsed_ms: u128::from(number("elapsed_ms")),
+        schema: value
+            .get("schema")
+            .and_then(|schema| serde_json::from_value(schema.clone()).ok()),
     })
 }
 
@@ -566,6 +578,9 @@ fn render_summary(summary: &GraphBuildSummary) {
             );
         }
     }
+    if let Some(schema) = &summary.schema {
+        render_schema(schema);
+    }
     println!(
         "  {}",
         format!(
@@ -573,6 +588,39 @@ fn render_summary(summary: &GraphBuildSummary) {
             summary.ambiguity_cap
         )
         .dimmed()
+    );
+}
+
+fn render_schema(schema: &SchemaSummary) {
+    let link = &schema.link;
+    let rules: Vec<String> = link
+        .by_rule
+        .iter()
+        .map(|(rule, models)| {
+            let name = serde_json::to_value(rule)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default();
+            format!("{name} {models}")
+        })
+        .collect();
+    println!(
+        "  Schema: {} tables, {} columns; {} tables read by {} models ({}).",
+        link.tables,
+        link.columns,
+        link.tables_linked,
+        link.models_linked,
+        rules.join(", ")
+    );
+    println!(
+        "    Unmatched: {} tables without a model, {} models without a table, {} models with two candidate tables (--format json lists them).",
+        link.tables_without_model.len(),
+        link.models_without_table.len(),
+        link.ambiguous_models.len()
+    );
+    println!(
+        "    Column edges: {} ({} references).",
+        schema.column_edges, schema.column_references
     );
 }
 

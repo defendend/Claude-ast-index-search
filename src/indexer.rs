@@ -1842,6 +1842,7 @@ fn index_directory_scoped_with_max_depth(
             gb.build().ok()
         }
     };
+    let schema_exclude = exclude_matcher.clone();
 
     let mut builder = WalkBuilder::new(walk_dir);
     builder
@@ -1974,7 +1975,14 @@ fn index_directory_scoped_with_max_depth(
         ));
     }
 
-    let files = collected.files;
+    let mut files = collected.files;
+    if use_git || arc_root.is_some() {
+        for schema in rails_schema_files(root, walk_dir, schema_exclude.as_ref()) {
+            if !files.contains(&schema) {
+                files.push(schema);
+            }
+        }
+    }
     let module_files = collected.module_files;
     let storyboard_files = collected.storyboard_files;
     let xcassets_dirs = collected.xcassets_dirs;
@@ -2303,25 +2311,31 @@ pub fn update_directory_incremental(
             }
         }
         let walker = builder.build();
-
-        for entry in walker.filter_map(|e| e.ok()) {
+        let walked = walker.filter_map(|e| e.ok()).filter_map(|entry| {
             let is_supported = entry
                 .path()
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .map(parsers::is_supported_extension)
                 .unwrap_or(false);
-            if !is_supported {
-                continue;
-            }
+            is_supported.then(|| entry.path().to_path_buf())
+        });
+        let schema_files = if is_git || arc_root.is_some() {
+            rails_schema_files(anchor, walk_dir, exclude_matcher)
+        } else {
+            Vec::new()
+        };
 
-            let file_path = entry.path().to_path_buf();
+        for file_path in walked.chain(schema_files) {
             let rel_path = file_path
                 .strip_prefix(anchor)
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .to_string();
-            let root_key = db::normalize_root_for_storage(anchor);
+            let key = (db::normalize_root_for_storage(anchor), rel_path);
+            if current_paths.contains(&key) {
+                continue;
+            }
 
             let (file_mtime, file_size) = fs::metadata(&file_path)
                 .ok()
@@ -2336,7 +2350,7 @@ pub fn update_directory_incremental(
                 })
                 .unwrap_or((0, 0));
 
-            let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
+            let need_parse = match existing_files.get(&key) {
                 Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
                 None => true,
             };
@@ -2347,7 +2361,7 @@ pub fn update_directory_incremental(
                     path: file_path,
                 });
             }
-            current_paths.insert((root_key, rel_path));
+            current_paths.insert(key);
         }
     }
 
@@ -4517,6 +4531,42 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     }
 
     Ok(count)
+}
+
+/// Rails schema dumps under `root` (`db/schema.rb`, `db/<database>_schema.rb`)
+/// that lie inside `walk_dir` and outside the configured excludes.
+///
+/// They are indexed even when ignore rules hide them: teams often gitignore
+/// the dump because every migration regenerates it, yet it is the only place
+/// that declares a model's columns. Like `node_modules` type declarations, it
+/// is generated but describes code the project uses.
+fn rails_schema_files(
+    root: &Path,
+    walk_dir: &Path,
+    exclude: Option<&ignore::gitignore::Gitignore>,
+) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root.join("db")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "schema.rb" || name.ends_with("_schema.rb"))
+        })
+        .filter(|path| path.starts_with(walk_dir))
+        .filter(|path| {
+            exclude.is_none_or(|matcher| {
+                !path.starts_with(matcher.path())
+                    || !matcher.matched_path_or_any_parents(path, false).is_ignore()
+            })
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {

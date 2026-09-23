@@ -21,6 +21,13 @@
   left: [(constant) (scope_resolution)] @assign_const_name
   right: (_) @assign_const_value) @assign_const_node
 
+; Class-level setting: self.table_name = "legacy_users"
+(assignment
+  left: (call
+    receiver: (self)
+    method: (identifier) @self_setting_name)
+  right: (_) @self_setting_value)
+
 ; Call expressions (DSL methods like require, include, attr_reader, etc.)
 ; We capture the method name and first argument for all call nodes
 (call

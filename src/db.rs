@@ -5468,6 +5468,9 @@ pub enum SymbolKind {
     Import,
     // For annotations/decorators
     Annotation,
+    // Database schema dumps (Rails `db/schema.rb`)
+    Table,
+    Column,
 }
 
 impl SymbolKind {
@@ -5485,6 +5488,8 @@ impl SymbolKind {
             SymbolKind::Constant => "constant",
             SymbolKind::Import => "import",
             SymbolKind::Annotation => "annotation",
+            SymbolKind::Table => "table",
+            SymbolKind::Column => "column",
         }
     }
 }
@@ -9511,12 +9516,13 @@ pub fn find_graph_symbols_by_name(conn: &Connection, name: &str) -> Result<Vec<G
            OR s.name = 'self.' || ?1
            OR s.name = ':' || ?1
            OR s.name LIKE ?2 ESCAPE '\'
+           OR s.name LIKE ?3 ESCAPE '\'
         ORDER BY f.path, s.line
         "#,
     )?;
     let rows = stmt
         .query_map(
-            params![name, format!("%::{escaped}")],
+            params![name, format!("%::{escaped}"), format!("%.{escaped}")],
             row_to_graph_symbol_info,
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -9534,7 +9540,7 @@ pub fn find_member_symbols(conn: &Connection, container_id: i64) -> Result<Vec<G
         WHERE c.id = ?1
           AND m.id <> c.id
           AND c.end_line IS NOT NULL
-          AND c.kind IN ('class', 'interface', 'object', 'enum', 'package')
+          AND c.kind IN ('class', 'interface', 'object', 'enum', 'package', 'table')
           AND m.kind NOT IN ('import', 'annotation')
           AND m.line >= c.line
           AND COALESCE(m.end_line, m.line) <= c.end_line
@@ -9592,7 +9598,7 @@ pub fn find_enclosing_container(
         JOIN files f ON f.id = c.file_id
         WHERE s.id = ?1
           AND c.id <> s.id
-          AND c.kind IN ('class', 'interface', 'object', 'enum', 'package')
+          AND c.kind IN ('class', 'interface', 'object', 'enum', 'package', 'table')
           AND c.end_line IS NOT NULL
           AND c.line <= s.line
           AND c.end_line >= COALESCE(s.end_line, s.line)

@@ -127,6 +127,12 @@ how the target was chosen among same-named definitions: `0` local (same file),
 edge per candidate, each with `candidates = k` (up to 8; references with more
 candidates are not stored). Resolved edges have `candidates = 1`.
 
+Rails schema dumps add two symbol kinds: `table` (one per `create_table`) and
+`column` (named `table.column`). They are never matched by name: a column is
+an edge target only for code inside a model whose table declares it (the
+model-to-table match follows Active Record's naming rules; `graph build`
+stores what it matched in `symbol_graph_summary.schema`).
+
 `symbol_metrics` has one row per symbol that touches any edge. `fan_in`,
 `fan_out`, `fan_in_files`, `dependents` (distinct symbols reaching this one
 within 3 hops) and `pagerank` count resolved edges only; `fan_in_ambiguous`
