@@ -944,8 +944,26 @@ impl LanguageParser for TypeScriptParser {
                             }
                         }
                     }
-                    // export default function name() {} or export default class Name {}
-                    // These are already caught by other patterns
+                    // export default () => {} / function () {} / class {}
+                    "arrow_function" | "function_expression" | "generator_function" | "class" => {
+                        let (kind, parents) = if node.kind() == "class" {
+                            (SymbolKind::Class, extract_class_parents(content, node))
+                        } else {
+                            (SymbolKind::Function, vec![])
+                        };
+                        if emitted_lines.insert((ANONYMOUS_DEFAULT_EXPORT.to_string(), line)) {
+                            symbols.push(ParsedSymbol {
+                                name: ANONYMOUS_DEFAULT_EXPORT.to_string(),
+                                kind,
+                                line,
+                                signature: sig,
+                                parents,
+                                end_line: Some(node_end_line(node)),
+                            });
+                        }
+                    }
+                    // A named `export default function f() {}` or `class F {}` is a
+                    // declaration, not a value, and the declaration patterns emit it.
                     _ => {}
                 }
                 continue;
@@ -1041,6 +1059,57 @@ fn classify_function_name(name: &str) -> SymbolKind {
     } else {
         SymbolKind::Function
     }
+}
+
+/// Placeholder name [`TypeScriptParser`] gives an anonymous `export default`
+/// function or class. The parser never sees the file path the real name comes
+/// from, so callers that know it pass the symbols through
+/// [`name_default_export`].
+///
+/// The space keeps it apart from every real symbol: the query captures names
+/// only as identifiers, and a method or field may well be called `default`.
+pub const ANONYMOUS_DEFAULT_EXPORT: &str = "export default";
+
+/// Renames the anonymous `export default` function or class after its module.
+///
+/// Every importer picks its own local name for such a value, so the one name
+/// it reliably goes by is the module it is imported from. Without a name the
+/// symbol is unfindable, and a call inside its body — which has a range, so
+/// the owner lookup trusts it — is attributed to a symbol no one searches for.
+///
+/// A function is then classified the way a declaration with that name would
+/// be, so an anonymous component in `Button.jsx` indexes like `function
+/// Button()`. A path that yields no name falls back to `default`, the name
+/// `export default {}` already gets.
+pub fn name_default_export(symbols: &mut [ParsedSymbol], path: &str) {
+    let name = default_export_name(path).unwrap_or_else(|| "default".to_string());
+    for symbol in symbols
+        .iter_mut()
+        .filter(|s| s.name == ANONYMOUS_DEFAULT_EXPORT)
+    {
+        if symbol.kind == SymbolKind::Function {
+            symbol.kind = classify_function_name(&name);
+        }
+        symbol.name = name.clone();
+    }
+}
+
+/// The name a module is imported by: `hooks/useMap.js` → `useMap`. An
+/// `index` file stands for its directory (`./Button` resolves to
+/// `Button/index.jsx`), and everything from the first dot on is dropped
+/// (`Button.test.jsx`, `index.web.js`, `types.d.ts`) — no identifier has one.
+fn default_export_name(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let module = path.file_name()?.to_str()?.split('.').next()?;
+    let name = if module == "index" {
+        path.parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|dir| dir.to_str())
+            .unwrap_or(module)
+    } else {
+        module
+    };
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn find_capture<'a>(
@@ -1668,6 +1737,170 @@ declare function internalHelper(): void;
                 .iter()
                 .map(|s| (&s.name, &s.kind))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    fn anonymous_default(content: &str) -> Vec<(SymbolKind, usize, Option<usize>)> {
+        TYPESCRIPT_PARSER
+            .parse_symbols(content)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.name == ANONYMOUS_DEFAULT_EXPORT)
+            .map(|s| (s.kind, s.line, s.end_line))
+            .collect()
+    }
+
+    #[test]
+    fn anonymous_default_export_gets_a_ranged_symbol() {
+        let cases = [
+            (
+                "const a = 1;\nexport default ({ a }) => {\n  return a;\n};\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default async () => {\n  await x();\n}\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default function () {\n  x();\n}\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default async function () {\n  x();\n}\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default function* () {\n  yield 1;\n}\n",
+                SymbolKind::Function,
+            ),
+            ("export default class {\n  run() {}\n}\n", SymbolKind::Class),
+        ];
+        for (content, kind) in cases {
+            let start = content
+                .lines()
+                .position(|l| l.starts_with("export"))
+                .unwrap()
+                + 1;
+            let end = content.lines().count();
+            assert_eq!(
+                anonymous_default(content),
+                vec![(kind, start, Some(end))],
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_default_class_keeps_its_parents() {
+        let content = "export default class extends Component {\n  render() {}\n}\n";
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        let class = symbols
+            .iter()
+            .find(|s| s.name == ANONYMOUS_DEFAULT_EXPORT)
+            .unwrap();
+        assert_eq!(
+            class.parents,
+            vec![("Component".to_string(), "extends".to_string())]
+        );
+        assert!(symbols.iter().any(|s| s.name == "render"));
+    }
+
+    #[test]
+    fn named_default_export_is_not_duplicated() {
+        for content in [
+            "export default function useMap() {\n  x();\n}\n",
+            "export default class Widget {\n  run() {}\n}\n",
+            "export default function* gen() {\n  yield 1;\n}\n",
+        ] {
+            assert!(anonymous_default(content).is_empty(), "{content}");
+        }
+        let symbols = TYPESCRIPT_PARSER
+            .parse_symbols("export default function useMap() {\n  x();\n}\n")
+            .unwrap();
+        assert_eq!(
+            symbols.iter().filter(|s| s.name == "useMap").count(),
+            1,
+            "{symbols:?}"
+        );
+    }
+
+    #[test]
+    fn default_export_is_named_after_its_module() {
+        let rename = |content: &str, path: &str| {
+            let mut symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+            name_default_export(&mut symbols, path);
+            symbols
+                .into_iter()
+                .map(|s| (s.name, s.kind))
+                .collect::<Vec<_>>()
+        };
+        let arrow = "export default () => {\n  x();\n};\n";
+        assert_eq!(
+            rename(arrow, "src/hooks/useMap.js"),
+            vec![("useMap".to_string(), SymbolKind::Function)]
+        );
+        assert_eq!(
+            rename(arrow, "src/components/Button/index.jsx"),
+            vec![("Button".to_string(), SymbolKind::Class)]
+        );
+        assert_eq!(
+            rename(arrow, "src/Button.web.tsx"),
+            vec![("Button".to_string(), SymbolKind::Class)]
+        );
+        assert_eq!(
+            rename(arrow, "index.js"),
+            vec![("index".to_string(), SymbolKind::Function)]
+        );
+        assert_eq!(
+            rename("export default class {}\n", "src/api/client.ts"),
+            vec![("client".to_string(), SymbolKind::Class)]
+        );
+        assert_eq!(
+            rename(arrow, "src/.hidden.js"),
+            vec![("default".to_string(), SymbolKind::Function)]
+        );
+    }
+
+    #[test]
+    fn default_export_naming_leaves_other_default_symbols_alone() {
+        for (content, expected) in [
+            ("export default {\n  a: 1,\n};\n", "default"),
+            (
+                "const router = 1;\nexport default router;\n",
+                "default(router)",
+            ),
+            ("export default createRouter({});\n", "createRouter"),
+        ] {
+            let mut symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+            name_default_export(&mut symbols, "src/router.js");
+            assert!(
+                symbols.iter().any(|s| s.name == expected),
+                "{content}: {symbols:?}"
+            );
+            assert!(!symbols.iter().any(|s| s.name == "router"), "{symbols:?}");
+        }
+    }
+
+    #[test]
+    fn default_export_naming_keeps_members_called_default() {
+        let content = "class Config {\n  default = 1;\n  static default() {}\n}\n\nexport default () => new Config();\n";
+        let mut symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        name_default_export(&mut symbols, "src/config.js");
+        let named = symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind, s.line))
+            .collect::<Vec<_>>();
+        assert!(
+            named.contains(&("default", SymbolKind::Property, 2)),
+            "{named:?}"
+        );
+        assert!(
+            named.contains(&("default", SymbolKind::Function, 3)),
+            "{named:?}"
+        );
+        assert!(
+            named.contains(&("config", SymbolKind::Function, 6)),
+            "{named:?}"
         );
     }
 

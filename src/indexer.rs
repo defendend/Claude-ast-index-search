@@ -1226,6 +1226,10 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         qualified_names = parsers::treesitter::cpp::collect_qualified_names(&content)?;
     }
 
+    if file_type == parsers::FileType::TypeScript {
+        parsers::treesitter::typescript::name_default_export(&mut symbols, &rel_path);
+    }
+
     // BSL (1C:Enterprise) — module names are encoded in directory structure,
     // not in file content. Extract module name from path and emit synthetic symbol.
     if file_type == parsers::FileType::Bsl {
@@ -4732,7 +4736,8 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
     // Symbols only: a .d.ts is indexed so that a library's exported types resolve,
     // and its internal references would otherwise dominate `usages`/`refs` output
     // for common names, pushing the project's own code past the result limit.
-    let symbols = parsers::parse_file_symbols_only(&content, parsers::FileType::TypeScript)?;
+    let mut symbols = parsers::parse_file_symbols_only(&content, parsers::FileType::TypeScript)?;
+    parsers::treesitter::typescript::name_default_export(&mut symbols, rel_path);
 
     Ok(ParsedFile {
         rel_path: rel_path.to_string(),

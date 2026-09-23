@@ -102,6 +102,31 @@ fn cmd_outline_parses_a_kotlin_file() {
 }
 
 #[test]
+fn outline_names_an_anonymous_default_export_after_its_file() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+    let src = dir.path().join("hooks/useMap.js");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    fs::write(
+        &src,
+        "const searchPath = () => '';\n\nexport default ({ form }) => {\n  return searchPath(form);\n};\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ast-index"))
+        .current_dir(dir.path())
+        .env("NO_COLOR", "1")
+        .args(["outline", "hooks/useMap.js"])
+        .output()
+        .expect("ast-index binary must run");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout={stdout}");
+    assert!(stdout.contains(":3 useMap [function]"), "stdout={stdout}");
+    assert!(!stdout.contains(" default "), "stdout={stdout}");
+}
+
+#[test]
 fn cmd_outline_handles_unsupported_extension() {
     let dir = TempDir::new().unwrap();
     let src = dir.path().join("notes.unknown_ext_xyz");

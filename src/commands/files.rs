@@ -27,8 +27,13 @@ fn outline_via_treesitter(
     skip_kinds: &[SymbolKind],
 ) -> Result<bool> {
     let (symbols, _refs) = crate::parsers::parse_file_symbols(content, file_type)?;
+    Ok(print_outline(&symbols, skip_kinds))
+}
+
+/// Prints outline rows, skipping specified kinds. Returns true if any were printed.
+fn print_outline(symbols: &[crate::parsers::ParsedSymbol], skip_kinds: &[SymbolKind]) -> bool {
     let mut found = false;
-    for sym in &symbols {
+    for sym in symbols {
         if skip_kinds.contains(&sym.kind) {
             continue;
         }
@@ -40,7 +45,7 @@ fn outline_via_treesitter(
         );
         found = true;
     }
-    Ok(found)
+    found
 }
 
 /// Find files by pattern
@@ -161,13 +166,15 @@ pub fn cmd_outline(root: &Path, file: &str) -> Result<()> {
             crate::parsers::FileType::Java,
             &[SymbolKind::Import, SymbolKind::Annotation],
         )?;
-    } else if ext == "ts" || ext == "tsx" || ext == "mts" || ext == "js" || ext == "jsx" {
-        // TypeScript/JavaScript — delegate to tree-sitter
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::TypeScript,
-            &[SymbolKind::Import],
-        )?;
+    } else if crate::parsers::FileType::from_extension(ext)
+        == Some(crate::parsers::FileType::TypeScript)
+    {
+        // TypeScript/JavaScript — delegate to tree-sitter, naming the anonymous
+        // default export after the file exactly as the index does.
+        let (mut symbols, _refs) =
+            crate::parsers::parse_file_symbols(&content, crate::parsers::FileType::TypeScript)?;
+        crate::parsers::treesitter::typescript::name_default_export(&mut symbols, file);
+        found = print_outline(&symbols, &[SymbolKind::Import]);
     } else if ext == "vue" {
         found = outline_via_treesitter(
             &content,
