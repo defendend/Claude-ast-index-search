@@ -250,21 +250,19 @@ fn every_end_line_is_at_or_after_its_start_line() {
 
 #[test]
 fn parsers_without_range_support_store_null() {
-    let project = TempDir::new().unwrap();
-    write_file(
-        &project.path().join("main.go"),
-        "package main\n\nfunc Run() int {\n\treturn 1\n}\n",
+    // Perl is parsed by regular expressions, with no syntax tree to take a
+    // range from.
+    let conn = index_single(
+        "lib/Run.pm",
+        "package main;\n\nsub run {\n  return 1;\n}\n1;\n",
     );
-
-    let mut conn = fresh_db();
-    indexer::index_directory(&mut conn, project.path(), false, false).unwrap();
 
     let ranges = symbol_ranges(&conn, "function");
     let run = ranges
         .iter()
-        .find(|(n, _, _)| n == "Run")
-        .expect("go function must be indexed");
-    assert_eq!(run.2, None, "go parser does not report ranges yet");
+        .find(|(n, _, _)| n == "run")
+        .expect("perl sub must be indexed");
+    assert_eq!(run.2, None, "perl parser does not report ranges");
 }
 
 #[test]
@@ -296,5 +294,41 @@ fn python_class_methods_and_function_get_ranges() {
     assert_encloses(class, span(&conn, "function", "hello"));
     assert_encloses(class, span(&conn, "function", "name"));
     assert_eq!(span(&conn, "function", "build"), (11, 12));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn go_struct_methods_and_function_get_ranges() {
+    let conn = index_single(
+        "server.go",
+        concat!(
+            "package main\n",
+            "\n",
+            "import \"fmt\"\n",
+            "\n",
+            "type Server struct {\n",
+            "\taddr string\n",
+            "}\n",
+            "\n",
+            "func (s *Server) Start() error {\n",
+            "\treturn run(s.addr)\n",
+            "}\n",
+            "\n",
+            "func (s Server) Stop() {\n",
+            "\tfmt.Println(\"stop\")\n",
+            "}\n",
+            "\n",
+            "func run(addr string) error {\n",
+            "\treturn nil\n",
+            "}\n",
+        ),
+    );
+
+    // Go declares methods beside the struct, not inside it.
+    assert_eq!(span(&conn, "class", "Server"), (5, 7));
+    assert_eq!(span(&conn, "function", "Start"), (9, 11));
+    assert_eq!(span(&conn, "function", "Stop"), (13, 15));
+    assert_eq!(span(&conn, "function", "run"), (17, 19));
+    assert_eq!(span(&conn, "import", "fmt"), (3, 3));
     assert_all_ranges_filled(&conn);
 }
