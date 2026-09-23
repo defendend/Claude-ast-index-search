@@ -332,3 +332,51 @@ fn go_struct_methods_and_function_get_ranges() {
     assert_eq!(span(&conn, "import", "fmt"), (3, 3));
     assert_all_ranges_filled(&conn);
 }
+
+#[test]
+fn rust_impl_block_encloses_its_methods() {
+    let conn = index_single(
+        "src/point.rs",
+        concat!(
+            "pub struct Point {\n",
+            "    x: i32,\n",
+            "}\n",
+            "\n",
+            "impl Point {\n",
+            "    pub fn new(x: i32) -> Self {\n",
+            "        Point { x }\n",
+            "    }\n",
+            "\n",
+            "    #[inline]\n",
+            "    fn get(&self) -> i32 {\n",
+            "        self.x\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "pub fn run() {\n",
+            "    let p = Point::new(1);\n",
+            "}\n",
+            "\n",
+            "mod tests {\n",
+            "    fn works() {\n",
+            "        super::run();\n",
+            "    }\n",
+            "}\n",
+        ),
+    );
+
+    assert_eq!(span(&conn, "class", "Point"), (1, 3));
+    let block = span(&conn, "class", "impl Point");
+    assert_eq!(block, (5, 14));
+    assert_eq!(span(&conn, "function", "new"), (6, 8));
+    // The attribute belongs to the impl block around the method.
+    assert_eq!(span(&conn, "function", "get"), (11, 13));
+    assert_eq!(span(&conn, "annotation", "#[inline]"), (10, 10));
+    assert_encloses(block, span(&conn, "function", "new"));
+    assert_encloses(block, span(&conn, "function", "get"));
+    assert_eq!(span(&conn, "function", "run"), (16, 18));
+    let module = span(&conn, "package", "tests");
+    assert_eq!(module, (20, 24));
+    assert_encloses(module, span(&conn, "function", "works"));
+    assert_all_ranges_filled(&conn);
+}
