@@ -913,3 +913,212 @@ fn groovy_class_methods_and_statements_get_ranges() {
     assert_encloses(class, span(&conn, "function", "bye"));
     assert_all_ranges_filled(&conn);
 }
+
+#[test]
+fn bash_functions_get_ranges() {
+    let conn = index_single(
+        "bin/run.sh",
+        "#!/bin/bash\nNAME=app\n\ngreet() {\n  echo \"hi\"\n}\n\nfunction run {\n  greet\n}\n",
+    );
+
+    assert_eq!(span(&conn, "function", "greet"), (4, 6));
+    assert_eq!(span(&conn, "function", "run"), (8, 10));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn sql_statements_get_ranges() {
+    let conn = index_single(
+        "db/schema.sql",
+        concat!(
+            "CREATE TABLE users (\n",
+            "  id INT,\n",
+            "  name TEXT\n",
+            ");\n",
+            "\n",
+            "CREATE FUNCTION add(a INT, b INT) RETURNS INT AS $$\n",
+            "  SELECT a + b;\n",
+            "$$ LANGUAGE SQL;\n",
+        ),
+    );
+
+    assert_eq!(span(&conn, "class", "users"), (1, 4));
+    assert_eq!(span(&conn, "function", "add"), (6, 8));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn r_functions_get_ranges() {
+    let conn = index_single(
+        "R/greet.R",
+        concat!(
+            "library(dplyr)\n",
+            "\n",
+            "greet <- function(name) {\n",
+            "  paste(\"hi\", name)\n",
+            "}\n",
+            "\n",
+            "run = function() {\n",
+            "  greet(\"x\")\n",
+            "}\n",
+        ),
+    );
+
+    assert_eq!(span(&conn, "function", "greet"), (3, 5));
+    assert_eq!(span(&conn, "function", "run"), (7, 9));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn matlab_classdef_encloses_its_methods() {
+    let conn = index_single(
+        "Greeter.m",
+        concat!(
+            "classdef Greeter < handle\n",
+            "    properties\n",
+            "        Name\n",
+            "    end\n",
+            "    methods\n",
+            "        function obj = Greeter(n)\n",
+            "            obj.Name = n;\n",
+            "        end\n",
+            "\n",
+            "        function hello(obj)\n",
+            "            disp(obj.Name);\n",
+            "        end\n",
+            "    end\n",
+            "end\n",
+        ),
+    );
+
+    let class = span(&conn, "class", "Greeter");
+    assert_eq!(class, (1, 14));
+    assert_eq!(span(&conn, "function", "hello"), (10, 12));
+    assert_encloses(class, span(&conn, "function", "Greeter"));
+    assert_encloses(class, span(&conn, "function", "hello"));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn gdscript_script_class_encloses_its_functions() {
+    let conn = index_single(
+        "scripts/greeter.gd",
+        concat!(
+            "extends Node\n",
+            "class_name Greeter\n",
+            "\n",
+            "var count = 0\n",
+            "\n",
+            "func _init():\n",
+            "\tcount = 1\n",
+            "\n",
+            "func hello():\n",
+            "\tprint(\"hi\")\n",
+            "\n",
+            "class Inner:\n",
+            "\tfunc deep():\n",
+            "\t\tpass\n",
+        ),
+    );
+
+    // `class_name` names the whole script.
+    let script = span(&conn, "class", "Greeter");
+    assert_eq!(script, (2, 14));
+    assert_eq!(span(&conn, "function", "_init"), (6, 7));
+    assert_eq!(span(&conn, "function", "hello"), (9, 10));
+    let inner = span(&conn, "class", "Inner");
+    assert_eq!(inner, (12, 14));
+    assert_encloses(script, span(&conn, "function", "hello"));
+    assert_encloses(script, inner);
+    assert_encloses(inner, span(&conn, "function", "deep"));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn common_lisp_forms_get_ranges() {
+    let conn = index_single(
+        "src/greeter.lisp",
+        concat!(
+            "(defpackage :app\n",
+            "  (:use :cl))\n",
+            "\n",
+            "(defun greet (name)\n",
+            "  (format t \"hi ~a\" name))\n",
+            "\n",
+            "(defclass greeter ()\n",
+            "  ((name :initarg :name)))\n",
+        ),
+    );
+
+    assert_eq!(span(&conn, "package", "app"), (1, 2));
+    // The body forms follow the `defun_header` inside the enclosing list.
+    assert_eq!(span(&conn, "function", "greet"), (4, 5));
+    assert_eq!(span(&conn, "class", "greeter"), (7, 8));
+    assert_all_ranges_filled(&conn);
+}
+
+#[test]
+fn bsl_module_encloses_procedures_and_regions_stay_rangeless() {
+    let conn = index_single(
+        "CommonModules/Greeter/Ext/Module.bsl",
+        concat!(
+            "#Область ПрограммныйИнтерфейс\n",
+            "\n",
+            "Процедура Привет() Экспорт\n",
+            "\tСообщить(\"привет\");\n",
+            "КонецПроцедуры\n",
+            "\n",
+            "Функция Сумма(А, Б)\n",
+            "\tВозврат А + Б;\n",
+            "КонецФункции\n",
+            "\n",
+            "#КонецОбласти\n",
+        ),
+    );
+
+    // The module is named by its directory and spans the whole file.
+    let module = span(&conn, "package", "Greeter");
+    assert_eq!(module, (1, 11));
+    assert_eq!(span(&conn, "procedure", "Привет"), (3, 5));
+    assert_eq!(span(&conn, "function", "Сумма"), (7, 9));
+    assert_encloses(module, span(&conn, "procedure", "Привет"));
+    assert_encloses(module, span(&conn, "function", "Сумма"));
+
+    // A region folds code but is no scope, so it reports no range.
+    let packages = symbol_ranges(&conn, "package");
+    let region = packages
+        .iter()
+        .find(|(name, _, _)| name == "ПрограммныйИнтерфейс")
+        .expect("region must be indexed");
+    assert_eq!(region.2, None);
+}
+
+#[test]
+fn proto_service_and_nested_messages_get_ranges() {
+    let conn = index_single(
+        "proto/greeter.proto",
+        concat!(
+            "syntax = \"proto3\";\n",
+            "package app.v1;\n",
+            "\n",
+            "service Greeter {\n",
+            "  rpc Hello (HelloRequest) returns (HelloReply);\n",
+            "}\n",
+            "\n",
+            "message HelloRequest {\n",
+            "  string name = 1;\n",
+            "  message Inner {\n",
+            "    int32 x = 1;\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+
+    let service = span(&conn, "interface", "Greeter");
+    assert_eq!(service, (4, 6));
+    assert_encloses(service, span(&conn, "function", "Hello"));
+    let message = span(&conn, "class", "HelloRequest");
+    assert_eq!(message, (8, 13));
+    assert_encloses(message, span(&conn, "class", "HelloRequest.Inner"));
+    assert_all_ranges_filled(&conn);
+}

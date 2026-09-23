@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -39,10 +39,17 @@ impl LanguageParser for MatlabParser {
         let idx_property_name = idx("property_name");
         let idx_enum_name = idx("enum_name");
         let idx_event_name = idx("event_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = m
+                .captures
+                .iter()
+                .find(|c| Some(c.index) == idx_definition)
+                .map(|c| text_end_line(content, &c.node));
+
             for cap in m.captures {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
@@ -58,7 +65,7 @@ impl LanguageParser for MatlabParser {
                         line,
                         signature: sig,
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 } else if Some(cap.index) == idx_func_name {
                     // Check if this function is inside a class (method) or standalone
@@ -75,7 +82,7 @@ impl LanguageParser for MatlabParser {
                         line,
                         signature: sig,
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 } else if Some(cap.index) == idx_property_name {
                     let parent_class = find_parent_class(content, &cap.node);
@@ -90,7 +97,7 @@ impl LanguageParser for MatlabParser {
                         line,
                         signature: sig,
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 } else if Some(cap.index) == idx_enum_name {
                     let parent_class = find_parent_class(content, &cap.node);
@@ -105,7 +112,7 @@ impl LanguageParser for MatlabParser {
                         line,
                         signature: sig,
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 } else if Some(cap.index) == idx_event_name {
                     let parent_class = find_parent_class(content, &cap.node);
@@ -120,7 +127,7 @@ impl LanguageParser for MatlabParser {
                         line,
                         signature: sig,
                         parents,
-                        end_line: None,
+                        end_line,
                     });
                 }
             }

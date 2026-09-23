@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::{ParsedRef, ParsedSymbol};
 
@@ -266,6 +266,7 @@ impl LanguageParser for BslParser {
         let idx_var_name = idx("var_name");
         let idx_region_name = idx("region_name");
         let idx_annotation_name = idx("annotation_name");
+        let idx_definition = idx("definition");
 
         // Track annotation lines already emitted as part of proc/func
         let mut emitted_annotation_lines: HashSet<usize> = HashSet::new();
@@ -273,6 +274,8 @@ impl LanguageParser for BslParser {
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Procedure → SymbolKind::Procedure (P2)
             if let Some(name_cap) = find_capture(m, idx_proc_name) {
                 let decl_cap = find_capture(m, idx_proc_decl);
@@ -297,7 +300,7 @@ impl LanguageParser for BslParser {
                         line: ann_line,
                         signature: line_text(content, ann_line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line: Some(ann_line),
                     });
                 }
 
@@ -307,7 +310,7 @@ impl LanguageParser for BslParser {
                     line,
                     signature: sig,
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -336,7 +339,7 @@ impl LanguageParser for BslParser {
                         line: ann_line,
                         signature: line_text(content, ann_line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line: Some(ann_line),
                     });
                 }
 
@@ -346,7 +349,7 @@ impl LanguageParser for BslParser {
                     line,
                     signature: sig,
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -361,7 +364,7 @@ impl LanguageParser for BslParser {
                     line,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
-                    end_line: None,
+                    end_line,
                 });
                 continue;
             }
@@ -370,6 +373,8 @@ impl LanguageParser for BslParser {
             if let Some(cap) = find_capture(m, idx_region_name) {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
+                // A region only folds code: with a range it would become a
+                // namespace and hide `Module.Procedure` behind its own name.
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
@@ -396,7 +401,7 @@ impl LanguageParser for BslParser {
                         line,
                         signature: line_text(content, line).trim().to_string(),
                         parents: vec![],
-                        end_line: None,
+                        end_line,
                     });
                 }
                 continue;
