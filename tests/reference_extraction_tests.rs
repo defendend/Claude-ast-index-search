@@ -221,3 +221,69 @@ fn usages_of_a_snake_case_function_are_indexed() {
         "the definition is not a usage: {hits:?}"
     );
 }
+
+#[test]
+fn bsl_indexing_records_cyrillic_calls_with_their_source_line() {
+    let content = "Процедура Обработать() Экспорт
+    Результат = ПолучитьДанные();
+    ЗаписатьВЖурнал(Результат);
+    Если НЕ ОбщегоНазначения.ЗначениеЗаполнено(Результат) Тогда
+    КонецЕсли;
+КонецПроцедуры
+
+Функция ПолучитьДанные()
+    Возврат Новый Структура;
+КонецФункции
+";
+    let (_, refs) = parse_file_symbols(content, FileType::Bsl).unwrap();
+    let call = refs
+        .iter()
+        .find(|r| r.name == "ПолучитьДанные")
+        .unwrap_or_else(|| panic!("no ПолучитьДанные reference: {refs:?}"));
+    // Called above its definition in the same module: still a usage.
+    assert_eq!(call.line, 2);
+    assert_eq!(call.context.as_str(), "Результат = ПолучитьДанные();");
+    assert!(refs
+        .iter()
+        .any(|r| r.name == "ЗаписатьВЖурнал" && r.line == 3));
+    assert!(
+        !refs
+            .iter()
+            .any(|r| r.name == "ПолучитьДанные" && r.line == 8),
+        "the definition line is not a usage: {refs:?}"
+    );
+    // A module before `.` and a type after `Новый` are references; a
+    // variable is not, and neither is a keyword in any letter case.
+    assert!(refs
+        .iter()
+        .any(|r| r.name == "ОбщегоНазначения" && r.line == 4));
+    assert!(refs.iter().any(|r| r.name == "Структура" && r.line == 9));
+    for word in ["Результат", "Возврат", "Новый", "НЕ", "Если", "Тогда"]
+    {
+        assert!(
+            !refs.iter().any(|r| r.name == word),
+            "{word:?} recorded as a reference: {refs:?}"
+        );
+    }
+}
+
+#[test]
+fn stylesheets_record_no_references() {
+    for (file_type, content) in [
+        (
+            FileType::Css,
+            ".card { border-radius: var(--r); color: rgba(0, 0, 0, .5); font-family: Arial; }\n",
+        ),
+        (
+            FileType::Scss,
+            ".btn { @include border-radius($r); color: darken($c, 10%); }\n",
+        ),
+        (
+            FileType::Less,
+            ".btn { .border-radius(4px); color: fade(@c, 50%); }\n",
+        ),
+    ] {
+        let (_, refs) = parse_file_symbols(content, file_type).unwrap();
+        assert!(refs.is_empty(), "{file_type:?}: {refs:?}");
+    }
+}

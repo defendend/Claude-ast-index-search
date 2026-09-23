@@ -9,7 +9,7 @@ use tree_sitter::{Language, Query};
 
 use super::css::parse_with_query;
 use super::{parse_tree, LanguageParser};
-use crate::parsers::{ParsedRef, ParsedSymbol};
+use crate::parsers::{FileType, ParsedRef, ParsedSymbol};
 
 static LESS_LANGUAGE: LazyLock<Language> = LazyLock::new(tree_sitter_less::language);
 
@@ -30,6 +30,15 @@ impl LanguageParser for LessParser {
 
     fn extract_refs(&self, _content: &str, _defined: &[ParsedSymbol]) -> Result<Vec<ParsedRef>> {
         Ok(Vec::new())
+    }
+
+    fn extract_refs_for_lang(
+        &self,
+        content: &str,
+        defined: &[ParsedSymbol],
+        _file_type: FileType,
+    ) -> Result<Vec<ParsedRef>> {
+        self.extract_refs(content, defined)
     }
 }
 

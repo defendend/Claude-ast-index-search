@@ -507,6 +507,12 @@ words of C/C++, Go, Python, Rust, Perl and JavaScript never count: `sizeof (x)`,
 `except (A, B):` and `None`. A reserved word used as a member
 (`map.delete(key)`) or called as a Perl `&name(...)` is still a reference.
 
+BSL (1C:Enterprise, OneScript) references are calls in Cyrillic or Latin
+(`ПолучитьДанные()`), a module or object before `.` (`ОбщегоНазначения.`) and
+the type after `Новый` / `New`; a plain capitalized word is a variable, and
+keywords are skipped in any letter case (`НЕ`, `Не`). Stylesheets (CSS, SCSS,
+Less) record no references.
+
 Ruby references include calls without parentheses (`recv.name`, `name arg`,
 a bare `name` that is not a local variable), so the graph also links a method
 to the instance methods and attribute readers it calls on `self`, and an RSpec
