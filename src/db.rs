@@ -961,14 +961,14 @@ fn is_cache_owner_intent_name(name: &str, cache_key: &str) -> bool {
     cache_owner_intent_key(name) == Some(cache_key)
 }
 
-fn read_cache_owner_intents(
-    cache_base: &Path,
-    cache_dir: &Path,
-    only_cache_key: Option<&str>,
-) -> Result<Vec<(PathBuf, String, CacheOwnerManifest)>> {
-    let Some(generation) = read_cache_generation(cache_dir)? else {
-        return Ok(Vec::new());
-    };
+fn cache_owner_intent_path_key(path: &Path) -> Option<&str> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(cache_owner_intent_key)
+}
+
+/// Every owner-intent file under `.leases`, in path order.
+fn list_cache_owner_intent_paths(cache_base: &Path) -> Result<Vec<PathBuf>> {
     let intent_dir = leases_dir(cache_base);
     ensure_real_cache_directory(&intent_dir)?;
     let entries = std::fs::read_dir(&intent_dir)?.collect::<std::io::Result<Vec<_>>>()?;
@@ -979,21 +979,25 @@ fn read_cache_owner_intents(
                 .file_name()
                 .to_str()
                 .and_then(cache_owner_intent_key)
-                .map(|cache_key| only_cache_key.map_or(true, |only| only == cache_key))
-                .unwrap_or(false)
+                .is_some()
         })
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
     paths.sort();
+    Ok(paths)
+}
 
-    let mut intents = Vec::with_capacity(paths.len());
+/// Read and validate the listed intents, keeping those recorded against
+/// `generation`. Any unreadable or inconsistent listed intent is an error.
+fn read_generation_owner_intents<'a>(
+    generation: &str,
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+) -> Result<Vec<(PathBuf, String, CacheOwnerManifest)>> {
+    let mut intents = Vec::new();
     for path in paths {
-        let intent: CacheOwnerIntent = read_bounded_json_file(&path)?
+        let intent: CacheOwnerIntent = read_bounded_json_file(path)?
             .with_context(|| format!("cache owner intent disappeared: {}", path.display()))?;
-        let filename_key = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(cache_owner_intent_key)
+        let filename_key = cache_owner_intent_path_key(path)
             .context("cache owner intent filename changed while reading")?;
         anyhow::ensure!(
             intent.version == CACHE_OWNER_INTENT_VERSION
@@ -1003,10 +1007,27 @@ fn read_cache_owner_intents(
             path.display()
         );
         if intent.generation == generation {
-            intents.push((path, intent.cache_key, intent.owner));
+            intents.push((path.clone(), intent.cache_key, intent.owner));
         }
     }
     Ok(intents)
+}
+
+fn read_cache_owner_intents(
+    cache_base: &Path,
+    cache_dir: &Path,
+    only_cache_key: Option<&str>,
+) -> Result<Vec<(PathBuf, String, CacheOwnerManifest)>> {
+    let Some(generation) = read_cache_generation(cache_dir)? else {
+        return Ok(Vec::new());
+    };
+    let paths = list_cache_owner_intent_paths(cache_base)?;
+    read_generation_owner_intents(
+        &generation,
+        paths.iter().filter(|path| {
+            only_cache_key.map_or(true, |only| cache_owner_intent_path_key(path) == Some(only))
+        }),
+    )
 }
 
 fn cache_owner_intents(
@@ -1014,12 +1035,76 @@ fn cache_owner_intents(
     cache_dir: &Path,
     cache_key: &str,
 ) -> Result<Vec<(PathBuf, CacheOwnerManifest)>> {
-    read_cache_owner_intents(cache_base, cache_dir, Some(cache_key)).map(|intents| {
-        intents
-            .into_iter()
-            .map(|(path, _cache_key, owner)| (path, owner))
-            .collect()
-    })
+    read_cache_owner_intents(cache_base, cache_dir, Some(cache_key)).map(without_intent_keys)
+}
+
+fn without_intent_keys(
+    intents: Vec<(PathBuf, String, CacheOwnerManifest)>,
+) -> Vec<(PathBuf, CacheOwnerManifest)> {
+    intents
+        .into_iter()
+        .map(|(path, _cache_key, owner)| (path, owner))
+        .collect()
+}
+
+/// Owner intents of many caches under one base, with `.leases` listed at most
+/// once instead of once per cache.
+///
+/// Reusing the listing is sound only while the caller holds the base's
+/// cache-layout lock and creates or removes no intents itself. Intents are
+/// only created under that lock, so none can appear unseen. The one removal
+/// that bypasses it (the legacy migration sweeping its source base) makes a
+/// listed read fail closed, as it already could between a per-cache listing
+/// and its reads. Generation markers, manifests, and intent contents are
+/// still read on every lookup. A failed listing is not cached, so each lookup
+/// retries it exactly as a per-cache read would.
+struct CacheOwnerIntentListing<'a> {
+    cache_base: &'a Path,
+    by_key: Option<HashMap<String, Vec<PathBuf>>>,
+}
+
+impl<'a> CacheOwnerIntentListing<'a> {
+    fn new(cache_base: &'a Path) -> Self {
+        Self {
+            cache_base,
+            by_key: None,
+        }
+    }
+
+    /// Same result as `cache_owner_intents` for this base.
+    fn intents(
+        &mut self,
+        cache_dir: &Path,
+        cache_key: &str,
+    ) -> Result<Vec<(PathBuf, CacheOwnerManifest)>> {
+        let Some(generation) = read_cache_generation(cache_dir)? else {
+            return Ok(Vec::new());
+        };
+        if self.by_key.is_none() {
+            let mut by_key: HashMap<String, Vec<PathBuf>> = HashMap::new();
+            for path in list_cache_owner_intent_paths(self.cache_base)? {
+                if let Some(key) = cache_owner_intent_path_key(&path) {
+                    by_key.entry(key.to_owned()).or_default().push(path);
+                }
+            }
+            self.by_key = Some(by_key);
+        }
+        let paths = self
+            .by_key
+            .as_ref()
+            .and_then(|by_key| by_key.get(cache_key));
+        read_generation_owner_intents(&generation, paths.into_iter().flatten())
+            .map(without_intent_keys)
+    }
+
+    /// Same result as `effective_cache_owner` for this base.
+    fn effective_owner(
+        &mut self,
+        cache_dir: &Path,
+        cache_key: &str,
+    ) -> Result<Option<CacheOwnerManifest>> {
+        effective_cache_owner_from(cache_dir, cache_key, || self.intents(cache_dir, cache_key))
+    }
 }
 
 fn effective_cache_owner(
@@ -1027,8 +1112,18 @@ fn effective_cache_owner(
     cache_dir: &Path,
     cache_key: &str,
 ) -> Result<Option<CacheOwnerManifest>> {
+    effective_cache_owner_from(cache_dir, cache_key, || {
+        cache_owner_intents(cache_base, cache_dir, cache_key)
+    })
+}
+
+fn effective_cache_owner_from(
+    cache_dir: &Path,
+    cache_key: &str,
+    intents: impl FnOnce() -> Result<Vec<(PathBuf, CacheOwnerManifest)>>,
+) -> Result<Option<CacheOwnerManifest>> {
     let final_owner = read_cache_owner_manifest(cache_dir)?;
-    let intents = cache_owner_intents(cache_base, cache_dir, cache_key)?;
+    let intents = intents()?;
     let mut effective = match final_owner {
         Some(owner) if owner.is_self_consistent(cache_key) => Some(owner),
         Some(owner) => {
@@ -1694,6 +1789,11 @@ fn resolve_db_path_and_lease(project_root: &Path) -> Result<(PathBuf, ProjectLea
     // metadata. Foreign DBs are opened read-only and never schema-migrated.
     if !db_path.exists() && !interrupted_publication {
         if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            // Inspecting candidates writes no owner intents, and no other
+            // process can create any while the layout lock is held, so one
+            // `.leases` listing serves every candidate. The locked migration
+            // below re-reads intents fresh and ends the scan once it writes.
+            let mut candidate_intents = CacheOwnerIntentListing::new(&cache_dir);
             for entry in entries.flatten() {
                 let is_real_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
                 let old_dir = entry.path();
@@ -1719,7 +1819,7 @@ fn resolve_db_path_and_lease(project_root: &Path) -> Result<(PathBuf, ProjectLea
                     continue;
                 }
                 ensure_safe_live_db_artifacts(&old_db)?;
-                let cache_owner = match effective_cache_owner(&cache_dir, &old_dir, old_key) {
+                let cache_owner = match candidate_intents.effective_owner(&old_dir, old_key) {
                     Ok(owner) => owner,
                     Err(owner_error) => match read_cached_project_root(&old_db) {
                         Ok(root) if root != normalized && root != raw_identity => continue,
@@ -11256,6 +11356,302 @@ mod tests {
         assert!(recreated.contains_root(replacement_alias));
         assert!(!recreated.contains_root(remounted_alias));
         assert!(!recreated.overlaps(&requested_after_remount));
+    }
+
+    fn owner_lookup_outcome(result: Result<Option<CacheOwnerManifest>>) -> String {
+        match result {
+            Ok(owner) => format!("{owner:?}"),
+            Err(error) => format!("error: {error:#}"),
+        }
+    }
+
+    /// Walk the base the way the auto-migration scan does and check that one
+    /// shared listing answers every owner lookup exactly like a per-cache one.
+    fn assert_shared_listing_matches_per_cache_reads(cache_base: &Path) -> HashMap<String, String> {
+        let mut listing = CacheOwnerIntentListing::new(cache_base);
+        let mut outcomes = HashMap::new();
+        for entry in std::fs::read_dir(cache_base).unwrap() {
+            let entry = entry.unwrap();
+            let key = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type().unwrap().is_dir() || !is_cache_key(&key) {
+                continue;
+            }
+            let cache_dir = entry.path();
+            let shared = owner_lookup_outcome(listing.effective_owner(&cache_dir, &key));
+            let per_cache =
+                owner_lookup_outcome(effective_cache_owner(cache_base, &cache_dir, &key));
+            assert_eq!(shared, per_cache, "owner lookup diverged for cache {key}");
+            outcomes.insert(key, shared);
+        }
+        outcomes
+    }
+
+    fn create_owned_cache(cache_base: &Path, root: &str) -> (String, PathBuf) {
+        let key = simple_hash(root);
+        let cache_dir = cache_base.join(&key);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("index.db"), b"").unwrap();
+        persist_cache_owner_manifest(&cache_dir, &key, &CacheOwnerManifest::new(root, root))
+            .unwrap();
+        for suffix in ["lock", "publish.lock"] {
+            open_lock_file(&leases_dir(cache_base).join(format!("{key}.{suffix}"))).unwrap();
+        }
+        (key, cache_dir)
+    }
+
+    fn raw_owner_intent(key: &str, generation: &str, owner: &CacheOwnerManifest) -> Vec<u8> {
+        serde_json::to_vec(&CacheOwnerIntent {
+            version: CACHE_OWNER_INTENT_VERSION,
+            cache_key: key.to_owned(),
+            generation: generation.to_owned(),
+            owner: owner.clone(),
+        })
+        .unwrap()
+    }
+
+    fn write_raw_owner_intent(cache_base: &Path, key: &str, nonce: u32, contents: &[u8]) {
+        let name = cache_owner_intent_name(key, 4242, u128::from(nonce));
+        std::fs::write(leases_dir(cache_base).join(name), contents).unwrap();
+    }
+
+    #[test]
+    fn shared_intent_listing_matches_per_cache_owner_reads() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_base = temp.path().join("cache");
+        std::fs::create_dir_all(leases_dir(&cache_base)).unwrap();
+        let retired_alias = "/retired/alias";
+
+        // Plain caches, some with an intent left by a retired generation.
+        let mut plain = Vec::new();
+        for index in 0..24_u32 {
+            let root = format!("/layout/plain/{index}");
+            let (key, _) = create_owned_cache(&cache_base, &root);
+            if index % 5 == 0 {
+                let retired = CacheOwnerManifest::new(&root, retired_alias);
+                write_raw_owner_intent(
+                    &cache_base,
+                    &key,
+                    index,
+                    &raw_owner_intent(&key, "1-1-1", &retired),
+                );
+            }
+            plain.push(key);
+        }
+        let live_lease =
+            open_lock_file(&leases_dir(&cache_base).join(format!("{}.lock", plain[1]))).unwrap();
+        fs2::FileExt::lock_shared(&live_lease).unwrap();
+
+        // Several current-generation intents extend one installed owner.
+        let alias_root = "/layout/aliases";
+        let (alias_key, alias_dir) = create_owned_cache(&cache_base, alias_root);
+        let aliases = ["/alias/one", "/alias/two", "/alias/three"];
+        for alias in aliases {
+            let intent = CacheOwnerManifest::new(alias_root, alias);
+            write_cache_owner_intent(&cache_base, &alias_dir, &alias_key, &intent).unwrap();
+        }
+
+        // A directory moved to a new key whose manifest still names the old
+        // key: only the current-generation intent bridges the two.
+        let first_root = "/layout/rekey/first";
+        let second_root = "/layout/rekey/second";
+        let rekey_alias = "/layout/rekey/alias";
+        let first_key = simple_hash(first_root);
+        let second_key = simple_hash(second_root);
+        let first_dir = cache_base.join(&first_key);
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::write(first_dir.join("index.db"), b"").unwrap();
+        let first_owner = CacheOwnerManifest::new(first_root, rekey_alias);
+        persist_cache_owner_manifest(&first_dir, &first_key, &first_owner).unwrap();
+        let second_desired = first_owner
+            .merged_for_target(&CacheOwnerManifest::new(second_root, rekey_alias))
+            .unwrap();
+        rename_cache_directory(
+            &first_dir,
+            &cache_base.join(&second_key),
+            &second_key,
+            &second_desired,
+        )
+        .unwrap();
+
+        // The owner exists only as an intent; no manifest was installed.
+        let intent_only_root = "/layout/intent-only";
+        let intent_only_key = simple_hash(intent_only_root);
+        let intent_only_dir = cache_base.join(&intent_only_key);
+        std::fs::create_dir_all(&intent_only_dir).unwrap();
+        write_cache_owner_intent(
+            &cache_base,
+            &intent_only_dir,
+            &intent_only_key,
+            &CacheOwnerManifest::new(intent_only_root, intent_only_root),
+        )
+        .unwrap();
+
+        // A manifest for another key with no intent to bridge it.
+        let mismatched_key = simple_hash("/layout/mismatched");
+        let mismatched_dir = cache_base.join(&mismatched_key);
+        std::fs::create_dir_all(&mismatched_dir).unwrap();
+        ensure_cache_generation(&mismatched_dir).unwrap();
+        std::fs::write(
+            cache_owner_manifest_path(&mismatched_dir),
+            serde_json::to_vec(&CacheOwnerManifest::new("/layout/other", "/layout/other")).unwrap(),
+        )
+        .unwrap();
+
+        // Unreadable and inconsistent intents fail only their own cache.
+        let (malformed_key, _) = create_owned_cache(&cache_base, "/layout/malformed-intent");
+        write_raw_owner_intent(&cache_base, &malformed_key, 1, b"{not-json");
+        let (wrong_key, wrong_dir) = create_owned_cache(&cache_base, "/layout/wrong-key");
+        let wrong_generation = read_cache_generation(&wrong_dir).unwrap().unwrap();
+        write_raw_owner_intent(
+            &cache_base,
+            &wrong_key,
+            1,
+            &raw_owner_intent(
+                &plain[0],
+                &wrong_generation,
+                &CacheOwnerManifest::new("/layout/plain/0", "/layout/plain/0"),
+            ),
+        );
+
+        // Without a generation marker no intent applies, not even a broken one.
+        let unmarked_root = "/layout/unmarked";
+        let unmarked_key = simple_hash(unmarked_root);
+        let unmarked_dir = cache_base.join(&unmarked_key);
+        std::fs::create_dir_all(&unmarked_dir).unwrap();
+        std::fs::write(
+            cache_owner_manifest_path(&unmarked_dir),
+            serde_json::to_vec(&CacheOwnerManifest::new(unmarked_root, unmarked_root)).unwrap(),
+        )
+        .unwrap();
+        write_raw_owner_intent(&cache_base, &unmarked_key, 1, b"{not-json");
+
+        let (bad_marker_key, bad_marker_dir) =
+            create_owned_cache(&cache_base, "/layout/bad-marker");
+        std::fs::write(cache_generation_marker_path(&bad_marker_dir), b"{bad").unwrap();
+
+        let legacy_key = simple_hash("/layout/legacy");
+        std::fs::create_dir_all(cache_base.join(&legacy_key)).unwrap();
+
+        let (publishing_key, publishing_dir) =
+            create_owned_cache(&cache_base, "/layout/publishing");
+        std::fs::write(publishing_dir.join("index.db.publish-state-v1"), b"{}").unwrap();
+        std::fs::write(publishing_dir.join("index.db.swap"), b"").unwrap();
+
+        // Lease files and intents whose caches are gone, plus crash leftovers.
+        for index in 0..8_u32 {
+            let gone_root = format!("/layout/gone/{index}");
+            let gone_key = simple_hash(&gone_root);
+            for suffix in ["lock", "publish.lock"] {
+                open_lock_file(&leases_dir(&cache_base).join(format!("{gone_key}.{suffix}")))
+                    .unwrap();
+            }
+            write_raw_owner_intent(
+                &cache_base,
+                &gone_key,
+                index,
+                &raw_owner_intent(
+                    &gone_key,
+                    "2-2-2",
+                    &CacheOwnerManifest::new(&gone_root, &gone_root),
+                ),
+            );
+        }
+        std::fs::write(
+            leases_dir(&cache_base).join(".owner-manifest.4242.1.tmp"),
+            b"",
+        )
+        .unwrap();
+        std::fs::create_dir_all(cache_base.join(".gc-trash")).unwrap();
+
+        let outcomes = assert_shared_listing_matches_per_cache_reads(&cache_base);
+        drop(live_lease);
+
+        let outcome = |key: &str| {
+            outcomes
+                .get(key)
+                .unwrap_or_else(|| panic!("cache {key} was not inspected"))
+                .clone()
+        };
+        for (index, key) in plain.iter().enumerate() {
+            let owner = outcome(key);
+            assert!(
+                owner.contains(&format!("\"/layout/plain/{index}\"")),
+                "{owner}"
+            );
+            assert!(
+                !owner.contains(retired_alias),
+                "retired intent applied: {owner}"
+            );
+        }
+        for alias in aliases {
+            assert!(outcome(&alias_key).contains(alias));
+        }
+        let rekeyed = outcome(&second_key);
+        for identity in [first_root, second_root, rekey_alias] {
+            assert!(rekeyed.contains(identity), "{rekeyed}");
+        }
+        assert!(outcome(&intent_only_key).contains(intent_only_root));
+        assert!(outcome(&mismatched_key).contains("does not match directory key"));
+        assert!(outcome(&malformed_key).contains("invalid cache owner manifest"));
+        assert!(outcome(&wrong_key).contains("does not match filename key"));
+        assert!(outcome(&unmarked_key).starts_with("Some("));
+        assert!(outcome(&bad_marker_key).starts_with("error: "));
+        assert_eq!(outcome(&legacy_key), "None");
+        assert!(outcome(&publishing_key).contains("/layout/publishing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_intent_listing_retries_a_failed_listing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_base = temp.path().join("cache");
+        let (first_key, first_dir) = create_owned_cache(&cache_base, "/retry/first");
+        let (second_key, second_dir) = create_owned_cache(&cache_base, "/retry/second");
+        let leases = leases_dir(&cache_base);
+        let real_leases = temp.path().join("real-leases");
+        std::fs::rename(&leases, &real_leases).unwrap();
+        std::os::unix::fs::symlink(&real_leases, &leases).unwrap();
+
+        let mut listing = CacheOwnerIntentListing::new(&cache_base);
+        let unusable = owner_lookup_outcome(listing.effective_owner(&first_dir, &first_key));
+        assert_eq!(
+            unusable,
+            owner_lookup_outcome(effective_cache_owner(&cache_base, &first_dir, &first_key))
+        );
+        assert!(unusable.contains("not a real directory"), "{unusable}");
+
+        std::fs::remove_file(&leases).unwrap();
+        std::fs::rename(&real_leases, &leases).unwrap();
+        let recovered = owner_lookup_outcome(listing.effective_owner(&second_dir, &second_key));
+        assert_eq!(
+            recovered,
+            owner_lookup_outcome(effective_cache_owner(&cache_base, &second_dir, &second_key))
+        );
+        assert!(recovered.contains("/retry/second"), "{recovered}");
+    }
+
+    #[test]
+    fn intent_removed_behind_a_shared_listing_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_base = temp.path().join("cache");
+        let (first_key, first_dir) = create_owned_cache(&cache_base, "/removed/first");
+        let second_root = "/removed/second";
+        let (second_key, second_dir) = create_owned_cache(&cache_base, second_root);
+        let alias = CacheOwnerManifest::new(second_root, "/removed/alias");
+        let intent =
+            write_cache_owner_intent(&cache_base, &second_dir, &second_key, &alias).unwrap();
+
+        let mut listing = CacheOwnerIntentListing::new(&cache_base);
+        listing.effective_owner(&first_dir, &first_key).unwrap();
+        std::fs::remove_file(&intent).unwrap();
+
+        let error = listing
+            .effective_owner(&second_dir, &second_key)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("disappeared"), "{error:#}");
+        assert!(effective_cache_owner(&cache_base, &second_dir, &second_key)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
