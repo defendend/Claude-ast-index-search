@@ -26,7 +26,7 @@ use super::changed::{
     discover_vcs_root, os_args, parse_utf8, render_stderr, run_bounded, Deadline, Vcs, STDOUT_LIMIT,
 };
 use super::Page;
-use crate::db::{self, GitFileStats};
+use crate::db::{self, GitFileSignalRow, GitFileStats};
 
 /// Commit cursor: the last commit whose diffs are already accumulated.
 const META_HEAD: &str = "git_signals_head";
@@ -41,8 +41,8 @@ const META_COMMITS: &str = "git_signals_commits";
 
 /// Files bigger than this are not line-counted; relative churn is skipped.
 const MAX_LINE_COUNT_BYTES: u64 = 8 * 1024 * 1024;
-const PERCENTILE_HIGH: f64 = 90.0;
-const PERCENTILE_ELEVATED: f64 = 75.0;
+pub(crate) const PERCENTILE_HIGH: f64 = 90.0;
+pub(crate) const PERCENTILE_ELEVATED: f64 = 75.0;
 /// Below this many commits a fix ratio is noise (1 of 1 is not "100% bugs").
 const MIN_COMMITS_FOR_FIX_LABEL: i64 = 4;
 const SECONDS_PER_DAY: f64 = 86_400.0;
@@ -807,7 +807,7 @@ pub fn collect_git_signals(
     })
 }
 
-fn short_sha(sha: &str) -> &str {
+pub(crate) fn short_sha(sha: &str) -> &str {
     &sha[..sha.len().min(10)]
 }
 
@@ -828,21 +828,27 @@ fn unix_millis_now() -> i64 {
 /// (a repository full of single-commit files) from pushing that value to
 /// the 100th percentile.
 fn percentile_ranks(values: &[f64]) -> Vec<f64> {
-    let count = values.len();
-    if count == 0 {
+    if values.is_empty() {
         return Vec::new();
     }
     let mut sorted = values.to_vec();
     sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     values
         .iter()
-        .map(|value| {
-            let less = sorted.partition_point(|candidate| candidate < value);
-            let not_greater = sorted.partition_point(|candidate| candidate <= value);
-            let equal = not_greater - less;
-            100.0 * (less as f64 + 0.5 * equal as f64) / count as f64
-        })
+        .map(|value| midrank_percentile(&sorted, *value))
         .collect()
+}
+
+/// Midrank percentile of `value` against an ascending `sorted` population,
+/// 0..100. `value` need not be a member: a value below every member is 0.
+pub(crate) fn midrank_percentile(sorted: &[f64], value: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let less = sorted.partition_point(|candidate| *candidate < value);
+    let not_greater = sorted.partition_point(|candidate| *candidate <= value);
+    let equal = not_greater - less;
+    100.0 * (less as f64 + 0.5 * equal as f64) / sorted.len() as f64
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -936,7 +942,7 @@ fn hotspot_score(commits_pct: f64, churn_pct: f64, fix_ratio_pct: f64) -> u32 {
     ((commits_pct + churn_pct + fix_ratio_pct) / 3.0).round() as u32
 }
 
-fn build_hotspots(rows: Vec<GitFileStats>, now_seconds: i64) -> Vec<Hotspot> {
+fn build_hotspots(rows: Vec<GitFileSignalRow>, now_seconds: i64) -> Vec<Hotspot> {
     let commits: Vec<f64> = rows.iter().map(|row| row.commits as f64).collect();
     let churn: Vec<f64> = rows
         .iter()
@@ -959,7 +965,7 @@ fn build_hotspots(rows: Vec<GitFileStats>, now_seconds: i64) -> Vec<Hotspot> {
             }
         })
         .collect();
-    let authors: Vec<f64> = rows.iter().map(|row| row.authors.len() as f64).collect();
+    let authors: Vec<f64> = rows.iter().map(|row| row.authors as f64).collect();
     let age: Vec<f64> = rows
         .iter()
         .map(|row| match row.first_commit_at {
@@ -998,7 +1004,7 @@ fn build_hotspots(rows: Vec<GitFileStats>, now_seconds: i64) -> Vec<Hotspot> {
                     .filter(|lines| *lines > 0)
                     .map(|_| round2(relative_churn[position])),
                 relative_churn_pct: relative_churn_pct[position].round() as u32,
-                authors: row.authors.len(),
+                authors: row.authors,
                 authors_pct: authors_pct[position].round() as u32,
                 current_lines: row.current_lines,
                 age_days: row.first_commit_at.map(|_| round1(age[position])),
@@ -1015,6 +1021,77 @@ fn build_hotspots(rows: Vec<GitFileStats>, now_seconds: i64) -> Vec<Hotspot> {
             hotspot
         })
         .collect()
+}
+
+/// One live file's history, ranked against every other live file exactly as
+/// the `hotspots` report ranks it.
+#[derive(Clone, Debug)]
+pub struct FileHistory {
+    pub hotspot: Hotspot,
+    /// Percentile of days since the last change: high means untouched for
+    /// longer than most files.
+    pub idle_pct: u32,
+}
+
+/// The collected history, keyed by primary-root-relative path.
+#[derive(Clone, Debug)]
+pub struct HistorySnapshot {
+    pub head: Option<String>,
+    pub collected_at: Option<i64>,
+    pub commits_analyzed: usize,
+    pub files: HashMap<String, FileHistory>,
+}
+
+pub enum HistoryAvailability {
+    /// `hotspots --collect` never ran against this index.
+    NotCollected,
+    /// A collection ran, but no file that still exists has history.
+    Empty,
+    Ready(HistorySnapshot),
+}
+
+/// Load every live file's history with percentiles and labels, for callers
+/// that rank something other than the `hotspots` report by it.
+pub fn load_history_snapshot(conn: &Connection) -> Result<HistoryAvailability> {
+    let head = db::get_metadata_value(conn, META_HEAD)?;
+    if head.is_none() {
+        return Ok(HistoryAvailability::NotCollected);
+    }
+    let rows = db::load_live_git_file_signals(conn)?;
+    if rows.is_empty() {
+        return Ok(HistoryAvailability::Empty);
+    }
+    let now_seconds = unix_millis_now() / 1000;
+    let idle: Vec<f64> = rows
+        .iter()
+        .map(|row| match row.last_commit_at {
+            Some(last) => (now_seconds - last).max(0) as f64,
+            None => 0.0,
+        })
+        .collect();
+    let idle_pct = percentile_ranks(&idle);
+    let files = build_hotspots(rows, now_seconds)
+        .into_iter()
+        .zip(idle_pct)
+        .map(|(hotspot, idle)| {
+            (
+                hotspot.path.clone(),
+                FileHistory {
+                    hotspot,
+                    idle_pct: idle.round() as u32,
+                },
+            )
+        })
+        .collect();
+    Ok(HistoryAvailability::Ready(HistorySnapshot {
+        head,
+        collected_at: db::get_metadata_value(conn, META_COLLECTED_AT)?
+            .and_then(|value| value.parse::<i64>().ok()),
+        commits_analyzed: db::get_metadata_value(conn, META_COMMITS)?
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0),
+        files,
+    }))
 }
 
 fn round1(value: f64) -> f64 {
@@ -1123,9 +1200,10 @@ pub fn cmd_hotspots(
     // Percentiles describe the files a reader can actually choose between, so
     // paths that no longer exist are dropped before ranking: a repository that
     // deleted half its history would otherwise inflate every survivor.
-    let rows: Vec<GitFileStats> = rows
+    let rows: Vec<GitFileSignalRow> = rows
         .into_iter()
         .filter(|row| row.current_lines.is_some())
+        .map(GitFileSignalRow::from)
         .collect();
     let files_with_history = rows.len();
     let now_seconds = unix_millis_now() / 1000;

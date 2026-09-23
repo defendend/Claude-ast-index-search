@@ -372,6 +372,7 @@ slice via offset/limit. Never bulk-read large files.
 - `ast-index dependents "NetworkKit"` — what depends on this module?
 - `ast-index changed` — what changed in my branch?
 - `ast-index hotspots --collect` — which files churn most and attract the most bugfixes?
+- `ast-index search Service --rank proven` — which of these is safe to copy? (also `risky`, `hotspots`, `central`)
 - `ast-index graph impact "PaymentGateway" --depth 3` — what breaks if I change this, transitively?
 - `ast-index todo` — find all TODOs
 ````
@@ -420,6 +421,7 @@ permissions to your own policy.
 
 ```bash
 ast-index search "Payment"              # broad search across files and symbols
+ast-index search "Payment" --rank risky # re-rank by history + graph (proven|hotspots|risky|central)
 ast-index file "PaymentView"            # find files by name
 ast-index symbol "PaymentRepository"    # find a symbol
 ast-index class "BaseController"        # find class-like definitions
@@ -486,6 +488,122 @@ receiver type or inheritance), `import`, `unique`, or `ambiguous` with the
 number of candidates. Metrics count resolved edges only; `--include-ambiguous`
 lists the rest. After `update` changes the index the graph reports itself as
 stale until `graph build` (or a query with `--refresh`) runs again.
+
+### Ranking search results by history and structure
+
+`search --rank <preset>` re-orders the **Files** and **Symbols** sections of a
+search by what the index knows beyond the name: the Git history of the file
+(`hotspots --collect`) and the symbol's place in the dependency graph
+(`graph build`). References and content matches keep their plain order.
+
+```bash
+ast-index hotspots --collect && ast-index graph build     # once; both are explicit
+ast-index search Service --fuzzy --module app/services/ --rank proven   # what to copy
+ast-index search Merge --rank risky                       # what is dangerous to touch
+ast-index search Import --module app/services/ --rank hotspots          # where it keeps breaking
+ast-index search Event --module app/models/ --rank central
+ast-index --format json search Merge --rank risky         # dossier per result
+```
+
+| Preset | Question | Needs |
+|--------|----------|-------|
+| `proven` | Which of these is safe to copy as a pattern? | history + graph |
+| `hotspots` | Which of these keeps being changed and fixed? | history |
+| `risky` | Which of these is dangerous to touch? | history + graph |
+| `central` | Which of these does the rest of the code lean on? | graph |
+
+**Formulas.** Every input is a 0..1 value; history percentiles are against all
+live files of the repository, graph percentiles against all symbols with at
+least one resolved caller.
+
+- `hotspots` = the file's hotspot score: mean percentile of commits, churn and
+  bugfix ratio — the same number `ast-index hotspots` prints.
+- `proven` = mean of four terms: *calm* (1 − hotspot score), *age* (file age
+  percentile), *idle* (percentile of days since the file last changed) and
+  *used* (1 when at least one resolved reference points at the symbol, else 0).
+- `risky` = *blast radius* × hotspot score, where blast radius is the
+  percentile of the symbol's transitive dependents (≤ 3 hops, resolved edges),
+  0 when nothing depends on it. Both have to be high.
+- `central` = PageRank percentile, 0 when nothing resolves to the symbol.
+
+**Why these formulas.** They were chosen by backtesting on a 40k-file
+Ruby/TypeScript monorepo with 25k commits: file signals were computed from the
+history up to a cut-off T, and the outcome was bugfix commits to the same file
+in the 12 months after T, for T = 12, 24 and 36 months before HEAD.
+
+- The hotspot score's top 10% of files received a bugfix 4.2×, 2.2× and 5.1× as
+  often as the average file. Bugfix ratio on its own managed only 1.5×, 0.9×
+  and 1.6×: it is part of the score, but activity is what predicts.
+- `proven`: among files something depends on, the top 10% by `proven` were
+  fixed 0.15×, 0.06× and 0.09× as often as the average such file, and every
+  one of them is used. Adding the author count made the top decile *more*
+  fix-prone (0.5–1.3× the base rate, because authors track activity), so authors
+  are shown but not scored. Weighting usage by how many files use a symbol
+  instead of 1/0 was worse too (0.45×, 0.21×, 0.47×): more callers, more
+  exposure.
+- `risky` was measured as impact-weighted damage — P(bugfix next year) ×
+  log2(1 + dependents) — collected by the top decile: 7.4×, 6.9× and 8.0×
+  random, against 6.3×/5.8×/6.7× for centrality alone, 5.1×/4.0×/6.4× for the
+  hotspot score alone, and 7.0×/6.3×/7.5× for the same product with dependents
+  ranked against all graph nodes.
+- `central`: PageRank, fan-in and dependents rank-correlate at 0.98+ among
+  graph nodes, so the choice matters only at the top; PageRank is what
+  `graph top` sorts by. 69% of graph nodes have no resolved caller, so against
+  all nodes any caller at all lands above the 69th percentile; ranking against
+  referenced symbols spreads the scale over the range that varies.
+
+**Relevance is kept, not replaced.**
+
+1. The pool is the top 100 project symbols of the plain relevance order (or
+   `--limit` + 1 if larger) and up to 2000 project files matching the path.
+2. Symbol tiers are hard: exact name (case-sensitive), exact name ignoring
+   case, a word of the name starting with the query (a substring with
+   `--fuzzy`, where case is not told apart), signature-only match. A preset
+   only re-orders inside a tier, so an exact match is never pushed below a
+   partial one.
+3. Inside a tier the sort key is `0.9 × score + 0.1 × relevance`, where
+   relevance is `1 / (1 + position / 20)` and position is the candidate's place
+   in the tier's plain order. The weight was swept over 11 queries: 0.9
+   realizes 93% of the score the tiers allow in the top five while reaching
+   about 21 positions deep on average; 0.8 kept 73%, 1.0 reached 33 deep.
+4. Files all contain the query in their path and come back alphabetically, so
+   where the match sits — file stem, file name, directory — is their relevance
+   term (`1 / (1 + tier)`), with the same 0.9 weight.
+
+**Granularity.** History is per *file*: every symbol in a file shares its
+file's history, and the output says "file history". Graph metrics are per
+*symbol*; a file result borrows them from its strongest symbol (highest
+PageRank), named in the output.
+
+**Missing evidence.** A preset whose data is missing is not applied: results
+stay in plain relevance order, the text output says what is missing and which
+command collects it, and JSON reports `rank.applied: false` with
+`rank.missing: [{signal, reason, command}]`. A stale graph (the index changed
+since `graph build`) still ranks, with a warning and `rank.graph.stale: true`.
+
+**Unscored results.** Third-party code (`node_modules`, `.d.ts`) has no
+history in the repository and no graph edges (`graph build` never targets
+installed packages), so presets never score it and list it after every project
+result. Project files without collected history (untracked, or newer than the
+last `hotspots --collect`) and files of attached subtrees (history covers the
+primary root only) keep their relevance order after the scored results of
+their tier, marked `unscored`.
+
+**Output.** Each file and symbol carries its dossier: the preset score and its
+terms, the relevance position and tier, the raw history numbers with their
+percentiles and labels (`churn:high`, `fixes:elevated`, `authors:many`,
+`veteran`, …) and the graph numbers with theirs (`fan-in:high`,
+`dependents:high`, `pagerank:high`, `callers:unresolved` when only ambiguous
+references point at it). In JSON, `files` become objects `{path, rank}` and
+symbols gain a `rank` object; the top-level `rank` object carries the preset,
+formula, evidence summary, pool sizes and weight.
+
+**Known limits.** When a query's exact-name tier fills the page (`search
+Policy` in a code base full of `POLICY` constants), a preset can only re-order
+that tier; the files section usually answers better. `proven` favours code that
+has been left alone for years — safe by the numbers, but possibly written in an
+older style. History is per file, so for a small method it describes the class
+around it.
 
 Use structural search through ast-grep when `sg` is installed:
 

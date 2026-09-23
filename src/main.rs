@@ -352,6 +352,11 @@ enum Commands {
         /// Fuzzy search (exact → prefix → contains)
         #[arg(long)]
         fuzzy: bool,
+        /// Re-rank files and symbols by a preset: proven (safe to copy),
+        /// hotspots (frequently fixed), risky (dangerous to touch), central
+        /// (structurally central). Needs `hotspots --collect` and/or `graph build`
+        #[arg(long, value_parser = ["proven", "hotspots", "risky", "central"])]
+        rank: Option<String>,
     },
     /// Find files by name
     File {
@@ -1308,6 +1313,7 @@ fn main() -> Result<()> {
             in_file,
             module,
             fuzzy,
+            rank,
         } => {
             let scope = db::SearchScope {
                 in_file: in_file.as_deref(),
@@ -1322,6 +1328,7 @@ fn main() -> Result<()> {
                 format,
                 &scope,
                 fuzzy,
+                rank.as_deref(),
             )
         }
         Commands::Symbol {
