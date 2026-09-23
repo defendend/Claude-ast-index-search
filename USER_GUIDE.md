@@ -93,7 +93,9 @@ After a successful `rebuild` or `update`, `ast-index` removes caches for other
 projects only when they have not been touched for more than 14 days. Open
 commands and a running `watch` hold an external lease, so an active index is
 never selected by this cleanup. A removed cache is recreated by the next
-`ast-index rebuild` in that project.
+`ast-index rebuild` in that project. The same pass also deletes the lock files
+in the cache's `.leases` directory that belong to caches which no longer exist,
+whatever their age; a lock that another process holds is kept.
 
 ## Connect It To A Project
 

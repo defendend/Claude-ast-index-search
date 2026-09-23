@@ -2826,10 +2826,135 @@ fn cache_has_unresolved_publication(cache_dir: &Path) -> bool {
     )
 }
 
+/// The cache key a `.leases` project or publication lock file belongs to.
+fn lease_lock_key(name: &str) -> Option<&str> {
+    name.strip_suffix(".publish.lock")
+        .or_else(|| name.strip_suffix(".lock"))
+        .filter(|key| is_cache_key(key))
+}
+
+fn cache_entry_is_absent(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn open_lease_lock_for_removal(path: &Path, create: bool) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if file.metadata()?.file_type().is_file() {
+        Ok(file)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "lease lock is not a regular file",
+        ))
+    }
+}
+
+/// Unlink `path` only while it still names the inode locked through `file`.
+fn remove_locked_lease_file(path: &Path, file: &File) -> bool {
+    let (Ok(listed), Ok(opened)) = (std::fs::symlink_metadata(path), file.metadata()) else {
+        return false;
+    };
+    listed.file_type().is_file()
+        && same_file_identity(&listed, &opened)
+        && std::fs::remove_file(path).is_ok()
+}
+
+fn remove_orphaned_key_locks(base: &Path, leases: &Path, key: &str) {
+    use fs2::FileExt;
+
+    let cache_dir = base.join(key);
+    if !cache_entry_is_absent(&cache_dir) {
+        return;
+    }
+    let project_path = leases.join(format!("{key}.lock"));
+    let publication_path = leases.join(format!("{key}.publish.lock"));
+    let Ok(project) = open_lease_lock_for_removal(&project_path, true) else {
+        return;
+    };
+    if project.try_lock_exclusive().is_err() || !cache_entry_is_absent(&cache_dir) {
+        return;
+    }
+    let publication = match open_lease_lock_for_removal(&publication_path, false) {
+        Ok(file) => {
+            if file.try_lock_exclusive().is_err() {
+                return;
+            }
+            Some(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return,
+    };
+    // Publication lockers hold the project lease, so the project lock file
+    // must outlive the publication lock file.
+    if let Some(file) = &publication {
+        if !remove_locked_lease_file(&publication_path, file) {
+            return;
+        }
+    }
+    remove_locked_lease_file(&project_path, &project);
+}
+
+/// Remove the `{key}.lock` and `{key}.publish.lock` files of every cache key
+/// other than `keep` whose directory is gone, whether GC just quarantined it
+/// or it disappeared some other way.
+///
+/// The caller must hold the exclusive cache-layout lock. Every opener of a
+/// `{key}.lock` holds that lock from opening the file until its flock is
+/// taken, and every opener of a `{key}.publish.lock` holds a shared
+/// `{key}.lock` lease meanwhile. So once both files are locked exclusively
+/// here, nobody holds either inode or is about to lock it, and unlinking them
+/// cannot leave two processes locking different inodes for one key. Anything
+/// busy, not a regular file, or with a cache entry present is left alone.
+fn remove_orphaned_lease_locks(base: &Path, keep: Option<&str>) {
+    let leases = leases_dir(base);
+    if !std::fs::symlink_metadata(&leases)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&leases) else {
+        return;
+    };
+    let mut keys = std::collections::BTreeSet::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(key) = name.to_str().and_then(lease_lock_key) else {
+            continue;
+        };
+        if Some(key) != keep && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            keys.insert(key.to_owned());
+        }
+    }
+    for key in keys {
+        remove_orphaned_key_locks(base, &leases, &key);
+    }
+}
+
 /// Remove cached indexes for *other* projects that have not been touched
 /// within `max_age`. Best-effort: unreadable or undeletable entries are
 /// skipped. `keep` is the hash-dir name of the project currently in use, so
 /// it is never removed. Returns the number of project caches deleted.
+///
+/// The same sweep drops the `.leases` lock files of every other key whose
+/// cache directory no longer exists, regardless of `max_age`.
 ///
 /// Split out from `gc_stale_caches` so tests can drive it against a
 /// throwaway base dir with an injected `now`.
@@ -2919,6 +3044,8 @@ pub fn gc_stale_caches_in(
             removed += 1;
         }
     }
+
+    remove_orphaned_lease_locks(base, keep);
 
     // Renaming is the atomic logical deletion. Physical cleanup happens
     // after releasing all locks; crash leftovers are retried on the next GC.
