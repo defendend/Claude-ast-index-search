@@ -58,6 +58,7 @@ impl LanguageParser for SwiftParser {
                     name: node_text(content, &cap.node).to_string(),
                     kind: SymbolKind::Import,
                     line,
+                    end_line: None,
                     signature: line_text(content, line).trim().to_string(),
                     parents: vec![],
                 });
