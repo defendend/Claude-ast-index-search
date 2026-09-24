@@ -47,7 +47,10 @@ const META_COLLECTED_AT: &str = "git_signals_collected_at";
 const META_COMMITS: &str = "git_signals_commits";
 /// Layout of the per-commit store the derived tables were folded from.
 const META_STORE: &str = "git_signals_store";
-const STORE_LAYOUT: &str = "commits-v1";
+/// Bumped whenever a stored column changes meaning, as `is_fix` did with the
+/// bugfix heuristic: commits already in a store are never read again, so an
+/// older store has to be recollected once to match a fresh collection.
+const STORE_LAYOUT: &str = "commits-v2";
 /// Paths that carry history once renames are followed, deleted ones included.
 const META_PATHS: &str = "git_signals_paths";
 
@@ -87,14 +90,23 @@ const SECONDS_PER_DAY: f64 = 86_400.0;
 // Bugfix heuristic
 // ---------------------------------------------------------------------------
 
-/// Leading tracker key or issue number: `[ABC-123] `, `ABC-123: `, `#42 `.
-/// Stripped before the bugfix match so a repository whose keys happen to read
-/// `BUG-1234` does not score every commit as a fix.
+/// Leading tracker keys and issue numbers, bare or bracketed: `[ABC-123] `,
+/// `ABC-123: `, `#42 `, `[ABC-1][ABC-2] `, `(ABC-1, ABC-2) `. Stripped before
+/// the bugfix match so a repository whose keys happen to read `BUG-1234` does
+/// not score every commit as a fix. Only keys go: a bracketed tag such as
+/// `[HOTFIX]` or `[FIX]` stays for the vocabulary to match.
 fn issue_prefix_regex() -> &'static Regex {
     static CELL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     CELL.get_or_init(|| {
-        Regex::new(r"(?i)^\s*(?:\[[^\]]{1,40}\]|\(#\d+\)|#\d+|[a-z][a-z0-9_]{1,15}-\d+)[\s:.,-]*")
-            .expect("issue prefix regex must compile")
+        const KEY: &str = r"(?:[a-z][a-z0-9_]{1,15}-\d+|#\d+)";
+        // Listed keys are apart by a separator or a space, never by a bare
+        // `-`: in `ABC-12-fix-500-in-search` the `fix-500` is no second key.
+        let list = format!(r"{KEY}(?:(?:\s*[,;/|&]\s*|\s+){KEY})*");
+        let bracketed = format!(r"(?:\[\s*{list}\s*\]|\(\s*{list}\s*\))");
+        Regex::new(&format!(
+            r"(?i)^\s*(?:{bracketed}[\s:.,-]*)*(?:{list}[\s:.,-]*)?"
+        ))
+        .expect("issue prefix regex must compile")
     })
 }
 
@@ -115,7 +127,7 @@ fn bugfix_regex() -> &'static Regex {
             r"|workaround|resolve|resolves|resolved|correct|corrects|corrected",
             r"|incorrect|failure|failures|failing|misbehav\w*",
             // Russian
-            r"|фикс\w*|пофикс\w*|исправ\w*|поправ\w*|баг\w*|ошиб\w*",
+            r"|фикс\w*|пофикс\w*|хотфикс\w*|исправ\w*|поправ\w*|баг\w*|ошиб\w*",
             r"|почин\w*|слома\w*|ломает\w*|отвалил\w*|отвалива\w*",
             r"|паден\w*|падает|падают|краш\w*|регресс\w*|устран\w*",
             r")\b",
@@ -1469,7 +1481,7 @@ pub(crate) fn history_carry_rejection(
 ) -> Option<String> {
     let metadata = &history.metadata;
     if metadata.get(META_STORE).map(String::as_str) != Some(STORE_LAYOUT) {
-        return Some("it was collected by an older version without the per-commit store".into());
+        return Some("it was collected by an older version with a different store layout".into());
     }
     if !metadata.contains_key(META_HEAD) {
         return Some("it has no commit cursor".into());
@@ -1569,7 +1581,7 @@ pub fn collect_git_signals(
         }
         Some(_) if stored_layout.as_deref() != Some(STORE_LAYOUT) => {
             reset_reason = Some(
-                "history collected by an older version has no per-commit store; \
+                "history collected by an older version uses a different store layout; \
                  recollecting once"
                     .to_string(),
             );
@@ -2291,6 +2303,25 @@ mod tests {
         assert!(!is_bugfix_subject("[BUG-1234] Add a new export format"));
         assert!(is_bugfix_subject("[PTK-36985] Поправить тексты ошибок"));
         assert!(!is_bugfix_subject("[PTK-36985] Переименовать интеграцию"));
+        assert!(!is_bugfix_subject("BUG-12: Add a new export format"));
+        assert!(!is_bugfix_subject("#42 Add a new export format"));
+        assert!(!is_bugfix_subject("(#42) Add a new export format"));
+        assert!(!is_bugfix_subject("[BUG-1][BUG-2] Add a new export format"));
+        assert!(!is_bugfix_subject("[BUG-1, BUG-2] Add a new export format"));
+        assert!(!is_bugfix_subject("BUG-1 BUG-2: Add a new export format"));
+        assert!(is_bugfix_subject("ABC-12-fix-500-in-search (#115)"));
+        assert!(is_bugfix_subject("AB-1012fix"));
+    }
+
+    #[test]
+    fn bugfix_heuristic_keeps_bracketed_fix_tags() {
+        assert!(is_bugfix_subject("[HOTFIX][ABC-321] Add an export timeout"));
+        assert!(is_bugfix_subject("[ABC-321][HOTFIX] Add an export timeout"));
+        assert!(is_bugfix_subject("[ABC-3] [Hotfix] Add an export timeout"));
+        assert!(is_bugfix_subject("[FIX] Add an export timeout"));
+        assert!(is_bugfix_subject("[BUGFIX] Add an export timeout"));
+        assert!(is_bugfix_subject("[ХОТФИКС] Добавить таймаут выгрузки"));
+        assert!(!is_bugfix_subject("[WIP][ABC-321] Add an export timeout"));
     }
 
     #[test]

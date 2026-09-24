@@ -430,9 +430,9 @@ content — one-line bundles, fixtures, gutted views), `fixes:high` /
 of a large repository does not collapse into ties. `fixes` orders by the
 bugfix share discounted for thin history (lower bound of its 95% Wilson
 interval: 11 of 17 above 2 of 2), files under 4 commits last. Bugfix
-detection is a commit-subject heuristic (English and Russian, tracker key
-stripped first); merge commits are excluded and renames carry history onto
-the new path.
+detection is a commit-subject heuristic (English and Russian; leading tracker
+keys are stripped first, tags such as `[HOTFIX]` / `[FIX]` count as fixes);
+merge commits are excluded and renames carry history onto the new path.
 
 ### Public API
 

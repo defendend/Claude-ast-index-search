@@ -247,7 +247,7 @@ keys:
 | `git_signals_head`, `git_signals_repo_root`, `git_signals_scope`, `git_signals_collected_at` | Commit cursor and bookkeeping of the last `hotspots --collect`. |
 | `git_signals_commits` | Live commits that changed the project (the analysed history). |
 | `git_signals_paths` | Paths that carry history once renames are followed, deleted ones included. |
-| `git_signals_store` | Layout of the per-commit store (`commits-v1`); history collected without it is recollected once. |
+| `git_signals_store` | Layout of the per-commit store (`commits-v2`, bumped when a stored column such as `is_fix` changes meaning); history collected with another layout or without it is recollected once. |
 | `symbol_graph_fingerprint` | Digest of `files`, `symbols`, `refs` and `inheritance` row counts, highest ids and summed file mtimes/sizes when the graph was built; a mismatch marks the graph stale. |
 | `symbol_graph_built_at` | Unix timestamp in milliseconds of the last `graph build`. |
 | `symbol_graph_summary` | JSON summary of the last build: edges and references per confidence level, references not linked per reason. |
