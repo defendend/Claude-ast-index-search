@@ -423,9 +423,13 @@ ancestor of `HEAD` — branch switch, rebase, force-push, or a
 garbage-collected object — the run says so and rebuilds from scratch instead
 of failing or reporting stale numbers.
 
-Signals live in their own `git_file_stats` / `git_file_authors` tables keyed
-by project-relative path, so they survive a reindex and also cover files the
-parsers never look at (fixtures, configs, migrations).
+Signals live in their own tables, keyed by project-relative path, so they
+also cover files the parsers never look at (fixtures, configs, migrations).
+They depend on the repository, not on the index, so `rebuild` carries them
+into the new index and the next `--collect` stays incremental. It leaves them
+behind, says so, and the next `--collect` reads the history again only when
+they were collected by an older version or from another working tree or
+scope, or cannot be read back intact.
 
 ```text
 Git hotspots — 289 file(s) with history, 370 commit(s) analyzed, HEAD 50db069dbb, sorted by score:

@@ -64,6 +64,38 @@ fn finalize_rebuild_schema(conn: &rusqlite::Connection, verbose: bool) -> Result
     Ok(())
 }
 
+/// Keep what `hotspots --collect` gathered: the history depends on the
+/// repository, not on the index a full rebuild starts over.
+fn carry_git_history(conn: &rusqlite::Connection, root: &Path, verbose: bool) -> Result<()> {
+    let t = Instant::now();
+    let carry = db::carry_git_history(conn, root, |history| {
+        super::git_signals::history_carry_rejection(root, history)
+    })?;
+    match carry {
+        db::GitHistoryCarry::Absent => {}
+        db::GitHistoryCarry::Kept(history) => println!(
+            "{}",
+            format!(
+                "Kept the collected git history ({} commit(s) analyzed)",
+                history.live_commits
+            )
+            .dimmed()
+        ),
+        db::GitHistoryCarry::Dropped(reason) => println!(
+            "{}",
+            format!(
+                "Collected git history not kept: {reason}. \
+                 Run 'ast-index hotspots --collect' to collect it again."
+            )
+            .yellow()
+        ),
+    }
+    if verbose {
+        eprintln!("[verbose] carry_git_history in {:?}", t.elapsed());
+    }
+    Ok(())
+}
+
 fn restore_rebuild_pragmas(conn: &rusqlite::Connection, verbose: bool) -> Result<()> {
     let t = Instant::now();
     db::restore_rebuild_pragmas(conn)?;
@@ -808,6 +840,10 @@ pub fn cmd_rebuild(
         _ => {}
     }
 
+    // A seeded generation already holds the live history.
+    if !seed_from_live {
+        carry_git_history(&conn, root, verbose)?;
+    }
     if verbose {
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
@@ -1150,6 +1186,7 @@ fn cmd_rebuild_sub_projects(
             success_count, total_files, module_count, dep_count, trans_count, fail_count
         ).green()
     );
+    carry_git_history(&conn, root, verbose)?;
     if verbose {
         eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
     }

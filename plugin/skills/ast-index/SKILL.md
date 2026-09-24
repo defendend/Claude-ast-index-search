@@ -412,7 +412,9 @@ to the current `HEAD` by set difference — commits `HEAD` no longer reaches
 so switching branches costs time proportional to the commits that differ, and
 switching back re-reads nothing. The numbers always equal a full recollection
 at that `HEAD`. Only a garbage-collected cursor commit, a changed project root
-or `--full` rebuild from scratch.
+or `--full` rebuild from scratch. `rebuild` keeps the collected history (it
+does not depend on the index) unless it came from an older version or another
+working tree or scope; then the next `--collect` reads it again.
 
 Labels: `churn:high` / `churn:elevated`, `rewritten-often` (relative churn,
 only for files of 10+ lines: below that a line count no longer measures

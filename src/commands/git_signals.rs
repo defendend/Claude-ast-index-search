@@ -9,8 +9,9 @@
 //! means high relative to its neighbours instead of relative to a constant
 //! that only ever fits one repository size.
 //!
-//! Collection is never implicit: `rebuild` and `update` stay untouched and
-//! the user opts in with `hotspots --collect`.
+//! Collection is never implicit: `rebuild` and `update` never read the log
+//! (a rebuild only carries the collected history into the new index) and the
+//! user opts in with `hotspots --collect`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
@@ -1274,6 +1275,100 @@ fn scope_within_repo(project_root: &Path, repo_root: &Path) -> Result<Option<Str
     Ok(Some(parts.join("/")))
 }
 
+/// The working tree a project's history is read from.
+struct HistoryOrigin {
+    project_root: PathBuf,
+    repo_root: PathBuf,
+    /// Project root relative to the repo root; `None` when they coincide.
+    scope: Option<String>,
+}
+
+impl HistoryOrigin {
+    fn of(project_root: &Path) -> Result<HistoryOrigin> {
+        let vcs_root = discover_vcs_root(project_root)?;
+        if vcs_root.vcs != Vcs::Git {
+            bail!(
+                "git signals need a Git working tree; found {} at {}",
+                vcs_root.vcs.command_name(),
+                vcs_root.path.display()
+            );
+        }
+        let project_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
+        let repo_root = vcs_root
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| vcs_root.path.clone());
+        let scope = scope_within_repo(&project_root, &repo_root)?;
+        Ok(HistoryOrigin {
+            project_root,
+            repo_root,
+            scope,
+        })
+    }
+
+    /// Value of [`META_REPO_ROOT`] for history read from this working tree.
+    fn repo_key(&self) -> String {
+        self.repo_root.to_string_lossy().into_owned()
+    }
+
+    /// Value of [`META_SCOPE`] for history read from this working tree.
+    fn scope_key(&self) -> String {
+        self.scope.clone().unwrap_or_default()
+    }
+}
+
+/// Why the history the previous index holds cannot be carried into a rebuilt
+/// index of `project_root`; `None` when it can.
+///
+/// The history depends only on the repository, so it stays valid across a
+/// rebuild as long as the current store layout read it from the same working
+/// tree and scope, and the store agrees with its own bookkeeping. Anything
+/// else would be served by `hotspots` without a `--collect` as if it
+/// described this project.
+pub(crate) fn history_carry_rejection(
+    project_root: &Path,
+    history: &db::StoredGitHistory,
+) -> Option<String> {
+    let metadata = &history.metadata;
+    if metadata.get(META_STORE).map(String::as_str) != Some(STORE_LAYOUT) {
+        return Some("it was collected by an older version without the per-commit store".into());
+    }
+    if !metadata.contains_key(META_HEAD) {
+        return Some("it has no commit cursor".into());
+    }
+    let recorded = metadata
+        .get(META_COMMITS)
+        .and_then(|value| value.parse::<usize>().ok());
+    if recorded != Some(history.live_commits) {
+        return Some(format!(
+            "the stored history is inconsistent: {} live commit(s) in the store, {} recorded",
+            history.live_commits,
+            recorded
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+    }
+    let origin = match HistoryOrigin::of(project_root) {
+        Ok(origin) => origin,
+        Err(error) => return Some(format!("{error:#}")),
+    };
+    if metadata.get(META_REPO_ROOT) != Some(&origin.repo_key()) {
+        return Some(format!(
+            "it belongs to a different working tree ({})",
+            metadata
+                .get(META_REPO_ROOT)
+                .map(String::as_str)
+                .unwrap_or("unknown")
+        ));
+    }
+    if metadata.get(META_SCOPE).map(String::as_str).unwrap_or("") != origin.scope_key() {
+        return Some("it was collected for a different scope of the repository".into());
+    }
+    None
+}
+
 /// Collect (or refresh) git signals for `project_root`.
 ///
 /// The per-commit store is moved to HEAD by set difference: commits only the
@@ -1291,30 +1386,16 @@ pub fn collect_git_signals(
     verbose: bool,
 ) -> Result<CollectOutcome> {
     let started = Instant::now();
-    let vcs_root = discover_vcs_root(project_root)?;
-    if vcs_root.vcs != Vcs::Git {
-        bail!(
-            "git signals need a Git working tree; found {} at {}",
-            vcs_root.vcs.command_name(),
-            vcs_root.path.display()
-        );
-    }
-    let canonical_project = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let canonical_repo = vcs_root
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| vcs_root.path.clone());
-    let scope = scope_within_repo(&canonical_project, &canonical_repo)?;
-    let repo_key = canonical_repo.to_string_lossy().into_owned();
-    let scope_key = scope.clone().unwrap_or_default();
+    let origin = HistoryOrigin::of(project_root)?;
+    let repo_key = origin.repo_key();
+    let scope_key = origin.scope_key();
+    let canonical_repo = origin.repo_root.clone();
 
     let collector = Collector {
         executable: super::changed::vcs_executable(Vcs::Git),
-        repo_root: canonical_repo.clone(),
-        project_root: canonical_project,
-        scope,
+        repo_root: origin.repo_root,
+        project_root: origin.project_root,
+        scope: origin.scope,
         deadline: Deadline::new(Duration::from_millis(timeout_ms)),
         verbose,
         window,
@@ -2018,6 +2099,21 @@ fn render_text(report: &HotspotsReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rebuild_carries_every_history_key() {
+        for key in [
+            META_HEAD,
+            META_REPO_ROOT,
+            META_SCOPE,
+            META_COLLECTED_AT,
+            META_COMMITS,
+            META_STORE,
+            META_PATHS,
+        ] {
+            assert!(key.starts_with(db::GIT_SIGNALS_METADATA_PREFIX), "{key}");
+        }
+    }
 
     #[test]
     fn bugfix_heuristic_ignores_fix_inside_words() {

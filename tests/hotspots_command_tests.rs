@@ -176,19 +176,7 @@ struct CollectedSignals {
 impl CollectedSignals {
     fn read(db: &Path) -> CollectedSignals {
         let conn = rusqlite::Connection::open(db).unwrap();
-        let dump = |sql: &str| -> Vec<Vec<rusqlite::types::Value>> {
-            let mut statement = conn.prepare(sql).unwrap();
-            let columns = statement.column_count();
-            statement
-                .query_map([], |row| {
-                    (0..columns)
-                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
-                        .collect()
-                })
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
-        };
+        let dump = |sql: &str| dump_rows(&conn, sql);
         CollectedSignals {
             stats: dump("SELECT * FROM git_file_stats ORDER BY path"),
             authors: dump("SELECT * FROM git_file_authors ORDER BY path, author"),
@@ -199,6 +187,66 @@ impl CollectedSignals {
             ),
         }
     }
+}
+
+/// The whole collected history as raw SQLite values: the per-commit store,
+/// the tables derived from it and every `git_signals_*` metadata key.
+#[derive(Debug, PartialEq)]
+struct StoredHistory {
+    tables: Vec<(&'static str, Vec<Vec<rusqlite::types::Value>>)>,
+}
+
+impl StoredHistory {
+    fn read(db: &Path) -> StoredHistory {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let queries = [
+            ("git_commits", "SELECT * FROM git_commits ORDER BY id"),
+            ("git_paths", "SELECT * FROM git_paths ORDER BY id"),
+            (
+                "git_commit_changes",
+                "SELECT * FROM git_commit_changes ORDER BY commit_id, path_id",
+            ),
+            (
+                "git_file_stats",
+                "SELECT * FROM git_file_stats ORDER BY path",
+            ),
+            (
+                "git_file_authors",
+                "SELECT * FROM git_file_authors ORDER BY path, author",
+            ),
+            (
+                "metadata",
+                "SELECT key, value FROM metadata
+                 WHERE key LIKE 'git\\_signals\\_%' ESCAPE '\\' ORDER BY key",
+            ),
+        ];
+        StoredHistory {
+            tables: queries
+                .iter()
+                .map(|(table, sql)| (*table, dump_rows(&conn, sql)))
+                .collect(),
+        }
+    }
+
+    fn assert_empty(&self, label: &str) {
+        for (table, rows) in &self.tables {
+            assert!(rows.is_empty(), "{label}: {table} still has {rows:?}");
+        }
+    }
+}
+
+fn dump_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut statement = conn.prepare(sql).unwrap();
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..columns)
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect()
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
 }
 
 fn git_command(repo: &Path, args: &[&str]) -> Command {
@@ -1126,4 +1174,223 @@ fn exclude_tests_narrows_the_list_but_not_the_percentiles() {
     let text = workspace.ast_index(&["hotspots", "--exclude-tests"]);
     assert_success(&text);
     assert!(String::from_utf8_lossy(&text.stdout).contains("test files left out"));
+}
+
+/// A report with the fields that move with the wall clock taken out, so two
+/// reports of the same history compare equal a second apart.
+fn without_clock(mut report: Value) -> Value {
+    for item in report["items"].as_array_mut().unwrap() {
+        let item = item.as_object_mut().unwrap();
+        item.remove("age_days");
+        item.remove("days_since_change");
+    }
+    report
+}
+
+fn dead_commits(db: &Path) -> i64 {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM git_commits WHERE live = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Collect a history with renames, a deleted file and commits HEAD no longer
+/// reaches, so every table of the store has rows.
+fn collect_varied_history(workspace: &Workspace) {
+    workspace.init_git();
+    workspace.commit_at(
+        "Add parser and guide",
+        &[("src/a.rs", "a\n"), ("docs/guide.md", "g\n")],
+        at(1),
+    );
+    workspace.git(&["branch", "side"]);
+    workspace.commit_at("Fix parser crash", &[("src/a.rs", "a\nfix\n")], at(2));
+    workspace.git(&["mv", "src/a.rs", "src/b.rs"]);
+    workspace.git_at(&["commit", "-q", "-m", "Move parser"], at(3));
+    workspace.commit_at("Add scratch", &[("src/tmp.rs", "t\n")], at(4));
+    workspace.git(&["rm", "-q", "src/tmp.rs"]);
+    workspace.git_at(&["commit", "-q", "-m", "Drop scratch"], at(5));
+    workspace.git(&["checkout", "-q", "side"]);
+    workspace.commit_at("Tweak guide", &[("docs/guide.md", "g\ng2\n")], at(6));
+    workspace.rebuild();
+    workspace.hotspots_json(&["--collect"]);
+    workspace.git(&["checkout", "-q", "main"]);
+    workspace.hotspots_json(&["--collect"]);
+    assert!(dead_commits(&workspace.db) > 0);
+}
+
+#[test]
+fn rebuild_keeps_the_collected_history() {
+    let workspace = workspace();
+    collect_varied_history(&workspace);
+    let stored = StoredHistory::read(&workspace.db);
+    let report = workspace.hotspots_json(&[]);
+
+    // Leaving a directory out of the index changes the indexed files, not the
+    // history: that follows repository paths.
+    let output = workspace.ast_index(&["rebuild", "--exclude", "docs/"]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Kept the collected git history"),
+        "{stdout}"
+    );
+
+    assert_eq!(StoredHistory::read(&workspace.db), stored);
+    let after = workspace.hotspots_json(&[]);
+    assert_eq!(find_item(&after, "docs/guide.md")["commits"], 1);
+    assert_eq!(without_clock(after), without_clock(report));
+
+    let resumed = workspace.hotspots_json(&["--collect"]);
+    assert_eq!(resumed["collection"]["mode"], "incremental");
+    assert_eq!(resumed["collection"]["commits_scanned"], 0);
+    assert!(resumed["collection"].get("reset_reason").is_none());
+    workspace.assert_matches_fresh_collection("after a rebuild");
+
+    workspace.commit_at("Fix moved parser", &[("src/b.rs", "a\nfix\nb\n")], at(7));
+    workspace.rebuild();
+    workspace.collect_and_compare("a new commit after a rebuild");
+}
+
+#[test]
+fn partial_and_scoped_rebuilds_keep_the_collected_history() {
+    let workspace = workspace();
+    collect_varied_history(&workspace);
+    let stored = StoredHistory::read(&workspace.db);
+
+    for args in [
+        &["rebuild", "--type", "files"][..],
+        &["rebuild", "--type", "modules"][..],
+        // An allow-list switches to the per-directory rebuild.
+        &["rebuild", "--include", "src"][..],
+        &["rebuild", "--sub-projects"][..],
+    ] {
+        assert_success(&workspace.ast_index(args));
+        assert_eq!(StoredHistory::read(&workspace.db), stored, "{args:?}");
+    }
+}
+
+#[test]
+fn rebuild_without_a_previous_index_or_history_starts_empty() {
+    let workspace = workspace();
+    workspace.init_git();
+    workspace.commit("Add parser", &[("src/a.rs", "fn a() {}\n")]);
+    for label in ["no previous index", "a previous index without history"] {
+        let output = workspace.ast_index(&["rebuild"]);
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("git history"), "{label}: {stdout}");
+        StoredHistory::read(&workspace.db).assert_empty(label);
+    }
+}
+
+/// The history left after a rebuild that must not keep it: nothing, and the
+/// next collection reads everything again.
+fn assert_history_dropped(workspace: &Workspace, reason: &str) {
+    let output = workspace.ast_index(&["rebuild"]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Collected git history not kept") && stdout.contains(reason),
+        "{stdout}"
+    );
+    StoredHistory::read(&workspace.db).assert_empty(reason);
+    let report = workspace.ast_index(&["hotspots"]);
+    assert_success(&report);
+    assert!(
+        String::from_utf8_lossy(&report.stdout).contains("No git signals collected yet"),
+        "{reason}"
+    );
+
+    let json = workspace.hotspots_json(&["--collect"]);
+    assert_eq!(json["collection"]["mode"], "full", "{reason}");
+    workspace.assert_matches_fresh_collection(reason);
+}
+
+#[test]
+fn rebuild_drops_history_collected_by_an_older_version() {
+    let workspace = workspace();
+    workspace.init_git();
+    workspace.commit("Add parser", &[("src/a.rs", "fn a() {}\n")]);
+    workspace.rebuild();
+    workspace.hotspots_json(&["--collect"]);
+    let conn = rusqlite::Connection::open(&workspace.db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE git_commit_changes; DROP TABLE git_commits; DROP TABLE git_paths;
+         DELETE FROM metadata WHERE key IN ('git_signals_store', 'git_signals_paths');",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_history_dropped(&workspace, "older version");
+}
+
+#[test]
+fn rebuild_drops_history_of_another_working_tree() {
+    let workspace = workspace();
+    workspace.init_git();
+    workspace.commit("Add parser", &[("src/a.rs", "fn a() {}\n")]);
+    workspace.rebuild();
+    workspace.hotspots_json(&["--collect"]);
+
+    // The project is now a subdirectory of a different repository.
+    fs::remove_dir_all(workspace.root.join(".git")).unwrap();
+    let repo = workspace.root.parent().unwrap().to_path_buf();
+    git_in(&repo, &["init", "-q", "-b", "main"]);
+    git_in(&repo, &["add", "project/src/a.rs"]);
+    git_in(&repo, &["commit", "-q", "-m", "Import the project"]);
+
+    assert_history_dropped(&workspace, "different working tree");
+}
+
+#[test]
+fn rebuild_drops_history_collected_for_another_scope() {
+    let workspace = workspace();
+    workspace.init_git();
+    workspace.commit("Add parser", &[("src/a.rs", "fn a() {}\n")]);
+    workspace.rebuild();
+    workspace.hotspots_json(&["--collect"]);
+    let conn = rusqlite::Connection::open(&workspace.db).unwrap();
+    conn.execute(
+        "UPDATE metadata SET value = 'elsewhere' WHERE key = 'git_signals_scope'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_history_dropped(&workspace, "scope");
+}
+
+#[test]
+fn rebuild_drops_damaged_history_and_still_succeeds() {
+    let workspace = workspace();
+    workspace.init_git();
+    workspace.commit("Add parser", &[("src/a.rs", "fn a() {}\n")]);
+    workspace.commit("Fix parser", &[("src/a.rs", "fn a() {}\nfn b() {}\n")]);
+    workspace.rebuild();
+    workspace.hotspots_json(&["--collect"]);
+
+    // The cursor bookkeeping disagrees with the store.
+    let conn = rusqlite::Connection::open(&workspace.db).unwrap();
+    conn.execute(
+        "UPDATE metadata SET value = '7' WHERE key = 'git_signals_commits'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert_history_dropped(&workspace, "inconsistent");
+
+    // A store table that cannot be read the way the collector wrote it.
+    let conn = rusqlite::Connection::open(&workspace.db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE git_commit_changes;
+         CREATE TABLE git_commit_changes (commit_id INTEGER NOT NULL);",
+    )
+    .unwrap();
+    drop(conn);
+    assert_history_dropped(&workspace, "git_commit_changes");
 }

@@ -152,6 +152,18 @@ only the new HEAD reaches join it, and only the paths those commits touched
 (plus paths linked to them by renames) are refolded. The result equals a
 full collection at the same HEAD row for row.
 
+The history does not depend on the code index, so a full `rebuild` copies all
+five tables and every `git_signals_*` metadata key from the live generation
+into the staged one, in one transaction over one snapshot, before the staged
+generation is sealed and published. It copies nothing, leaving the tables
+empty for the next `hotspots --collect`, when `git_signals_store` is not the
+current layout, `git_signals_repo_root` / `git_signals_scope` do not match the
+project's working tree, `git_signals_commits` disagrees with the live commits
+in the store, a table's columns differ from the current schema, or reading
+the live generation fails. A partial
+`rebuild --type …` starts from a copy of the live generation and keeps the
+history with everything else.
+
 ### Symbol graph
 
 `symbol_edges` and `symbol_metrics` are filled only by `graph build`; `rebuild`

@@ -4574,9 +4574,10 @@ const CREATE_SUBTREES_SQL: &str = r#"
 "#;
 /// Per-file VCS history signals, collected on demand by `hotspots --collect`.
 ///
-/// Kept out of `files` and `symbols` on purpose: the rows survive a reindex,
-/// cover paths the indexer never parses (fixtures, configs, migrations), and
-/// follow the commit history rather than a file walk.
+/// Kept out of `files` and `symbols` on purpose: the rows cover paths the
+/// indexer never parses (fixtures, configs, migrations), follow the commit
+/// history rather than a file walk, and a rebuild carries them over
+/// ([`carry_git_history`]) instead of starting them over.
 ///
 /// `git_commits`, `git_paths` and `git_commit_changes` are the per-commit
 /// store: what each commit did to each project path. `git_commits.live` marks
@@ -9176,6 +9177,201 @@ pub fn clear_git_signals(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Prefix of every `metadata` key that belongs to the collected git history.
+pub const GIT_SIGNALS_METADATA_PREFIX: &str = "git_signals_";
+
+/// Schema name the live generation is attached under while a rebuild copies
+/// its git history.
+const CARRIED_HISTORY_SCHEMA: &str = "carried_history";
+
+/// The git history the live generation holds, as a rebuild sees it before
+/// deciding whether to keep it.
+#[derive(Debug)]
+pub struct StoredGitHistory {
+    /// Every `git_signals_*` metadata value.
+    pub metadata: HashMap<String, String>,
+    /// Live commits in the store that changed the project.
+    pub live_commits: usize,
+}
+
+/// What [`carry_git_history`] did with the live generation's git history.
+#[derive(Debug)]
+pub enum GitHistoryCarry {
+    /// There is no previous index, or no history was ever collected into it.
+    Absent,
+    /// The history is now part of the staged generation.
+    Kept(StoredGitHistory),
+    /// The previous index held history that was left behind, and why.
+    Dropped(String),
+}
+
+/// Copy the git history collected into the live generation into `staged`, a
+/// fresh full-rebuild generation, unless `rejection` gives a reason not to.
+///
+/// The history depends on the repository, not on the code index, so a
+/// rebuild keeps it instead of making the next `hotspots --collect` read the
+/// whole log again. The live generation is attached read-only and copied in
+/// one transaction: every table comes from the same snapshot of it, and any
+/// failure leaves the staged tables empty and returns
+/// [`GitHistoryCarry::Dropped`] rather than failing the rebuild. It is
+/// detached and released again before this returns, so the caller can seal
+/// and publish the staged generation exactly as before.
+pub fn carry_git_history<F>(
+    staged: &Connection,
+    project_root: &Path,
+    rejection: F,
+) -> Result<GitHistoryCarry>
+where
+    F: FnOnce(&StoredGitHistory) -> Option<String>,
+{
+    // Held for the whole copy: it keeps the live generation from being
+    // replaced meanwhile and its WAL index present for the read-only attach.
+    let live = match open_existing_db_leased(project_root) {
+        Ok(Some(live)) => live,
+        Ok(None) => return Ok(GitHistoryCarry::Absent),
+        Err(error) => {
+            return Ok(GitHistoryCarry::Dropped(format!(
+                "the previous index cannot be opened: {error:#}"
+            )))
+        }
+    };
+    let Some(uri) = live
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(read_only_sqlite_uri)
+    else {
+        return Ok(GitHistoryCarry::Dropped(
+            "the previous index has no usable file path".to_string(),
+        ));
+    };
+    if let Err(error) = staged.execute(
+        &format!("ATTACH DATABASE ?1 AS {CARRIED_HISTORY_SCHEMA}"),
+        params![uri],
+    ) {
+        return Ok(GitHistoryCarry::Dropped(format!(
+            "the previous index cannot be attached: {error}"
+        )));
+    }
+    let carried = copy_attached_git_history(staged, rejection);
+    staged
+        .execute(&format!("DETACH DATABASE {CARRIED_HISTORY_SCHEMA}"), [])
+        .context("failed to detach the previous index")?;
+    drop(live);
+    Ok(carried.unwrap_or_else(|error| GitHistoryCarry::Dropped(format!("{error:#}"))))
+}
+
+fn copy_attached_git_history<F>(staged: &Connection, rejection: F) -> Result<GitHistoryCarry>
+where
+    F: FnOnce(&StoredGitHistory) -> Option<String>,
+{
+    // Dropping the transaction on any early return rolls the copy back.
+    let tx = staged.unchecked_transaction()?;
+    let mut metadata = HashMap::new();
+    {
+        let mut statement = tx.prepare(&format!(
+            "SELECT key, value FROM {CARRIED_HISTORY_SCHEMA}.metadata"
+        ))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            if key.starts_with(GIT_SIGNALS_METADATA_PREFIX) {
+                metadata.insert(key, row.get(1)?);
+            }
+        }
+    }
+    if metadata.is_empty() {
+        return Ok(GitHistoryCarry::Absent);
+    }
+    let live_commits: i64 = tx
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {CARRIED_HISTORY_SCHEMA}.git_commits
+                 WHERE live = 1 AND author IS NOT NULL"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to read git_commits")?;
+    let history = StoredGitHistory {
+        metadata,
+        live_commits: live_commits as usize,
+    };
+    if let Some(reason) = rejection(&history) {
+        return Ok(GitHistoryCarry::Dropped(reason));
+    }
+
+    for table in GIT_SIGNAL_TABLES {
+        anyhow::ensure!(
+            table_layout(&tx, "main", table)? == table_layout(&tx, CARRIED_HISTORY_SCHEMA, table)?,
+            "{table} in the previous index has an unexpected layout"
+        );
+        tx.execute(&format!("DELETE FROM main.{table}"), [])
+            .with_context(|| format!("failed to clear {table}"))?;
+        // Identical column lists make `SELECT *` exact, and let SQLite copy
+        // the table's pages instead of inserting row by row.
+        tx.execute(
+            &format!("INSERT INTO main.{table} SELECT * FROM {CARRIED_HISTORY_SCHEMA}.{table}"),
+            [],
+        )
+        .with_context(|| format!("failed to copy {table}"))?;
+    }
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO main.metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )?;
+        for (key, value) in &history.metadata {
+            insert.execute(params![key, value])?;
+        }
+    }
+    tx.commit()
+        .context("failed to commit the copied git history")?;
+    Ok(GitHistoryCarry::Kept(history))
+}
+
+/// Column definitions of `schema.table` in declaration order: name, declared
+/// type, `NOT NULL`, default and primary-key position.
+type ColumnLayout = (String, String, bool, Option<String>, i64);
+
+fn table_layout(conn: &Connection, schema: &str, table: &str) -> Result<Vec<ColumnLayout>> {
+    let mut statement = conn.prepare(
+        "SELECT name, type, \"notnull\", dflt_value, pk
+         FROM pragma_table_info(?1, ?2) ORDER BY cid",
+    )?;
+    let layout = statement
+        .query_map(params![table, schema], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read the layout of {schema}.{table}"))?;
+    Ok(layout)
+}
+
+/// A `file:` URI that makes `ATTACH` open `path` read-only.
+fn read_only_sqlite_uri(path: &str) -> String {
+    #[cfg(windows)]
+    let path = path.replace('\\', "/");
+    let mut uri = String::from("file://");
+    if !path.starts_with('/') {
+        uri.push('/');
+    }
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            uri.push(byte as char);
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri.push_str("?mode=ro");
+    uri
+}
+
 /// Load every collected path, authors included. Used by the reporting path.
 pub fn load_all_git_file_stats(conn: &Connection) -> Result<Vec<GitFileStats>> {
     if !table_exists(conn, "git_file_stats")? {
@@ -10401,6 +10597,64 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         details.join("\n")
+    }
+
+    #[test]
+    fn table_layout_tells_reordered_columns_apart() {
+        let conn = create_test_db();
+        conn.execute("ATTACH DATABASE ':memory:' AS other", [])
+            .unwrap();
+        conn.execute_batch(
+            &CREATE_GIT_SIGNALS_SQL.replace(" TABLE IF NOT EXISTS ", " TABLE other."),
+        )
+        .unwrap();
+        for table in GIT_SIGNAL_TABLES {
+            let layout = table_layout(&conn, "main", table).unwrap();
+            assert!(!layout.is_empty(), "{table}");
+            assert_eq!(
+                layout,
+                table_layout(&conn, "other", table).unwrap(),
+                "{table}"
+            );
+        }
+
+        conn.execute_batch(
+            "DROP TABLE other.git_file_authors;
+             CREATE TABLE other.git_file_authors (
+                 author TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (path, author)
+             );",
+        )
+        .unwrap();
+        assert_ne!(
+            table_layout(&conn, "main", "git_file_authors").unwrap(),
+            table_layout(&conn, "other", "git_file_authors").unwrap()
+        );
+    }
+
+    #[test]
+    fn read_only_uri_attaches_awkward_paths_without_write_access() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let directory = temp.path().join("a b?c#d%e");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("index.db");
+        let source = Connection::open(&path).unwrap();
+        source
+            .execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('kept');")
+            .unwrap();
+        drop(source);
+
+        let uri = read_only_sqlite_uri(path.to_str().unwrap());
+        assert!(
+            uri.ends_with("/a%20b%3Fc%23d%25e/index.db?mode=ro"),
+            "{uri}"
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("ATTACH DATABASE ?1 AS other", [&uri]).unwrap();
+        let value: String = conn
+            .query_row("SELECT v FROM other.t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "kept");
+        assert!(conn.execute("DELETE FROM other.t", []).is_err());
     }
 
     #[test]

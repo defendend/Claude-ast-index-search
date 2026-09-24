@@ -196,6 +196,12 @@ the new `HEAD` no longer reaches and adds the new ones, reusing diffs it has
 read before, so a branch switch or a rebase costs about a second instead of a
 full rescan, and the numbers match a fresh `hotspots --collect --full`.
 
+`rebuild` keeps the collected history: it depends on the repository, not on
+the index, so the next `hotspots --collect` stays incremental. Only history
+collected by an older version, from another working tree or for another
+directory of the repository is left behind; the rebuild says so and the next
+`--collect` reads the history again.
+
 Use `rebuild` instead of `update` when:
 
 - the project root or `.ast-index.yaml` changed significantly;
