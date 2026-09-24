@@ -563,8 +563,31 @@ fn schema_columns_are_indexed_even_when_the_dump_is_gitignored() {
     assert!(columns.contains("people.first_name"), "{columns}");
     assert!(columns.contains("clients.first_name"), "{columns}");
     let outline = ws.run(&["outline", "db/schema.rb"]);
-    assert!(outline.contains("people [table]"), "{outline}");
-    assert!(outline.contains("people.archived [column]"), "{outline}");
+    assert!(
+        outline.contains(":2-6 people [table] 3 columns"),
+        "{outline}"
+    );
+    assert!(
+        outline.contains(":20-22 audits [table] 1 column"),
+        "{outline}"
+    );
+    assert!(!outline.contains("[column]"), "{outline}");
+    assert!(
+        outline.contains("7 columns folded into 5 tables: --full lists them"),
+        "{outline}"
+    );
+    let full = ws.run(&["outline", "db/schema.rb", "--full"]);
+    assert!(full.contains(":4 people.archived [column]"), "{full}");
+    assert!(!full.contains("folded"), "{full}");
+    let folded = ws.json(&["outline", "db/schema.rb"]);
+    let rows = folded["symbols"].as_array().unwrap();
+    assert_eq!(rows.len(), 5, "{folded:#}");
+    assert_eq!(rows[0]["name"], "people");
+    assert_eq!(rows[0]["columns"], 3);
+    let listed = ws.json(&["outline", "db/schema.rb", "--full"]);
+    let rows = listed["symbols"].as_array().unwrap();
+    assert_eq!(rows.len(), 12, "{listed:#}");
+    assert!(rows[0].get("columns").is_none(), "{listed:#}");
 
     ws.write(
         "db/schema.rb",

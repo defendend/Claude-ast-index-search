@@ -315,6 +315,11 @@ Rows are in source order. A definition spanning several lines prints its range
 definition prints `:12`. `end_line` is `null` in JSON where the parser reports
 no range.
 
+In a schema dump (`db/schema.rb`) the columns are folded into their table's
+row (`:96-149 orders [table] 33 columns`) so the outline stays small; `--full`
+lists every column, and `symbol --type column --pattern 'users.*'` lists one
+table's.
+
 ### Code Quality
 
 **`todo`** - Find TODO/FIXME/HACK comments in code.

@@ -88,7 +88,7 @@ fn file_cli_emits_json_when_requested() {
 #[test]
 fn cmd_outline_handles_missing_file_gracefully() {
     let dir = TempDir::new().unwrap();
-    cmd_outline(dir.path(), "does/not/exist.kt", "text")
+    cmd_outline(dir.path(), "does/not/exist.kt", false, "text")
         .expect("missing file must print a hint, not error");
 }
 
@@ -98,7 +98,7 @@ fn cmd_outline_parses_a_kotlin_file() {
     let src = dir.path().join("Foo.kt");
     fs::write(&src, "package demo\n\nclass Foo {\n  fun bar() {}\n}\n").unwrap();
 
-    cmd_outline(dir.path(), "Foo.kt", "text").expect("outline of valid Kotlin must succeed");
+    cmd_outline(dir.path(), "Foo.kt", false, "text").expect("outline of valid Kotlin must succeed");
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn cmd_outline_handles_unsupported_extension() {
     let src = dir.path().join("notes.unknown_ext_xyz");
     fs::write(&src, "hello\n").unwrap();
 
-    cmd_outline(dir.path(), "notes.unknown_ext_xyz", "text")
+    cmd_outline(dir.path(), "notes.unknown_ext_xyz", false, "text")
         .expect("unknown extension must print a hint, not error");
 }
 

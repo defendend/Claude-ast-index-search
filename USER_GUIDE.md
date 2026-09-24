@@ -493,6 +493,7 @@ The `changed` command remains on its independent schema v1. `outline --format
 json` reads one file and has no limit, so it uses its own schema v1 as well:
 `{ schema_version, file, symbols: [{ name, kind, line, end_line }] }`, plus
 `skipped` (`not_found`, `minified` or `unsupported`) when it parsed nothing.
+A schema table carries `columns` (the folded count) unless `--full` is given.
 `end_line` is `null` where the parser reports no range; the text form prints
 a multi-line definition as `:line-end_line`.
 
@@ -595,7 +596,10 @@ each `create_table` becomes a `table` symbol and each column a `column` symbol
 named `table.column` (`ast-index search email -t column`). The lines of the
 `ActiveRecord::Schema.define` block are not references: `t.string` and
 `t.integer` name column types, not the project's `string` or `integer`
-methods. `graph build`
+methods. `outline db/schema.rb` prints each table with its line range and
+column count (`:96-149 orders [table] 33 columns`) instead of thousands of
+column rows; `outline --full` lists every column, and `ast-index symbol --type
+column --pattern 'orders.*'` lists one table's. `graph build`
 matches tables to models by Active Record's rules — `self.table_name`,
 single-table inheritance, a model nested in another model, a namespace's
 `table_name_prefix` or engine `isolate_namespace`, then the pluralized class

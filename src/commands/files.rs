@@ -81,6 +81,9 @@ struct OutlineRow<'a> {
     line: usize,
     /// Last line of the definition; `null` where the parser reports none.
     end_line: Option<usize>,
+    /// Columns folded into a schema table's row (absent with `--full`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    columns: Option<usize>,
 }
 
 /// Why an outline lists no symbols without having parsed the file.
@@ -149,28 +152,23 @@ fn outline_symbols(
     Ok(Some(symbols))
 }
 
-/// `:line` or `:line-end_line` for a definition spanning several lines.
-fn outline_position(sym: &crate::parsers::ParsedSymbol) -> String {
-    match sym.end_line {
-        Some(end) if end > sym.line => format!(":{}-{}", sym.line, end),
-        _ => format!(":{}", sym.line),
-    }
-}
-
-fn print_outline_json(
-    file: &str,
-    symbols: &[crate::parsers::ParsedSymbol],
-    skipped: Option<OutlineSkip>,
-) -> Result<()> {
-    let rows: Vec<OutlineRow> = symbols
+/// Outline rows of `symbols`; unless `full`, a schema dump's columns are
+/// left out and counted on their table's row.
+fn outline_rows(symbols: &[crate::parsers::ParsedSymbol], full: bool) -> Vec<OutlineRow<'_>> {
+    symbols
         .iter()
+        .filter(|sym| full || sym.kind != SymbolKind::Column)
         .map(|sym| OutlineRow {
             name: &sym.name,
             kind: sym.kind.as_str(),
             line: sym.line,
             end_line: sym.end_line,
+            columns: (!full && sym.kind == SymbolKind::Table).then(|| table_columns(sym, symbols)),
         })
-        .collect();
+        .collect()
+}
+
+fn print_outline_json(file: &str, rows: &[OutlineRow], skipped: Option<OutlineSkip>) -> Result<()> {
     let mut document = serde_json::json!({
         "schema_version": OUTLINE_JSON_SCHEMA_VERSION,
         "file": file,
@@ -183,8 +181,10 @@ fn print_outline_json(
     Ok(())
 }
 
-/// Show file symbols outline
-pub fn cmd_outline(root: &Path, file: &str, format: &str) -> Result<()> {
+/// Show file symbols outline. The columns of a schema dump (Rails
+/// `db/schema.rb`) are folded into a count on their table's row unless `full`
+/// is set: thousands of column rows would bury the tables.
+pub fn cmd_outline(root: &Path, file: &str, full: bool, format: &str) -> Result<()> {
     let json = format == "json";
     let file_path = if file.starts_with('/') {
         PathBuf::from(file)
@@ -214,29 +214,67 @@ pub fn cmd_outline(root: &Path, file: &str, format: &str) -> Result<()> {
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let symbols = outline_symbols(&content, ext, file)?;
 
+    let rows = symbols
+        .as_deref()
+        .map(|symbols| outline_rows(symbols, full));
+
     if json {
-        let skipped = symbols.is_none().then_some(OutlineSkip::Unsupported);
-        return print_outline_json(file, symbols.as_deref().unwrap_or(&[]), skipped);
+        let skipped = rows.is_none().then_some(OutlineSkip::Unsupported);
+        return print_outline_json(file, rows.as_deref().unwrap_or(&[]), skipped);
     }
 
     println!("{}", header.bold());
-    let Some(symbols) = symbols else {
+    let Some(rows) = rows else {
         println!("  Unsupported file type: .{}", ext);
         println!("  No symbols found.");
         return Ok(());
     };
-    for sym in &symbols {
-        println!(
-            "  {} {} [{}]",
-            outline_position(sym).dimmed(),
-            sym.name.cyan(),
-            sym.kind.as_str()
-        );
+    let mut folded = (0, 0);
+    for row in &rows {
+        let position = match row.end_line {
+            Some(end) if end > row.line => format!(":{}-{}", row.line, end),
+            _ => format!(":{}", row.line),
+        };
+        let mut text = format!("  {} {} [{}]", position.dimmed(), row.name.cyan(), row.kind);
+        if let Some(columns) = row.columns.filter(|&columns| columns > 0) {
+            let noun = if columns == 1 { "column" } else { "columns" };
+            text.push_str(&format!(" {columns} {noun}"));
+            folded = (folded.0 + columns, folded.1 + 1);
+        }
+        println!("{text}");
     }
-    if symbols.is_empty() {
+    if rows.is_empty() {
         println!("  No symbols found.");
     }
+    if folded.0 > 0 {
+        println!(
+            "  {}",
+            format!(
+                "{} columns folded into {} tables: --full lists them, or symbol --type column --pattern '<table>.*'.",
+                folded.0, folded.1
+            )
+            .dimmed()
+        );
+    }
     Ok(())
+}
+
+/// Columns of a schema dump's `table` symbol: the `table.column` symbols
+/// inside its `create_table` block.
+fn table_columns(
+    table: &crate::parsers::ParsedSymbol,
+    symbols: &[crate::parsers::ParsedSymbol],
+) -> usize {
+    let prefix = format!("{}.", table.name);
+    let end = table.end_line.unwrap_or(table.line);
+    symbols
+        .iter()
+        .filter(|sym| {
+            sym.kind == SymbolKind::Column
+                && sym.name.starts_with(&prefix)
+                && (table.line..=end).contains(&sym.line)
+        })
+        .count()
 }
 
 /// Show file imports

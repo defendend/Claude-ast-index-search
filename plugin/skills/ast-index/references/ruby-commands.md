@@ -36,7 +36,8 @@ references, so `usages string` does not list its `t.string` lines.
 
 ```bash
 ast-index search first_name -t column       # every table with that column
-ast-index outline db/schema.rb              # tables and their columns
+ast-index outline db/schema.rb              # tables with line ranges and column counts
+ast-index outline db/schema.rb --full       # every column as its own row
 ast-index graph dependents users.email      # model code reading the column (after graph build)
 ```
 
