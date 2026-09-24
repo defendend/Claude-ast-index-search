@@ -2043,76 +2043,34 @@ fn index_directory_scoped_with_max_depth(
     if verbose {
         eprintln!("[verbose] using {} threads for parsing", num_threads);
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .stack_size(RAYON_WORKER_STACK_SIZE)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
-
-    let root_buf = root.to_path_buf();
     let root_key = db::normalize_root_for_storage(root);
-    let total_chunks = (files.len() + chunk_size - 1) / chunk_size;
-    for (chunk_idx, chunk) in files.chunks(chunk_size).enumerate() {
-        let root_clone = root_buf.clone();
-        let counter = parsed_global.clone();
-        let total = total_files;
-
-        if verbose {
-            eprintln!(
-                "[verbose] chunk {}/{}: parsing {} files...",
-                chunk_idx + 1,
-                total_chunks,
-                chunk.len()
-            );
-        }
-        let chunk_start = Instant::now();
-
-        // Parse chunk in parallel — at most `chunk_size` ParsedFiles in memory
-        let parsed_files: Vec<ParsedFile> = pool.install(|| {
-            chunk
-                .par_iter()
-                .filter_map(|path| {
-                    let result = parse_file_keyed(&root_clone, &root_key, path).ok();
-                    let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if progress && c % 2000 == 0 {
-                        eprintln!("Parsed {} / {} files...", c, total);
-                    }
-                    result
-                })
-                .collect()
-        });
-
-        if verbose {
-            eprintln!(
-                "[verbose] chunk {}/{}: parsed in {:?}, writing {} to DB...",
-                chunk_idx + 1,
-                total_chunks,
-                chunk_start.elapsed(),
-                parsed_files.len()
-            );
-        }
-        let write_start = Instant::now();
-
-        // Write to DB and free parsed_files
-        write_batch_to_db(
-            conn,
-            parsed_files,
-            &mut total_count,
-            WriteMode::FreshRebuild,
-        )?;
-
-        if verbose {
-            eprintln!(
-                "[verbose] chunk {}/{}: written in {:?}",
-                chunk_idx + 1,
-                total_chunks,
-                write_start.elapsed()
-            );
-        }
-
-        if progress {
-            eprintln!("Written {} / {} files to DB", total_count, total_files);
-        }
+    let parse_start = Instant::now();
+    parse_and_write_in_order(
+        conn,
+        &files,
+        num_threads,
+        chunk_size,
+        &|path: &PathBuf| {
+            let result = parse_file_keyed(root, &root_key, path).ok();
+            let c = parsed_global.fetch_add(1, Ordering::Relaxed) + 1;
+            if progress && c % 2000 == 0 {
+                eprintln!("Parsed {} / {} files...", c, total_files);
+            }
+            result
+        },
+        &mut total_count,
+        |written| {
+            if progress {
+                eprintln!("Written {} / {} files to DB", written, total_files);
+            }
+        },
+    )?;
+    if verbose {
+        eprintln!(
+            "[verbose] parsed and wrote {} files in {:?}",
+            total_count,
+            parse_start.elapsed()
+        );
     }
 
     Ok(WalkResult {
@@ -2123,6 +2081,95 @@ fn index_directory_scoped_with_max_depth(
         xml_layout_files,
         res_files,
         aborted_by_cap: false,
+    })
+}
+
+/// Parse `items` on `threads` workers and write the results to `conn` in
+/// input order, one transaction per `batch` items, while later items are
+/// still being parsed.
+///
+/// Parsing a chunk and then writing it left every parse thread idle during
+/// the write, and one large file held up its whole chunk. Workers now run at
+/// most two batches ahead of the writer, which bounds memory like the chunks
+/// did. Items are written in the order they are given, with the same
+/// transaction boundaries, so every file gets the id it got before.
+fn parse_and_write_in_order<T: Sync>(
+    conn: &mut Connection,
+    items: &[T],
+    threads: usize,
+    batch: usize,
+    parse: &(dyn Fn(&T) -> Option<ParsedFile> + Sync),
+    total_count: &mut usize,
+    mut after_batch: impl FnMut(usize),
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let batch = batch.max(1);
+    let window = batch * 2;
+    let next = AtomicUsize::new(0);
+    let written = AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (tx, rx) = crossbeam_channel::bounded::<(usize, Option<ParsedFile>)>(window);
+
+    std::thread::scope(|scope| -> Result<()> {
+        for _ in 0..threads.max(1).min(items.len()) {
+            let tx = tx.clone();
+            let (next, written, stop) = (&next, &written, &stop);
+            std::thread::Builder::new()
+                .stack_size(RAYON_WORKER_STACK_SIZE)
+                .spawn_scoped(scope, move || loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= items.len() {
+                        break;
+                    }
+                    while index >= written.load(Ordering::Acquire) + window
+                        && !stop.load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    if tx.send((index, parse(&items[index]))).is_err() {
+                        break;
+                    }
+                })
+                .map_err(|e| anyhow::anyhow!("Failed to start a parse thread: {}", e))?;
+        }
+        drop(tx);
+
+        let mut pending: HashMap<usize, Option<ParsedFile>> = HashMap::new();
+        let mut frontier = 0usize;
+        let mut consumed = 0usize;
+        let mut current: Vec<ParsedFile> = Vec::with_capacity(batch);
+        let result = (|| -> Result<()> {
+            for (index, parsed) in &rx {
+                pending.insert(index, parsed);
+                while let Some(parsed) = pending.remove(&frontier) {
+                    frontier += 1;
+                    consumed += 1;
+                    current.extend(parsed);
+                    if consumed == batch || frontier == items.len() {
+                        write_batch_to_db(
+                            conn,
+                            std::mem::take(&mut current),
+                            total_count,
+                            WriteMode::FreshRebuild,
+                        )?;
+                        consumed = 0;
+                        written.store(frontier, Ordering::Release);
+                        after_batch(*total_count);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        drop(rx);
+        result
     })
 }
 
@@ -4774,41 +4821,24 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
 
     let num_threads = effective_num_threads();
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .stack_size(RAYON_WORKER_STACK_SIZE)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
-
     let mut total_count = 0;
     let root_path = db::normalize_root_for_storage(root);
-
-    for chunk in dts_files.chunks(chunk_size) {
-        let counter = parsed_global.clone();
-        let total = total_files;
-        let root_path = root_path.clone();
-
-        let parsed_files: Vec<ParsedFile> = pool.install(|| {
-            chunk
-                .par_iter()
-                .filter_map(|(abs_path, rel_path)| {
-                    let result = parse_dts_file(abs_path, rel_path, &root_path).ok();
-                    let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if progress && c % 1000 == 0 {
-                        eprintln!("Parsed {} / {} .d.ts files...", c, total);
-                    }
-                    result
-                })
-                .collect()
-        });
-
-        write_batch_to_db(
-            conn,
-            parsed_files,
-            &mut total_count,
-            WriteMode::FreshRebuild,
-        )?;
-    }
+    parse_and_write_in_order(
+        conn,
+        &dts_files,
+        num_threads,
+        chunk_size,
+        &|(abs_path, rel_path): &(PathBuf, String)| {
+            let result = parse_dts_file(abs_path, rel_path, &root_path).ok();
+            let c = parsed_global.fetch_add(1, Ordering::Relaxed) + 1;
+            if progress && c % 1000 == 0 {
+                eprintln!("Parsed {} / {} .d.ts files...", c, total_files);
+            }
+            result
+        },
+        &mut total_count,
+        |_| {},
+    )?;
 
     if progress {
         eprintln!("Indexed {} .d.ts files from node_modules", total_count);
