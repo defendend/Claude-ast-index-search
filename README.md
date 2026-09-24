@@ -729,8 +729,21 @@ exclude:
 
 ### Unreleased
 
+- **`hotspots --sort fixes` discounts thin history** — files are ordered by the
+  lower bound of the 95% Wilson interval of their bugfix share, and files with
+  fewer than four commits follow the rest, so 11 fixes in 17 commits rank above
+  2 in 2.
+- **Bracketed fix tags count as bugfixes** — only tracker keys (`[ABC-123]`,
+  `ABC-123:`, `#42`, several in a row) are stripped before matching, so
+  `[HOTFIX][ABC-123] …`, `[FIX]`, `[BUGFIX]` and `хотфикс` count as fixes; the
+  store layout moved to `commits-v2`, so the first `--collect` recollects once.
+- **MCP descriptions no longer overpromise** — `usages` claimed it never
+  matches comments or strings and `callers` that it attributes calls to the
+  calling function; both now say what they do (`callers` points to
+  `call_tree`), and the heaviest descriptions were trimmed: `tools/list`
+  27.3 → 24.4 KB.
 - **`search`, `callers` and `call-tree` skip files that cannot match** — the
-  index now keeps each file's distinct words (`file_words`, about +7% index
+  index now keeps each file's distinct words (`file_words`, about +7–10% index
   size), and the grep-based commands no longer open a file whose words lack
   the searched literal while it is unchanged since indexing; edited and new
   files are still searched. On a 40k-file Rails monorepo `search` went from
@@ -844,10 +857,10 @@ exclude:
   that are not local variables; core collection and string methods called
   without parentheses are skipped. RSpec `let` / `subject` helpers resolve
   within their spec file. On a Rails monorepo resolved graph edges grew from
-  66k to 186k at +29% index size.
+  66k to 186k; references nearly doubled for Ruby files.
 - **Compound Ruby constants are indexed** — `Billing::Import = Container.injector`
-  and CamelCase assignments (`Types = Dry.Types()`) become constants, named
-  with their enclosing scopes like classes. In the graph a constant defined in
+  becomes a constant named with its enclosing scopes like a class, and CamelCase
+  assignments (`Types = Dry.Types()`) are indexed as constants too. In the graph a constant defined in
   an inner scope shadows an outer module of the same name, so
   `include Import[...]` inside `module Billing` no longer links every such
   class to an unrelated top-level `module Import`.
@@ -858,10 +871,14 @@ exclude:
   graph nodes, while search ranking still demotes every `.d.ts`.
 - **`hotspots --collect` survives branch switches, rebases and resets** —
   history is kept per commit, so moving HEAD subtracts the commits it no longer
-  reaches and adds new ones, reusing diffs already read. A switch on a
-  25k-commit monorepo takes under a second instead of a ~1-minute rescan, and
-  the numbers equal a fresh full collection. The git tables are ~40% smaller.
-  The first `--collect` after upgrading recollects once.
+  reaches and adds new ones, reusing diffs already read; when a merge joins or
+  leaves, files that differ between the two HEADs are recomputed too, so a file
+  only a merge edited keeps a correct line count. A switch on a 25k-commit
+  monorepo takes under a second instead of a ~1-minute rescan, and the numbers
+  equal a fresh full collection at the same HEAD (line counts come from the
+  working tree, so an uncommitted edit counts once the file is recomputed). The
+  git tables are ~40% smaller. The first `--collect` after upgrading recollects
+  once.
 - **Hotspot scores no longer collapse into ties** — `hotspots --sort score` and
   `search --rank hotspots|risky|proven` order by unrounded percentiles
   (`score_exact` in JSON).
@@ -947,7 +964,7 @@ exclude:
   references into symbol-to-symbol edges and stores them with per-edge
   resolution confidence (`local`, `scoped`, `import`, `unique`, `ambiguous`).
   Queries on top of it: `dependents`, `dependencies`, `impact` (transitive
-  dependents), `path`, `cycles`, `top` and `metrics` (fan-in, fan-out,
+  dependents), `path`, `cycles`, `top`, `status` and `metrics` (fan-in, fan-out,
   PageRank). Ruby references resolve through namespaces, lexical nesting,
   constant receivers, inheritance and mixins; JavaScript/TypeScript references
   through the module's own imports. Metrics count resolved edges only and
