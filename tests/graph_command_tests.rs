@@ -757,3 +757,138 @@ fn a_project_vendor_directory_is_part_of_the_graph() {
     let charge = ws.json(&["graph", "dependents", "BillingClient#charge"]);
     assert_eq!(other_names(&charge), vec!["run"], "{charge:#}");
 }
+
+/// A Rust crate whose calls reach other modules through their paths, `use`
+/// bindings, a re-export and the library's name from an integration test.
+/// `legacy` defines a second `open_db`, and a `HashMap` type with a `new`.
+fn rust_crate_project() -> Workspace {
+    let ws = workspace();
+    ws.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\n",
+    );
+    ws.write(
+        "src/lib.rs",
+        "pub mod commands;\npub mod db;\npub mod legacy;\n",
+    );
+    ws.write(
+        "src/db.rs",
+        concat!(
+            "pub struct Scope;\n\n",
+            "impl Scope {\n",
+            "    pub fn none() -> Scope {\n",
+            "        Scope\n",
+            "    }\n",
+            "}\n\n",
+            "pub fn open_db() -> u8 {\n",
+            "    1\n",
+            "}\n",
+        ),
+    );
+    ws.write(
+        "src/legacy.rs",
+        concat!(
+            "pub struct HashMap;\n\n",
+            "impl HashMap {\n",
+            "    pub fn new() -> HashMap {\n",
+            "        HashMap\n",
+            "    }\n",
+            "}\n\n",
+            "pub fn open_db() -> u8 {\n",
+            "    2\n",
+            "}\n",
+        ),
+    );
+    ws.write(
+        "src/commands/mod.rs",
+        concat!(
+            "pub mod grep;\n",
+            "mod paths;\n\n",
+            "pub use paths::is_test_path;\n\n",
+            "pub fn helper() -> u8 {\n",
+            "    3\n",
+            "}\n",
+        ),
+    );
+    ws.write(
+        "src/commands/paths.rs",
+        concat!(
+            "pub fn is_test_path(path: &str) -> bool {\n",
+            "    path.is_empty()\n",
+            "}\n\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    use super::*;\n\n",
+            "    #[test]\n",
+            "    fn detects() {\n",
+            "        assert!(is_test_path(\"\"));\n",
+            "    }\n",
+            "}\n",
+        ),
+    );
+    ws.write(
+        "src/commands/grep.rs",
+        concat!(
+            "use std::collections::HashMap;\n\n",
+            "use super::is_test_path;\n",
+            "use crate::db::{self, Scope as DbScope};\n\n",
+            "pub fn run() -> usize {\n",
+            "    let conn = db::open_db();\n",
+            "    let scope = DbScope::none();\n",
+            "    let helped = super::helper();\n",
+            "    let map: HashMap<u8, u8> = HashMap::new();\n",
+            "    usize::from(is_test_path(\"x\")) + map.len() + usize::from(conn + helped)\n",
+            "}\n",
+        ),
+    );
+    ws.write(
+        "tests/api.rs",
+        concat!(
+            "use demo_app::db;\n\n",
+            "#[test]\n",
+            "fn opens() {\n",
+            "    assert_eq!(db::open_db(), 1);\n",
+            "}\n",
+        ),
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+    ws
+}
+
+#[test]
+fn rust_paths_resolve_through_file_modules_and_use_declarations() {
+    let ws = rust_crate_project();
+    let run = ws.json(&["graph", "dependencies", "run"]);
+    let target = |name: &str| -> (String, String) {
+        let edge = find_other(&run, name);
+        (
+            edge["other"]["path"].as_str().unwrap().to_string(),
+            edge["confidence"].as_str().unwrap().to_string(),
+        )
+    };
+    assert_eq!(target("open_db"), ("src/db.rs".into(), "scoped".into()));
+    assert_eq!(target("none"), ("src/db.rs".into(), "scoped".into()));
+    assert_eq!(
+        target("helper"),
+        ("src/commands/mod.rs".into(), "scoped".into())
+    );
+    assert_eq!(
+        target("is_test_path"),
+        ("src/commands/paths.rs".into(), "import".into())
+    );
+    assert!(
+        !other_names(&run).contains(&"new".to_string()),
+        "std's HashMap::new is not the project's: {run:#}"
+    );
+
+    let open_db = ws.json(&["graph", "dependents", "open_db", "--in-file", "src/db.rs"]);
+    let mut callers = other_names(&open_db);
+    callers.sort();
+    assert_eq!(callers, vec!["opens", "run"], "{open_db:#}");
+    let legacy = ws.json(&["graph", "dependents", "open_db", "--in-file", "legacy"]);
+    assert!(items(&legacy).is_empty(), "{legacy:#}");
+
+    let detects = ws.json(&["graph", "dependencies", "detects"]);
+    assert_eq!(find_other(&detects, "is_test_path")["confidence"], "local");
+}

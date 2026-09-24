@@ -285,6 +285,14 @@ dependents and PageRank count **resolved edges only**; ambiguous edges are
 counted separately and listed with `--include-ambiguous` (on `impact` that
 gives an upper bound next to the resolved-only number).
 
+Rust paths resolve like the compiler reads them: a file is a module
+(`src/db.rs` is `db`), `crate::` / `super::` / `self::` walk the module tree,
+and `use` declarations (grouped, aliased, globbed, `pub use` re-exports) bind
+names, so `db::open_db(...)` is a `scoped` edge to `src/db.rs` and a name
+imported with `use` an `import` edge. Another workspace crate is reached by
+its `Cargo.toml` library name; `std::` and dependency paths never resolve to
+a same-named project definition.
+
 A class symbol only owns its class-level references (superclass, mixins);
 pass `--members` to `dependents` / `dependencies` / `impact` to cover the
 definitions inside it. `path` always treats a class as itself plus its

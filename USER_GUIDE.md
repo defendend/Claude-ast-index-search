@@ -545,6 +545,15 @@ reopens a class to stub a method is not what production code calls; see
 `--include-ambiguous` lists the rest. After `update` changes the index the graph reports itself as
 stale until `graph build` (or a query with `--refresh`) runs again.
 
+Rust paths resolve the way the compiler reads them: a file is a module
+(`src/db.rs` is `db`, `src/commands/mod.rs` is `commands`, `src/lib.rs` and
+`src/main.rs` the crate root), `crate::`, `super::` and `self::` walk that
+tree, and `use` declarations — grouped, aliased, globbed, re-exported with
+`pub use` — bind the names a file uses. Another crate of the workspace is
+reached by its library name from `Cargo.toml` (`my_crate::db::open_db` in
+`tests/`). A path that leaves the project (`std::`, a dependency, or a name a
+`use` binds to one) never resolves to a project definition of the same name.
+
 References are capitalized names and calls written `name(` — snake_case and
 `_private` names included (`update_profile(user)`, `self._compute()`). Reserved
 words of C/C++, Go, Python, Rust, Perl and JavaScript never count: `sizeof (x)`,

@@ -12,7 +12,8 @@
 //!   nesting, by a constant receiver (`Type.method`) or by the inheritance /
 //!   mixin chain of the enclosing class;
 //! * `import`    — bound by an import of the source file (JavaScript and
-//!   TypeScript imports are read from the source at build time);
+//!   TypeScript imports and Rust `use` declarations are read from the source
+//!   at build time);
 //! * `unique`    — the only definition of the name in the language, for a
 //!   plain reference in a language where that is meaningful evidence;
 //! * `ambiguous` — `candidates` definitions share the name and nothing above
@@ -32,6 +33,7 @@
 
 mod metrics;
 mod resolve;
+mod rust;
 mod schema;
 
 use std::cmp::Reverse;
