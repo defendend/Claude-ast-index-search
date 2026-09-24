@@ -729,6 +729,57 @@ exclude:
 
 ### Unreleased
 
+- **Definitions rank above imports** — inside every relevance tier of `search`
+  (plain, `--fuzzy`, `--rank`) definitions now come before imports, and imports
+  never enter the last-segment tier: `search InstallRequirement` in pip lists
+  the class first instead of 12th behind eleven imports, and `search Result` in
+  a Rust project no longer answers with a wall of `use anyhow::Result`.
+- **Schema columns named after the query rank first** — `.` now separates name
+  segments like `::`, so `search email -t column` lists `users.email` and every
+  other `*.email` column before `email_communicator_email_id`-style columns.
+- **Namespaced Ruby classes found by short or full name** — `symbol`, `class`,
+  `refs`, `hierarchy` and `implementations` find `class Billing::Invoice` by
+  `Invoice` or `Billing::Invoice` (Ruby stores the full name and no qualified
+  name, so `hierarchy` and `class` used to answer "not found"); an exact short
+  name still wins. `usages Billing::Invoice` lists references to `Invoice` on
+  lines that spell the full name out.
+- **`proven` favours settled, living examples over abandoned ones** — the score
+  is now mean(calm, mature, used) × substance × lineage: files under 10 lines
+  and empty class bodies score half, and so does code built on a base class the
+  project stopped extending; time since the last change is no longer scored. On
+  11 "which one to copy" queries the top five held 40 good examples of 55
+  instead of 22.
+- **Test symbols after production code** — in the partial-match tiers of
+  `search`, symbols in test files or named `test_*` / `TestX` follow the rest;
+  exact names keep their place.
+- **`usages` lists production code first** — references in test files follow
+  those in production files, each group by path and line (also in `refs`); JSON
+  marks test references with `"test": true`.
+- **Skip references inside the Rails schema dump** — `t.string` / `t.integer`
+  in `db/schema.rb` no longer count as uses of the project's `string` /
+  `integer` methods (≈3.7k references and 2.6k ambiguous graph edges fewer on a
+  large Rails app); tables and columns stay indexed.
+- **Tell code from prose by the syntax tree** — names in comments, docstrings
+  and string literals are no longer references in Ruby, Python, JS/TS, C/C++,
+  Objective-C, Go, Rust, Java, C#, PHP, Swift, Scala, Dart, Lua, Groovy,
+  Elixir, Bash, R, Zig and Proto. Interpolated code stays, and so do strings
+  that name code: Ruby constant-path strings and `%w[]` words
+  (`class_name: 'Invoice'`), Python dotted class names (`"pkg.models.User"`),
+  JS `import('./Page')`. References drop 7–51% per project.
+- **C/C++ prototypes are declarations** — a header prototype, `static` forward
+  declaration, class method declaration or function-pointer field no longer
+  counts as a use of the function.
+- **Ruby callbacks link to their methods** — `before_save :normalize`,
+  `validate :check`, `validates :email`, `if:` / `unless:`,
+  `rescue_from ... with:`, `alias_method`, `delegate` and `&:name` are
+  references; the graph links a model to its callback methods and validated
+  columns.
+- **`outline` prints line ranges and supports `--format json`** —
+  `:12-40 Invoice [class]`, rows in source order, JSON schema v1 with
+  `end_line`.
+- **Compact `outline` for schema dumps** — `db/schema.rb` columns fold into a
+  count per table (164 KB → 17 KB on a 335-table schema); `--full` lists every
+  column.
 - **`call-tree` shows same-named callers with their file** — two `it "works"`
   blocks or `export` methods of different files used to print as `(recursive)`
   without a path and still use up `--limit`. Every caller now prints with its
