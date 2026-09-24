@@ -476,6 +476,21 @@ ast-index map                           # compact project map
 ast-index conventions                   # detected frameworks and patterns
 ```
 
+`symbol`, `class`, `refs`, `hierarchy` and `implementations` find a class
+under a namespace by its short name or its full name: `LedgerImporter` and
+`Billing::LedgerImporter` both find `class Billing::LedgerImporter`. A short
+name looks for that exact name first and only then for names whose last `::`
+or `.` segment it is, so a top-level `LedgerImporter` wins over namespaced
+ones. References are recorded under the last segment, so `usages
+Billing::LedgerImporter` lists the references to `LedgerImporter` on lines that
+spell out `Billing::LedgerImporter` (and says so); `usages LedgerImporter`
+lists all of them. `unused-symbols` looks references up the same way.
+
+`usages` and the usages section of `refs` list references in production files
+first and in test files (**Test files** under ranking below) after them, each
+group by path and line, so a page shows the code that uses a name before its
+specs. In JSON a reference in a test file carries `"test": true`.
+
 Use JSON for scripts or agents:
 
 ```bash
@@ -575,7 +590,8 @@ syntax tree has a call: in a comment, a string or a heredoc it does not.
 
 In a Rails application `db/schema.rb` is indexed even when it is gitignored:
 each `create_table` becomes a `table` symbol and each column a `column` symbol
-named `table.column` (`ast-index search email -t column`). `graph build`
+named `table.column` (`ast-index search email -t column` lists the columns
+named `email` before `email_confirmed` and the like). `graph build`
 matches tables to models by Active Record's rules — `self.table_name`,
 single-table inheritance, a model nested in another model, a namespace's
 `table_name_prefix` or engine `isolate_namespace`, then the pluralized class
@@ -618,7 +634,7 @@ ast-index --format json search Merge --rank risky         # dossier per result
 
 | Preset | Question | Needs |
 |--------|----------|-------|
-| `proven` | Which of these is safe to copy as a pattern? | history + graph |
+| `proven` | Which of these is a settled, used example worth copying? | history + graph |
 | `hotspots` | Which of these keeps being changed and fixed? | history |
 | `risky` | Which of these is dangerous to touch? | history + graph |
 | `central` | Which of these does the rest of the code lean on? | graph |
@@ -631,9 +647,25 @@ least one resolved caller.
   bugfix ratio — the number `ast-index hotspots` prints rounded (`score`) and
   in full (`score_exact` in JSON). Presets use the unrounded percentiles, so
   files that share a rounded score near the top still order meaningfully.
-- `proven` = mean of four terms: *calm* (1 − hotspot score), *age* (file age
-  percentile), *idle* (percentile of days since the file last changed) and
-  *used* (1 when at least one resolved reference points at the symbol, else 0).
+- `proven` = mean(*calm*, *mature*, *used*) × *substance* × *lineage*:
+  - *calm* = 1 − hotspot score;
+  - *mature* = file age / 180 days, at most 1 — half a year of history counts
+    in full, and seven years count no more than that;
+  - *used* = 1 when at least one resolved reference points at the symbol,
+    else 0;
+  - *substance* = 0.5 for a stub — a file under 10 lines or a class with an
+    empty body (`class Billing::UpdateService < Billing::CreateService; end`) —
+    else 1;
+  - *lineage* = 0.5 + 0.5 × the vitality of the weakest base the class is or
+    descends from (superclasses as the graph resolved them, up to 4 hops).
+    A base's vitality is the share of its subclasses added in the last two
+    years, relative to the share of all files added in those two years, at
+    most 1; only bases with 5+ resolved subclasses count, and without one the
+    factor is 1. A base nobody has extended for years (a `Legacy::` service
+    base, a framework class the code moved away from) halves the score of
+    everything built on it.
+  How long a file has been left alone is shown but not scored: an abandoned
+  file is not a proven one.
 - `risky` = *blast radius* × hotspot score, where blast radius is the
   percentile of the symbol's transitive dependents (≤ 3 hops, resolved edges),
   0 when nothing depends on it. Both have to be high.
@@ -647,13 +679,25 @@ in the 12 months after T, for T = 12, 24 and 36 months before HEAD.
 - The hotspot score's top 10% of files received a bugfix 4.2×, 2.2× and 5.1× as
   often as the average file. Bugfix ratio on its own managed only 1.5×, 0.9×
   and 1.6×: it is part of the score, but activity is what predicts.
-- `proven`: among files something depends on, the top 10% by `proven` were
-  fixed 0.15×, 0.06× and 0.09× as often as the average such file, and every
-  one of them is used. Adding the author count made the top decile *more*
-  fix-prone (0.5–1.3× the base rate, because authors track activity), so authors
-  are shown but not scored. Weighting usage by how many files use a symbol
-  instead of 1/0 was worse too (0.45×, 0.21×, 0.47×): more callers, more
-  exposure.
+- `proven` answers "what to copy", and a formula tuned to next-year bugfixes
+  alone rewards what nobody touches: the first version (mean of calm, age
+  percentile, idle percentile and used) put stubs and code on abandoned bases
+  on top, because untouched files are not fixed. Re-run on the same protocol
+  with today's graph, among files something depends on, its top decile was
+  fixed 0.17×, 0.05× and 0.24× as often as the average such file — and 22–26%
+  of that decile were files under 10 lines, 35–43% sat on a dying lineage,
+  median age 3.5–5.3 years. The current formula's top decile is fixed 0.13×,
+  0.40× and 0.16× as often as average, with no stubs, no dying lineage and a
+  median age of 1–3 years. On 11 "which one do I copy" queries (update, create
+  and destroy services, show and list serializers, workers, consumers,
+  contracts, policies), judged by hand for a substantial class on a base the
+  team still uses, the top five held 24 of 55 such results before and 39 of 55
+  after; the rest are queries whose relevance tiers fill the pool with
+  methods, constants or spec blocks, which a preset cannot reorder away. The
+  first backtest found that the author count makes a top decile more
+  fix-prone (authors track activity), and weighting usage by caller count
+  instead of 1/0 picked no better examples here (38 of 55), so neither is
+  scored.
 - `risky` was measured as impact-weighted damage — P(bugfix next year) ×
   log2(1 + dependents) — collected by the top decile: 7.4×, 6.9× and 8.0×
   random, against 6.3×/5.8×/6.7× for centrality alone, 5.1×/4.0×/6.4× for the
@@ -670,12 +714,21 @@ in the 12 months after T, for T = 12, 24 and 36 months before HEAD.
 1. The pool is the top 100 project symbols of the plain relevance order (or
    `--limit` + 1 if larger) and up to 2000 project files matching the path.
 2. Symbol tiers are hard: exact name (case-sensitive), exact name ignoring
-   case, last `::` segment of the name equal to the query (case-sensitive, not
-   with `--fuzzy`; `Billing::LedgerImporter` for `LedgerImporter`), a word of
+   case, last `::` or `.` segment of the name equal to the query
+   (case-sensitive, not with `--fuzzy`; `Billing::LedgerImporter` for
+   `LedgerImporter`, the schema column `users.email` or the singleton method
+   `self.email` for `email`), a word of
    the name starting with the query (a substring with `--fuzzy`, where case is
    not told apart), signature-only match. The plain order uses the same tiers.
    A preset only re-orders inside a tier, so an exact match is never pushed
-   below a partial one.
+   below a partial one. Imports never take the last-segment tier (`use
+   anyhow::Result` is indexed as `anyhow::Result`), and inside every tier
+   definitions come before imports, whatever their scores: a class imported
+   in eleven files is listed before those eleven imports. In the partial
+   tiers (a word of the name, the signature) test symbols come after the
+   other definitions: a symbol in a test file (**Test files** below) or one
+   named `test_*` or `Test` + an uppercase letter (Rust unit tests live in
+   `src/`). An exact name keeps its place even in a test.
 3. Inside a tier the sort key is `0.9 × score + 0.1 × relevance`, where
    relevance is `1 / (1 + position / 20)` and position is the candidate's place
    in the tier's plain order. The weight was swept over 11 queries: 0.9
@@ -712,8 +765,10 @@ every file, so a file's score does not change with the flag; `hotspots
 
 One test-path rule serves `search --rank`, `hotspots`, `graph top`, `graph
 dependents` and `graph impact` with `--exclude-tests` (`impact` does not follow
-test dependents either), the graph (code outside tests never resolves into them) and
-`explore` (test files rank below source). A file is a test when its name
+test dependents either), the graph (code outside tests never resolves into
+them), `explore` (test files rank below source), the plain `search` order (test
+symbols follow the other partial matches) and `usages` (test files after
+production code). A file is a test when its name
 follows a test convention — `*_test.*`, `*_spec.*`, `*.test.*`, `*.spec.*`,
 `test_*.py`, `conftest.py`, and `FooTest` / `FooTests` / `FooSpec` in Java,
 Kotlin, Scala, Groovy, Swift, Objective-C, C#, PHP and C++ — or when it sits in
@@ -729,7 +784,10 @@ terms, the relevance position and tier, the raw history numbers with their
 percentiles and labels (`churn:high`, `fixes:elevated`, `authors:many`,
 `veteran`, …) and the graph numbers with theirs (`fan-in:high`,
 `dependents:high`, `pagerank:high`, `callers:unresolved` when only ambiguous
-references point at it). In JSON, `files` become objects `{path, rank}` and
+references point at it). `proven` adds why a result counts as a stub and its
+weakest lineage (`rank.proven.stub`, `rank.proven.lineage {base, subclasses,
+recent, vitality}` in JSON); its factors carry `"factor": true` among the
+components. In JSON, `files` become objects `{path, rank}` and
 symbols gain a `rank` object; the top-level `rank` object carries the preset,
 formula, evidence summary, pool sizes and weight.
 
@@ -741,10 +799,13 @@ three-line file by a third. Such files keep their absolute churn labels.
 
 **Known limits.** When a query's exact-name tier fills the page (`search
 Policy` in a code base full of `POLICY` constants), a preset can only re-order
-that tier; the files section usually answers better. `proven` favours code that
-has been left alone for years — safe by the numbers, but possibly written in an
-older style. History is per file, so for a small method it describes the class
-around it.
+that tier; the files section usually answers better. Safe by the numbers is not
+the same as a good example: `proven` knows that code is settled, used, more
+than a stub and built on a base the code base keeps extending, but not which of
+two living styles a team prefers today (two serializer bases can both still
+gain subclasses), and a base whose subclasses the graph cannot resolve
+(generic parameters, ambiguous names) is not judged at all. History is per
+file, so for a small method it describes the class around it.
 
 Use structural search through ast-grep when `sg` is installed:
 

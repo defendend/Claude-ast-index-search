@@ -108,13 +108,19 @@ ast-index search "@RestController"   # Find Spring REST controllers (annotation 
 ast-index search "@GetMapping"       # Find GET endpoint mappings
 ```
 
+Symbols come in tiers: exact name, then a name whose last `::` or `.` segment
+is the query (`Billing::Invoice` for `Invoice`, the schema column `users.email`
+for `email`), then partial matches. Inside each
+tier definitions come before imports and project code before `node_modules`;
+among partial matches test symbols (test files, `test_*`, `TestX`) come last.
+
 **`search --rank <preset>`** - Re-rank the Files and Symbols sections by the
 file's Git history and the symbol's place in the dependency graph, with a
 dossier next to every result explaining its position. Use it when the question
 is not "where is X" but "which of these X":
 
 ```bash
-ast-index search Service --fuzzy --module app/services/ --rank proven  # safe to copy as a pattern
+ast-index search Service --fuzzy --module app/services/ --rank proven  # a settled example to copy
 ast-index search Merge --rank risky                   # dangerous to touch: many dependents + unstable history
 ast-index search Import --rank hotspots               # keeps being changed and fixed
 ast-index search Import --rank hotspots --exclude-tests  # same, spec/test files left out
@@ -124,7 +130,7 @@ ast-index --format json search Merge --rank risky     # rank.applied / rank.miss
 
 | Preset | Score | Needs |
 |--------|-------|-------|
-| `proven` | mean(1 − hotspot score, file age pct, days-idle pct, used 1/0) | `hotspots --collect` + `graph build` |
+| `proven` | mean(1 − hotspot score, maturity, used 1/0) × substance (0.5 for stubs) × lineage (0.5 when the base is no longer extended) | `hotspots --collect` + `graph build` |
 | `hotspots` | file hotspot score (commits, churn, bugfix ratio pct) | `hotspots --collect` |
 | `risky` | dependents pct × hotspot score | both |
 | `central` | PageRank pct | `graph build` |
@@ -142,7 +148,10 @@ ast-index --format json search Merge --rank risky     # rank.applied / rank.miss
 - Third-party code (`node_modules`, `.d.ts`) is never scored and is listed
   after all project results.
 - Formulas were picked by backtesting next-year bugfixes on a 40k-file
-  monorepo; the numbers are in USER_GUIDE.md ("Ranking search results").
+  monorepo, `proven` also by hand-judged "which one to copy" queries; the
+  numbers are in USER_GUIDE.md ("Ranking search results"). Safe by the numbers
+  is not the same as a good example: `proven` cannot tell which of two living
+  styles the team prefers.
 
 ### File Search
 
@@ -164,6 +173,13 @@ ast-index symbol "Store" --fuzzy     # Fuzzy: exact → prefix → contains matc
 ast-index symbol "Mapper" --in-file "payments/" --limit 10  # Scoped search
 ast-index symbol "@Service"          # Find all @Service annotations
 ```
+
+A namespaced class is found by its short or its full name: `LedgerImporter` and
+`Billing::LedgerImporter` both find `class Billing::LedgerImporter` (also in
+`class`, `refs`, `hierarchy`, `implementations`). An exact short name wins
+over namespaced ones. `usages Billing::LedgerImporter` lists references to
+`LedgerImporter` on lines that spell out the full name; `usages LedgerImporter`
+lists all of them.
 
 ### Class Search
 
@@ -188,6 +204,10 @@ ast-index usages "fetchData" --in-file "src/api/"  # Scoped to file path
 ast-index usages "Repository" --module "features/auth" --limit 100
 ast-index usages "parse_config"      # snake_case calls: Python, Rust, Go, C, PHP, ...
 ```
+
+Usages (here and in `refs`) list production files first and test files after
+them, each group by path and line; in JSON a test reference carries
+`"test": true`.
 
 Indexed usages are capitalized names and calls written `name(`, snake_case and
 `_private` names included. Reserved words (`sizeof (x)`, `#if defined(X)`, Go's

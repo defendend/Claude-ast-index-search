@@ -305,6 +305,282 @@ fn an_exact_name_still_leads_a_namespaced_one() {
     );
 }
 
+#[test]
+fn a_column_named_after_the_query_leads_longer_columns() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // Rails schema columns are indexed as `table.column`. The longer columns
+    // are shorter FTS documents per match and sort before `users/` by path.
+    let schema = db::upsert_file(&conn, "db/schema.rb", 0, 100).unwrap();
+    for (line, (name, signature)) in [
+        (
+            "events.email_communicator_email_id",
+            "t.bigint \"email_communicator_email_id\"",
+        ),
+        ("accounts.email_confirmed", "t.boolean \"email_confirmed\""),
+        (
+            "users.email",
+            "t.string \"email\", null: false, default: \"\"",
+        ),
+        ("customers.email", "t.string \"email\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        db::insert_symbol(
+            &conn,
+            schema,
+            name,
+            SymbolKind::Column,
+            line + 1,
+            Some(signature),
+        )
+        .unwrap();
+    }
+    // A Ruby singleton method is indexed as `self.email`.
+    insert_with_signature(
+        &conn,
+        "app/models/user.rb",
+        "self.email",
+        SymbolKind::Function,
+        "def self.email(value)",
+    );
+
+    let none = SearchScope::none();
+    let columns =
+        db::search_symbol_terms_scoped(&conn, &["email"], Some("column"), 10, &none, false)
+            .unwrap();
+    assert_eq!(names(&columns)[..2], ["users.email", "customers.email"]);
+    assert_eq!(columns.len(), 4);
+    let all = db::search_symbol_terms_scoped(&conn, &["email"], None, 3, &none, false).unwrap();
+    assert_eq!(
+        names(&all),
+        ["self.email", "users.email", "customers.email"]
+    );
+}
+
+// ----------------------------------------------------------------------
+// Definitions before imports
+// ----------------------------------------------------------------------
+
+/// A Python class imported by eleven modules whose paths all sort before
+/// the one that defines it.
+fn seed_imported_class(conn: &rusqlite::Connection) {
+    for i in 0..11 {
+        insert_with_signature(
+            conn,
+            &format!("pkg/a{i:02}.py"),
+            "InstallRequirement",
+            SymbolKind::Import,
+            "from pkg.req.req_install import InstallRequirement",
+        );
+    }
+    insert_with_signature(
+        conn,
+        "pkg/req/req_install.py",
+        "InstallRequirement",
+        SymbolKind::Class,
+        "class InstallRequirement:",
+    );
+}
+
+#[test]
+fn a_definition_leads_the_imports_of_its_tier() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_imported_class(&conn);
+
+    let none = SearchScope::none();
+    let pages = [
+        db::search_symbols(&conn, "InstallRequirement", 5).unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["InstallRequirement"], None, 5, &none, false)
+            .unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["InstallRequirement"], None, 5, &none, true)
+            .unwrap(),
+        db::search_symbols_scoped(&conn, "InstallRequirement", 5, &module_scope("pkg")).unwrap(),
+        db::search_symbols_for_command(&conn, "InstallRequirement", None, 5, &none, false, false)
+            .unwrap(),
+        db::search_symbols_for_command(&conn, "InstallRequirement", None, 5, &none, true, false)
+            .unwrap(),
+    ];
+    for page in &pages {
+        assert_eq!(
+            located(page).first().map(String::as_str),
+            Some("InstallRequirement:pkg/req/req_install.py:3"),
+            "{:?}",
+            located(page)
+        );
+        assert_eq!(page.len(), 5);
+    }
+}
+
+#[test]
+fn an_import_path_is_not_a_namespaced_definition() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // `use std::path::Path` is indexed as `std::path::Path`, whose last
+    // segment is the query; the project's own types only start with it.
+    for i in 0..12 {
+        insert_with_signature(
+            &conn,
+            &format!("src/commands/c{i:02}.rs"),
+            "std::path::Path",
+            SymbolKind::Import,
+            "use std::path::Path;",
+        );
+    }
+    insert_with_signature(
+        &conn,
+        "src/resolve.rs",
+        "PathResolver",
+        SymbolKind::Class,
+        "pub struct PathResolver {",
+    );
+    insert_with_signature(
+        &conn,
+        "src/walk.rs",
+        "PathWalker",
+        SymbolKind::Class,
+        "pub struct PathWalker {",
+    );
+
+    let none = SearchScope::none();
+    for fuzzy in [false, true] {
+        let page = db::search_symbol_terms_scoped(&conn, &["Path"], None, 4, &none, fuzzy).unwrap();
+        let mut definitions = names(&page)[..2].to_vec();
+        definitions.sort_unstable();
+        assert_eq!(
+            definitions,
+            ["PathResolver", "PathWalker"],
+            "fuzzy: {fuzzy}"
+        );
+        assert_eq!(
+            names(&page)[2..],
+            ["std::path::Path", "std::path::Path"],
+            "fuzzy: {fuzzy}"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// Tests after production code in the partial tiers
+// ----------------------------------------------------------------------
+
+/// Rust keeps unit tests next to the code (`#[cfg(test)] fn test_parse_*`),
+/// and their one-line signatures are short bm25 documents that led every
+/// partial match of `parse`.
+fn seed_parsers_and_their_tests(conn: &rusqlite::Connection) {
+    let parser = db::upsert_file(conn, "src/parsers/go.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        parser,
+        "parse",
+        SymbolKind::Function,
+        5,
+        Some("fn parse("),
+    )
+    .unwrap();
+    for (line, name) in ["test_parse_var", "test_parse_enum", "test_parse_rpc"]
+        .iter()
+        .enumerate()
+    {
+        db::insert_symbol(
+            conn,
+            parser,
+            name,
+            SymbolKind::Function,
+            100 + line,
+            Some(&format!("fn {name}()")),
+        )
+        .unwrap();
+    }
+    let spec = db::upsert_file(conn, "tests/parse_tests.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        spec,
+        "parse_all_files",
+        SymbolKind::Function,
+        3,
+        Some("fn parse_all_files()"),
+    )
+    .unwrap();
+    let go_test = db::upsert_file(conn, "pkg/parse.go", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        go_test,
+        "TestParseHeader",
+        SymbolKind::Function,
+        9,
+        Some("func TestParseHeader(t *testing.T)"),
+    )
+    .unwrap();
+    let indexer = db::upsert_file(conn, "src/indexer.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        indexer,
+        "parse_file_symbols_for_every_supported_language",
+        SymbolKind::Function,
+        40,
+        Some("pub fn parse_file_symbols_for_every_supported_language(path: &Path, content: &str, kind: FileKind) -> Result<Vec<Symbol>>"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_symbols_follow_production_code_in_partial_tiers() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_parsers_and_their_tests(&conn);
+    // An exact test hit keeps its tier: the name is what was typed.
+    let helper = db::upsert_file(&conn, "tests/common/mod.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        &conn,
+        helper,
+        "parse",
+        SymbolKind::Function,
+        2,
+        Some("fn parse("),
+    )
+    .unwrap();
+
+    let none = SearchScope::none();
+    let expected_head = [
+        "parse:src/parsers/go.rs:5",
+        "parse:tests/common/mod.rs:2",
+        "parse_file_symbols_for_every_supported_language:src/indexer.rs:40",
+    ];
+    let pages = [
+        db::search_symbol_terms_scoped(&conn, &["parse"], None, 10, &none, false).unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["parse"], Some("function"), 10, &none, false)
+            .unwrap(),
+        db::search_symbols(&conn, "parse", 10).unwrap(),
+        db::search_symbols_scoped(&conn, "parse", 10, &module_scope("")).unwrap(),
+        db::search_symbols_for_command(&conn, "parse", None, 10, &none, false, false).unwrap(),
+    ];
+    for page in &pages {
+        let found = located(page);
+        // `TestParseHeader` is one FTS token and does not match `parse*`.
+        assert_eq!(found.len(), 7, "{found:?}");
+        assert_eq!(found[..3], expected_head, "{found:?}");
+    }
+    // Fuzzy search tiers by length, but tests still follow in the partial tier.
+    for fuzzy in [
+        db::search_symbol_terms_scoped(&conn, &["parse"], None, 10, &none, true).unwrap(),
+        db::search_symbols_for_command(&conn, "parse", None, 10, &none, true, false).unwrap(),
+    ] {
+        let found = names(&fuzzy);
+        assert_eq!(
+            found[..3],
+            [
+                "parse",
+                "parse",
+                "parse_file_symbols_for_every_supported_language"
+            ],
+            "{found:?}"
+        );
+    }
+}
+
 // ----------------------------------------------------------------------
 // Project code before third-party code
 // ----------------------------------------------------------------------

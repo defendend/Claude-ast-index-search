@@ -5913,17 +5913,38 @@ const VENDOR_PATH_SQL: &str = "(substr(f.path, 1, 13) = 'node_modules/' \
 
 const NAME_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
 
-/// Whether `name` is a namespaced name whose last `::` segment is `term`, as
+/// Whether `name` is a qualified name whose last segment is `term`, as
 /// `Billing::Importers::LedgerImporter` is for `LedgerImporter`.
 ///
+/// Segments are separated by `::` or `.`: the index records a Rails schema
+/// column as `users.email`, a Ruby singleton method as `self.build`, a
+/// nested protobuf message as `Outer.Inner` and a C# namespace as
+/// `MyApp.Services`.
+///
 /// Statements the index records as symbols — `include Foo::Bar`,
-/// `extend ActiveSupport::Concern` — contain whitespace and are not a name
-/// under a namespace, so they never qualify.
+/// `extend ActiveSupport::Concern`, `describe ".call"` — contain whitespace
+/// and are not a name under a namespace, so they never qualify.
 pub fn is_last_name_segment(name: &str, term: &str) -> bool {
     !name.contains(NAME_WHITESPACE)
         && name
             .strip_suffix(term)
-            .is_some_and(|namespace| namespace.ends_with("::"))
+            .is_some_and(|namespace| namespace.ends_with("::") || namespace.ends_with('.'))
+}
+
+/// The last `::` or `.` segment of a qualified name — what a reference to it
+/// is recorded under (`Billing::Invoice.new` records `Invoice`, a call of a
+/// Ruby `def self.build` records `build`). A name containing whitespace is a
+/// statement rather than a qualified name and comes back whole.
+pub fn last_name_segment(name: &str) -> &str {
+    if name.contains(NAME_WHITESPACE) {
+        return name;
+    }
+    let after_colons = name.rfind("::").map_or(0, |at| at + 2);
+    let after_dot = name.rfind('.').map_or(0, |at| at + 1);
+    match &name[after_colons.max(after_dot)..] {
+        "" => name,
+        segment => segment,
+    }
 }
 
 /// [`is_last_name_segment`] over `s.name` for any of `placeholders`. `substr`
@@ -5933,7 +5954,10 @@ fn last_name_segment_sql(placeholders: &[&str]) -> String {
     let suffixes = placeholders
         .iter()
         .map(|placeholder| {
-            format!("substr(s.name, -length({placeholder}) - 2) = '::' || {placeholder}")
+            format!(
+                "substr(s.name, -length({placeholder}) - 2) = '::' || {placeholder} \
+                 OR substr(s.name, -length({placeholder}) - 1) = '.' || {placeholder}"
+            )
         })
         .collect::<Vec<_>>()
         .join(" OR ");
@@ -5943,6 +5967,75 @@ fn last_name_segment_sql(placeholders: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(" AND ");
     format!("({no_whitespace} AND ({suffixes}))")
+}
+
+/// Whether a symbol of `kind` named `name` belongs to the last-segment tier
+/// for `term`: [`is_last_name_segment`], and not an import.
+///
+/// Imports are indexed under the path they bring in (`use anyhow::Result`
+/// as `anyhow::Result`, `import a.b.C` as `a.b.C`). They name a definition
+/// that lives elsewhere, so a query for `Result` must not rank every file
+/// that imports one above the project's own `SearchResult`.
+pub fn is_last_segment_match(name: &str, kind: &str, term: &str) -> bool {
+    kind != "import" && is_last_name_segment(name, term)
+}
+
+/// [`is_last_segment_match`] over `s.kind` and `s.name`.
+fn last_segment_match_sql(placeholders: &[&str]) -> String {
+    format!(
+        "(s.kind <> 'import' AND {})",
+        last_name_segment_sql(placeholders)
+    )
+}
+
+/// Sort key that puts definitions before imports inside a relevance tier.
+/// An import matches by name exactly like the definition it brings in, and
+/// a class imported in eleven files would otherwise bury the class itself.
+const IMPORT_LAST_SQL: &str = "s.kind = 'import'";
+
+/// SQL function [`crate::commands::is_test_symbol`]`(name, path)`, defined by
+/// [`ensure_test_functions`].
+const IS_TEST_SYMBOL_FN: &str = "ast_index_is_test_symbol";
+/// SQL function [`crate::commands::is_test_path`]`(path)`, defined by
+/// [`ensure_test_functions`].
+const IS_TEST_PATH_FN: &str = "ast_index_is_test_path";
+
+/// Define the SQL functions that tell test code apart on `conn`, unless they
+/// already are. They call the one Rust definition of a test path, which SQL
+/// could only copy. Connection-local, so every query that uses them calls
+/// this first; a lookup of an existing definition is a cached statement.
+fn ensure_test_functions(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    if conn
+        .prepare_cached(&format!(
+            "SELECT {IS_TEST_SYMBOL_FN}('', ''), {IS_TEST_PATH_FN}('')"
+        ))
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    let text = |ctx: &rusqlite::functions::Context<'_>, index: usize| -> rusqlite::Result<String> {
+        Ok(ctx.get::<Option<String>>(index)?.unwrap_or_default())
+    };
+    conn.create_scalar_function(IS_TEST_SYMBOL_FN, 2, flags, move |ctx| {
+        Ok(crate::commands::is_test_symbol(
+            &text(ctx, 0)?,
+            &text(ctx, 1)?,
+        ))
+    })?;
+    conn.create_scalar_function(IS_TEST_PATH_FN, 1, flags, move |ctx| {
+        Ok(crate::commands::is_test_path(&text(ctx, 0)?))
+    })?;
+    Ok(())
+}
+
+/// Sort key that lists test symbols ([`crate::commands::is_test_symbol`])
+/// after the others of a partial-match tier. `exact` is the condition of the
+/// tiers where the name itself is what was typed; those keep their order, so
+/// an exact `parse` in a test still leads a partial `parse_config`.
+fn test_last_sql(exact: &str) -> String {
+    format!("CASE WHEN {exact} THEN 0 WHEN {IS_TEST_SYMBOL_FN}(s.name, f.path) THEN 1 ELSE 0 END")
 }
 
 /// Deterministic ordering for a query that matches `symbols_fts`.
@@ -5956,11 +6049,12 @@ fn last_name_segment_sql(placeholders: &[&str]) -> String {
 /// `Applicant` the class lands above `applicant` the accessor for a
 /// capitalised query.
 ///
-/// Right below come names whose last `::` segment equals a term
-/// ([`is_last_name_segment`]): Ruby indexes `class A::B::MergeService` under
+/// Right below come names whose last `::` or `.` segment equals a term
+/// ([`is_last_segment_match`]): Ruby indexes `class A::B::MergeService` under
 /// its full name, so `MergeService` has no exact row, and bm25 alone put a
 /// spec's `describe "A::B::MergeService"` — a shorter document — above the
-/// class itself.
+/// class itself; `users.email` had the same problem against every longer
+/// column that merely starts with `email`. Imports never enter that tier.
 ///
 /// bm25 is then suppressed for the rows of those tiers. They all carry the
 /// same name or last segment, so what is left for the score to measure is
@@ -5970,15 +6064,24 @@ fn last_name_segment_sql(placeholders: &[&str]) -> String {
 /// s.line` decide instead, which also makes repeated runs return the same
 /// page.
 ///
-/// Inside each tier the project's own code leads third-party code
-/// ([`is_vendor_path`]). Without that, the path tie-break decided, and
-/// `node_modules/…` sorts ahead of `spec/` or `system/`. The tier still comes
-/// first: a library's exact `useState` stays above a project's partial
-/// `useStateModal`, because the library name is what was typed.
+/// Inside each tier definitions lead imports ([`IMPORT_LAST_SQL`]), and the
+/// project's own code leads third-party code ([`is_vendor_path`]). Without
+/// that, the path tie-break decided, and `node_modules/…` sorts ahead of
+/// `spec/` or `system/`. The tier still comes first: a library's exact
+/// `useState` stays above a project's partial `useStateModal`, because the
+/// library name is what was typed. In the partial tiers test symbols follow
+/// the rest of the project's code ([`test_last_sql`]): bm25 favours their
+/// short signatures, and `parse` in Rust sources was answered with a page of
+/// `#[cfg(test)] fn test_parse_*`.
+///
+/// The query must define the test functions first ([`ensure_test_functions`]).
 fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
     let tail = "length(COALESCE(s.qualified_name, s.name)), f.path, s.line";
     if exact_name_placeholders.is_empty() {
-        return format!(" ORDER BY {VENDOR_PATH_SQL}, {FTS_RANK}, {tail}");
+        return format!(
+            " ORDER BY {IMPORT_LAST_SQL}, {VENDOR_PATH_SQL}, {}, {FTS_RANK}, {tail}",
+            test_last_sql("0")
+        );
     }
     let cased = exact_name_placeholders.join(", ");
     let folded = exact_name_placeholders
@@ -5986,15 +6089,18 @@ fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
         .map(|placeholder| format!("lower({placeholder})"))
         .collect::<Vec<_>>()
         .join(", ");
-    let last_segment = last_name_segment_sql(exact_name_placeholders);
+    let last_segment = last_segment_match_sql(exact_name_placeholders);
     format!(
         " ORDER BY \
          CASE WHEN s.name IN ({cased}) THEN 0 \
          WHEN lower(s.name) IN ({folded}) THEN 1 \
          WHEN {last_segment} THEN 2 ELSE 3 END, \
+         {IMPORT_LAST_SQL}, \
          {VENDOR_PATH_SQL}, \
+         {test_last}, \
          CASE WHEN lower(s.name) IN ({folded}) OR {last_segment} THEN 0.0 ELSE {FTS_RANK} END, \
-         {tail}"
+         {tail}",
+        test_last = test_last_sql(&format!("lower(s.name) IN ({folded}) OR {last_segment}"))
     )
 }
 
@@ -6013,8 +6119,8 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
                 SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
-                WHERE s.qualified_name LIKE ?1
-                ORDER BY length(s.qualified_name), s.qualified_name
+                WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
+                ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
                 LIMIT ?2
                 "#,
                 format!("%{}", raw),
@@ -6025,8 +6131,8 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
                 SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
-                WHERE s.qualified_name LIKE ?1
-                ORDER BY length(s.qualified_name), s.qualified_name
+                WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
+                ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
                 LIMIT ?2
                 "#,
                 format!("{raw}%"),
@@ -6037,7 +6143,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
                 SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
-                WHERE s.qualified_name = ?1
+                WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))
                 LIMIT ?2
                 "#,
                 raw.to_string(),
@@ -6050,6 +6156,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
             .collect::<Result<Vec<_>, _>>()?);
     }
 
+    ensure_test_functions(conn)?;
     let escaped_query = escape_fts5_query(query);
     let exact_name = query.trim_end_matches('*');
 
@@ -6152,6 +6259,91 @@ fn row_to_search_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchResul
         path: row.get(5)?,
         root_path,
     })
+}
+
+/// The name a symbol is shown under ([`SearchResult::display_name`]):
+/// `qualified_name` where the parser records one (C++ keeps the bare name in
+/// `name`), otherwise `name`. Ruby records `class Billing::Invoice` under its
+/// full name and leaves `qualified_name` empty, so a lookup by a `::` name
+/// has to read `name` as well.
+const DISPLAY_NAME_SQL: &str = "COALESCE(s.qualified_name, s.name)";
+
+/// `DISPLAY_NAME_SQL = ?1`, spelled out so that the index on each column can
+/// serve its half.
+const DISPLAY_NAME_IS_FIRST_PARAM_SQL: &str =
+    "(s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))";
+
+/// WHERE condition, with its values bound from `?1`, for the symbols whose
+/// last `::` or `.` segment is `name` ([`is_last_segment_match`]).
+///
+/// Testing every symbol's name costs a full table scan per lookup, so the
+/// full-text index first narrows the candidates to names containing
+/// `name`'s words (`Billing::Invoice` holds the word `invoice`).
+fn last_segment_condition(name: &str) -> (String, Vec<String>) {
+    if !name.chars().any(char::is_alphanumeric) {
+        return (last_segment_match_sql(&["?1"]), vec![name.to_string()]);
+    }
+    (
+        format!(
+            "s.id IN (SELECT rowid FROM symbols_fts WHERE symbols_fts MATCH ?1) AND {}",
+            last_segment_match_sql(&["?2"])
+        ),
+        vec![
+            format!("name : {}", escape_fts5_query(name.trim_end_matches('*'))),
+            name.to_string(),
+        ],
+    )
+}
+
+/// Symbols whose last `::` or `.` segment is `name` ([`is_last_segment_match`]):
+/// the stage a bare-name lookup falls back to when no symbol has that exact
+/// name, because Ruby indexes `class Billing::Invoice` under its full name
+/// and `Invoice` alone finds nothing. Shortest name first.
+fn find_by_last_segment(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    class_only: bool,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let (condition, mut values) = last_segment_condition(name);
+    let mut sql = format!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path \
+         FROM symbols s JOIN files f ON s.file_id = f.id WHERE {condition}{scope_clause}"
+    );
+    values.extend(scope_params);
+    if let Some(kind) = kind {
+        sql.push_str(" AND s.kind = ?");
+        values.push(kind.to_string());
+    }
+    if class_only {
+        sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+    }
+    sql.push_str(" ORDER BY length(s.name), s.name, f.path, s.line LIMIT ?");
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params.as_slice(), row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
+/// How many symbols [`find_by_last_segment`] would list without a limit.
+fn count_by_last_segment(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    class_only: bool,
+    scope: &SearchScope,
+) -> Result<usize> {
+    let (condition, values) = last_segment_condition(name);
+    count_symbol_matches(conn, &condition, values, kind, scope, class_only, false)
 }
 
 #[derive(Debug, Serialize)]
@@ -6313,7 +6505,10 @@ pub fn find_files_with_roots_scoped(
     Ok(results)
 }
 
-/// Find symbols by name (exact match first, then prefix/contains if no results)
+/// Find symbols by name: the exact name first; failing that, names whose last
+/// `::` or `.` segment it is ([`find_by_last_segment`]), then the prefix. A
+/// `::` name is matched against [`DISPLAY_NAME_SQL`]: exactly, as the tail of
+/// a longer namespace, then as a prefix.
 pub fn find_symbols_by_name(
     conn: &Connection,
     name: &str,
@@ -6326,8 +6521,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1 AND s.kind = ?2
-            ORDER BY length(s.qualified_name), s.qualified_name
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind = ?2
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?3
             "#
         } else {
@@ -6335,8 +6530,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
-            ORDER BY length(s.qualified_name), s.qualified_name
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?2
             "#
         };
@@ -6359,7 +6554,7 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name = ?1 AND s.kind = ?2
+            WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1)) AND s.kind = ?2
             LIMIT ?3
             "#
         } else {
@@ -6367,7 +6562,7 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name = ?1
+            WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))
             LIMIT ?2
             "#
         };
@@ -6390,8 +6585,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1 AND s.kind = ?2
-            ORDER BY length(s.qualified_name)
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind = ?2
+            ORDER BY length(COALESCE(s.qualified_name, s.name))
             LIMIT ?3
             "#
         } else {
@@ -6399,8 +6594,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
-            ORDER BY length(s.qualified_name)
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
+            ORDER BY length(COALESCE(s.qualified_name, s.name))
             LIMIT ?2
             "#
         };
@@ -6427,8 +6622,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1 AND s.kind = ?2
-            ORDER BY length(s.qualified_name)
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind = ?2
+            ORDER BY length(COALESCE(s.qualified_name, s.name))
             LIMIT ?3
             "#
         } else {
@@ -6436,8 +6631,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
-            ORDER BY length(s.qualified_name)
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
+            ORDER BY length(COALESCE(s.qualified_name, s.name))
             LIMIT ?2
             "#
         };
@@ -6483,6 +6678,14 @@ pub fn find_symbols_by_name(
             .collect::<Result<Vec<_>, _>>()?
     };
 
+    if results.is_empty() {
+        let namespaced =
+            find_by_last_segment(conn, name, kind, false, limit, &SearchScope::none())?;
+        if !namespaced.is_empty() {
+            return Ok(namespaced);
+        }
+    }
+
     // If no exact match, try prefix match
     if results.is_empty() {
         let pattern = format!("{}%", name);
@@ -6520,7 +6723,8 @@ pub fn find_symbols_by_name(
     Ok(results)
 }
 
-/// Find class-like symbols (class, interface, object, enum) by name - single query
+/// Find class-like symbols (class, interface, object, enum) by name, in the
+/// stages of [`find_symbols_by_name`] minus its prefix fallback for a bare name.
 pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Vec<SearchResult>> {
     if name.starts_with("::") {
         let mut stmt = conn.prepare(
@@ -6528,9 +6732,9 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
               AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
-            ORDER BY length(s.qualified_name), s.qualified_name
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?2
             "#,
         )?;
@@ -6546,7 +6750,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name = ?1
+            WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))
               AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
             LIMIT ?2
             "#,
@@ -6564,9 +6768,9 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
               AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
-            ORDER BY length(s.qualified_name), s.qualified_name
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?2
             "#,
         )?;
@@ -6583,9 +6787,9 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
               AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
-            ORDER BY length(s.qualified_name), s.qualified_name
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?2
             "#,
         )?;
@@ -6608,6 +6812,9 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     let results = stmt
         .query_map(params![name, limit as i64], row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
+    if results.is_empty() {
+        return find_by_last_segment(conn, name, None, true, limit, &SearchScope::none());
+    }
 
     Ok(results)
 }
@@ -7056,6 +7263,10 @@ pub struct RefResult {
     pub path: String,
     #[serde(skip_serializing)]
     pub root_path: Option<String>,
+    /// The reference sits in a test file ([`crate::commands::is_test_path`]);
+    /// only serialized when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub test: bool,
 }
 
 fn row_to_ref_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<RefResult> {
@@ -7064,44 +7275,79 @@ fn row_to_ref_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<RefResult> {
     } else {
         None
     };
+    let path: String = row.get(3)?;
     Ok(RefResult {
         name: row.get(0)?,
         line: row.get(1)?,
         context: row.get(2)?,
-        path: row.get(3)?,
+        test: crate::commands::is_test_path(&path),
+        path,
         root_path,
     })
 }
 
-/// Find references (usages) of a symbol
-pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Vec<RefResult>> {
-    // Early materialization: filter and sort refs using covering index BEFORE
-    // joining with files. Avoids SQLite planner choosing full scan on large
-    // tables (~12M rows) when ORDER BY references the joined table. See #19.
-    //
-    // Inner ORDER BY (file_id, line) is free because idx_refs_name_file_line
-    // has exactly this sort order. Outer ORDER BY f.path reshuffles the tiny
-    // result set (bounded by LIMIT) so output is stable for users.
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT r.name, r.line, r.context, f.path, f.root_path
-        FROM (
-            SELECT name, file_id, line, context
-            FROM refs
-            WHERE name = ?1
-            ORDER BY file_id, line
-            LIMIT ?2
-        ) r
-        JOIN files f ON f.id = r.file_id
-        ORDER BY f.path, r.line
-        "#,
-    )?;
-
+/// The first `limit` references matching `condition` (over `refs r0`, with
+/// `values` bound in order): production files first, test files
+/// ([`crate::commands::is_test_path`]) after them, each group by path and
+/// line, so the references of one file stay together.
+///
+/// The page is picked from `(name, file_id, line)` of
+/// `idx_refs_name_file_line` plus the file path — refs drive the join
+/// (`CROSS JOIN`), so the planner never scans every file or ref (see #19) —
+/// and only the rows on the page read their context.
+fn find_references_where(
+    conn: &Connection,
+    condition: &str,
+    mut values: Vec<String>,
+    limit: usize,
+) -> Result<Vec<RefResult>> {
+    ensure_test_functions(conn)?;
+    let order =
+        |r: &str, f: &str| format!("{IS_TEST_PATH_FN}({f}.path), {f}.path, {r}.file_id, {r}.line");
+    let sql = format!(
+        "SELECT r.name, r.line, r.context, f.path, f.root_path
+         FROM (
+             SELECT r0.id AS id
+             FROM refs r0 CROSS JOIN files f0
+             WHERE {condition} AND f0.id = r0.file_id
+             ORDER BY {inner}
+             LIMIT ?
+         ) page
+         CROSS JOIN refs r CROSS JOIN files f
+         WHERE r.id = page.id AND f.id = r.file_id
+         ORDER BY {outer}",
+        inner = order("r0", "f0"),
+        outer = order("r", "f"),
+    );
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
     let results = stmt
-        .query_map(params![name, limit as i64], row_to_ref_result)?
+        .query_map(params.as_slice(), row_to_ref_result)?
         .collect::<Result<Vec<_>, _>>()?;
-
     Ok(results)
+}
+
+/// `AND` condition on `r0.file_id` for `scope`, and its values.
+fn ref_scope_condition(scope: &SearchScope) -> (String, Vec<String>) {
+    let (scope_clause, scope_params) = scope.path_condition();
+    if scope_clause.is_empty() {
+        return (String::new(), scope_params);
+    }
+    let bare_conditions = scope_clause.trim_start_matches(" AND ");
+    (
+        format!(" AND r0.file_id IN (SELECT id FROM files f WHERE {bare_conditions})"),
+        scope_params,
+    )
+}
+
+/// Find references (usages) of a symbol, production code first
+/// ([`find_references_where`]).
+pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Vec<RefResult>> {
+    find_references_where(conn, "r0.name = ?", vec![name.to_string()], limit)
 }
 
 pub fn count_references_scoped(
@@ -7539,25 +7785,28 @@ pub fn find_definitions(conn: &Connection, name: &str, limit: usize) -> Result<V
     };
 
     if name.starts_with("::") {
-        return find("s.qualified_name LIKE ?", format!("%{name}"));
+        return find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%{name}"));
     }
     if name.contains("::") {
-        let exact = find("s.qualified_name = ?", name.to_string())?;
+        let exact = find(DISPLAY_NAME_IS_FIRST_PARAM_SQL, name.to_string())?;
         if !exact.is_empty() {
             return Ok(exact);
         }
-        let suffix = find("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        let suffix = find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%::{name}"))?;
         if !suffix.is_empty() {
             return Ok(suffix);
         }
-        return find("s.qualified_name LIKE ?", format!("{name}%"));
+        return find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("{name}%"));
     }
     let exact = find("s.name = ?", name.to_string())?;
     if !exact.is_empty() {
-        Ok(exact)
-    } else {
-        find("s.name LIKE ?", format!("{name}%"))
+        return Ok(exact);
     }
+    let namespaced = find_by_last_segment(conn, name, None, false, limit, &SearchScope::none())?;
+    if !namespaced.is_empty() {
+        return Ok(namespaced);
+    }
+    find("s.name LIKE ?", format!("{name}%"))
 }
 
 pub fn find_definitions_scoped(
@@ -7586,25 +7835,28 @@ pub fn find_definitions_scoped(
     };
 
     if name.starts_with("::") {
-        return find("s.qualified_name LIKE ?", format!("%{name}"));
+        return find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%{name}"));
     }
     if name.contains("::") {
-        let exact = find("s.qualified_name = ?", name.to_string())?;
+        let exact = find(DISPLAY_NAME_IS_FIRST_PARAM_SQL, name.to_string())?;
         if !exact.is_empty() {
             return Ok(exact);
         }
-        let suffix = find("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        let suffix = find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%::{name}"))?;
         if !suffix.is_empty() {
             return Ok(suffix);
         }
-        return find("s.qualified_name LIKE ?", format!("{name}%"));
+        return find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("{name}%"));
     }
     let exact = find("s.name = ?", name.to_string())?;
     if !exact.is_empty() {
-        Ok(exact)
-    } else {
-        find("s.name LIKE ?", format!("{name}%"))
+        return Ok(exact);
     }
+    let namespaced = find_by_last_segment(conn, name, None, false, limit, scope)?;
+    if !namespaced.is_empty() {
+        return Ok(namespaced);
+    }
+    find("s.name LIKE ?", format!("{name}%"))
 }
 
 /// Find all cross-references for a symbol: definitions, imports, and usages
@@ -7640,12 +7892,12 @@ pub fn search_symbols_fuzzy(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
             ORDER BY
-                CASE WHEN s.qualified_name = ?2 THEN 0
-                     WHEN s.qualified_name LIKE ?3 THEN 1
+                CASE WHEN COALESCE(s.qualified_name, s.name) = ?2 THEN 0
+                     WHEN COALESCE(s.qualified_name, s.name) LIKE ?3 THEN 1
                      ELSE 2 END,
-                length(s.qualified_name)
+                length(COALESCE(s.qualified_name, s.name))
             LIMIT ?4
             "#,
         )?;
@@ -7827,26 +8079,29 @@ pub fn count_symbols_by_name_scoped(
         )
     };
     if name.starts_with("::") {
-        return count("s.qualified_name LIKE ?", format!("%{name}"));
+        return count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%{name}"));
     }
     if name.contains("::") {
-        let exact = count("s.qualified_name = ?", name.to_string())?;
+        let exact = count(DISPLAY_NAME_IS_FIRST_PARAM_SQL, name.to_string())?;
         if exact > 0 {
             return Ok(exact);
         }
-        let suffix = count("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        let suffix = count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%::{name}"))?;
         if suffix > 0 {
             return Ok(suffix);
         }
-        return count("s.qualified_name LIKE ?", format!("{name}%"));
+        return count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("{name}%"));
     }
 
     let exact = count("s.name = ?", name.to_string())?;
     if exact > 0 {
-        Ok(exact)
-    } else {
-        count("s.name LIKE ?", format!("{name}%"))
+        return Ok(exact);
     }
+    let namespaced = count_by_last_segment(conn, name, kind, false, scope)?;
+    if namespaced > 0 {
+        return Ok(namespaced);
+    }
+    count("s.name LIKE ?", format!("{name}%"))
 }
 
 pub fn count_symbols_by_pattern_scoped(
@@ -7899,20 +8154,24 @@ pub fn count_class_like_scoped(
         count_symbol_matches(conn, predicate, vec![value], None, scope, true, false)
     };
     if name.starts_with("::") {
-        return count("s.qualified_name LIKE ?", format!("%{name}"));
+        return count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%{name}"));
     }
     if name.contains("::") {
-        let exact = count("s.qualified_name = ?", name.to_string())?;
+        let exact = count(DISPLAY_NAME_IS_FIRST_PARAM_SQL, name.to_string())?;
         if exact > 0 {
             return Ok(exact);
         }
-        let suffix = count("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        let suffix = count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%::{name}"))?;
         if suffix > 0 {
             return Ok(suffix);
         }
-        return count("s.qualified_name LIKE ?", format!("{name}%"));
+        return count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("{name}%"));
     }
-    count("s.name = ?", name.to_string())
+    let exact = count("s.name = ?", name.to_string())?;
+    if exact > 0 {
+        return Ok(exact);
+    }
+    count_by_last_segment(conn, name, None, true, scope)
 }
 
 pub fn count_symbols_fuzzy_scoped(
@@ -7923,7 +8182,10 @@ pub fn count_symbols_fuzzy_scoped(
     class_only: bool,
 ) -> Result<usize> {
     let (predicate, value) = if query.contains("::") {
-        ("s.qualified_name LIKE ?", format!("%{query}%"))
+        (
+            "COALESCE(s.qualified_name, s.name) LIKE ?",
+            format!("%{query}%"),
+        )
     } else {
         ("s.name LIKE ?", format!("%{query}%"))
     };
@@ -7942,11 +8204,17 @@ pub fn count_search_symbols_scoped(
     if query.contains("::") {
         let raw = query.trim_end_matches('*');
         let (predicate, value) = if query.starts_with("::") {
-            ("s.qualified_name LIKE ?", format!("%{raw}"))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?",
+                format!("%{raw}"),
+            )
         } else if query.ends_with('*') {
-            ("s.qualified_name LIKE ?", format!("{raw}%"))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?",
+                format!("{raw}%"),
+            )
         } else {
-            ("s.qualified_name = ?", raw.to_string())
+            (DISPLAY_NAME_IS_FIRST_PARAM_SQL, raw.to_string())
         };
         return count_symbol_matches(conn, predicate, vec![value], kind, scope, false, false);
     }
@@ -7996,7 +8264,7 @@ pub fn count_search_symbol_terms_scoped(
             .map(|term| {
                 values.push(format!("%{term}%"));
                 if term.contains("::") {
-                    "s.qualified_name LIKE ?"
+                    "COALESCE(s.qualified_name, s.name) LIKE ?"
                 } else {
                     "s.name LIKE ?"
                 }
@@ -8076,6 +8344,7 @@ pub fn search_symbol_terms_scoped_with_ids(
     if terms.is_empty() {
         return Ok(Vec::new());
     }
+    ensure_test_functions(conn)?;
     let (scope_clause, scope_params) = scope.path_condition();
     let vendor_clause = vendor_condition(vendor);
     let mut values = Vec::new();
@@ -8085,7 +8354,7 @@ pub fn search_symbol_terms_scoped_with_ids(
             .map(|term| {
                 values.push(format!("%{term}%"));
                 if term.contains("::") {
-                    "s.qualified_name LIKE ?"
+                    "COALESCE(s.qualified_name, s.name) LIKE ?"
                 } else {
                     "s.name LIKE ?"
                 }
@@ -8117,9 +8386,23 @@ pub fn search_symbol_terms_scoped_with_ids(
         values.push(kind.to_string());
     }
     if fuzzy {
+        // Fuzzy matching does not tell case apart, so its tiers are a name
+        // equal to a term ignoring case, then any other match.
+        let first = values.len() + 1;
+        let folded = (0..terms.len())
+            .map(|offset| format!("lower(?{})", first + offset))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let exact = format!("lower(s.name) IN ({folded})");
         sql.push_str(&format!(
-            " ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), {VENDOR_PATH_SQL}, f.path, s.line"
+            " ORDER BY CASE WHEN {exact} THEN 0 ELSE 1 END, {IMPORT_LAST_SQL}, {}, length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), {VENDOR_PATH_SQL}, f.path, s.line",
+            test_last_sql(&exact)
         ));
+        values.extend(
+            terms
+                .iter()
+                .map(|term| term.trim_end_matches('*').to_string()),
+        );
     } else {
         let first = values.len() + 1;
         let placeholders = (0..terms.len())
@@ -8160,6 +8443,7 @@ pub fn search_symbols_for_command(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
+    ensure_test_functions(conn)?;
     let (scope_clause, scope_params) = scope.path_condition();
     let mut values = Vec::new();
     let mut sql;
@@ -8167,7 +8451,7 @@ pub fn search_symbols_for_command(
     if fuzzy {
         let (column, contains, exact, prefix) = if query.contains("::") {
             (
-                "s.qualified_name",
+                DISPLAY_NAME_SQL,
                 format!("%{query}%"),
                 if query.starts_with("::") {
                     format!("%{query}")
@@ -8205,22 +8489,30 @@ pub fn search_symbols_for_command(
             sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
         }
         sql.push_str(&format!(
-            " ORDER BY CASE WHEN {column} = ? THEN 0 WHEN {column} LIKE ? THEN 1 ELSE 2 END, length({column}) LIMIT ?"
+            " ORDER BY CASE WHEN {column} = ? THEN 0 WHEN {column} LIKE ? THEN 1 ELSE 2 END, {IMPORT_LAST_SQL}, {}, length({column}) LIMIT ?",
+            test_last_sql(&format!("{column} = ?"))
         ));
         if let Some(kind) = kind {
             values.push(kind.to_string());
         }
-        values.push(exact);
+        values.push(exact.clone());
         values.push(prefix);
+        values.push(exact);
         values.push(limit.to_string());
     } else if query.contains("::") {
         let raw = query.trim_end_matches('*');
         let (predicate, value) = if query.starts_with("::") {
-            ("s.qualified_name LIKE ?", format!("%{raw}"))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?",
+                format!("%{raw}"),
+            )
         } else if query.ends_with('*') {
-            ("s.qualified_name LIKE ?", format!("{raw}%"))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?",
+                format!("{raw}%"),
+            )
         } else {
-            ("s.qualified_name = ?", raw.to_string())
+            (DISPLAY_NAME_IS_FIRST_PARAM_SQL, raw.to_string())
         };
         sql = format!(
             r#"
@@ -8238,7 +8530,7 @@ pub fn search_symbols_for_command(
         if class_only {
             sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
         }
-        sql.push_str(" ORDER BY length(s.qualified_name), s.qualified_name LIMIT ?");
+        sql.push_str(" ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name) LIMIT ?");
         if let Some(kind) = kind {
             values.push(kind.to_string());
         }
@@ -8299,11 +8591,17 @@ pub fn search_symbols_scoped(
         let raw = query.trim_end_matches('*');
         let (scope_clause, scope_params) = scope.path_condition();
         let (predicate, value) = if query.starts_with("::") {
-            ("s.qualified_name LIKE ?1", format!("%{}", raw))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?1",
+                format!("%{}", raw),
+            )
         } else if query.ends_with('*') {
-            ("s.qualified_name LIKE ?1", format!("{raw}%"))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?1",
+                format!("{raw}%"),
+            )
         } else {
-            ("s.qualified_name = ?1", raw.to_string())
+            (DISPLAY_NAME_IS_FIRST_PARAM_SQL, raw.to_string())
         };
 
         let sql = format!(
@@ -8312,7 +8610,7 @@ pub fn search_symbols_scoped(
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE {}{}
-            ORDER BY length(s.qualified_name), s.qualified_name
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?{}
             "#,
             predicate,
@@ -8335,6 +8633,7 @@ pub fn search_symbols_scoped(
             .collect::<Result<Vec<_>, _>>()?);
     }
 
+    ensure_test_functions(conn)?;
     let escaped_query = escape_fts5_query(query);
     let (scope_clause, scope_params) = scope.path_condition();
 
@@ -8387,9 +8686,9 @@ pub fn find_symbols_by_name_scoped(
 
     if name.starts_with("::") || name.contains("::") {
         let predicate = if name.starts_with("::") {
-            "s.qualified_name LIKE ?1"
+            "COALESCE(s.qualified_name, s.name) LIKE ?1"
         } else {
-            "s.qualified_name = ?1"
+            DISPLAY_NAME_IS_FIRST_PARAM_SQL
         };
         let value = if name.starts_with("::") {
             format!("%{}", name)
@@ -8429,7 +8728,7 @@ pub fn find_symbols_by_name_scoped(
         }
 
         let mut sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.qualified_name LIKE ?1{}",
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE COALESCE(s.qualified_name, s.name) LIKE ?1{}",
             scope_clause
         );
         if kind.is_some() {
@@ -8460,7 +8759,7 @@ pub fn find_symbols_by_name_scoped(
         }
 
         let mut sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.qualified_name LIKE ?1{}",
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE COALESCE(s.qualified_name, s.name) LIKE ?1{}",
             scope_clause
         );
         if kind.is_some() {
@@ -8515,6 +8814,9 @@ pub fn find_symbols_by_name_scoped(
     let results = stmt
         .query_map(param_refs.as_slice(), row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
+    if results.is_empty() {
+        return find_by_last_segment(conn, name, kind, false, limit, scope);
+    }
 
     Ok(results)
 }
@@ -8532,9 +8834,9 @@ pub fn find_class_like_scoped(
 
     let (scope_clause, scope_params) = scope.path_condition();
     let predicate = if name.starts_with("::") {
-        "s.qualified_name LIKE ?1"
+        "COALESCE(s.qualified_name, s.name) LIKE ?1"
     } else if name.contains("::") {
-        "s.qualified_name = ?1"
+        DISPLAY_NAME_IS_FIRST_PARAM_SQL
     } else {
         "s.name = ?1"
     };
@@ -8577,7 +8879,7 @@ pub fn find_class_like_scoped(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
             LIMIT ?{}
             "#,
             scope_clause,
@@ -8596,72 +8898,77 @@ pub fn find_class_like_scoped(
             .query_map(param_refs.as_slice(), row_to_search_result)?
             .collect::<Result<Vec<_>, _>>()?);
     }
+    if results.is_empty() && !name.contains("::") {
+        return find_by_last_segment(conn, name, None, true, limit, scope);
+    }
 
     Ok(results)
 }
 
-/// Find references with scope filtering
+/// Find references with scope filtering, production code first
+/// ([`find_references_where`]).
 pub fn find_references_scoped(
     conn: &Connection,
     name: &str,
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<RefResult>> {
-    if scope.is_empty() {
-        return find_references(conn, name, limit);
-    }
+    let (scope_condition, scope_params) = ref_scope_condition(scope);
+    let mut values = vec![name.to_string()];
+    values.extend(scope_params);
+    find_references_where(
+        conn,
+        &format!("r0.name = ?{scope_condition}"),
+        values,
+        limit,
+    )
+}
 
+/// References recorded under `name` on a line that contains `mention`.
+///
+/// This is how a qualified name that no reference is recorded under is
+/// looked up: `Billing::Invoice.new` records `Invoice`, so `usages
+/// Billing::Invoice` reads the references to `Invoice` whose line spells
+/// `Billing::Invoice` out, leaving another namespace's `Invoice` alone.
+pub fn find_references_mentioning_scoped(
+    conn: &Connection,
+    name: &str,
+    mention: &str,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<RefResult>> {
+    let (scope_condition, scope_params) = ref_scope_condition(scope);
+    let mut values = vec![name.to_string(), mention.to_string()];
+    values.extend(scope_params);
+    find_references_where(
+        conn,
+        &format!("r0.name = ? AND instr(r0.context, ?) > 0{scope_condition}"),
+        values,
+        limit,
+    )
+}
+
+/// How many references [`find_references_mentioning_scoped`] would list
+/// without a limit.
+pub fn count_references_mentioning_scoped(
+    conn: &Connection,
+    name: &str,
+    mention: &str,
+    scope: &SearchScope,
+) -> Result<usize> {
     let (scope_clause, scope_params) = scope.path_condition();
-
-    // Early materialization with scope pushed into the subquery via IN clause.
-    // Avoids materializing millions of refs when scope narrows by path. See #19.
-    //
-    // Scope filter is applied at files table (small, ~tens of thousands),
-    // producing a small file_id set, then refs are filtered by both name
-    // AND file_id — both covered by idx_refs_name_file_line.
-    let scope_subquery = if scope_clause.is_empty() {
-        String::new()
-    } else {
-        // Strip leading " AND " and wrap in file_id IN subselect
-        let bare_conditions = scope_clause.trim_start_matches(" AND ");
-        format!(
-            " AND file_id IN (SELECT id FROM files f WHERE {})",
-            bare_conditions
-        )
-    };
-
     let sql = format!(
-        r#"
-        SELECT r.name, r.line, r.context, f.path, f.root_path
-        FROM (
-            SELECT name, file_id, line, context
-            FROM refs
-            WHERE name = ?1{}
-            ORDER BY file_id, line
-            LIMIT ?{}
-        ) r
-        JOIN files f ON f.id = r.file_id
-        ORDER BY f.path, r.line
-        "#,
-        scope_subquery,
-        2 + scope_params.len()
+        "SELECT COUNT(*) FROM refs r CROSS JOIN files f \
+         WHERE r.name = ? AND f.id = r.file_id AND instr(r.context, ?) > 0{scope_clause}"
     );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    all_params.push(Box::new(name.to_string()));
-    for p in &scope_params {
-        all_params.push(Box::new(p.clone()));
-    }
-    all_params.push(Box::new(limit as i64));
-
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
-    let results = stmt
-        .query_map(param_refs.as_slice(), row_to_ref_result)?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(results)
+    let mut values = vec![name.to_string(), mention.to_string()];
+    values.extend(scope_params);
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
 }
 
 /// A named workspace subtree attached to the current project (#31).
@@ -10445,6 +10752,121 @@ pub fn load_file_symbol_metrics(
     Ok(rows)
 }
 
+/// The last name segment of an inheritance parent as the source wrote it:
+/// `BaseImporter` for `Billing::BaseImporter`, `Contract` for a parametrised
+/// `Component::Contract[Query]`.
+fn inheritance_parent_segment(parent_name: &str) -> &str {
+    let name = parent_name.trim_start_matches(':');
+    let end = name
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':' || c == '.'))
+        .unwrap_or(name.len());
+    last_name_segment(&name[..end])
+}
+
+/// Superclasses of a class as the symbol graph resolved them: targets of the
+/// class's edges on its declaration line (`class A < B`) that are class-like
+/// and whose last name segment is one of the class's inheritance parents.
+/// Ambiguous edges are left out. Empty when the graph was never built.
+pub fn load_superclasses(conn: &Connection, class_id: i64) -> Result<Vec<(i64, String)>> {
+    if !table_exists(conn, "symbol_edges")? {
+        return Ok(Vec::new());
+    }
+    let parents: Vec<String> = conn
+        .prepare_cached("SELECT parent_name FROM inheritance WHERE child_id = ?1")?
+        .query_map(params![class_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if parents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let segments: Vec<&str> = parents
+        .iter()
+        .map(|parent| inheritance_parent_segment(parent))
+        .collect();
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.id, t.name FROM symbols c
+         JOIN symbol_edges e ON e.source_id = c.id AND e.line = c.line
+         JOIN symbols t ON t.id = e.target_id
+         WHERE c.id = ?1 AND e.confidence < 4
+           AND t.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')",
+    )?;
+    let targets = stmt
+        .query_map(params![class_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(targets
+        .into_iter()
+        .filter(|(_, name)| segments.contains(&last_name_segment(name)))
+        .collect())
+}
+
+/// `(root_path, path)` of the file of every class whose superclass resolves
+/// to `class_id` ([`load_superclasses`]), one entry per class.
+pub fn load_subclass_files(
+    conn: &Connection,
+    class_id: i64,
+    class_name: &str,
+) -> Result<Vec<(Option<String>, String)>> {
+    if !table_exists(conn, "symbol_edges")? {
+        return Ok(Vec::new());
+    }
+    let segment = last_name_segment(class_name);
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id, f.root_path, f.path, i.parent_name FROM symbol_edges e
+         JOIN symbols c ON c.id = e.source_id AND e.line = c.line
+         JOIN inheritance i ON i.child_id = c.id
+         JOIN files f ON f.id = c.file_id
+         WHERE e.target_id = ?1 AND e.confidence < 4",
+    )?;
+    let rows = stmt
+        .query_map(params![class_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty()),
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|(_, _, _, parent)| inheritance_parent_segment(parent) == segment)
+        .filter(|(id, _, _, _)| seen.insert(*id))
+        .map(|(_, root, path, _)| (root, path))
+        .collect())
+}
+
+/// `(kind, line, end_line)` of each of `symbol_ids`; `end_line` is `None`
+/// for parsers that record no ranges.
+pub fn load_symbol_extents(
+    conn: &Connection,
+    symbol_ids: &[i64],
+) -> Result<HashMap<i64, (String, i64, Option<i64>)>> {
+    let mut extents = HashMap::with_capacity(symbol_ids.len());
+    for chunk in symbol_ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql =
+            format!("SELECT id, kind, line, end_line FROM symbols WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(values.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                (row.get(1)?, row.get(2)?, row.get::<_, Option<i64>>(3)?),
+            ))
+        })?;
+        for row in rows {
+            let (id, extent) = row?;
+            extents.insert(id, extent);
+        }
+    }
+    Ok(extents)
+}
+
 /// Every stored metrics row (symbols touching at least one edge).
 pub fn load_all_symbol_graph_metrics(conn: &Connection) -> Result<Vec<SymbolGraphMetrics>> {
     let mut stmt = conn.prepare(
@@ -10840,6 +11262,16 @@ mod tests {
             ("Scopes::Größe", "Größe"),
             ("A::B", "A::B"),
             ("X::A::B", "A::B"),
+            ("users.email", "email"),
+            ("events.email_communicator_email_id", "email"),
+            ("users.email", "Email"),
+            ("self.build", "build"),
+            ("Outer.Inner", "Inner"),
+            ("MyApp.Services", "Services"),
+            ("describe \".call\"", "call"),
+            ("users_email", "email"),
+            ("email", "email"),
+            ("Größe.Maß", "Maß"),
         ];
         for (name, term) in cases {
             let in_sql: bool = conn
@@ -10861,6 +11293,57 @@ mod tests {
         assert!(is_last_name_segment("A::B::Merge", "Merge"));
         assert!(!is_last_name_segment("A::B::AutoMerge", "Merge"));
         assert!(!is_last_name_segment("include A::Merge", "Merge"));
+        assert!(is_last_name_segment("users.email", "email"));
+        assert!(is_last_name_segment("self.build", "build"));
+        assert!(!is_last_name_segment("users.primary_email", "email"));
+        assert!(!is_last_name_segment("describe \".call\"", "call"));
+    }
+
+    #[test]
+    fn last_name_segment_is_what_references_are_recorded_under() {
+        assert_eq!(last_name_segment("Billing::Importers::Ledger"), "Ledger");
+        assert_eq!(last_name_segment("::Ledger"), "Ledger");
+        assert_eq!(last_name_segment("self.build"), "build");
+        assert_eq!(last_name_segment("users.email"), "email");
+        assert_eq!(last_name_segment("Outer.Inner::Deep"), "Deep");
+        assert_eq!(last_name_segment("Ledger"), "Ledger");
+        assert_eq!(last_name_segment("Billing::"), "Billing::");
+        assert_eq!(last_name_segment("include A::B"), "include A::B");
+    }
+
+    #[test]
+    fn last_segment_match_leaves_imports_out() {
+        let conn = Connection::open_in_memory().unwrap();
+        let cases = [
+            ("anyhow::Result", "import", "Result"),
+            ("anyhow::Result", "typealias", "Result"),
+            ("Billing::LedgerImporter", "class", "LedgerImporter"),
+            ("Billing::LedgerImporter", "import", "LedgerImporter"),
+            ("Result", "import", "Result"),
+        ];
+        for (name, kind, term) in cases {
+            let in_sql: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM (SELECT ?1 AS name, ?2 AS kind) s",
+                        last_segment_match_sql(&["?3"])
+                    ),
+                    params![name, kind, term],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                in_sql,
+                is_last_segment_match(name, kind, term),
+                "{name:?} [{kind}] / {term:?}"
+            );
+        }
+        assert!(!is_last_segment_match("anyhow::Result", "import", "Result"));
+        assert!(is_last_segment_match(
+            "anyhow::Result",
+            "typealias",
+            "Result"
+        ));
     }
 
     #[test]

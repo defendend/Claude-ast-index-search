@@ -308,8 +308,167 @@ fn proven_preset_prefers_calm_used_code_over_the_hotspot() {
         .iter()
         .map(|component| component["name"].as_str().unwrap())
         .collect();
-    assert_eq!(components, vec!["calm", "age", "idle", "used"]);
-    assert_eq!(ledger["components"][3]["value"], 1.0);
+    assert_eq!(
+        components,
+        vec!["calm", "mature", "used", "substance", "lineage"]
+    );
+    assert_eq!(ledger["components"][1]["value"], 1.0, "years old: mature");
+    assert_eq!(
+        ledger["components"][2]["value"], 1.0,
+        "called from checkout"
+    );
+    assert_eq!(ledger["components"][3]["factor"], true);
+    // Every class of this fixture sits in a file of six lines.
+    assert_eq!(ledger["components"][3]["value"], 0.5);
+    assert_eq!(ledger["proven"]["stub"], "short_file");
+    assert_eq!(ledger["components"][4]["value"], 1.0, "no base to judge");
+}
+
+fn worker(name: &str, base: &str) -> String {
+    let steps: String = (1..=8)
+        .map(|step| format!("  def step{step}(job)\n    job.advance({step})\n  end\n\n"))
+        .collect();
+    format!("class {name} < {base}\n{steps}end\n")
+}
+
+/// Two families of workers that differ only in whether the code base still
+/// adds members to them: six `LegacyBase` workers from 2019 and six
+/// `LiveBase` workers from 2025, all substantial, all called from `Runner`.
+/// `LiveBase` also has a one-line stub subclass and an empty one.
+fn worker_project() -> Workspace {
+    let ws = workspace();
+    git_in(&ws.root, &[], &["init", "-q", "-b", "main"]);
+    ws.commit(
+        "2019-01-01T10:00:00",
+        "dev1",
+        "Add legacy base",
+        &[(
+            "app/legacy_base.rb",
+            "class LegacyBase\n  def perform\n  end\nend\n",
+        )],
+    );
+    for i in 0..6 {
+        ws.commit(
+            &format!("2019-02-0{}T10:00:00", i + 1),
+            "dev1",
+            &format!("Add legacy worker {i}"),
+            &[(
+                &format!("app/legacy/legacy_worker{i}.rb"),
+                &worker(&format!("LegacyWorker{i}"), "LegacyBase"),
+            )],
+        );
+    }
+    ws.commit(
+        "2025-01-01T10:00:00",
+        "dev2",
+        "Add live base",
+        &[(
+            "app/live_base.rb",
+            "class LiveBase\n  def perform\n  end\nend\n",
+        )],
+    );
+    for i in 0..6 {
+        ws.commit(
+            &format!("2025-02-0{}T10:00:00", i + 1),
+            "dev2",
+            &format!("Add live worker {i}"),
+            &[(
+                &format!("app/live/live_worker{i}.rb"),
+                &worker(&format!("LiveWorker{i}"), "LiveBase"),
+            )],
+        );
+    }
+    ws.commit(
+        "2025-03-01T10:00:00",
+        "dev2",
+        "Add stub workers",
+        &[
+            (
+                "app/live/stub_worker.rb",
+                "class LiveStubWorker < LiveBase; end\n",
+            ),
+            (
+                "app/live/empty_worker.rb",
+                &format!(
+                    "class LiveEmptyWorker < LiveBase\nend\n\n{}",
+                    worker("LiveEmptyWorkerHelper", "Object")
+                ),
+            ),
+        ],
+    );
+    let calls: String = (0..6)
+        .map(|i| format!("    LegacyWorker{i}.new.perform\n    LiveWorker{i}.new.perform\n"))
+        .collect();
+    ws.commit(
+        "2025-04-01T10:00:00",
+        "dev3",
+        "Add runner",
+        &[(
+            "app/runner.rb",
+            &format!(
+                "class Runner\n  def call\n{calls}    LiveStubWorker.new.perform\n    LiveEmptyWorker.new.perform\n  end\nend\n"
+            ),
+        )],
+    );
+    ws
+}
+
+#[test]
+fn proven_prefers_a_live_lineage_and_real_code_over_stubs() {
+    let ws = worker_project();
+    collect_everything(&ws);
+
+    let report = ws.json(&["search", "Worker", "--fuzzy", "--rank", "proven"]);
+    let names = symbol_names(&report);
+    let live: Vec<usize> = (0..6)
+        .map(|i| position(&names, &format!("LiveWorker{i}")))
+        .collect();
+    let legacy: Vec<usize> = (0..6)
+        .map(|i| position(&names, &format!("LegacyWorker{i}")))
+        .collect();
+    let stubs = [
+        position(&names, "LiveStubWorker"),
+        position(&names, "LiveEmptyWorker"),
+    ];
+    assert!(
+        live.iter().max() < legacy.iter().min(),
+        "a live family leads a dying one: {names:?}"
+    );
+    assert!(
+        live.iter().max() < stubs.iter().min(),
+        "real code leads stubs of the same family: {names:?}"
+    );
+
+    let legacy = &symbol(&report, "LegacyWorker0")["rank"];
+    assert_eq!(legacy["proven"]["lineage"]["base"], "LegacyBase");
+    assert_eq!(legacy["proven"]["lineage"]["subclasses"], 6);
+    assert_eq!(legacy["proven"]["lineage"]["recent"], 0);
+    assert_eq!(legacy["components"][4]["value"], 0.5);
+    assert_eq!(
+        legacy["components"][1]["value"], 1.0,
+        "seven years old counts no more than half a year"
+    );
+    let live = &symbol(&report, "LiveWorker0")["rank"];
+    assert_eq!(live["proven"]["lineage"]["base"], "LiveBase");
+    assert_eq!(live["components"][4]["value"], 1.0);
+    assert!(live["proven"].get("stub").is_none());
+    assert_eq!(
+        symbol(&report, "LiveStubWorker")["rank"]["proven"]["stub"],
+        "short_file"
+    );
+    assert_eq!(
+        symbol(&report, "LiveEmptyWorker")["rank"]["proven"]["stub"],
+        "empty_class_body"
+    );
+
+    let text = ws.run(&["search", "Worker", "--fuzzy", "--rank", "proven"]);
+    assert!(
+        text.contains(
+            "lineage: weakest base LegacyBase — 0 of 6 subclasses added in the last 2 years"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("substance: stub, empty class body"), "{text}");
 }
 
 #[test]

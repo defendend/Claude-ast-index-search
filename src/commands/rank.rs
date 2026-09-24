@@ -42,7 +42,7 @@ use super::git_signals::{
     HistorySnapshot, PERCENTILE_ELEVATED, PERCENTILE_HIGH,
 };
 use super::graph::DEPENDENTS_DEPTH;
-use super::PathResolver;
+use super::{is_test_symbol, PathResolver};
 use crate::db::{self, FileResult, SearchResult, SymbolGraphMetrics};
 
 /// Share of the in-tier sort key that comes from the preset score; the rest
@@ -65,6 +65,21 @@ const SYMBOL_POOL: usize = 100;
 /// (they come back alphabetically), so the pool is as wide as is cheap.
 const FILE_POOL: usize = 2000;
 const SECONDS_PER_DAY: i64 = 86_400;
+/// `proven`: history a file needs before it counts as mature; older files
+/// get no further credit for their age.
+const MATURE_DAYS: f64 = 180.0;
+/// `proven`: files shorter than this are stubs, not patterns (the same
+/// threshold relative churn uses to stop measuring content).
+const STUB_LINES: i64 = 10;
+/// `proven`: the factor a stub, or the weakest lineage, scores at worst.
+const PROVEN_FLOOR: f64 = 0.5;
+/// `proven`: how far back "added recently" reaches for a lineage.
+const LINEAGE_WINDOW_DAYS: i64 = 730;
+/// `proven`: a base with fewer resolved subclasses says nothing about
+/// whether its pattern is still followed.
+const LINEAGE_MIN_SUBCLASSES: usize = 5;
+/// `proven`: superclass hops followed from a class.
+const LINEAGE_DEPTH: usize = 4;
 
 pub const PRESET_NAMES: [&str; 4] = ["proven", "hotspots", "risky", "central"];
 
@@ -108,9 +123,12 @@ impl Preset {
     fn formula(self) -> &'static str {
         match self {
             Preset::Proven => {
-                "mean of calm (1 - file hotspot score), file age percentile, idle percentile \
-                 (days since the file last changed) and used (1 when at least one caller \
-                 resolves to the symbol, else 0)"
+                "mean of calm (1 - file hotspot score), mature (file age / 180 days, at most 1) \
+                 and used (1 when at least one caller resolves to the symbol, else 0), times \
+                 substance (0.5 for a file under 10 lines or an empty class body, else 1) and \
+                 lineage (0.5 + 0.5 x vitality of the weakest base the class descends from or \
+                 is: the share of its subclasses added in the last two years, relative to the \
+                 share of all files added then; 1 when no base has 5+ resolved subclasses)"
             }
             Preset::Hotspots => {
                 "file hotspot score: mean percentile of commits, churn and bugfix ratio, \
@@ -187,6 +205,7 @@ impl GraphPopulation {
 pub struct RankContext {
     preset: Preset,
     history: Option<HistorySnapshot>,
+    lineage: Option<LineageWindow>,
     graph: Option<GraphPopulation>,
     graph_state: Option<db::SymbolGraphState>,
     missing: Vec<MissingSignal>,
@@ -242,10 +261,15 @@ impl RankContext {
             Some(state) if state.built && missing.is_empty() => Some(GraphPopulation::load(conn)?),
             _ => None,
         };
+        let lineage = match (&history, &graph) {
+            (Some(snapshot), Some(_)) if preset == Preset::Proven => LineageWindow::new(snapshot),
+            _ => None,
+        };
 
         Ok(RankContext {
             preset,
             history,
+            lineage,
             graph,
             graph_state,
             missing,
@@ -259,6 +283,221 @@ impl RankContext {
 
     pub fn preset(&self) -> Preset {
         self.preset
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `proven`: substance and lineage
+// ---------------------------------------------------------------------------
+
+/// Kinds whose empty body makes a stub: a class that only renames its
+/// superclass (`class Billing::UpdateService < Billing::CreateService; end`)
+/// shows nothing worth copying.
+const CLASS_KINDS: [&str; 8] = [
+    "class",
+    "interface",
+    "object",
+    "enum",
+    "protocol",
+    "struct",
+    "actor",
+    "package",
+];
+
+/// What "added recently" means for a lineage, and how fast the repository
+/// as a whole grows by that measure.
+struct LineageWindow {
+    /// Files first committed after this (unix seconds) count as recent.
+    cutoff: i64,
+    /// Share of the files with collected history that are recent.
+    repo_share: f64,
+}
+
+impl LineageWindow {
+    /// `None` when no file was added within the window: a repository that
+    /// does not grow says nothing about which of its patterns are dying.
+    fn new(snapshot: &HistorySnapshot) -> Option<LineageWindow> {
+        let reference = snapshot
+            .collected_at
+            .unwrap_or_else(now_millis)
+            .div_euclid(1000);
+        let cutoff = reference - LINEAGE_WINDOW_DAYS * SECONDS_PER_DAY;
+        let births: Vec<i64> = snapshot
+            .files
+            .values()
+            .filter_map(|history| history.hotspot.first_commit_at)
+            .collect();
+        let recent = births.iter().filter(|&&born| born > cutoff).count();
+        (recent > 0).then(|| LineageWindow {
+            cutoff,
+            repo_share: recent as f64 / births.len() as f64,
+        })
+    }
+}
+
+/// The weakest base of a class lineage: the class itself or a superclass,
+/// whichever pattern the code base is abandoning fastest.
+#[derive(Clone, Debug, Serialize)]
+pub struct LineageDossier {
+    pub base: String,
+    /// Resolved subclasses of the base with collected history.
+    pub subclasses: usize,
+    /// Those whose file was first committed within the last two years.
+    pub recent: usize,
+    /// `recent / subclasses` relative to the share of all files added in
+    /// the same two years, at most 1.
+    #[serde(serialize_with = "git_signals::serialize_round3")]
+    pub vitality: f64,
+}
+
+/// The `proven` evidence beyond history and graph metrics.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ProvenDossier {
+    /// Why the result is a stub rather than a pattern: `short_file` (under
+    /// 10 lines) or `empty_class_body`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stub: Option<&'static str>,
+    /// Lines of the file, for a `short_file` stub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_lines: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<LineageDossier>,
+}
+
+impl ProvenDossier {
+    fn render(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        match (self.stub, self.file_lines) {
+            (Some("short_file"), Some(file_lines)) => {
+                lines.push(format!("substance: stub, {file_lines}-line file"))
+            }
+            (Some(_), _) => lines.push("substance: stub, empty class body".to_string()),
+            (None, _) => {}
+        }
+        if let Some(lineage) = &self.lineage {
+            lines.push(format!(
+                "lineage: weakest base {} — {} of {} subclasses added in the last 2 years (vitality {:.2})",
+                lineage.base, lineage.recent, lineage.subclasses, lineage.vitality
+            ));
+        }
+        lines
+    }
+}
+
+/// [`ProvenDossier`] without the lineage: whether the result is a stub,
+/// by its file's size or (for a class) its body.
+fn substance(
+    history: Option<&FileHistory>,
+    extent: Option<&(String, i64, Option<i64>)>,
+) -> ProvenDossier {
+    let file_lines = history.and_then(|history| history.hotspot.current_lines);
+    if let Some(file_lines) = file_lines.filter(|&lines| lines < STUB_LINES) {
+        return ProvenDossier {
+            stub: Some("short_file"),
+            file_lines: Some(file_lines),
+            lineage: None,
+        };
+    }
+    let empty_class = matches!(
+        extent,
+        Some((kind, line, Some(end_line)))
+            if CLASS_KINDS.contains(&kind.as_str()) && end_line - line <= 1
+    );
+    ProvenDossier {
+        stub: empty_class.then_some("empty_class_body"),
+        ..ProvenDossier::default()
+    }
+}
+
+/// Lineages of the candidates of one ranking call; a base shared by many of
+/// them (`ApplicationService`) is measured once.
+struct Lineages<'a> {
+    conn: &'a Connection,
+    window: &'a LineageWindow,
+    history: &'a HistorySnapshot,
+    resolver: &'a PathResolver,
+    families: HashMap<i64, Option<(usize, usize)>>,
+    superclasses: HashMap<i64, Vec<(i64, String)>>,
+}
+
+impl<'a> Lineages<'a> {
+    fn new(conn: &'a Connection, ctx: &'a RankContext, resolver: &'a PathResolver) -> Option<Self> {
+        Some(Lineages {
+            conn,
+            window: ctx.lineage.as_ref()?,
+            history: ctx.history.as_ref()?,
+            resolver,
+            families: HashMap::new(),
+            superclasses: HashMap::new(),
+        })
+    }
+
+    /// `(subclasses, recent)` of a base with enough resolved subclasses in
+    /// the primary root to judge.
+    fn family(&mut self, class_id: i64, name: &str) -> Result<Option<(usize, usize)>> {
+        if let Some(family) = self.families.get(&class_id) {
+            return Ok(*family);
+        }
+        let mut subclasses = 0;
+        let mut recent = 0;
+        for (root, path) in db::load_subclass_files(self.conn, class_id, name)? {
+            if !self.resolver.is_primary_root(root.as_deref()) {
+                continue;
+            }
+            let Some(born) = self
+                .history
+                .files
+                .get(&path)
+                .and_then(|history| history.hotspot.first_commit_at)
+            else {
+                continue;
+            };
+            subclasses += 1;
+            if born > self.window.cutoff {
+                recent += 1;
+            }
+        }
+        let family = (subclasses >= LINEAGE_MIN_SUBCLASSES).then_some((subclasses, recent));
+        self.families.insert(class_id, family);
+        Ok(family)
+    }
+
+    /// The weakest base among the class and its superclasses, `None` when
+    /// none of them has enough resolved subclasses.
+    fn weakest(&mut self, class_id: i64, name: &str) -> Result<Option<LineageDossier>> {
+        let mut weakest: Option<LineageDossier> = None;
+        let mut seen = std::collections::HashSet::from([class_id]);
+        let mut frontier = vec![(class_id, name.to_string())];
+        for depth in 0..=LINEAGE_DEPTH {
+            let mut next = Vec::new();
+            for (id, name) in frontier {
+                if let Some((subclasses, recent)) = self.family(id, &name)? {
+                    let vitality =
+                        (recent as f64 / subclasses as f64 / self.window.repo_share).min(1.0);
+                    if weakest.as_ref().map_or(true, |w| vitality < w.vitality) {
+                        weakest = Some(LineageDossier {
+                            base: name.clone(),
+                            subclasses,
+                            recent,
+                            vitality,
+                        });
+                    }
+                }
+                if depth < LINEAGE_DEPTH {
+                    if !self.superclasses.contains_key(&id) {
+                        let parents = db::load_superclasses(self.conn, id)?;
+                        self.superclasses.insert(id, parents);
+                    }
+                    for (parent, parent_name) in &self.superclasses[&id] {
+                        if seen.insert(*parent) {
+                            next.push((*parent, parent_name.clone()));
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+        Ok(weakest)
     }
 }
 
@@ -503,6 +742,27 @@ impl Unscored {
 pub struct Component {
     pub name: &'static str,
     pub value: f64,
+    /// A factor multiplies the combined terms instead of being one of them.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub factor: bool,
+}
+
+impl Component {
+    fn term(name: &'static str, value: f64) -> Component {
+        Component {
+            name,
+            value,
+            factor: false,
+        }
+    }
+
+    fn factor(name: &'static str, value: f64) -> Component {
+        Component {
+            name,
+            value,
+            factor: true,
+        }
+    }
 }
 
 /// Evidence and position for one ranked result.
@@ -529,6 +789,9 @@ pub struct Dossier {
     pub history: Option<Option<HistoryDossier>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph: Option<Option<GraphDossier>>,
+    /// `proven` only: stub and lineage evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proven: Option<ProvenDossier>,
 }
 
 impl Dossier {
@@ -539,19 +802,12 @@ impl Dossier {
             None => format!("match: {}", self.tier),
         };
         let head = match (self.score, self.unscored) {
-            (Some(score), _) => {
-                let parts: Vec<String> = self
-                    .components
-                    .iter()
-                    .map(|component| format!("{} {:.2}", component.name, component.value))
-                    .collect();
-                format!(
-                    "{} {:.2} = {} · {position}",
-                    preset.as_str(),
-                    score,
-                    combine_label(preset, &parts),
-                )
-            }
+            (Some(score), _) => format!(
+                "{} {:.2} = {} · {position}",
+                preset.as_str(),
+                score,
+                combine_label(preset, &self.components),
+            ),
             (None, Some(reason)) => format!(
                 "{} not scored: {} · {position}",
                 preset.as_str(),
@@ -566,16 +822,34 @@ impl Dossier {
         if let Some(Some(graph)) = &self.graph {
             lines.push(graph.render());
         }
+        if let Some(proven) = &self.proven {
+            lines.extend(proven.render());
+        }
         lines
     }
 }
 
-fn combine_label(preset: Preset, parts: &[String]) -> String {
-    match preset {
-        Preset::Proven => format!("mean({})", parts.join(", ")),
-        Preset::Risky => parts.join(" × "),
-        Preset::Hotspots | Preset::Central => parts.join(", "),
-    }
+fn combine_label(preset: Preset, components: &[Component]) -> String {
+    let render = |component: &Component| format!("{} {:.2}", component.name, component.value);
+    let terms: Vec<String> = components
+        .iter()
+        .filter(|component| !component.factor)
+        .map(render)
+        .collect();
+    let factors: Vec<String> = components
+        .iter()
+        .filter(|component| component.factor)
+        .map(render)
+        .collect();
+    let combined = match preset {
+        Preset::Proven => format!("mean({})", terms.join(", ")),
+        Preset::Risky => terms.join(" × "),
+        Preset::Hotspots | Preset::Central => terms.join(", "),
+    };
+    std::iter::once(combined)
+        .chain(factors)
+        .collect::<Vec<_>>()
+        .join(" × ")
 }
 
 // ---------------------------------------------------------------------------
@@ -586,65 +860,66 @@ fn score(
     preset: Preset,
     history: Option<&FileHistory>,
     graph: Option<&GraphDossier>,
+    proven: Option<&ProvenDossier>,
 ) -> Option<(f64, Vec<Component>)> {
     let hot = history.map(|history| history.hotspot.score_exact / 100.0);
     let components = match preset {
-        Preset::Hotspots => vec![Component {
-            name: "hotspot",
-            value: hot?,
-        }],
+        Preset::Hotspots => vec![Component::term("hotspot", hot?)],
         Preset::Proven => {
             let history = history?;
             let graph = graph?;
+            let proven = proven?;
+            let age_days = history.hotspot.age_days.unwrap_or(0.0);
             vec![
-                Component {
-                    name: "calm",
-                    value: 1.0 - hot?,
-                },
-                Component {
-                    name: "age",
-                    value: history.hotspot.age_pct_exact / 100.0,
-                },
-                Component {
-                    name: "idle",
-                    value: history.idle_pct_exact / 100.0,
-                },
-                Component {
-                    name: "used",
-                    value: if graph.fan_in > 0 { 1.0 } else { 0.0 },
-                },
+                Component::term("calm", 1.0 - hot?),
+                Component::term("mature", (age_days / MATURE_DAYS).min(1.0)),
+                Component::term("used", if graph.fan_in > 0 { 1.0 } else { 0.0 }),
+                Component::factor(
+                    "substance",
+                    if proven.stub.is_some() {
+                        PROVEN_FLOOR
+                    } else {
+                        1.0
+                    },
+                ),
+                Component::factor(
+                    "lineage",
+                    proven.lineage.as_ref().map_or(1.0, |lineage| {
+                        PROVEN_FLOOR + (1.0 - PROVEN_FLOOR) * lineage.vitality
+                    }),
+                ),
             ]
         }
         Preset::Risky => {
             let graph = graph?;
             vec![
-                Component {
-                    name: "blast_radius",
-                    value: graph.dependents_pct / 100.0,
-                },
-                Component {
-                    name: "hotspot",
-                    value: hot?,
-                },
+                Component::term("blast_radius", graph.dependents_pct / 100.0),
+                Component::term("hotspot", hot?),
             ]
         }
         Preset::Central => {
             let graph = graph?;
-            vec![Component {
-                name: "pagerank",
-                value: graph.pagerank_pct / 100.0,
-            }]
+            vec![Component::term("pagerank", graph.pagerank_pct / 100.0)]
         }
     };
-    let value = match preset {
-        Preset::Risky => components.iter().map(|c| c.value).product(),
-        _ => components.iter().map(|c| c.value).sum::<f64>() / components.len() as f64,
+    let terms: Vec<f64> = components
+        .iter()
+        .filter(|component| !component.factor)
+        .map(|component| component.value)
+        .collect();
+    let combined = match preset {
+        Preset::Risky => terms.iter().product(),
+        _ => terms.iter().sum::<f64>() / terms.len() as f64,
     };
+    let value = components
+        .iter()
+        .filter(|component| component.factor)
+        .fold(combined, |value, component| value * component.value);
     let components = components
         .into_iter()
         .map(|component| Component {
-            name: component.name,
             value: round3(component.value),
+            ..component
         })
         .collect();
     Some((value, components))
@@ -675,6 +950,9 @@ struct Candidate<T> {
     item: T,
     relevance_rank: usize,
     tier: u8,
+    /// Sub-tier: candidates of a tier with a higher demotion go after those
+    /// with a lower one whatever their scores ([`symbol_demotion`]).
+    demotion: u8,
     dossier: Dossier,
 }
 
@@ -732,6 +1010,7 @@ fn order<T>(candidates: &mut [Candidate<T>], grading: Grading) {
         vendor(left)
             .cmp(&vendor(right))
             .then_with(|| hard_tier(left).cmp(&hard_tier(right)))
+            .then_with(|| left.demotion.cmp(&right.demotion))
             .then_with(|| match (left.dossier.blended, right.dossier.blended) {
                 (Some(a), Some(b)) => b.total_cmp(&a),
                 (Some(_), None) => std::cmp::Ordering::Less,
@@ -758,10 +1037,10 @@ const FILE_TIERS: [&str; 3] = ["file_stem", "file_name", "directory"];
 
 /// Relevance tier of a symbol hit, mirroring what the plain order ranks
 /// first: the name is a term (case-sensitively, then folded; fuzzy search
-/// does not tell case apart), the last `::` segment of the name is a term
-/// (not under `--fuzzy`), a word of the name starts with a term (what FTS
-/// prefix matching found; a substring under `--fuzzy`), or only the
-/// signature matched.
+/// does not tell case apart), the last `::` or `.` segment of the name is a
+/// term (not under `--fuzzy`, never for an import), a word of the name starts
+/// with a term (what FTS prefix matching found; a substring under
+/// `--fuzzy`), or only the signature matched.
 fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
     let name = result.name.as_str();
     let terms: Vec<&str> = terms.iter().map(|t| t.trim_end_matches('*')).collect();
@@ -776,7 +1055,7 @@ fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
     if !fuzzy
         && terms
             .iter()
-            .any(|term| db::is_last_name_segment(name, term))
+            .any(|term| db::is_last_segment_match(name, &result.kind, term))
     {
         return 2;
     }
@@ -796,6 +1075,20 @@ fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
         3
     } else {
         4
+    }
+}
+
+/// Sub-tier of a symbol hit, as the plain order sorts it, whatever the
+/// preset thinks of the file it sits in: an import goes after every
+/// definition of its tier, and in the partial tiers (`name`, `signature`) a
+/// test symbol ([`is_test_symbol`]) goes after the other definitions.
+fn symbol_demotion(result: &SearchResult, tier: u8) -> u8 {
+    if result.kind == "import" {
+        2
+    } else if tier >= 3 && is_test_symbol(&result.name, &result.path) {
+        1
+    } else {
+        0
     }
 }
 
@@ -847,6 +1140,7 @@ fn blank_dossier(ctx: &RankContext, relevance_rank: Option<usize>, tier: &'stati
         components: Vec::new(),
         history: ctx.preset.needs_history().then_some(None),
         graph: ctx.preset.needs_graph().then_some(None),
+        proven: None,
     }
 }
 
@@ -875,6 +1169,12 @@ pub fn rank_symbols(
     } else {
         HashMap::new()
     };
+    let extents = if ctx.preset == Preset::Proven {
+        db::load_symbol_extents(conn, &ids)?
+    } else {
+        HashMap::new()
+    };
+    let mut lineages = Lineages::new(conn, ctx, resolver);
     let mut candidates: Vec<Candidate<SearchResult>> = Vec::with_capacity(pool.len());
     for (position, (id, result)) in pool.into_iter().enumerate() {
         let tier = symbol_tier(&result, terms, fuzzy);
@@ -886,10 +1186,17 @@ pub fn rank_symbols(
                 .graph
                 .as_ref()
                 .map(|population| GraphDossier::build(metrics.get(&id), population, None));
-            let primary = resolver.is_primary_root(result.root_path.as_deref());
-            fill(ctx, &mut dossier, &result.path, primary, graph);
+            let evidence = Evidence {
+                path: &result.path,
+                primary_root: resolver.is_primary_root(result.root_path.as_deref()),
+                graph,
+                extent: extents.get(&id),
+                class: Some((id, result.name.as_str())),
+            };
+            fill(ctx, &mut lineages, &mut dossier, evidence)?;
         }
         candidates.push(Candidate {
+            demotion: symbol_demotion(&result, tier),
             item: result,
             relevance_rank: position + 1,
             tier,
@@ -932,6 +1239,16 @@ pub fn rank_files(
     } else {
         HashMap::new()
     };
+    let extents = if ctx.preset == Preset::Proven {
+        let ids: Vec<i64> = strongest
+            .values()
+            .map(|row| row.metrics.symbol_id)
+            .collect();
+        db::load_symbol_extents(conn, &ids)?
+    } else {
+        HashMap::new()
+    };
+    let mut lineages = Lineages::new(conn, ctx, resolver);
     let mut candidates: Vec<Candidate<FileResult>> = Vec::with_capacity(pool.len());
     for (position, file) in pool.into_iter().enumerate() {
         let tier = file_tier(&file.path, terms);
@@ -939,31 +1256,37 @@ pub fn rank_files(
         if db::is_vendor_path(&file.path) {
             dossier.unscored = Some(Unscored::Vendor);
         } else {
-            let graph = ctx.graph.as_ref().map(|population| {
-                let key = (file.root_path.clone(), file.path.clone());
-                match strongest.get(&key) {
-                    Some(row) => GraphDossier::build(
-                        Some(&row.metrics),
-                        population,
-                        Some(StrongestSymbol {
-                            name: row.name.clone(),
-                            kind: row.kind.clone(),
-                            line: row.line,
-                        }),
-                    ),
-                    None => GraphDossier {
-                        granularity: "file",
-                        ..GraphDossier::build(None, population, None)
-                    },
-                }
+            let key = (file.root_path.clone(), file.path.clone());
+            let strongest_row = strongest.get(&key);
+            let graph = ctx.graph.as_ref().map(|population| match strongest_row {
+                Some(row) => GraphDossier::build(
+                    Some(&row.metrics),
+                    population,
+                    Some(StrongestSymbol {
+                        name: row.name.clone(),
+                        kind: row.kind.clone(),
+                        line: row.line,
+                    }),
+                ),
+                None => GraphDossier {
+                    granularity: "file",
+                    ..GraphDossier::build(None, population, None)
+                },
             });
-            let primary = resolver.is_primary_root(file.root_path.as_deref());
-            fill(ctx, &mut dossier, &file.path, primary, graph);
+            let evidence = Evidence {
+                path: &file.path,
+                primary_root: resolver.is_primary_root(file.root_path.as_deref()),
+                graph,
+                extent: strongest_row.and_then(|row| extents.get(&row.metrics.symbol_id)),
+                class: strongest_row.map(|row| (row.metrics.symbol_id, row.name.as_str())),
+            };
+            fill(ctx, &mut lineages, &mut dossier, evidence)?;
         }
         candidates.push(Candidate {
             item: file,
             relevance_rank: position + 1,
             tier,
+            demotion: 0,
             dossier,
         });
     }
@@ -979,14 +1302,25 @@ pub fn rank_files(
         .collect())
 }
 
-fn fill(
-    ctx: &RankContext,
-    dossier: &mut Dossier,
-    path: &str,
+/// Evidence of one scored candidate besides its file's history.
+struct Evidence<'a> {
+    path: &'a str,
     primary_root: bool,
     graph: Option<GraphDossier>,
-) {
-    let history = match history_for(ctx, path, primary_root) {
+    /// `(kind, line, end_line)` of the symbol, or of a file's strongest
+    /// symbol.
+    extent: Option<&'a (String, i64, Option<i64>)>,
+    /// The symbol whose lineage `proven` weighs, with its name.
+    class: Option<(i64, &'a str)>,
+}
+
+fn fill(
+    ctx: &RankContext,
+    lineages: &mut Option<Lineages>,
+    dossier: &mut Dossier,
+    evidence: Evidence,
+) -> Result<()> {
+    let history = match history_for(ctx, evidence.path, evidence.primary_root) {
         Ok(history) => history,
         Err(reason) => {
             dossier.unscored = Some(reason);
@@ -996,15 +1330,28 @@ fn fill(
     if dossier.history.is_some() {
         dossier.history = Some(history.map(HistoryDossier::from));
     }
+    if ctx.preset == Preset::Proven && dossier.unscored.is_none() {
+        let mut proven = substance(history, evidence.extent);
+        if let (Some(lineages), Some((id, name))) = (lineages.as_mut(), evidence.class) {
+            proven.lineage = lineages.weakest(id, name)?;
+        }
+        dossier.proven = Some(proven);
+    }
     if dossier.unscored.is_none() {
-        if let Some((value, components)) = score(ctx.preset, history, graph.as_ref()) {
+        if let Some((value, components)) = score(
+            ctx.preset,
+            history,
+            evidence.graph.as_ref(),
+            dossier.proven.as_ref(),
+        ) {
             dossier.score = Some(value);
             dossier.components = components;
         }
     }
     if dossier.graph.is_some() {
-        dossier.graph = Some(graph);
+        dossier.graph = Some(evidence.graph);
     }
+    Ok(())
 }
 
 /// Per file (keyed by root and path), the symbol with the highest PageRank.
@@ -1251,6 +1598,69 @@ mod tests {
         assert_eq!(symbol_tier(&symbol("AutoMerge"), &terms, false), 4);
         assert_eq!(symbol_tier(&symbol("AutoMerge"), &terms, true), 3);
         assert_eq!(symbol_tier(&symbol("MERGE"), &terms, true), 0);
+        assert_eq!(symbol_tier(&symbol("self.Merge"), &terms, false), 2);
+        assert_eq!(symbol_tier(&symbol("jobs.Merge"), &terms, false), 2);
+        assert_eq!(symbol_tier(&symbol("jobs.Merged"), &terms, false), 3);
+    }
+
+    #[test]
+    fn imports_never_take_the_last_segment_tier_and_follow_definitions() {
+        let import = SearchResult {
+            kind: "import".to_string(),
+            ..symbol("anyhow::Result")
+        };
+        let terms = ["Result"];
+        assert_eq!(symbol_tier(&import, &terms, false), 3);
+        assert_eq!(symbol_tier(&symbol("anyhow::Result"), &terms, false), 2);
+        assert_eq!(symbol_demotion(&import, 0), 2);
+        assert_eq!(symbol_demotion(&symbol("SearchResult"), 0), 0);
+
+        let dossier = |score: f64| Dossier {
+            score: Some(score),
+            blended: None,
+            relevance_rank: None,
+            tier: "exact_name",
+            unscored: None,
+            components: Vec::new(),
+            history: None,
+            graph: None,
+            proven: None,
+        };
+        let mut candidates = vec![
+            Candidate {
+                item: "import-hot",
+                relevance_rank: 1,
+                tier: 0,
+                demotion: 1,
+                dossier: dossier(0.9),
+            },
+            Candidate {
+                item: "class-cold",
+                relevance_rank: 2,
+                tier: 0,
+                demotion: 0,
+                dossier: dossier(0.1),
+            },
+        ];
+        order(&mut candidates, Grading::Positional);
+        assert_eq!(candidates[0].item, "class-cold");
+    }
+
+    #[test]
+    fn test_symbols_follow_in_partial_tiers_only() {
+        let in_spec = SearchResult {
+            path: "spec/models/merge_spec.rb".to_string(),
+            ..symbol("merge_all")
+        };
+        assert_eq!(symbol_demotion(&in_spec, 3), 1);
+        assert_eq!(symbol_demotion(&in_spec, 4), 1);
+        assert_eq!(
+            symbol_demotion(&in_spec, 0),
+            0,
+            "an exact name keeps its place"
+        );
+        assert_eq!(symbol_demotion(&symbol("test_merge_all"), 3), 1);
+        assert_eq!(symbol_demotion(&symbol("merge_all"), 3), 0);
     }
 
     #[test]
@@ -1301,6 +1711,7 @@ mod tests {
             components: Vec::new(),
             history: None,
             graph: None,
+            proven: None,
         };
         let project = Dossier {
             score: Some(0.1),
@@ -1314,12 +1725,14 @@ mod tests {
                 item: "vendor-exact",
                 relevance_rank: 1,
                 tier: 0,
+                demotion: 0,
                 dossier: vendor,
             },
             Candidate {
                 item: "project-signature",
                 relevance_rank: 2,
                 tier: 3,
+                demotion: 0,
                 dossier: project,
             },
         ];
@@ -1338,11 +1751,13 @@ mod tests {
             components: Vec::new(),
             history: None,
             graph: None,
+            proven: None,
         };
         let candidate = |item: &'static str, rank: usize, tier: u8, score: f64| Candidate {
             item,
             relevance_rank: rank,
             tier,
+            demotion: 0,
             dossier: dossier(score),
         };
         let mut candidates = vec![
@@ -1370,11 +1785,13 @@ mod tests {
             components: Vec::new(),
             history: None,
             graph: None,
+            proven: None,
         };
         let candidate = |item: &'static str, rank: usize, tier: u8, score: Option<f64>| Candidate {
             item,
             relevance_rank: rank,
             tier,
+            demotion: 0,
             dossier: dossier(score),
         };
         let mut candidates = vec![

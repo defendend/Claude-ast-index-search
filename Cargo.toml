@@ -40,7 +40,7 @@ grep-regex = "0.1"
 grep-matcher = "0.1"
 
 # SQLite + FTS5
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "functions"] }
 
 # Utilities
 walkdir = "2"
