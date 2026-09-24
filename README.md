@@ -683,6 +683,36 @@ exclude:
 
 ### Unreleased
 
+- **snake_case calls are references in every language** — the generic
+  reference extractor did not allow `_` in a called name, so `usages`, `refs`
+  and the graph missed `update_profile(user)` and `self._compute()` in Python,
+  Rust, Go, C/C++, PHP, Lua, TypeScript and every other language using it
+  (`usages open_db` on a Rust codebase went from 0 to 50 hits). Reserved words
+  (`sizeof (x)`, `#if defined(X)`, Go `func (r *T)`, Rust `pub(crate)`,
+  Python `None`) are no longer recorded as references. In Ruby, a lowercase
+  `name(` inside a comment, string or heredoc is no longer a reference.
+- **BSL and stylesheets use their own reference extractors again** — the
+  trait default sent every language to the generic ASCII extractor, so BSL
+  (1C:Enterprise / OneScript) files had no Cyrillic references at all and
+  CSS, SCSS and Less recorded kebab-case fragments. BSL now records Cyrillic
+  calls, modules before `.` and types after `Новый`, with the source line as
+  context; stylesheets record none.
+- **One test-path rule** for `explore`, the symbol graph and `--exclude-tests`
+  (`graph top`, `hotspots`, `search --rank`): adds `test_*.py`, `conftest.py`
+  and `FooTest`/`FooTests`/`FooSpec` files in JVM/Swift/C#/PHP/C++, and stops
+  treating Ruby namespaces under `app/`/`lib/` (e.g. `app/jobs/tests/`) and
+  PascalCase JS component folders (`components/Test/`) as tests.
+- **First open of a project no longer slows down quadratically with the
+  cache** — the cache-migration scan now lists the lease directory once
+  instead of once per cached project (a first `rebuild` beside 5000 cached
+  projects dropped from about 70 s to about 1.4 s).
+- **Cache GC removes lease lock files of caches that no longer exist** —
+  `.leases` kept a `{key}.lock` and `{key}.publish.lock` for every cache ever
+  opened, so it grew without bound. The cleanup after `rebuild` / `update` now
+  deletes them whatever their age, and only under the cache-layout lock after
+  locking both files itself, so a lock another process holds or is about to
+  take is never split across two files. Every command that resolves the index
+  gets faster on a cache that had accumulated them.
 - **Symbol ranges for every tree-sitter language** — `end_line` used to be
   filled only for Ruby and TypeScript/JavaScript, so `call-tree`,
   `explore --rwr` and `graph` fell back to "the last definition above the
