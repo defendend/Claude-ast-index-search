@@ -515,6 +515,10 @@ an import or annotation line (`use`, `import`, `include Mod`, a Rails
 callback, a multi-line RSpec `include(...)` matcher), and a line that
 declares the function itself (a Go method `func (s *Server) Handle(`, a
 JavaScript method `handle(event) {`, `let(:handle)`) is not a call of it.
+`callers` and `call-tree` count a Ruby symbol naming the method as a call
+(`before_save :handle`, `delegate :handle`, `map(&:handle)`), but not
+`:handle?` / `:handle!` / `:handle=` (other methods) and not a `::handle`
+path (`use super::handle;`, `Billing::Handle`) that nothing calls.
 
 Build the symbol dependency graph when you need to know who really depends on
 a definition, how central it is, or what a change would reach transitively:

@@ -232,6 +232,12 @@ ast-index callers "onClick"          # Find all onClick calls
 ast-index callers "fetchUser"        # Find API call sites
 ```
 
+A Ruby symbol naming the method counts as a call site (`before_save :name`,
+`validate :name`, `delegate :name`, `map(&:name)`); `:name?`, `:name!` and
+`:name=` name other methods and do not, and neither does a `::name` path
+(`use super::name;`, `Billing::Name`) unless it is called (`Mod::name(`,
+`Billing::Name.new`).
+
 ### Call Tree
 
 **`call-tree`** - Show complete call hierarchy going UP (who calls the callers). Supports Kotlin, Java, Swift, Perl, ObjC.

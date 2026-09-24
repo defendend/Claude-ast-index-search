@@ -78,10 +78,18 @@ fn trailing_boundary(function_name: &str) -> &str {
     }
 }
 
+/// A Ruby symbol naming the method: `before_save :name`, `validate :name`,
+/// `delegate :name`, `map(&:name)`, `send(:name)`. The symbol has to end
+/// where the name does, since `:name?`, `:name!` and `:name=` name other
+/// methods (`authorize(record, :update?)` is about `update?`, not `update`),
+/// and a `::` in front is a path, not a symbol (`use super::name;`,
+/// `Billing::Invoice`, `std::mem::take`).
+const SYMBOL_REF_IDIOM: &str = r"(?:^|[^:]):{fn}(?:[^\w?!=]|$)";
+
 /// Call idioms recognised across languages, joined into one alternation.
-/// `{fn}` stands for the escaped function name and `{tb}` for its trailing
-/// boundary. Every idiom contains `{fn}`, so a line that matches always
-/// contains the name verbatim; the batched call-tree scan relies on that.
+/// `{fn}` stands for the escaped function name. Every idiom contains `{fn}`,
+/// so a line that matches always contains the name verbatim; the batched
+/// call-tree scan relies on that.
 const CALLER_IDIOMS: [&str; 13] = [
     r"[.>]{fn}\s*\(",                // obj.func( or obj->func(
     r"\b{fn}\s*\(",                  // bare func( anywhere in line
@@ -90,7 +98,7 @@ const CALLER_IDIOMS: [&str; 13] = [
     r"this\.{fn}\s*\(",              // this.func(
     r"super\.{fn}\s*\(",             // super.func(
     r"\.{fn}(?:\s|$)",               // Ruby: obj.method (no parens)
-    r":{fn}{tb}",                    // Ruby: :method_name (symbol ref in callbacks)
+    SYMBOL_REF_IDIOM,                // Ruby: :method_name (callbacks, delegate, &:name)
     r"\b{fn}\.",                     // Ruby: bare method.chain (e.g. scope.where)
     r"\bawait\s+{fn}\s*\(",          // TS: await func(
     r"\bawait\s+[\w.]+\.{fn}\s*\(",  // TS: await obj.func(
@@ -116,10 +124,10 @@ fn is_predicate_or_bang_name(function_name: &str) -> bool {
         })
 }
 
-fn caller_pattern(fn_pattern: &str, trailing: &str) -> String {
+fn caller_pattern(fn_pattern: &str) -> String {
     CALLER_IDIOMS
         .iter()
-        .map(|idiom| idiom.replace("{fn}", fn_pattern).replace("{tb}", trailing))
+        .map(|idiom| idiom.replace("{fn}", fn_pattern))
         .collect::<Vec<_>>()
         .join("|")
 }
@@ -127,7 +135,7 @@ fn caller_pattern(fn_pattern: &str, trailing: &str) -> String {
 /// Build regex pattern that matches function/method calls across languages
 fn build_caller_pattern(function_name: &str) -> String {
     let escaped = regex::escape(function_name);
-    let mut pattern = caller_pattern(&escaped, trailing_boundary(function_name));
+    let mut pattern = caller_pattern(&escaped);
     if is_predicate_or_bang_name(function_name) {
         pattern.push('|');
         pattern.push_str(&BARE_PREDICATE_CALL_IDIOM.replace("{fn}", &escaped));
@@ -136,15 +144,15 @@ fn build_caller_pattern(function_name: &str) -> String {
 }
 
 /// A pattern matching every line that [`build_caller_pattern`] matches for
-/// at least one of `function_names`. Dropping the trailing boundary only
-/// widens the `:symbol` idiom, and the bare name at a word boundary widens
-/// the bare predicate idiom, so the superset holds for every name.
+/// at least one of `function_names`. Every idiom holds the alternation of
+/// the names where one name stood, and the bare name at a word boundary
+/// widens the bare predicate idiom, so the superset holds for every name.
 fn build_any_caller_pattern(function_names: &[String]) -> String {
     let names: Vec<String> = function_names
         .iter()
         .map(|name| regex::escape(name))
         .collect();
-    let mut pattern = caller_pattern(&format!("(?:{})", names.join("|")), "");
+    let mut pattern = caller_pattern(&format!("(?:{})", names.join("|")));
     let predicates: Vec<String> = function_names
         .iter()
         .filter(|name| is_predicate_or_bang_name(name))
@@ -1545,6 +1553,36 @@ mod tests {
             &pat,
             "  after_create :set_timestamps, if: :active?"
         ));
+        for line in [
+            "  validate :set_timestamps",
+            "  delegate :set_timestamps, to: :record",
+            "  records.each(&:set_timestamps)",
+            "  send(:set_timestamps)",
+            "  alias_method :touch, :set_timestamps",
+            "  only: %i[a] + [:set_timestamps]",
+            ":set_timestamps",
+        ] {
+            assert!(matches(&pat, line), "{line}");
+        }
+    }
+
+    #[test]
+    fn symbol_ref_ends_with_the_name_and_is_no_path() {
+        let pat = build_caller_pattern("update");
+        for line in [
+            "    authorize(@job, :update?)",
+            "  permissions :update! do",
+            "  alias_method :update=, :write",
+            "  :updated_at",
+            "use super::update;",
+            "  Billing::update",
+            "  mem::update",
+        ] {
+            assert!(!matches(&pat, line), "{line}");
+        }
+        assert!(matches(&pat, "  before_action :update, only: :show"));
+        let pat = build_caller_pattern("valid?");
+        assert!(matches(&pat, "  validate :valid?, on: :create"));
     }
 
     #[test]
