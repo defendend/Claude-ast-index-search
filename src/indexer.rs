@@ -1155,6 +1155,7 @@ struct ParsedFile {
 enum PendingUpdateFile {
     Regular {
         root: PathBuf,
+        root_key: String,
         path: PathBuf,
     },
     NodeModulesDts {
@@ -1165,14 +1166,22 @@ enum PendingUpdateFile {
 }
 
 /// Parse a single file without DB access (thread-safe)
+#[cfg(test)]
 fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
+    parse_file_keyed(root, &db::normalize_root_for_storage(root), file_path)
+}
+
+/// [`parse_file`] with the storage key of `root` computed by the caller.
+/// The key costs a thread and a `realpath` per call, which a walk over tens
+/// of thousands of files must not pay per file.
+fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<ParsedFile> {
     let metadata = fs::metadata(file_path)?;
     let mtime = metadata
         .modified()?
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_secs() as i64;
     let size = metadata.len() as i64;
-    let root_path = db::normalize_root_for_storage(root);
+    let root_path = root_key.to_string();
 
     let rel_path = file_path
         .strip_prefix(root)
@@ -2041,6 +2050,7 @@ fn index_directory_scoped_with_max_depth(
         .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
     let root_buf = root.to_path_buf();
+    let root_key = db::normalize_root_for_storage(root);
     let total_chunks = (files.len() + chunk_size - 1) / chunk_size;
     for (chunk_idx, chunk) in files.chunks(chunk_size).enumerate() {
         let root_clone = root_buf.clone();
@@ -2062,7 +2072,7 @@ fn index_directory_scoped_with_max_depth(
             chunk
                 .par_iter()
                 .filter_map(|path| {
-                    let result = parse_file(&root_clone, path).ok();
+                    let result = parse_file_keyed(&root_clone, &root_key, path).ok();
                     let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if progress && c % 2000 == 0 {
                         eprintln!("Parsed {} / {} files...", c, total);
@@ -2196,6 +2206,29 @@ fn write_batch_to_db(
     Ok(())
 }
 
+/// `(mtime seconds, size)` of every path, in order; `(0, 0)` for a path that
+/// cannot be read. Stats run on the rayon pool: one by one they made the
+/// change scan of `update` wait on tens of thousands of serial syscalls.
+fn stat_mtime_size_parallel(paths: &[PathBuf]) -> Vec<(i64, i64)> {
+    paths
+        .par_iter()
+        .map(|path| {
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| {
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    (mtime, metadata.len() as i64)
+                })
+                .unwrap_or((0, 0))
+        })
+        .collect()
+}
+
 /// Incremental update: only re-index changed/new files, delete removed files.
 ///
 /// Walks the primary root AND every extra_root registered in metadata. Each
@@ -2283,6 +2316,7 @@ pub fn update_directory_incremental(
         std::collections::HashSet::new();
 
     for (walk_dir, anchor) in &walk_specs {
+        let anchor_key = db::normalize_root_for_storage(anchor);
         let is_git = has_git_repo(walk_dir) || has_git_repo(anchor);
         let arc_root = find_arc_root(walk_dir).or_else(|| find_arc_root(anchor));
         let mut builder = WalkBuilder::new(walk_dir);
@@ -2310,45 +2344,53 @@ pub fn update_directory_incremental(
                 builder.add_ignore(root_gitignore);
             }
         }
-        let walker = builder.build();
-        let walked = walker.filter_map(|e| e.ok()).filter_map(|entry| {
-            let is_supported = entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(parsers::is_supported_extension)
-                .unwrap_or(false);
-            is_supported.then(|| entry.path().to_path_buf())
-        });
+        // A parallel walk, sorted afterwards so the outcome does not depend
+        // on thread timing. Only the order changed files are written in (and
+        // so the ids they get) differs from the former serial walk order.
+        let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+        builder
+            .threads(effective_num_threads())
+            .build_parallel()
+            .run(|| {
+                let tx = tx.clone();
+                Box::new(move |entry| {
+                    if let Ok(entry) = entry {
+                        let is_supported = entry
+                            .path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(parsers::is_supported_extension)
+                            .unwrap_or(false);
+                        if is_supported {
+                            let _ = tx.send(entry.into_path());
+                        }
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+        drop(tx);
+        let mut walked: Vec<PathBuf> = rx.into_iter().collect();
+        walked.sort_unstable();
         let schema_files = if is_git || arc_root.is_some() {
             rails_schema_files(anchor, walk_dir, exclude_matcher)
         } else {
             Vec::new()
         };
 
-        for file_path in walked.chain(schema_files) {
+        // Stat in parallel but decide in walk order: which pending file comes
+        // first sets the order changed files are written, and so their ids.
+        let paths: Vec<PathBuf> = walked.into_iter().chain(schema_files).collect();
+        let stats = stat_mtime_size_parallel(&paths);
+        for (file_path, (file_mtime, file_size)) in paths.into_iter().zip(stats) {
             let rel_path = file_path
                 .strip_prefix(anchor)
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .to_string();
-            let key = (db::normalize_root_for_storage(anchor), rel_path);
+            let key = (anchor_key.clone(), rel_path);
             if current_paths.contains(&key) {
                 continue;
             }
-
-            let (file_mtime, file_size) = fs::metadata(&file_path)
-                .ok()
-                .map(|metadata| {
-                    let mtime = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    (mtime, metadata.len() as i64)
-                })
-                .unwrap_or((0, 0));
 
             let need_parse = match existing_files.get(&key) {
                 Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
@@ -2358,6 +2400,7 @@ pub fn update_directory_incremental(
             if need_parse {
                 files_to_parse.push(PendingUpdateFile::Regular {
                     root: anchor.clone(),
+                    root_key: anchor_key.clone(),
                     path: file_path,
                 });
             }
@@ -2366,20 +2409,10 @@ pub fn update_directory_incremental(
     }
 
     let root_key = db::normalize_root_for_storage(root);
-    for (file_path, rel_path) in collect_node_modules_dts_files(root) {
-        let (file_mtime, file_size) = fs::metadata(&file_path)
-            .ok()
-            .map(|metadata| {
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                (mtime, metadata.len() as i64)
-            })
-            .unwrap_or((0, 0));
-
+    let dts_files = collect_node_modules_dts_files(root);
+    let dts_paths: Vec<PathBuf> = dts_files.iter().map(|(path, _)| path.clone()).collect();
+    let dts_stats = stat_mtime_size_parallel(&dts_paths);
+    for ((file_path, rel_path), (file_mtime, file_size)) in dts_files.into_iter().zip(dts_stats) {
         let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
             Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
             None => true,
@@ -2455,7 +2488,11 @@ pub fn update_directory_incremental(
                 .par_iter()
                 .filter_map(|pending| {
                     let result = match pending {
-                        PendingUpdateFile::Regular { root, path } => parse_file(root, path),
+                        PendingUpdateFile::Regular {
+                            root,
+                            root_key,
+                            path,
+                        } => parse_file_keyed(root, root_key, path),
                         PendingUpdateFile::NodeModulesDts {
                             path,
                             rel_path,
@@ -2513,11 +2550,18 @@ fn swift_target_name(module_name: &str) -> &str {
 /// named after its target — the Swift `import` name — unless that name is
 /// declared more than once or already taken, in which case every such target
 /// gets a manifest-qualified `dir.path.Target` name so none silently wins.
-fn index_swift_manifest_modules(conn: &Connection, root: &Path, manifests: &[&Path]) -> Result<usize> {
+fn index_swift_manifest_modules(
+    conn: &Connection,
+    root: &Path,
+    manifests: &[&Path],
+) -> Result<usize> {
     let mut declared = Vec::new();
     for manifest in manifests {
         let (Some(kind), Some(dir)) = (
-            manifest.file_name().and_then(|n| n.to_str()).and_then(swift_manifest_kind),
+            manifest
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(swift_manifest_kind),
             manifest.parent(),
         ) else {
             continue;
@@ -3484,11 +3528,17 @@ fn swift_manifest_edges(
             continue;
         };
         for dep in &target.dependencies {
-            let local = targets.iter().find(|t| t.name == dep.name).and_then(local_id);
-            let dep_id = local.or_else(|| match modules.by_target.get(&dep.name).map(Vec::as_slice) {
-                Some([only]) => Some(*only),
-                _ => None,
-            });
+            let local = targets
+                .iter()
+                .find(|t| t.name == dep.name)
+                .and_then(local_id);
+            let dep_id =
+                local.or_else(
+                    || match modules.by_target.get(&dep.name).map(Vec::as_slice) {
+                        Some([only]) => Some(*only),
+                        _ => None,
+                    },
+                );
             if let Some(dep_id) = dep_id.filter(|id| *id != module_id) {
                 edges.push((module_id, dep_id, dep.kind.clone()));
             }
@@ -4570,8 +4620,6 @@ fn rails_schema_files(
 }
 
 fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {
-    use ignore::WalkBuilder;
-
     let node_modules = root.join("node_modules");
     if !node_modules.exists() || !node_modules.is_dir() {
         return Vec::new();
@@ -4627,44 +4675,52 @@ fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {
     // Walk each resolved package dir for .d.ts files.
     // follow_links=false — already resolved top-level symlinks.
     // Store (abs_path, rel_path) pairs for correct DB storage.
-    let mut dts_files: Vec<(PathBuf, String)> = Vec::new();
+    // Thousands of small package walks run in parallel and are concatenated
+    // in package order, so the list comes out exactly as a serial walk's.
+    let per_package: Vec<Vec<(PathBuf, String)>> = pkg_map
+        .par_iter()
+        .map(|(pkg_dir, nm_prefix)| walk_package_dts(pkg_dir, nm_prefix))
+        .collect();
+    per_package.concat()
+}
 
-    for (pkg_dir, nm_prefix) in &pkg_map {
-        let mut builder = WalkBuilder::new(pkg_dir);
-        builder
-            .hidden(false)
-            .git_ignore(false)
-            .git_exclude(false)
-            .follow_links(false)
-            .max_depth(Some(8))
-            .filter_entry(|entry| {
-                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name == "node_modules" || name.starts_with('.') {
-                            return false;
-                        }
+fn walk_package_dts(pkg_dir: &Path, nm_prefix: &str) -> Vec<(PathBuf, String)> {
+    use ignore::WalkBuilder;
+
+    let mut dts_files: Vec<(PathBuf, String)> = Vec::new();
+    let mut builder = WalkBuilder::new(pkg_dir);
+    builder
+        .hidden(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .follow_links(false)
+        .max_depth(Some(8))
+        .filter_entry(|entry| {
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name == "node_modules" || name.starts_with('.') {
+                        return false;
                     }
                 }
-                true
-            });
+            }
+            true
+        });
 
-        for entry in builder.build().filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".d.ts") {
-                    // Map resolved path back to node_modules/... relative path
-                    let sub_path = path.strip_prefix(pkg_dir).unwrap_or(path).to_string_lossy();
-                    let rel_path = if sub_path.is_empty() || sub_path == "." {
-                        nm_prefix.clone()
-                    } else {
-                        format!("{}/{}", nm_prefix, sub_path)
-                    };
-                    dts_files.push((path.to_path_buf(), rel_path));
-                }
+    for entry in builder.build().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.ends_with(".d.ts") {
+                // Map resolved path back to node_modules/... relative path
+                let sub_path = path.strip_prefix(pkg_dir).unwrap_or(path).to_string_lossy();
+                let rel_path = if sub_path.is_empty() || sub_path == "." {
+                    nm_prefix.to_string()
+                } else {
+                    format!("{}/{}", nm_prefix, sub_path)
+                };
+                dts_files.push((path.to_path_buf(), rel_path));
             }
         }
     }
-
     dts_files
 }
 
