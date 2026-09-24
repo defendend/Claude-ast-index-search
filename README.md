@@ -686,6 +686,19 @@ exclude:
 
 ### Unreleased
 
+- **Minified JavaScript and CSS are left out** — `.js` / `.mjs` / `.cjs` /
+  `.css` files named `*.min.*` or `*-min.*`, or whose first 64 KiB is minifier
+  output (lines of 1000+ bytes on average, 100+ of them outside string
+  literals), are no longer indexed, read by the grep-based commands (`search`
+  contents, `callers`, `call-tree`, `todo`, …) or parsed by `outline` /
+  `imports`, which now say the file was skipped. A one-line stylesheet gave
+  each of its thousands of selectors the whole file as a signature: on a Rails
+  monorepo with a 589 KB `app.min.css`, `outline` of that file took 4.6 GB and
+  `rebuild` peaked at 4–7 GB; now 11 MB and 0.21 GB. `callers` / `call-tree`
+  no longer answer from bundles (`__webpack_require__`). Source with a few long
+  strings, SVG paths or data URIs is unaffected, and TypeScript, JSX, SCSS and
+  `.d.ts` are never judged. `update` drops minified files an older index kept,
+  without a rebuild. `AST_INDEX_SKIP_MINIFIED=0` turns the filter off.
 - **`rebuild` keeps the collected Git history** — the per-commit store, the
   per-file signals and the collection cursor are copied into the new index
   instead of being dropped, so `hotspots` reports right after a rebuild and the
