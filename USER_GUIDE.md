@@ -46,17 +46,13 @@ npx @ast-index/cli search MyClass
 winget install --id defendend.ast-index
 ```
 
-### Cargo (pending first crates.io release)
+### Cargo (crates.io)
 
-This channel becomes available with the first ast-index release on crates.io.
-After that rollout, install with a Rust toolchain:
+Builds from source; requires a Rust toolchain:
 
 ```bash
 cargo install ast-index --locked
 ```
-
-Before the first crates.io release, use one of the binary channels above or
-build from source.
 
 ### GitHub Releases
 
@@ -157,17 +153,17 @@ indexes new or changed supported source files, and removes deleted files from
 the index. It honors `.gitignore`, built-in ignored directories, and
 `.ast-index.yaml` `include` / `exclude` settings.
 
-Change detection is timestamp-based. During `rebuild` and `update`,
+Change detection is metadata-based. During `rebuild` and `update`,
 `ast-index` stores each indexed file's relative path, filesystem modified time
 (`mtime`), and size in SQLite. On the next `update`, it walks the current source
-tree and compares each file's current `mtime` with the stored one:
+tree and compares each file's current `mtime` and size with the stored ones:
 
 - path is missing from the database: index it as a new file;
-- current `mtime` is newer than stored `mtime`: re-parse and replace that file's
-  symbols and references;
+- `mtime` or size differs from the stored value (newer or older): re-parse and
+  replace that file's symbols and references;
 - path exists in the database but is no longer found on disk: delete it from the
   index;
-- current `mtime` is the same or older: leave the existing index rows as-is.
+- `mtime` and size are both unchanged: leave the existing index rows as-is.
 
 A new or changed file that is minified is not indexed, and one that is already
 in the index is removed like a deleted file. An index written by an older
@@ -395,7 +391,7 @@ slice via offset/limit. Never bulk-read large files.
 - **Hierarchy:** `implementations`, `hierarchy`, `extensions` — class hierarchy
 - **Modules:** `module`, `deps`, `dependents`, `api` — module dependencies
 - **Files:** `outline`, `imports`, `changed` — file analysis
-- **iOS:** `storyboard-usages`, `asset-usages`, `asset-unused` — storyboard/asset search
+- **iOS:** `storyboard-usages`, `asset-usages` (`--unused` for unused assets) — storyboard/asset search
 - **Quality:** `todo`, `deprecated`, `hotspots` — TODOs, deprecated items, Git-history risk
 - **Index:** `rebuild`, `update`, `watch`, `stats` — index management
 
@@ -403,7 +399,7 @@ slice via offset/limit. Never bulk-read large files.
 
 - `ast-index usages "PaymentViewController"` — where is this class used?
 - `ast-index implementations "PaymentProcessing"` — what implements this protocol?
-- `ast-index callers "processPayment"` — what calls this function?
+- `ast-index callers "processPayment"` — where is this function called?
 - `ast-index call-tree "processPayment" -d 3` — call hierarchy
 - `ast-index deps "PaymentFeature"` — module dependencies
 - `ast-index dependents "NetworkKit"` — what depends on this module?

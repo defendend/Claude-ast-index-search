@@ -43,7 +43,7 @@ cd /path/to/project
 ast-index rebuild
 ```
 
-The index is stored at `~/Library/Caches/ast-index/<project-hash>/index.db` (macOS) or `~/.cache/ast-index/<project-hash>/index.db` (Linux). Rebuild deletes the DB file entirely and creates a fresh index.
+The index is stored at `~/Library/Caches/ast-index/<project-hash>/index.db` (macOS) or `~/.cache/ast-index/<project-hash>/index.db` (Linux). Rebuild builds a fresh index and swaps it in; named subtrees and the collected Git history (`hotspots --collect`) are carried over.
 
 ## Supported Projects
 
@@ -225,7 +225,7 @@ ast-index hierarchy "BaseFragment"   # Show fragment inheritance tree
 
 ### Caller Search
 
-**`callers`** - Find all places that call a specific function.
+**`callers`** - Find the lines that call a function, matched by name at query time (`name(`, `.name`, …). It prints call sites, not the function each one sits in — use `call-tree` for that.
 
 ```bash
 ast-index callers "onClick"          # Find all onClick calls
@@ -234,7 +234,7 @@ ast-index callers "fetchUser"        # Find API call sites
 
 ### Call Tree
 
-**`call-tree`** - Show complete call hierarchy going UP (who calls the callers). Supports Kotlin, Java, Swift, Perl, ObjC.
+**`call-tree`** - Show the call hierarchy going UP: the function each call sits in, then its callers. Works in every indexed language: the caller is the innermost definition whose line range encloses the call for the tree-sitter languages (Ruby, TypeScript/JavaScript, Python, Go, Rust, Java, Kotlin, Swift, C#, C/C++, PHP, …); the regex-based parsers without ranges (Perl, WSDL/XSD) fall back to the nearest definition above the call.
 
 ```bash
 ast-index call-tree "processPayment" --depth 3 --limit 10
@@ -299,7 +299,7 @@ index, queries print a stale warning (`"stale": true` in JSON); rerun
 ast-index imports "path/to/File.kt"  # Show Kotlin file imports
 ```
 
-**`outline`** - Show all symbols defined in a file. Uses tree-sitter for accurate parsing of all supported languages.
+**`outline`** - Show all symbols defined in a file, parsed the way the index parses it (tree-sitter for most languages).
 
 ```bash
 ast-index outline "PaymentFragment.kt"    # Show Kotlin fragment structure
@@ -489,13 +489,13 @@ Detects:
 
 ## Common Flags
 
-Most search commands (`search`, `symbol`, `class`, `usages`, `implementations`) support:
+Most search commands (`search`, `symbol`, `class`, `usages`, `implementations`, `refs`) support:
 
 | Flag | Description |
 |------|-------------|
-| `--fuzzy` | Fuzzy search: exact match → prefix match → contains match |
-| `--in-file <PATH>` | Filter results by file path (substring match) |
-| `--module <PATH>` | Filter results by module path (substring match) |
+| `--fuzzy` | Fuzzy search: exact match → prefix match → contains match (`search`, `symbol`, `class` only) |
+| `--in-file <PATH>` | Filter results by file path (substring match; also on `callers` and `call-tree`) |
+| `--module <PATH>` | Filter results by path prefix |
 | `--limit <N>` | Max results to return |
 | `--format json` | JSON output for structured processing |
 
@@ -523,7 +523,7 @@ When running search from a subdirectory, results are automatically limited to th
 
 ```bash
 cd /project/root
-ast-index rebuild                        # Index entire project, creates .ast-index-root
+ast-index rebuild                        # Index entire project
 ast-index search "Payment"              # Finds results across entire project
 
 cd /project/root/services/payments
@@ -535,14 +535,18 @@ This works with all search commands: `search`, `symbol`, `class`, `implementatio
 
 ## Multi-Root Projects
 
-Add additional source roots for monorepos or multi-project setups. Extra roots are indexed alongside the primary project and their module dependencies are included.
+Attach named subtrees for workspaces that intentionally span sibling source trees. They are indexed alongside the primary project, which must be indexed first:
 
 ```bash
-ast-index add-root /path/to/other/source    # Add source root (warns on overlap)
-ast-index add-root ./subdir --force         # Force add even if inside project root
-ast-index remove-root /path/to/other/source # Remove source root
-ast-index list-roots                        # List configured roots
+ast-index subtree add shared ../shared-library   # Attach a named subtree
+ast-index update                                 # Index its files
+ast-index subtree list                           # List attached subtrees
+ast-index subtree remove shared                  # Detach, then rebuild to drop its files
+ast-index --subtree shared search "Payment"      # Query one subtree
+ast-index --local search "Payment"               # Query the primary project only
 ```
+
+`add-root`, `remove-root` and `list-roots` remain as compatibility aliases. Do not attach one git worktree to another: each worktree gets its own index.
 
 ## Utility Commands
 
@@ -802,11 +806,11 @@ Consult: `references/module-commands.md`
 ## Workflow Recommendations
 
 1. Run `ast-index rebuild` once in project root to build the index
-3. **Start a session** with `ast-index conventions` + `ast-index map` to understand project structure (~80 lines, ~500 tokens)
-4. Use `ast-index map --module <path>` to drill down into specific areas
-5. Use `ast-index search` for quick universal search when exploring
+2. **Start a session** with `ast-index conventions` + `ast-index map` to understand project structure (~80 lines, ~500 tokens)
+3. Use `ast-index map --module <path>` to drill down into specific areas
+4. Use `ast-index search` for quick universal search when exploring
 5. Use `ast-index class` for precise class/interface lookup
-6. Use `ast-index usages` to find all references before refactoring
+6. Use `ast-index usages` to find all references before refactoring (`graph dependents` for the dependents of one definition)
 7. Use `ast-index implementations` to understand inheritance
 8. Use `ast-index changed --base main` to inventory branch files before code review
 9. Run `ast-index update` periodically to keep index fresh
@@ -820,10 +824,10 @@ Add `--format json` only when:
 - Need exact field values (file paths, statuses, line numbers, symbol kinds)
 - Integrating with another tool
 
-Supported commands: `search`, `symbol`, `class`, `usages`, `implementations`, `refs`, `stats`, `changed`, `unused-symbols`, `map`, `conventions`.
+Commands with JSON output include `search`, `explore`, `file`, `symbol`, `class`, `usages`, `callers`, `implementations`, `refs`, `stats`, `changed`, `hotspots`, `graph …`, `unused-symbols`, `map` and `conventions`; others (`outline`, `call-tree`, `hierarchy`, `imports`, `todo`) print text either way.
 
 ```bash
-ast-index search "Query" --format json | jq '.results[].path'
+ast-index --format json search "Query" | jq '.symbols[].path'
 ```
 
 ## Additional Resources

@@ -41,6 +41,12 @@ ast-index class BaseFragment
 ast-index usages Repository
 ast-index implementations Presenter
 ast-index deps app
+
+# Opt-in data: Git history and the symbol graph (neither runs on rebuild/update)
+ast-index hotspots --collect                  # rank files by churn, fixes, authors
+ast-index graph build                         # symbol-to-symbol dependency graph
+ast-index graph dependents ApplicationService # who depends on it, before a change
+ast-index search Service --rank proven        # which match is safe to copy
 ```
 
 Use `ast-index update` after edits or branch switches. Hooks can queue a
@@ -123,7 +129,7 @@ brew install ast-index
 git clone https://github.com/defendend/Claude-ast-index-search.git
 cd Claude-ast-index-search
 cargo build --release
-# Binary: target/release/ast-index (~44 MB)
+# Binary: target/release/ast-index (~50 MB)
 ```
 
 ### Troubleshooting: Syntax errors on install
@@ -281,6 +287,7 @@ the index fresh.
 ```bash
 ast-index explore <QUERY...>       # One-shot context: ranked source + neighbours + tests (--rwr for graph)
 ast-index search <QUERY>           # Universal structural search
+ast-index search <QUERY> --rank <PRESET>  # Re-rank by history + graph: proven, hotspots, risky, central
 ast-index file <PATTERN>           # Find files
 ast-index symbol <NAME>            # Find symbols
 ast-index class <NAME>             # Find classes/interfaces
@@ -293,6 +300,7 @@ ast-index implementations <PARENT> # Find implementations
 ast-index hierarchy <CLASS>        # Class hierarchy tree
 ast-index changed [--base BRANCH]  # Branch-level changed files (A/M/D/R)
 ast-index hotspots [--collect]     # Rank files by Git history (churn, fixes, authors)
+ast-index graph <SUBCOMMAND>       # Symbol graph: build, dependents, impact, path, cycles, top, metrics
 ast-index todo [PATTERN]           # TODO/FIXME/HACK comments
 ast-index deprecated [QUERY]       # Deprecated items
 ```
@@ -462,6 +470,29 @@ for thin history — the lower bound of its 95% Wilson interval, so 11 fixes in
 after the rest. `--subtree` is rejected: the signals describe the project's own
 working tree.
 
+### Symbol graph and ranked search
+
+`graph build` turns indexed references into symbol-to-symbol edges, each with
+the confidence of its resolution (`local`, `scoped`, `import`, `unique`,
+`ambiguous`). Like history collection it is explicit: `rebuild` and `update`
+never run it, and queries flag a graph gone stale (`--refresh` rebuilds first).
+
+```bash
+ast-index graph build
+ast-index graph dependents ApplicationService      # incoming edges
+ast-index graph impact PaymentGateway --depth 3    # transitive dependents per hop
+ast-index graph path OrdersController Invoice      # how one reaches the other
+ast-index graph top --kind class --exclude-tests   # most central symbols
+```
+
+`search --rank <preset>` re-orders the Files and Symbols of a search by the
+collected Git history and the graph: `proven` (safe to copy), `hotspots`
+(keeps being fixed), `risky` (many dependents and unstable history), `central`
+(PageRank). Exact name matches stay first; a preset whose data is missing is
+not applied and the output names the command that collects it. Formulas and
+their backtest are in the
+[user guide](USER_GUIDE.md#ranking-search-results-by-history-and-structure).
+
 ### Module analysis
 
 ```bash
@@ -536,7 +567,6 @@ ast-index perl-imports [QUERY]       # Find use/require statements
 ### Index management
 
 ```bash
-ast-index init                     # Initialize DB
 ast-index rebuild [--type TYPE]    # Full reindex
 ast-index update                   # Incremental update
 ast-index stats                    # Index statistics
@@ -667,6 +697,11 @@ exclude:
   - "vendor"
   - "build"
   - "node_modules"
+
+# Index only these directories (allow-list; everything else is skipped)
+include:
+  - "app"
+  - "packages/shared"
 
 # Include files ignored by .gitignore
 no_ignore: false
