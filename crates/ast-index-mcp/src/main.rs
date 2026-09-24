@@ -166,7 +166,7 @@ fn handle_request(
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION
                 },
-                "instructions": "Prefer these ast-index tools over grep/ripgrep and over reading whole files for any code or symbol search in this project. They query a precomputed index: precise (never match inside comments or strings), language-aware, and far cheaper in tokens and round-trips. Rules of thumb: `explore` FIRST to understand an area or answer 'how does X work' (one call returns ranked source + callers/subclasses + tests); `search` for broad discovery; `usages`/`refs`/`callers` for a named symbol; `outline` before reading a file over ~500 lines; `graph_dependents` before changing a symbol; `search` with `rank` to pick which of several matches to copy or to treat with care. Reach for raw grep/Read only for plain text, regex, or non-code files, or to confirm a detail these tools did not cover."
+                "instructions": "Prefer these ast-index tools over grep/ripgrep and over reading whole files for any code or symbol search in this project. They query a precomputed index of definitions, references and files: structural, language-aware, and far cheaper in tokens and round-trips. Rules of thumb: `explore` FIRST to understand an area or answer 'how does X work' (one call returns ranked source + callers/subclasses + tests); `search` for broad discovery; `usages`/`refs`/`callers` for a named symbol; `outline` before reading a file over ~500 lines; `graph_dependents` before changing a symbol; `search` with `rank` to pick which of several matches to copy or to treat with care. Reach for raw grep/Read only for plain text, regex, or non-code files, or to confirm a detail these tools did not cover."
             }),
         ),
         "tools/list" => ok(id, json!({ "tools": tool_descriptors() })),
@@ -198,13 +198,13 @@ fn tool_descriptors() -> Vec<Value> {
     vec![
         json!({
             "name": "explore",
-            "description": "Call this FIRST for almost any 'how does X work', 'where/what is X', architecture, or area-survey question — one call returns the ranked verbatim source of the relevant symbols (read fresh from disk), their graph neighbours (callers/subclasses), and tests located by path convention. It REPLACES a grep + read loop: more precise (no comment/string false positives) and far fewer tool calls and tokens. Reach for raw grep/read only to confirm a detail this didn't cover. Language-agnostic and vendor-aware (node_modules .d.ts and cross-stack matches are down-ranked). Set `rwr` to re-rank by an in-memory call/inheritance graph (personalized PageRank) — surfaces callers/subclasses.",
+            "description": "Call this FIRST for 'how does X work', 'where/what is X' or an area survey: one call returns the ranked source of the relevant symbols (read fresh from disk), their callers/subclasses and tests found by path convention — instead of a grep + read loop. Dependencies' .d.ts and cross-stack matches rank lower.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query":        { "type": "string",  "description": "Natural-language question or a bag of symbol/file names." },
                     "max_files":    { "type": "integer", "description": "Max source files to include (default 6)." },
-                    "rwr":          { "type": "boolean", "description": "Re-rank via in-memory call/inheritance graph (RWR). Surfaces callers/subclasses; slightly slower." },
+                    "rwr":          { "type": "boolean", "description": "Re-rank by an in-memory call/inheritance graph to surface callers/subclasses; slightly slower." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
                     "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient)." }
                 },
@@ -213,7 +213,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "search",
-            "description": "Literal code search across file paths, symbol definitions, imports/usages, and file contents. Use it when you already know an identifier or path fragment (`UserService`, `parseConfig`, `auth/`). For a question or a description of what you are looking for, call `explore` instead — it ranks by relevance. If a multi-word query has no literal match, `search` automatically returns `explore` results with a `fallback: \"explore\"` marker in JSON. Prefer this over grep. Choosing among several matches (which to copy as a pattern, which is risky to touch)? Add `rank`.",
+            "description": "Literal search over paths, definitions, imports/usages and file contents, for a known identifier or path fragment (`UserService`, `auth/`). A question goes to `explore` (a multi-word query without literal hits falls back to it). Choosing among several matches? Add `rank`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -223,10 +223,10 @@ fn tool_descriptors() -> Vec<Value> {
                     "in_file":      { "type": "string",  "description": "Restrict to files whose path contains this substring." },
                     "module":       { "type": "string",  "description": "Restrict to files whose path starts with this prefix." },
                     "fuzzy":        { "type": "boolean", "description": "Enable typo-tolerant fuzzy matching." },
-                    "rank":         { "type": "string",  "enum": ["proven", "hotspots", "risky", "central"], "description": "Re-order files and symbols by Git history and the dependency graph, evidence next to each result. proven: safest to copy as a pattern (calm, old, untouched, used); risky: dangerous to change (many dependents × unstable history); hotspots: keeps being changed and fixed; central: what the code leans on. Exact-name matches stay first. Needs collected history (all but central: `ast-index hotspots --collect` in a shell) and the symbol graph (all but hotspots: `graph_build`); if missing, results stay in plain order and say what to run." },
-                    "exclude_tests": { "type": "boolean", "description": "With `rank`: leave test files (spec/, tests/, *_test.*, *.spec.*) out of the ranked files and symbols; they otherwise crowd the top of `hotspots` and `risky`." },
+                    "rank":         { "type": "string",  "enum": ["proven", "hotspots", "risky", "central"], "description": "Re-order by Git history and the symbol graph, evidence per result. proven: safest to copy; risky: dangerous to change; hotspots: keeps being changed and fixed; central: what the code leans on. Exact names stay first. Needs `ast-index hotspots --collect` in a shell (not for central) and `graph_build` (not for hotspots); what is missing is reported." },
+                    "exclude_tests": { "type": "boolean", "description": "With `rank`: leave test files out of the ranked results (they crowd `hotspots` and `risky`)." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional if the server was started with --root or AST_INDEX_ROOT." },
-                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
                 "required": ["query"]
             }
@@ -246,7 +246,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "usages",
-            "description": "Find every usage (call site, import, downcast, DI registration) of a symbol anywhere in the indexed codebase. Use this when the question is 'who uses X' / 'where is X called from'. Returns file:line + surrounding context. Prefer this over grepping the symbol name — it resolves real references and won't match inside comments or strings.",
+            "description": "Every indexed reference to a symbol name (call, type use, import, …) as file:line + the line's text — for 'who uses X'. Matched by name, not resolved by type: same-named symbols are mixed, and a mention in a comment or string can slip in. For the dependents of one definition use `graph_dependents`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -255,21 +255,21 @@ fn tool_descriptors() -> Vec<Value> {
                     "in_file":      { "type": "string",  "description": "Restrict to files whose path contains this substring." },
                     "module":       { "type": "string",  "description": "Restrict to files whose path starts with this prefix." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
-                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
                 "required": ["symbol"]
             }
         }),
         json!({
             "name": "callers",
-            "description": "Find every function that calls the given function, one level up. Use for 'who calls processPayment' questions. For the full transitive caller tree, call this repeatedly or use `search` with deeper queries. Prefer this over grep for call sites — it attributes calls to the calling function, not just raw text matches.",
+            "description": "Call sites of a function by name: matching lines (`name(`, `.name`, …) as file:line + text — for 'where is X called'. It does not name the calling function; for that, and for callers of callers, use `call_tree`. A text match at query time: same-named methods, comments and strings can appear.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "function":     { "type": "string",  "description": "Function or method name." },
                     "limit":        { "type": "integer", "description": "Max results (default 50)." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
-                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
                 "required": ["function"]
             }
@@ -285,21 +285,21 @@ fn tool_descriptors() -> Vec<Value> {
                     "in_file":      { "type": "string",  "description": "Restrict to files whose path contains this substring." },
                     "module":       { "type": "string",  "description": "Restrict to files whose path starts with this prefix." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
-                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
                 "required": ["parent"]
             }
         }),
         json!({
             "name": "refs",
-            "description": "Show cross-references for a symbol in one shot: every definition, every import, every usage. Use this when you want the complete picture in a single response, rather than calling `usages` / `callers` separately. Prefer this over grep for a symbol — precise, deduplicated, and grouped by kind.",
+            "description": "Show cross-references for a symbol in one shot: every definition, every import, every usage. Use this when you want the complete picture in a single response, rather than calling `usages` / `callers` separately. Deduplicated and grouped by kind; usages are matched by name, as in `usages`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "symbol":       { "type": "string",  "description": "Symbol name." },
                     "limit":        { "type": "integer", "description": "Max results per category (default 50)." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
-                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
                 "required": ["symbol"]
             }
@@ -490,7 +490,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "graph_dependents",
-            "description": "Call this BEFORE changing a class/method/function's name, signature or behaviour: who depends on it, from the precomputed symbol dependency graph. `depth: 1` (default) lists direct dependents at the line to edit, with resolution confidence; `depth: 2`-`3` gives the transitive blast radius, symbols and files per hop. Unlike `usages` (every text match of the name), each edge points at one definition, so same-named symbols elsewhere stay out; references matching several definitions are counted apart (`include_ambiguous` lists them). Resolution is richest for Ruby and JS/TS; elsewhere edges come mostly from same-file and unique names, so 'no dependents' is weaker evidence — confirm with `usages`. Module-level reverse deps: `dependents`. If the graph is missing or stale the output says so; repeat with `refresh: true` (rebuilds in seconds).",
+            "description": "Call BEFORE changing a symbol's name, signature or behaviour: who depends on it, from the precomputed symbol graph. `depth` 1 (default): direct dependents with resolution confidence; 2-3: transitive blast radius per hop. Unlike `usages`, edges point at one definition, so same-named symbols stay out. Best resolved for Ruby and JS/TS; elsewhere confirm 'no dependents' with `usages`. Missing or stale graph: add `refresh: true`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -510,7 +510,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "graph_dependencies",
-            "description": "What a symbol depends on: the classes, methods and constants its definition references, each resolved to one definition with a confidence level. Use it to see what a class or method pulls in before moving, extracting or stubbing it — e.g. which collaborators a test has to set up. For a class pass `members: true`: calls live on its methods, the class itself only owns superclass/mixins. Same graph, resolution caveats and `refresh` as `graph_dependents`.",
+            "description": "What a symbol's definition references (classes, methods, constants), each resolved to one definition with confidence — what it pulls in before you move, extract or stub it. For a class pass `members: true` (calls live in its methods). Same graph, caveats and `refresh` as `graph_dependents`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -529,7 +529,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "graph_path",
-            "description": "How does A reach B? Shortest dependency path(s) from `from` to `to`, hop by hop with each edge's confidence — e.g. which controller action ends up in a model, or why a change in one place affects another. A class stands for itself and its methods (a `contains` hop steps into a method). If only `to` reaches `from`, that reverse path is shown and labelled. Same graph and `refresh` as `graph_dependents`.",
+            "description": "How does A reach B? Shortest dependency path(s) from `from` to `to`, hop by hop with edge confidence. A class stands for itself and its methods (`contains` hops); if only `to` reaches `from`, the reverse path is shown. Same graph and `refresh` as `graph_dependents`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -549,7 +549,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "graph_metrics",
-            "description": "Centrality from the symbol graph. Without `symbols`: the most central symbols of the codebase — the core abstractions everything leans on — to orient in an unfamiliar repo (`sort`, `kind`, `path`, `exclude_tests` apply). With `symbols`: fan-in (and from how many files), fan-out, transitive dependents and PageRank percentile of those symbols — how load-bearing is this before I touch it (`in_file`, `kind` apply). Counts use resolved edges only. Same graph and `refresh` as `graph_dependents`.",
+            "description": "Centrality from the symbol graph. Without `symbols`: the most central symbols, to orient in an unfamiliar repo. With `symbols`: their fan-in, fan-out, dependents and PageRank percentile — how load-bearing before you touch them. Same graph and `refresh` as `graph_dependents`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -568,7 +568,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "graph_cycles",
-            "description": "Dependency cycles: strongly connected components over resolved edges, largest first, each with one concrete cycle (A -> B -> A) and its members. Use when untangling architecture or when a change keeps rippling back into itself. Same graph and `refresh` as `graph_dependents`.",
+            "description": "Dependency cycles (strongly connected components over resolved edges), largest first, each with one concrete cycle — for untangling architecture. Same graph and `refresh` as `graph_dependents`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -583,7 +583,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "graph_build",
-            "description": "Build (or rebuild) the symbol dependency graph that the `graph_*` tools and `search` `rank` (proven, risky, central) read. Call it only when one of them reports the graph missing or stale — the `graph_*` tools can instead take `refresh: true`. Takes seconds even on a large monorepo; `rebuild` and `update` never build it. Returns node and edge counts per resolution confidence.",
+            "description": "Build the symbol graph that the `graph_*` tools and `search` `rank` (proven, risky, central) read — only when one of them reports it missing or stale (`graph_*` tools can take `refresh: true` instead). Seconds even on a large monorepo; `rebuild` and `update` never build it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -594,14 +594,14 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "hotspots",
-            "description": "Git-history risk per file: commits, churn, bugfix share, distinct authors, age and time since the last change, labelled by percentiles within this repository (churn:high, fixes:high, rewritten-often, authors:many, veteran). Use it before editing to see whether a file is fragile, when scoping a refactor, or to find where bugs keep landing (`sort: fixes`; `path` narrows the list, percentiles stay repo-wide). To weigh search results the same way, use `search` with `rank`. Reports what was collected; if nothing was, it says so — collection is not available through MCP (the first run reads the whole history, about a minute on a large monorepo): run `ast-index hotspots --collect` in a shell, later runs are incremental.",
+            "description": "Git-history risk per file — commits, churn, bugfix share, authors, age, last change — labelled by percentiles within this repository. Use before editing a file, when scoping a refactor, or with `sort: fixes` to find where bugs keep landing. Reads collected history only: collect with `ast-index hotspots --collect` in a shell (the first run reads the whole history, later ones are incremental).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "sort":         { "type": "string",  "enum": ["score", "commits", "churn", "relative-churn", "fixes", "authors", "recent"], "description": "Ranking key (default score = mean percentile of commits, churn and bugfix ratio)." },
+                    "sort":         { "type": "string",  "enum": ["score", "commits", "churn", "relative-churn", "fixes", "authors", "recent"], "description": "Ranking key. score (default): mean percentile of commits, churn and bugfix ratio; fixes: bugfix share discounted for thin history." },
                     "path":         { "type": "string",  "description": "Only files whose path starts with this prefix." },
                     "min_commits":  { "type": "integer", "description": "Skip files with fewer commits (default 1)." },
-                    "exclude_tests": { "type": "boolean", "description": "Leave test files out of the list (percentiles still rank every file). Spec files churn by nature and crowd the top otherwise." },
+                    "exclude_tests": { "type": "boolean", "description": "Leave test files out of the list; percentiles still rank every file." },
                     "limit":        { "type": "integer", "description": "Max files (default 20)." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
                     "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact). 'json' = raw CLI JSON." }

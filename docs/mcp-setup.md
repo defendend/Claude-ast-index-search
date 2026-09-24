@@ -20,9 +20,9 @@ tools directly — no per-agent plugin required.
 | `explore` | One-shot answer to "how does X work": ranked source of the relevant symbols, their callers/subclasses, and tests |
 | `search` | Literal search: filenames + symbols + imports/usages + content, one call; `rank` re-orders by history and graph (see below) |
 | `outline` | Structural outline of one file (classes, functions, line numbers) — ALWAYS run before reading files > 500 lines |
-| `usages` | Every usage of a symbol |
-| `callers` | Who calls a function (one level up) |
-| `call_tree` | Callers of callers, up to a depth |
+| `usages` | Every indexed reference to a symbol, matched by name |
+| `callers` | Call-site lines of a function, matched by name at query time |
+| `call_tree` | The function each call sits in, then its callers, up to a depth |
 | `implementations` | Concrete types that implement an interface / protocol / abstract class |
 | `hierarchy` | Superclasses and subclasses of a type |
 | `refs` | Cross-references in one shot: definitions + imports + usages |
@@ -54,10 +54,10 @@ index `rebuild` / `update` produce; each is collected by an explicit command.
   `risky` or `hotspots`. Collect it with `ast-index hotspots --collect` in a
   shell. It is deliberately **not** exposed through MCP: the first collection
   reads the whole history (about a minute on a large monorepo), longer than
-  many MCP clients wait for a tool call, and the server handles one call at a
-  time. Later runs take seconds, including after a branch switch, rebase or
-  `rebuild`: history is stored per commit, so only commits HEAD gained or lost
-  are read. A Git hook or a session-start hook is a good place for it.
+  many MCP clients wait for a tool call. Later runs take seconds, including
+  after a branch switch, rebase or `rebuild`: history is stored per commit, so
+  only commits HEAD gained or lost are read. A Git hook or a session-start
+  hook is a good place for it.
 
 When either is missing, the tools say so and name the remedy instead of
 returning empty results; `search` with `rank` falls back to plain relevance
@@ -321,8 +321,9 @@ When you need to find code in this repository:
 1. Use the ast-index MCP tools BEFORE grep or bulk Read.
 2. Before reading any file longer than 500 lines, call `outline` on it
    first, then Read only the line range you actually need.
-3. For "who uses X" questions use `usages`; for "who calls X" use
-   `callers`; for "what implements X" use `implementations`.
+3. For "who uses X" questions use `usages`; for "where is X called" use
+   `callers`, or `call_tree` to get the calling functions; for "what
+   implements X" use `implementations`.
 4. Before changing a class or method, call `graph_dependents` on it; pass
    `depth: 3` to see how far the change reaches.
 5. Picking an existing file to copy as a pattern, use `search` with
