@@ -5989,6 +5989,51 @@ fn last_segment_match_sql(placeholders: &[&str]) -> String {
 /// a class imported in eleven files would otherwise bury the class itself.
 const IMPORT_LAST_SQL: &str = "s.kind = 'import'";
 
+/// SQL function [`crate::commands::is_test_symbol`]`(name, path)`, defined by
+/// [`ensure_test_functions`].
+const IS_TEST_SYMBOL_FN: &str = "ast_index_is_test_symbol";
+/// SQL function [`crate::commands::is_test_path`]`(path)`, defined by
+/// [`ensure_test_functions`].
+const IS_TEST_PATH_FN: &str = "ast_index_is_test_path";
+
+/// Define the SQL functions that tell test code apart on `conn`, unless they
+/// already are. They call the one Rust definition of a test path, which SQL
+/// could only copy. Connection-local, so every query that uses them calls
+/// this first; a lookup of an existing definition is a cached statement.
+fn ensure_test_functions(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    if conn
+        .prepare_cached(&format!(
+            "SELECT {IS_TEST_SYMBOL_FN}('', ''), {IS_TEST_PATH_FN}('')"
+        ))
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    let text = |ctx: &rusqlite::functions::Context<'_>, index: usize| -> rusqlite::Result<String> {
+        Ok(ctx.get::<Option<String>>(index)?.unwrap_or_default())
+    };
+    conn.create_scalar_function(IS_TEST_SYMBOL_FN, 2, flags, move |ctx| {
+        Ok(crate::commands::is_test_symbol(
+            &text(ctx, 0)?,
+            &text(ctx, 1)?,
+        ))
+    })?;
+    conn.create_scalar_function(IS_TEST_PATH_FN, 1, flags, move |ctx| {
+        Ok(crate::commands::is_test_path(&text(ctx, 0)?))
+    })?;
+    Ok(())
+}
+
+/// Sort key that lists test symbols ([`crate::commands::is_test_symbol`])
+/// after the others of a partial-match tier. `exact` is the condition of the
+/// tiers where the name itself is what was typed; those keep their order, so
+/// an exact `parse` in a test still leads a partial `parse_config`.
+fn test_last_sql(exact: &str) -> String {
+    format!("CASE WHEN {exact} THEN 0 WHEN {IS_TEST_SYMBOL_FN}(s.name, f.path) THEN 1 ELSE 0 END")
+}
+
 /// Deterministic ordering for a query that matches `symbols_fts`.
 ///
 /// `exact_name_placeholders` bind the raw query terms, and each one is read
@@ -6020,11 +6065,19 @@ const IMPORT_LAST_SQL: &str = "s.kind = 'import'";
 /// that, the path tie-break decided, and `node_modules/…` sorts ahead of
 /// `spec/` or `system/`. The tier still comes first: a library's exact
 /// `useState` stays above a project's partial `useStateModal`, because the
-/// library name is what was typed.
+/// library name is what was typed. In the partial tiers test symbols follow
+/// the rest of the project's code ([`test_last_sql`]): bm25 favours their
+/// short signatures, and `parse` in Rust sources was answered with a page of
+/// `#[cfg(test)] fn test_parse_*`.
+///
+/// The query must define the test functions first ([`ensure_test_functions`]).
 fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
     let tail = "length(COALESCE(s.qualified_name, s.name)), f.path, s.line";
     if exact_name_placeholders.is_empty() {
-        return format!(" ORDER BY {IMPORT_LAST_SQL}, {VENDOR_PATH_SQL}, {FTS_RANK}, {tail}");
+        return format!(
+            " ORDER BY {IMPORT_LAST_SQL}, {VENDOR_PATH_SQL}, {}, {FTS_RANK}, {tail}",
+            test_last_sql("0")
+        );
     }
     let cased = exact_name_placeholders.join(", ");
     let folded = exact_name_placeholders
@@ -6040,8 +6093,10 @@ fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
          WHEN {last_segment} THEN 2 ELSE 3 END, \
          {IMPORT_LAST_SQL}, \
          {VENDOR_PATH_SQL}, \
+         {test_last}, \
          CASE WHEN lower(s.name) IN ({folded}) OR {last_segment} THEN 0.0 ELSE {FTS_RANK} END, \
-         {tail}"
+         {tail}",
+        test_last = test_last_sql(&format!("lower(s.name) IN ({folded}) OR {last_segment}"))
     )
 }
 
@@ -6097,6 +6152,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
             .collect::<Result<Vec<_>, _>>()?);
     }
 
+    ensure_test_functions(conn)?;
     let escaped_query = escape_fts5_query(query);
     let exact_name = query.trim_end_matches('*');
 
@@ -8202,6 +8258,7 @@ pub fn search_symbol_terms_scoped_with_ids(
     if terms.is_empty() {
         return Ok(Vec::new());
     }
+    ensure_test_functions(conn)?;
     let (scope_clause, scope_params) = scope.path_condition();
     let vendor_clause = vendor_condition(vendor);
     let mut values = Vec::new();
@@ -8250,8 +8307,10 @@ pub fn search_symbol_terms_scoped_with_ids(
             .map(|offset| format!("lower(?{})", first + offset))
             .collect::<Vec<_>>()
             .join(", ");
+        let exact = format!("lower(s.name) IN ({folded})");
         sql.push_str(&format!(
-            " ORDER BY CASE WHEN lower(s.name) IN ({folded}) THEN 0 ELSE 1 END, {IMPORT_LAST_SQL}, length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), {VENDOR_PATH_SQL}, f.path, s.line"
+            " ORDER BY CASE WHEN {exact} THEN 0 ELSE 1 END, {IMPORT_LAST_SQL}, {}, length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), {VENDOR_PATH_SQL}, f.path, s.line",
+            test_last_sql(&exact)
         ));
         values.extend(
             terms
@@ -8298,6 +8357,7 @@ pub fn search_symbols_for_command(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
+    ensure_test_functions(conn)?;
     let (scope_clause, scope_params) = scope.path_condition();
     let mut values = Vec::new();
     let mut sql;
@@ -8343,13 +8403,15 @@ pub fn search_symbols_for_command(
             sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
         }
         sql.push_str(&format!(
-            " ORDER BY CASE WHEN {column} = ? THEN 0 WHEN {column} LIKE ? THEN 1 ELSE 2 END, {IMPORT_LAST_SQL}, length({column}) LIMIT ?"
+            " ORDER BY CASE WHEN {column} = ? THEN 0 WHEN {column} LIKE ? THEN 1 ELSE 2 END, {IMPORT_LAST_SQL}, {}, length({column}) LIMIT ?",
+            test_last_sql(&format!("{column} = ?"))
         ));
         if let Some(kind) = kind {
             values.push(kind.to_string());
         }
-        values.push(exact);
+        values.push(exact.clone());
         values.push(prefix);
+        values.push(exact);
         values.push(limit.to_string());
     } else if query.contains("::") {
         let raw = query.trim_end_matches('*');
@@ -8485,6 +8547,7 @@ pub fn search_symbols_scoped(
             .collect::<Result<Vec<_>, _>>()?);
     }
 
+    ensure_test_functions(conn)?;
     let escaped_query = escape_fts5_query(query);
     let (scope_clause, scope_params) = scope.path_condition();
 

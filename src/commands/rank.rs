@@ -42,7 +42,7 @@ use super::git_signals::{
     HistorySnapshot, PERCENTILE_ELEVATED, PERCENTILE_HIGH,
 };
 use super::graph::DEPENDENTS_DEPTH;
-use super::PathResolver;
+use super::{is_test_symbol, PathResolver};
 use crate::db::{self, FileResult, SearchResult, SymbolGraphMetrics};
 
 /// Share of the in-tier sort key that comes from the preset score; the rest
@@ -1078,11 +1078,18 @@ fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
     }
 }
 
-/// Sub-tier of a symbol hit, as the plain order sorts it: an import goes
-/// after every definition of its tier, whatever the preset thinks of the
-/// file it sits in.
-fn symbol_demotion(result: &SearchResult) -> u8 {
-    u8::from(result.kind == "import")
+/// Sub-tier of a symbol hit, as the plain order sorts it, whatever the
+/// preset thinks of the file it sits in: an import goes after every
+/// definition of its tier, and in the partial tiers (`name`, `signature`) a
+/// test symbol ([`is_test_symbol`]) goes after the other definitions.
+fn symbol_demotion(result: &SearchResult, tier: u8) -> u8 {
+    if result.kind == "import" {
+        2
+    } else if tier >= 3 && is_test_symbol(&result.name, &result.path) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Relevance tier of a path hit: the file name without extension is a term,
@@ -1189,7 +1196,7 @@ pub fn rank_symbols(
             fill(ctx, &mut lineages, &mut dossier, evidence)?;
         }
         candidates.push(Candidate {
-            demotion: symbol_demotion(&result),
+            demotion: symbol_demotion(&result, tier),
             item: result,
             relevance_rank: position + 1,
             tier,
@@ -1605,8 +1612,8 @@ mod tests {
         let terms = ["Result"];
         assert_eq!(symbol_tier(&import, &terms, false), 3);
         assert_eq!(symbol_tier(&symbol("anyhow::Result"), &terms, false), 2);
-        assert_eq!(symbol_demotion(&import), 1);
-        assert_eq!(symbol_demotion(&symbol("SearchResult")), 0);
+        assert_eq!(symbol_demotion(&import, 0), 2);
+        assert_eq!(symbol_demotion(&symbol("SearchResult"), 0), 0);
 
         let dossier = |score: f64| Dossier {
             score: Some(score),
@@ -1637,6 +1644,23 @@ mod tests {
         ];
         order(&mut candidates, Grading::Positional);
         assert_eq!(candidates[0].item, "class-cold");
+    }
+
+    #[test]
+    fn test_symbols_follow_in_partial_tiers_only() {
+        let in_spec = SearchResult {
+            path: "spec/models/merge_spec.rb".to_string(),
+            ..symbol("merge_all")
+        };
+        assert_eq!(symbol_demotion(&in_spec, 3), 1);
+        assert_eq!(symbol_demotion(&in_spec, 4), 1);
+        assert_eq!(
+            symbol_demotion(&in_spec, 0),
+            0,
+            "an exact name keeps its place"
+        );
+        assert_eq!(symbol_demotion(&symbol("test_merge_all"), 3), 1);
+        assert_eq!(symbol_demotion(&symbol("merge_all"), 3), 0);
     }
 
     #[test]

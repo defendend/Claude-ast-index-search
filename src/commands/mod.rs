@@ -28,7 +28,7 @@ pub mod rank;
 pub mod test_paths;
 pub mod watch;
 
-pub use test_paths::is_test_path;
+pub use test_paths::{is_test_path, is_test_symbol};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

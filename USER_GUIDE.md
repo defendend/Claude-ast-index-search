@@ -689,7 +689,11 @@ in the 12 months after T, for T = 12, 24 and 36 months before HEAD.
    below a partial one. Imports never take the last-segment tier (`use
    anyhow::Result` is indexed as `anyhow::Result`), and inside every tier
    definitions come before imports, whatever their scores: a class imported
-   in eleven files is listed before those eleven imports.
+   in eleven files is listed before those eleven imports. In the partial
+   tiers (a word of the name, the signature) test symbols come after the
+   other definitions: a symbol in a test file (**Test files** below) or one
+   named `test_*` or `Test` + an uppercase letter (Rust unit tests live in
+   `src/`). An exact name keeps its place even in a test.
 3. Inside a tier the sort key is `0.9 × score + 0.1 × relevance`, where
    relevance is `1 / (1 + position / 20)` and position is the candidate's place
    in the tier's plain order. The weight was swept over 11 queries: 0.9
@@ -725,8 +729,9 @@ every file, so a file's score does not change with the flag; `hotspots
 --exclude-tests` works the same way.
 
 One test-path rule serves `search --rank`, `hotspots` and `graph top` with
-`--exclude-tests`, the graph (code outside tests never resolves into them) and
-`explore` (test files rank below source). A file is a test when its name
+`--exclude-tests`, the graph (code outside tests never resolves into them),
+`explore` (test files rank below source) and the plain `search` order (test
+symbols follow the other partial matches). A file is a test when its name
 follows a test convention — `*_test.*`, `*_spec.*`, `*.test.*`, `*.spec.*`,
 `test_*.py`, `conftest.py`, and `FooTest` / `FooTests` / `FooSpec` in Java,
 Kotlin, Scala, Groovy, Swift, Objective-C, C#, PHP and C++ — or when it sits in

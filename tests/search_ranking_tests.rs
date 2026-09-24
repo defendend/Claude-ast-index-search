@@ -463,6 +463,125 @@ fn an_import_path_is_not_a_namespaced_definition() {
 }
 
 // ----------------------------------------------------------------------
+// Tests after production code in the partial tiers
+// ----------------------------------------------------------------------
+
+/// Rust keeps unit tests next to the code (`#[cfg(test)] fn test_parse_*`),
+/// and their one-line signatures are short bm25 documents that led every
+/// partial match of `parse`.
+fn seed_parsers_and_their_tests(conn: &rusqlite::Connection) {
+    let parser = db::upsert_file(conn, "src/parsers/go.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        parser,
+        "parse",
+        SymbolKind::Function,
+        5,
+        Some("fn parse("),
+    )
+    .unwrap();
+    for (line, name) in ["test_parse_var", "test_parse_enum", "test_parse_rpc"]
+        .iter()
+        .enumerate()
+    {
+        db::insert_symbol(
+            conn,
+            parser,
+            name,
+            SymbolKind::Function,
+            100 + line,
+            Some(&format!("fn {name}()")),
+        )
+        .unwrap();
+    }
+    let spec = db::upsert_file(conn, "tests/parse_tests.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        spec,
+        "parse_all_files",
+        SymbolKind::Function,
+        3,
+        Some("fn parse_all_files()"),
+    )
+    .unwrap();
+    let go_test = db::upsert_file(conn, "pkg/parse.go", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        go_test,
+        "TestParseHeader",
+        SymbolKind::Function,
+        9,
+        Some("func TestParseHeader(t *testing.T)"),
+    )
+    .unwrap();
+    let indexer = db::upsert_file(conn, "src/indexer.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        indexer,
+        "parse_file_symbols_for_every_supported_language",
+        SymbolKind::Function,
+        40,
+        Some("pub fn parse_file_symbols_for_every_supported_language(path: &Path, content: &str, kind: FileKind) -> Result<Vec<Symbol>>"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_symbols_follow_production_code_in_partial_tiers() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_parsers_and_their_tests(&conn);
+    // An exact test hit keeps its tier: the name is what was typed.
+    let helper = db::upsert_file(&conn, "tests/common/mod.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        &conn,
+        helper,
+        "parse",
+        SymbolKind::Function,
+        2,
+        Some("fn parse("),
+    )
+    .unwrap();
+
+    let none = SearchScope::none();
+    let expected_head = [
+        "parse:src/parsers/go.rs:5",
+        "parse:tests/common/mod.rs:2",
+        "parse_file_symbols_for_every_supported_language:src/indexer.rs:40",
+    ];
+    let pages = [
+        db::search_symbol_terms_scoped(&conn, &["parse"], None, 10, &none, false).unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["parse"], Some("function"), 10, &none, false)
+            .unwrap(),
+        db::search_symbols(&conn, "parse", 10).unwrap(),
+        db::search_symbols_scoped(&conn, "parse", 10, &module_scope("")).unwrap(),
+        db::search_symbols_for_command(&conn, "parse", None, 10, &none, false, false).unwrap(),
+    ];
+    for page in &pages {
+        let found = located(page);
+        // `TestParseHeader` is one FTS token and does not match `parse*`.
+        assert_eq!(found.len(), 7, "{found:?}");
+        assert_eq!(found[..3], expected_head, "{found:?}");
+    }
+    // Fuzzy search tiers by length, but tests still follow in the partial tier.
+    for fuzzy in [
+        db::search_symbol_terms_scoped(&conn, &["parse"], None, 10, &none, true).unwrap(),
+        db::search_symbols_for_command(&conn, "parse", None, 10, &none, true, false).unwrap(),
+    ] {
+        let found = names(&fuzzy);
+        assert_eq!(
+            found[..3],
+            [
+                "parse",
+                "parse",
+                "parse_file_symbols_for_every_supported_language"
+            ],
+            "{found:?}"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
 // Project code before third-party code
 // ----------------------------------------------------------------------
 

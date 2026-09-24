@@ -2,9 +2,11 @@
 //!
 //! One definition for every command that tells tests from the code under
 //! test: `explore` ranks test files below source, the symbol graph never
-//! resolves production code to a definition inside a test tree, and
+//! resolves production code to a definition inside a test tree,
 //! `graph --exclude-tests`, `hotspots --exclude-tests` and
-//! `search --rank --exclude-tests` leave test files out.
+//! `search --rank --exclude-tests` leave test files out, `search` lists test
+//! symbols after the others of a partial-match tier and `usages` lists test
+//! files after production code.
 
 /// Directory names that hold tests.
 const TEST_DIRS: [&str; 4] = ["spec", "test", "tests", "__tests__"];
@@ -51,6 +53,26 @@ pub fn is_test_path(path: &str) -> bool {
     is_test_file_name(file, &extension) || in_test_directory(dirs, &extension)
 }
 
+/// Whether a symbol is test code: it sits in a test file ([`is_test_path`]),
+/// or its name follows a test naming convention ([`is_test_symbol_name`]) —
+/// a Rust `#[test] fn test_parse` lives in `src/` next to the code it tests.
+pub fn is_test_symbol(name: &str, path: &str) -> bool {
+    is_test_symbol_name(name) || is_test_path(path)
+}
+
+/// `test_*` (pytest, unittest, Rust, C) or `Test` followed by an uppercase
+/// letter, a digit or `_` (Go's `TestParse`, xUnit's `TestParser` classes).
+/// `testing`, `Testimonial` and `TestFlight`… are not: the character after
+/// the prefix decides, and `TestFlight` is the one false positive left.
+pub fn is_test_symbol_name(name: &str) -> bool {
+    if name.starts_with("test_") {
+        return true;
+    }
+    name.strip_prefix("Test")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|next| next.is_ascii_uppercase() || next.is_ascii_digit() || next == '_')
+}
+
 fn is_test_file_name(file: &str, extension: &str) -> bool {
     let lower = file.to_ascii_lowercase();
     if ["_test.", "_spec.", ".test.", ".spec."]
@@ -95,7 +117,36 @@ fn in_test_directory(dirs: &str, extension: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_test_path;
+    use super::{is_test_path, is_test_symbol, is_test_symbol_name};
+
+    #[test]
+    fn test_symbol_names() {
+        for name in [
+            "test_parse_var",
+            "TestParse",
+            "TestParser",
+            "Test_parse",
+            "Test2Phase",
+        ] {
+            assert!(is_test_symbol_name(name), "{name} is a test name");
+        }
+        for name in [
+            "test",
+            "testing",
+            "tests",
+            "Test",
+            "Testimonial",
+            "contest_entry",
+            "parse_test",
+            "latest_version",
+            "attest_",
+        ] {
+            assert!(!is_test_symbol_name(name), "{name} is not a test name");
+        }
+        assert!(is_test_symbol("parse", "tests/parse.rs"));
+        assert!(is_test_symbol("test_parse", "src/parse.rs"));
+        assert!(!is_test_symbol("parse", "src/parse.rs"));
+    }
 
     #[test]
     fn test_paths() {
