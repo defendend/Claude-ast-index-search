@@ -892,3 +892,71 @@ fn rust_paths_resolve_through_file_modules_and_use_declarations() {
     let detects = ws.json(&["graph", "dependencies", "detects"]);
     assert_eq!(find_other(&detects, "is_test_path")["confidence"], "local");
 }
+
+/// `MergeService` is called from one production method and from specs, and
+/// that method is itself exercised by a spec.
+fn merge_service_project() -> Workspace {
+    let ws = workspace();
+    ws.write(
+        "app/services/merge_service.rb",
+        "class MergeService\n  def self.call\n    1\n  end\nend\n",
+    );
+    ws.write(
+        "app/services/dedupe.rb",
+        "class Dedupe\n  def run\n    MergeService.call\n  end\nend\n",
+    );
+    ws.write(
+        "spec/services/merge_service_spec.rb",
+        "describe MergeService do\n  it \"merges\" do\n    MergeService.call\n  end\nend\n",
+    );
+    ws.write(
+        "spec/services/dedupe_spec.rb",
+        "describe Dedupe do\n  it \"runs\" do\n    Dedupe.new.run\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+    ws
+}
+
+#[test]
+fn exclude_tests_leaves_test_dependents_out_of_dependents_and_impact() {
+    let ws = merge_service_project();
+    let all = ws.json(&["graph", "dependents", "MergeService"]);
+    assert!(
+        items(&all)
+            .iter()
+            .any(|item| item["other"]["path"].as_str().unwrap().starts_with("spec/")),
+        "{all:#}"
+    );
+    let production = ws.json(&["graph", "dependents", "MergeService", "--exclude-tests"]);
+    assert_eq!(other_names(&production), vec!["run"], "{production:#}");
+    assert_eq!(production["exclude_tests"], true);
+    assert!(production["excluded_test_edges"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        production["resolved_edges"].as_u64().unwrap() as usize,
+        items(&production).len()
+    );
+    let text = ws.run(&["graph", "dependents", "MergeService", "--exclude-tests"]);
+    assert!(text.contains("from test files left out"), "{text}");
+
+    let impact = ws.json(&["graph", "impact", "MergeService", "--depth", "3"]);
+    assert!(impact["total_symbols"].as_u64().unwrap() > 1, "{impact:#}");
+    let impact = ws.json(&[
+        "graph",
+        "impact",
+        "MergeService",
+        "--depth",
+        "3",
+        "--exclude-tests",
+    ]);
+    let names: Vec<&str> = items(&impact)
+        .iter()
+        .map(|item| item["symbol"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["run"], "{impact:#}");
+    assert_eq!(impact["total_symbols"], 1);
+    assert!(
+        impact["excluded_test_symbols"].as_u64().unwrap() >= 2,
+        "{impact:#}"
+    );
+}

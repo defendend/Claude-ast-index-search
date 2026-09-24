@@ -267,6 +267,7 @@ ast-index graph build                                 # Build/refresh the graph 
 ast-index graph status                                # Built? Stale? Edge counts per confidence
 ast-index graph dependents ApplicationService         # Who depends on it (incoming edges)
 ast-index graph dependents "Billing::Invoice#total"   # A member of one class
+ast-index graph dependents MergeService --exclude-tests  # Production dependents only (also on impact)
 ast-index graph dependencies CheckoutController --members  # What a class and its methods use
 ast-index graph impact PaymentGateway --depth 3       # Blast radius: dependents per depth, files
 ast-index graph path OrdersController Invoice         # Shortest dependency path(s) between two symbols

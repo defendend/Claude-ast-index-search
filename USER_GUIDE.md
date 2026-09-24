@@ -704,8 +704,9 @@ and symbols sections and their totals. Percentiles are still computed against
 every file, so a file's score does not change with the flag; `hotspots
 --exclude-tests` works the same way.
 
-One test-path rule serves `search --rank`, `hotspots` and `graph top` with
-`--exclude-tests`, the graph (code outside tests never resolves into them) and
+One test-path rule serves `search --rank`, `hotspots`, `graph top`, `graph
+dependents` and `graph impact` with `--exclude-tests` (`impact` does not follow
+test dependents either), the graph (code outside tests never resolves into them) and
 `explore` (test files rank below source). A file is a test when its name
 follows a test convention — `*_test.*`, `*_spec.*`, `*.test.*`, `*.spec.*`,
 `test_*.py`, `conftest.py`, and `FooTest` / `FooTests` / `FooSpec` in Java,

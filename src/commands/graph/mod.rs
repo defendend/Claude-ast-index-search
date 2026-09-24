@@ -670,8 +670,27 @@ struct EdgeReport {
     include_ambiguous: bool,
     /// Whether definitions inside matched classes were included.
     members: bool,
+    /// Whether dependents defined in test files were left out; they are not
+    /// in `resolved_edges` / `ambiguous_edges` then.
+    exclude_tests: bool,
+    /// Edges left out by `exclude_tests`.
+    excluded_test_edges: usize,
     #[serde(flatten)]
     page: Page<EdgeItem>,
+}
+
+/// Edges whose other end — the dependent — is defined in a test file
+/// ([`is_test_path`]), left out of `edges`. Returns how many were.
+fn drop_test_dependents(conn: &Connection, edges: &mut Vec<SymbolEdgeRow>) -> Result<usize> {
+    let sources: HashSet<i64> = edges.iter().map(|edge| edge.source_id).collect();
+    let infos = infos_for(conn, &sources)?;
+    let before = edges.len();
+    edges.retain(|edge| {
+        infos
+            .get(&edge.source_id)
+            .is_none_or(|info| !is_test_path(&info.path))
+    });
+    Ok(before - edges.len())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -681,6 +700,7 @@ pub fn cmd_graph_edges(
     direction: Direction,
     include_ambiguous: bool,
     members: bool,
+    exclude_tests: bool,
     filter: &SymbolFilter,
     limit: usize,
     refresh: bool,
@@ -710,12 +730,18 @@ pub fn cmd_graph_edges(
         }
     };
     // Edges between two members of the same class are internal to it.
-    let all_edges: Vec<SymbolEdgeRow> = all_edges
+    let mut all_edges: Vec<SymbolEdgeRow> = all_edges
         .into_iter()
         .filter(|edge| {
             !(subject_ids.contains(&edge.source_id) && subject_ids.contains(&edge.target_id))
         })
         .collect();
+    let exclude_tests = exclude_tests && direction == Direction::Dependents;
+    let excluded_test_edges = if exclude_tests {
+        drop_test_dependents(&conn, &mut all_edges)?
+    } else {
+        0
+    };
     let ambiguous_edges = all_edges
         .iter()
         .filter(|edge| !Confidence::from_code(edge.confidence).is_resolved())
@@ -775,6 +801,8 @@ pub fn cmd_graph_edges(
         ambiguous_edges,
         include_ambiguous,
         members,
+        exclude_tests,
+        excluded_test_edges,
         page: Page::new(items, total, limit),
     };
     if format == "json" {
@@ -800,6 +828,12 @@ pub fn cmd_graph_edges(
             ""
         }
     );
+    if exclude_tests {
+        println!(
+            "  {} edge(s) from test files left out (--exclude-tests).",
+            excluded_test_edges
+        );
+    }
     let multi = report.matched.len() > 1 || members;
     for item in &report.page.items {
         let level = if item.confidence.is_resolved() {
@@ -865,6 +899,11 @@ struct ImpactReport {
     depth: usize,
     include_ambiguous: bool,
     members: bool,
+    /// Whether dependents defined in test files were neither counted nor
+    /// followed.
+    exclude_tests: bool,
+    /// Distinct test-file dependents met and left out by `exclude_tests`.
+    excluded_test_symbols: usize,
     levels: Vec<ImpactLevel>,
     total_symbols: usize,
     total_files: usize,
@@ -879,21 +918,39 @@ struct ImpactReport {
 struct Reach {
     /// symbol id -> (depth, via symbol id, confidence of the hop)
     visited: HashMap<i64, (usize, i64, u8)>,
+    /// Dependents left out because they are defined in test files.
+    excluded: HashSet<i64>,
 }
 
-fn reverse_reach(conn: &Connection, seeds: &[i64], depth: usize, max_code: u8) -> Result<Reach> {
+fn reverse_reach(
+    conn: &Connection,
+    seeds: &[i64],
+    depth: usize,
+    max_code: u8,
+    exclude_tests: bool,
+) -> Result<Reach> {
     let seed_set: HashSet<i64> = seeds.iter().copied().collect();
     let mut visited: HashMap<i64, (usize, i64, u8)> = HashMap::new();
+    let mut excluded: HashSet<i64> = HashSet::new();
     let mut frontier: Vec<i64> = seeds.to_vec();
     for level in 1..=depth {
         if frontier.is_empty() {
             break;
         }
         let mut edges = db::load_symbol_edges_to(conn, &frontier, max_code)?;
+        edges.retain(|edge| {
+            !seed_set.contains(&edge.source_id) && !visited.contains_key(&edge.source_id)
+        });
+        if exclude_tests {
+            let before: HashSet<i64> = edges.iter().map(|edge| edge.source_id).collect();
+            drop_test_dependents(conn, &mut edges)?;
+            let kept: HashSet<i64> = edges.iter().map(|edge| edge.source_id).collect();
+            excluded.extend(before.difference(&kept));
+        }
         edges.sort_by_key(|edge| (edge.confidence, edge.source_id, edge.target_id));
         let mut next = Vec::new();
         for edge in edges {
-            if seed_set.contains(&edge.source_id) || visited.contains_key(&edge.source_id) {
+            if visited.contains_key(&edge.source_id) {
                 continue;
             }
             visited.insert(edge.source_id, (level, edge.target_id, edge.confidence));
@@ -901,7 +958,7 @@ fn reverse_reach(conn: &Connection, seeds: &[i64], depth: usize, max_code: u8) -
         }
         frontier = next;
     }
-    Ok(Reach { visited })
+    Ok(Reach { visited, excluded })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -911,6 +968,7 @@ pub fn cmd_graph_impact(
     depth: usize,
     include_ambiguous: bool,
     members: bool,
+    exclude_tests: bool,
     filter: &SymbolFilter,
     limit: usize,
     refresh: bool,
@@ -931,9 +989,21 @@ pub fn cmd_graph_impact(
     };
     let seeds: Vec<i64> = seed_infos.iter().map(|info| info.id).collect();
     let depth = depth.max(1);
-    let reach = reverse_reach(&conn, &seeds, depth, max_confidence(include_ambiguous))?;
+    let reach = reverse_reach(
+        &conn,
+        &seeds,
+        depth,
+        max_confidence(include_ambiguous),
+        exclude_tests,
+    )?;
     let resolved_only = if include_ambiguous {
-        Some(reverse_reach(&conn, &seeds, depth, max_confidence(false))?)
+        Some(reverse_reach(
+            &conn,
+            &seeds,
+            depth,
+            max_confidence(false),
+            exclude_tests,
+        )?)
     } else {
         None
     };
@@ -1021,6 +1091,8 @@ pub fn cmd_graph_impact(
         depth,
         include_ambiguous,
         members,
+        exclude_tests,
+        excluded_test_symbols: reach.excluded.len(),
         levels,
         total_symbols: reach.visited.len(),
         total_files: all_files.len(),
@@ -1058,6 +1130,12 @@ pub fn cmd_graph_impact(
         "  total: {} symbol(s) in {} file(s)",
         report.total_symbols, report.total_files
     );
+    if exclude_tests {
+        println!(
+            "  {} dependent(s) in test files left out and not followed (--exclude-tests).",
+            report.excluded_test_symbols
+        );
+    }
     if let (Some(symbols), Some(files)) = (report.resolved_only_symbols, report.resolved_only_files)
     {
         println!(
