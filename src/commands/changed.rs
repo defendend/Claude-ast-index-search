@@ -450,6 +450,25 @@ pub(crate) fn run_bounded(
     deadline: Deadline,
     verbose: bool,
 ) -> Result<ProcessOutput> {
+    run_bounded_capped(
+        executable,
+        args,
+        current_dir,
+        deadline,
+        verbose,
+        STDOUT_LIMIT,
+    )
+}
+
+/// [`run_bounded`] keeping at most `stdout_limit` bytes of stdout.
+pub(crate) fn run_bounded_capped(
+    executable: &OsStr,
+    args: &[OsString],
+    current_dir: &Path,
+    deadline: Deadline,
+    verbose: bool,
+    stdout_limit: usize,
+) -> Result<ProcessOutput> {
     if deadline.expired() {
         return Err(deadline.timeout_error());
     }
@@ -477,7 +496,7 @@ pub(crate) fn run_bounded(
         .stderr
         .take()
         .ok_or_else(|| anyhow!("failed to capture VCS stderr"))?;
-    let stdout_reader = thread::spawn(move || read_capped(stdout, STDOUT_LIMIT));
+    let stdout_reader = thread::spawn(move || read_capped(stdout, stdout_limit));
     let stderr_reader = thread::spawn(move || read_capped(stderr, STDERR_LIMIT));
 
     let mut status = None;

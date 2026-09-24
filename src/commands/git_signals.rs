@@ -16,6 +16,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -26,7 +28,8 @@ use rusqlite::{Connection, TransactionBehavior};
 use serde::Serialize;
 
 use super::changed::{
-    discover_vcs_root, os_args, parse_utf8, render_stderr, run_bounded, Deadline, Vcs, STDOUT_LIMIT,
+    discover_vcs_root, os_args, parse_utf8, render_stderr, run_bounded, run_bounded_capped,
+    Deadline, Vcs, STDOUT_LIMIT,
 };
 use super::is_test_path;
 use super::Page;
@@ -51,6 +54,15 @@ const META_PATHS: &str = "git_signals_paths";
 /// Commits per `git rev-list` window when listing the commit graph; a line
 /// is about 100 bytes, well under the captured-stdout ceiling.
 const GRAPH_WINDOW: usize = 100_000;
+/// Captured-stdout ceiling for one `git log --numstat` window. The oldest
+/// commits of a repository tend to be bulk imports: in a 25k-commit history
+/// the last 2000-commit window printed 28 MB, and every time a window
+/// overflowed the general ceiling it was diffed again at half the size,
+/// re-reading those same commits some six times over.
+const LOG_WINDOW_STDOUT_LIMIT: usize = 128 * 1024 * 1024;
+/// Most `git` processes that read windows at once. Each diffs its own range
+/// of commits on one core; the ranges are joined back in order.
+const MAX_PARALLEL_WINDOWS: usize = 8;
 /// Commits HEAD no longer reaches stay in the store, so switching back costs
 /// nothing, until there are more than this many of them or more than one
 /// per [`DEAD_COMMITS_SHARE`] live commits; then all of them are dropped.
@@ -241,12 +253,18 @@ impl Collector {
     /// stdout comes back as `None` rather than an error so the caller can
     /// retry with a smaller commit window.
     fn git_allow_truncation(&self, args: &[OsString]) -> Result<Option<Vec<u8>>> {
-        let output = run_bounded(
+        self.git_capped(args, STDOUT_LIMIT)
+    }
+
+    /// [`Self::git_allow_truncation`] keeping up to `stdout_limit` bytes.
+    fn git_capped(&self, args: &[OsString], stdout_limit: usize) -> Result<Option<Vec<u8>>> {
+        let output = run_bounded_capped(
             &self.executable,
             args,
             &self.repo_root,
             self.deadline,
             self.verbose,
+            stdout_limit,
         )
         .context("git command failed")?;
         if !output.status.success() {
@@ -324,8 +342,14 @@ impl Collector {
     }
 
     /// Run `prefix … revs` over `total` commits in `--skip`/`--max-count`
-    /// windows. A window whose output overflows is split in half.
-    fn windowed<T>(
+    /// windows. A window whose output overflows `stdout_limit` is split in
+    /// half.
+    ///
+    /// Windows are read by up to [`MAX_PARALLEL_WINDOWS`] `git` processes at
+    /// once and joined in window order, so the result is the one a single
+    /// pass over the windows gives.
+    #[allow(clippy::too_many_arguments)]
+    fn windowed<T: Send>(
         &self,
         prefix: &[OsString],
         revs: &[OsString],
@@ -333,13 +357,57 @@ impl Collector {
         total: usize,
         window: usize,
         parse: fn(&[u8]) -> Result<Vec<T>>,
+        stdout_limit: usize,
     ) -> Result<Vec<T>> {
+        let window = window.max(1);
+        let windows: Vec<(usize, usize)> = (0..total)
+            .step_by(window)
+            .map(|offset| (offset, window.min(total - offset)))
+            .collect();
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(MAX_PARALLEL_WINDOWS)
+            .min(windows.len());
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let slots: Vec<Mutex<Option<Result<Vec<T>>>>> =
+            windows.iter().map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    while !failed.load(Ordering::Relaxed) {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(skip, count)) = windows.get(index) else {
+                            break;
+                        };
+                        let mut out = Vec::new();
+                        let read = self
+                            .window_into(
+                                prefix,
+                                revs,
+                                pathspec,
+                                skip,
+                                count,
+                                parse,
+                                &mut out,
+                                stdout_limit,
+                            )
+                            .map(|()| out);
+                        if read.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        *slots[index].lock().unwrap_or_else(|e| e.into_inner()) = Some(read);
+                    }
+                });
+            }
+        });
         let mut out = Vec::new();
-        let mut offset = 0;
-        while offset < total {
-            let count = window.max(1).min(total - offset);
-            self.window_into(prefix, revs, pathspec, offset, count, parse, &mut out)?;
-            offset += count;
+        for slot in slots {
+            match slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                Some(read) => out.extend(read?),
+                None => bail!("a git log window was not read"),
+            }
         }
         Ok(out)
     }
@@ -354,6 +422,7 @@ impl Collector {
         count: usize,
         parse: fn(&[u8]) -> Result<Vec<T>>,
         out: &mut Vec<T>,
+        stdout_limit: usize,
     ) -> Result<()> {
         let mut args = prefix.to_vec();
         args.push(OsString::from(format!("--skip={skip}")));
@@ -362,18 +431,27 @@ impl Collector {
         if pathspec {
             self.push_pathspec(&mut args);
         }
-        match self.git_allow_truncation(&args)? {
+        match self.git_capped(&args, stdout_limit)? {
             Some(bytes) => {
                 out.extend(parse(&bytes)?);
                 Ok(())
             }
             None if count <= 1 => bail!(
-                "a single commit's output exceeded {STDOUT_LIMIT} bytes; \
+                "a single commit's output exceeded {stdout_limit} bytes; \
                  collection cannot proceed"
             ),
             None => {
                 let first = count / 2;
-                self.window_into(prefix, revs, pathspec, skip, first, parse, out)?;
+                self.window_into(
+                    prefix,
+                    revs,
+                    pathspec,
+                    skip,
+                    first,
+                    parse,
+                    out,
+                    stdout_limit,
+                )?;
                 self.window_into(
                     prefix,
                     revs,
@@ -382,6 +460,7 @@ impl Collector {
                     count - first,
                     parse,
                     out,
+                    stdout_limit,
                 )
             }
         }
@@ -398,6 +477,7 @@ impl Collector {
             total,
             GRAPH_WINDOW,
             parse_graph,
+            STDOUT_LIMIT,
         )
     }
 
@@ -424,7 +504,15 @@ impl Collector {
                 self.window.max(1)
             );
         }
-        self.windowed(&log_args, revs, true, total, self.window, parse_git_log)
+        self.windowed(
+            &log_args,
+            revs,
+            true,
+            total,
+            self.window,
+            parse_git_log,
+            LOG_WINDOW_STDOUT_LIMIT,
+        )
     }
 
     /// Plan for a store rebuilt from scratch at `head`.
