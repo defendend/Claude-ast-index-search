@@ -2268,6 +2268,9 @@ fn write_batch_to_db(
     mode: WriteMode,
 ) -> Result<()> {
     let tx = conn.transaction()?;
+    if !batch.is_empty() {
+        db::bump_index_generation(&tx)?;
+    }
 
     {
         let file_sql = match mode {
@@ -2617,6 +2620,7 @@ pub fn update_directory_incremental(
                 del_file_stmt.execute(rusqlite::params![root_path, path])?;
             }
         }
+        db::bump_index_generation(&tx)?;
         tx.commit()?;
     }
 

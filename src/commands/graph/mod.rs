@@ -27,9 +27,10 @@
 //! only and reports the ambiguous ones in separate counters.
 //!
 //! Building is explicit (`graph build`) so `rebuild` and `update` stay as
-//! fast as before. The build records a fingerprint of the index; every query
-//! compares it with the live index and flags a stale graph instead of
-//! answering from outdated edges silently.
+//! fast as before. The build records the index's write generation and highest
+//! row ids (`db::index_fingerprint`); every query compares them with the live
+//! index and flags a stale graph instead of answering from outdated edges
+//! silently.
 
 mod metrics;
 mod resolve;

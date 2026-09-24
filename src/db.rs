@@ -5815,7 +5815,9 @@ pub fn upsert_file(conn: &Connection, path: &str, mtime: i64, size: i64) -> Resu
         "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?1, ?2, ?3)",
         params![path, mtime, size],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    bump_index_generation(conn)?;
+    Ok(id)
 }
 
 /// Insert a symbol
@@ -5831,7 +5833,9 @@ pub fn insert_symbol(
         "INSERT INTO symbols (file_id, name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![file_id, name, kind.as_str(), line as i64, signature],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    bump_index_generation(conn)?;
+    Ok(id)
 }
 
 /// Insert inheritance relationship
@@ -5845,7 +5849,7 @@ pub fn insert_inheritance(
         "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)",
         params![child_id, parent_name, kind],
     )?;
-    Ok(())
+    bump_index_generation(conn)
 }
 
 /// Escape FTS5 special characters
@@ -7017,7 +7021,7 @@ pub fn clear_db(conn: &Connection) -> Result<()> {
         DELETE FROM files;
         "#,
     )?;
-    Ok(())
+    bump_index_generation(conn)
 }
 
 /// `(path, mtime, size, words)` of every file indexed under `root_key`
@@ -9968,6 +9972,8 @@ pub fn prune_dead_git_commits(conn: &Connection) -> Result<usize> {
 // ---------------------------------------------------------------------------
 
 const SYMBOL_GRAPH_FINGERPRINT_KEY: &str = "symbol_graph_fingerprint";
+/// Writes of the indexed content so far; see [`bump_index_generation`].
+const INDEX_GENERATION_KEY: &str = "index_generation";
 const SYMBOL_GRAPH_BUILT_AT_KEY: &str = "symbol_graph_built_at";
 const SYMBOL_GRAPH_SUMMARY_KEY: &str = "symbol_graph_summary";
 /// SQLite's default host-parameter ceiling is 32766 on current builds but 999
@@ -10105,33 +10111,44 @@ pub fn load_inheritance_rows(conn: &Connection) -> Result<Vec<(i64, String)>> {
     Ok(rows)
 }
 
-/// Cheap digest of the indexed content the graph was derived from.
-///
-/// Incremental updates delete and re-insert the rows of every changed file,
-/// so row counts, the highest row ids and the summed file mtimes/sizes all
-/// move when anything the graph depends on changes, while an update that
-/// found nothing to do leaves the digest untouched.
+/// Count one more write of the indexed content the symbol graph is derived
+/// from — `files`, `symbols`, `refs` or `inheritance` rows — in the metadata
+/// row [`INDEX_GENERATION_KEY`]. Every writer calls it in the transaction of
+/// its write, and only when it writes something: an update that finds
+/// nothing to do has to leave the graph fresh.
+pub fn bump_index_generation(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        params![INDEX_GENERATION_KEY],
+    )?;
+    Ok(())
+}
+
+/// What the symbol graph records about the index it was built from, and a
+/// query compares with the live index: the write generation
+/// ([`bump_index_generation`]) and the highest row ids of `files`, `symbols`
+/// and `refs`. A metadata read and three seeks to the end of a rowid tree,
+/// where counting and summing the tables cost every graph query tens of
+/// milliseconds on a large index. The ids catch what a version without the
+/// counter writes into the same index: re-indexing a file inserts its rows
+/// anew. An index no version with the counter has written reads as
+/// generation 0.
 pub fn index_fingerprint(conn: &Connection) -> Result<String> {
-    let (files, file_max, mtimes, sizes): (i64, i64, i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(mtime), 0), COALESCE(SUM(size), 0)
-         FROM files",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    )?;
-    let (symbols, symbol_max): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM symbols",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let (refs, ref_max): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM refs",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let inheritance: i64 =
-        conn.query_row("SELECT COUNT(*) FROM inheritance", [], |row| row.get(0))?;
+    let generation = get_metadata_value(conn, INDEX_GENERATION_KEY)?;
+    let max_id = |table: &str| -> Result<i64> {
+        Ok(conn.query_row(
+            &format!("SELECT COALESCE(MAX(id), 0) FROM {table}"),
+            [],
+            |row| row.get(0),
+        )?)
+    };
     Ok(format!(
-        "f{files}:{file_max}:{mtimes}:{sizes}/s{symbols}:{symbol_max}/r{refs}:{ref_max}/i{inheritance}"
+        "generation:{}/ids:{}:{}:{}",
+        generation.as_deref().unwrap_or("0"),
+        max_id("files")?,
+        max_id("symbols")?,
+        max_id("refs")?
     ))
 }
 
@@ -12495,6 +12512,40 @@ mod tests {
 
         let results = search_symbols(&conn, "Test", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn index_writes_move_the_generation_the_graph_is_checked_against() {
+        let mut conn = create_test_db();
+        assert_eq!(index_fingerprint(&conn).unwrap(), "generation:0/ids:0:0:0");
+        let file_id = upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
+        insert_symbol(&conn, file_id, "Main", SymbolKind::Class, 1, None).unwrap();
+        let built = index_fingerprint(&conn).unwrap();
+        assert_eq!(built, "generation:2/ids:1:1:0");
+        store_symbol_graph(&mut conn, &[], &[], &built, "{}").unwrap();
+        assert!(!symbol_graph_state(&conn).unwrap().stale);
+
+        insert_inheritance(&conn, 1, "Base", "extends").unwrap();
+        assert!(symbol_graph_state(&conn).unwrap().stale);
+        let rebuilt = index_fingerprint(&conn).unwrap();
+        store_symbol_graph(&mut conn, &[], &[], &rebuilt, "{}").unwrap();
+        assert!(!symbol_graph_state(&conn).unwrap().stale);
+        clear_db(&conn).unwrap();
+        assert!(symbol_graph_state(&conn).unwrap().stale);
+
+        // A writer without the counter still moves the row ids.
+        let unchanged = index_fingerprint(&conn).unwrap();
+        store_symbol_graph(&mut conn, &[], &[], &unchanged, "{}").unwrap();
+        conn.execute(
+            "INSERT INTO files (path, root_path, mtime, size) VALUES ('b.kt', '', 1, 1)",
+            [],
+        )
+        .unwrap();
+        assert!(symbol_graph_state(&conn).unwrap().stale);
+
+        // A graph an older version built recorded a row-count digest.
+        store_symbol_graph(&mut conn, &[], &[], "f1:1:1000:100/s1:1/r0:0/i0", "{}").unwrap();
+        assert!(symbol_graph_state(&conn).unwrap().stale);
     }
 
     #[test]

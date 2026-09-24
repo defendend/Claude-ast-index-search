@@ -996,3 +996,21 @@ fn column_dependents_say_that_reads_elsewhere_are_not_edges() {
     let class = ws.json(&["graph", "dependents", "Person"]);
     assert!(class.get("notes").is_none(), "{class:#}");
 }
+
+#[test]
+fn deleting_a_file_or_reindexing_symbols_marks_the_graph_stale() {
+    let ws = billing_project();
+    ws.run(&["graph", "build"]);
+    fs::remove_file(ws.root.join("lib/ping.rb")).unwrap();
+    assert_success(&ws.ast_index(&["update"]));
+    assert_eq!(ws.json(&["graph", "status"])["graph"]["stale"], true);
+
+    ws.run(&["graph", "build"]);
+    assert_eq!(ws.json(&["graph", "status"])["graph"]["stale"], false);
+    assert_success(&ws.ast_index(&["update"]));
+    assert_eq!(ws.json(&["graph", "status"])["graph"]["stale"], false);
+    assert_success(&ws.ast_index(&["rebuild", "--type", "symbols"]));
+    let status = ws.json(&["graph", "status"]);
+    assert_eq!(status["graph"]["built"], true, "{status:#}");
+    assert_eq!(status["graph"]["stale"], true, "{status:#}");
+}

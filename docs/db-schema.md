@@ -212,8 +212,10 @@ average node scores 1.0; `pagerank_pct` is its midrank percentile.
 
 Neither table declares a foreign key: a cascading delete would slow every
 incremental update, and rows that silently disappeared would make an outdated
-graph look current. Instead `graph build` stores a digest of the index
-(`symbol_graph_fingerprint`) and queries compare it with the live index.
+graph look current. Instead `graph build` stores the index's write generation
+(`index_generation`) and the highest row ids of `files`, `symbols` and `refs`
+as `symbol_graph_fingerprint`, and queries compare it with the live index — a
+metadata read and three rowid seeks, not a scan of the tables.
 
 ### Platform-specific data
 
@@ -242,7 +244,8 @@ keys:
 | `git_signals_commits` | Live commits that changed the project (the analysed history). |
 | `git_signals_paths` | Paths that carry history once renames are followed, deleted ones included. |
 | `git_signals_store` | Layout of the per-commit store (`commits-v1`); history collected without it is recollected once. |
-| `symbol_graph_fingerprint` | Digest of `files`, `symbols`, `refs` and `inheritance` row counts, highest ids and summed file mtimes/sizes when the graph was built; a mismatch marks the graph stale. |
+| `index_generation` | Count of the writes to `files`, `symbols`, `refs` and `inheritance` (each `rebuild` / `update` batch, file deletion, clear); an update that finds nothing to change leaves it alone. Absent in an index no version with the counter has written, read as 0. |
+| `symbol_graph_fingerprint` | `generation:<n>/ids:<files>:<symbols>:<refs>` — the `index_generation` and the highest row ids when the graph was built. The ids also move when a version without the counter re-indexes files. A mismatch, including the row-count digest older versions stored, marks the graph stale. |
 | `symbol_graph_built_at` | Unix timestamp in milliseconds of the last `graph build`. |
 | `symbol_graph_summary` | JSON summary of the last build: edges and references per confidence level, references not linked per reason. |
 

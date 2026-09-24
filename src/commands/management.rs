@@ -782,6 +782,7 @@ pub fn cmd_rebuild(
             println!("{}", "Rebuilding symbols index...".cyan());
             conn.execute("DELETE FROM symbols", [])?;
             conn.execute("DELETE FROM files", [])?;
+            db::bump_index_generation(&conn)?;
             let walk = indexer::index_directory_with_config(
                 &mut conn,
                 root,
