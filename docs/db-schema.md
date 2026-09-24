@@ -52,6 +52,7 @@ Every declared foreign key below uses `ON DELETE CASCADE`.
 | `module_deps` | `id INTEGER PK`, `module_id INTEGER NN`, `dep_module_id INTEGER NN`, `dep_kind TEXT` | `module_id → modules.id`, `dep_module_id → modules.id` |
 | `inheritance` | `id INTEGER PK`, `child_id INTEGER NN`, `parent_name TEXT NN`, `kind TEXT NN` | `child_id → symbols.id` |
 | `refs` | `id INTEGER PK`, `file_id INTEGER NN`, `name TEXT NN`, `line INTEGER NN`, `context TEXT` | `file_id → files.id` |
+| `file_words` | `file_id INTEGER PK`, `mtime INTEGER NN`, `size INTEGER NN`, `words TEXT NN` | `file_id → files.id ON DELETE CASCADE` |
 | `xml_usages` | `id INTEGER PK`, `module_id INTEGER`, `file_path TEXT NN`, `line INTEGER NN`, `class_name TEXT NN`, `usage_type TEXT`, `element_id TEXT` | `module_id → modules.id` |
 | `resources` | `id INTEGER PK`, `module_id INTEGER`, `type TEXT NN`, `name TEXT NN`, `file_path TEXT NN`, `line INTEGER` | `module_id → modules.id` |
 | `resource_usages` | `id INTEGER PK`, `resource_id INTEGER`, `usage_file TEXT NN`, `usage_line INTEGER NN`, `usage_type TEXT` | `resource_id → resources.id` |
@@ -89,6 +90,16 @@ shared by two roots never answers from the wrong one; for the primary root,
 as the same root. Attached roots are registered in `subtrees`; `original_path` preserves
 what the user entered, while `canonical_path` is the normalized value used in
 `files.root_path`.
+
+### File words
+
+`file_words` holds the distinct word runs (`[\p{Alnum}_]+`) of each indexed
+file's text, sorted and newline-joined. Grep-based commands (`search`
+contents, `callers`, `call-tree`) skip a file only when its words lack a run
+containing every searched literal and its current `mtime` / `size` equal the
+stored ones; a file without a row, or changed since indexing, is searched in
+full. No row is written for minified files, files over the size cap or `.d.ts`
+from `node_modules`.
 
 ### Symbols, references, and inheritance
 

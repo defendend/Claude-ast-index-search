@@ -686,6 +686,40 @@ exclude:
 
 ### Unreleased
 
+- **`search`, `callers` and `call-tree` skip files that cannot match** — the
+  index now keeps each file's distinct words (`file_words`, about +7% index
+  size), and the grep-based commands no longer open a file whose words lack
+  the searched literal while it is unchanged since indexing; edited and new
+  files are still searched. On a 40k-file Rails monorepo `search` went from
+  0.67 to 0.33 s, `callers merge` from 0.60 to 0.26 s, `call-tree --depth 3`
+  from 1.13 to 0.66 s, with the same results. An index built by an older
+  version is searched in full until its next `rebuild`.
+- **`callers` checks for definitions cheaply and in parallel** — the "is this
+  line a definition?" test ran a capturing regex on one thread for every call
+  line; a capture-free pre-check now runs on the search threads.
+- **`update` finds changes 3–4× faster** — the project root was canonicalized
+  once per file (a thread and a `realpath` each), and files were stat'ed and
+  `node_modules` packages walked one by one; now once per walk and in
+  parallel. A no-op `update` on a 40k-file project: 2.1 → 0.6 s; 20 changed
+  files: 1.8 → 0.4 s.
+- **`rebuild` is about 40% faster** — signatures looked up their source line
+  by scanning the file from the top for every symbol (quadratic in file
+  length) and copied the whole line before truncating it; Ruby and TypeScript
+  files were parsed twice (symbols, then references); and parse threads sat
+  idle while each chunk was written. Lines are now indexed once per file,
+  signatures capped before copying, each file parsed once, and writing
+  overlaps parsing in the same order, so the index is byte-for-byte the same:
+  9.3 → 5.5 s on a 40k-file monorepo.
+- **`graph build` 2.5× faster** — references are resolved per file in parallel
+  and import matches memoized, with an identical graph: 4.2 → 1.7 s.
+- **`hotspots --collect` reads history 5× faster** — `git log` windows run in
+  parallel (up to 8), and a window of old bulk-import commits no longer
+  overflows the 16 MB output cap and gets re-read at half size again and
+  again: a full collection of a 25k-commit history took 50 s, now 10 s, with
+  the same stored history.
+- **The MCP server answers tool calls concurrently** — several calls sent at
+  once used to wait for each other; responses may now arrive out of order,
+  matched by `id` as JSON-RPC allows.
 - **Minified JavaScript and CSS are left out** — `.js` / `.mjs` / `.cjs` /
   `.css` files named `*.min.*` or `*-min.*`, or whose first 64 KiB is minifier
   output (lines of 1000+ bytes on average, 100+ of them outside string
