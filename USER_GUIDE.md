@@ -572,6 +572,19 @@ example to the `let` helpers it uses. Calls on a receiver of unknown type stay
 parentheses are not recorded at all. A lowercase `name(` counts only where the
 syntax tree has a call: in a comment, a string or a heredoc it does not.
 
+A symbol that names a method is a reference to it: a callback or custom
+validator (`before_save :normalize`, `before_action :authorize`, `validate
+:check_total`, and the other Active Record, Action Controller and Active Job
+callbacks), an attribute a validation reads (`validates :email`,
+`validates_presence_of :email` — inside a model that resolves to the column),
+a condition (`if: :paid?`, `unless: [:draft?, :locked?]`), `rescue_from ...
+with: :handler`, `helper_method :current_user`, the original of `alias_method`,
+and what `delegate :name, to: :owner` forwards and where. The class links to
+those methods, so `graph dependents normalize` shows the model that registers
+the callback. `map(&:total)` and the forwarded `name` are calls on another
+object and resolve like `value.total`; other symbols (`on: :create`, `status:
+:active`) are data.
+
 In a Rails application `db/schema.rb` is indexed even when it is gitignored:
 each `create_table` becomes a `table` symbol and each column a `column` symbol
 named `table.column` (`ast-index search email -t column`). The lines of the

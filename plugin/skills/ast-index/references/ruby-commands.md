@@ -241,6 +241,14 @@ string or `%w[]` word that is exactly a constant path (`class_name:
 heredoc (`WHERE type = 'Event::Stage'`). RSpec `let(:name)` /
 `subject(:name)` helpers are graph targets named `name` inside their spec file.
 
+A symbol naming a method is a reference too: callbacks and custom validators
+(`before_save :normalize`, `before_action :authorize`, `validate :check`),
+validated attributes (`validates :email`, `validates_presence_of :email`),
+`if:` / `unless:` conditions, `rescue_from ... with: :handler`,
+`helper_method`, the original of `alias_method`, `delegate :name, to: :owner`
+(both names) and block arguments (`map(&:total)`). Other symbols
+(`on: :create`, enum values) are data.
+
 ## Import Handling
 
 Both `require` and `require_relative` are tracked:

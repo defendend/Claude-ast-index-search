@@ -428,6 +428,11 @@ fn classify_usage<'a>(context: Option<&'a str>, name: &str, ruby: bool) -> Usage
             continue;
         }
         if ruby && before.ends_with(':') && !before.ends_with("::") {
+            // `map(&:total)` and the methods `delegate` forwards are called
+            // on another object, not on the surrounding class.
+            if before.ends_with("&:") || is_delegated_name(context, before) {
+                return Usage::UnknownReceiver("");
+            }
             return Usage::Symbol;
         }
         return classify_prefix(before);
@@ -441,6 +446,13 @@ fn classify_usage<'a>(context: Option<&'a str>, name: &str, ruby: bool) -> Usage
     } else {
         Usage::Bare
     }
+}
+
+/// A method name `delegate` forwards (`delegate :name, to: :owner` — `name`,
+/// not the `owner` target, which is a method of the class itself).
+fn is_delegated_name(context: &str, before: &str) -> bool {
+    context.trim_start().starts_with("delegate ")
+        && !before.trim_end_matches(':').trim_end().ends_with("to:")
 }
 
 fn classify_prefix(before: &str) -> Usage<'_> {
@@ -760,8 +772,7 @@ impl Builder {
                     };
                     // Ruby parsers qualify `class A::B` and `A::B = value`
                     // with their enclosing scopes already.
-                    let qualified_by_parser = (is_container_kind(&sym.kind)
-                        && reopened.is_none())
+                    let qualified_by_parser = (is_container_kind(&sym.kind) && reopened.is_none())
                         || (sym.kind == "constant" && ruby);
                     if qualified_by_parser && sym.name.contains("::") {
                         sym.name.trim_start_matches("::").to_string()
@@ -2182,6 +2193,22 @@ mod tests {
             Usage::UnknownReceiver("")
         );
         assert_eq!(ruby("  Invoice", "Payment"), Usage::Unseen);
+        assert_eq!(
+            ruby("before_save :normalize, if: :paid?", "paid?"),
+            Usage::Symbol
+        );
+        assert_eq!(
+            ruby("rows.map(&:total).sum", "total"),
+            Usage::UnknownReceiver("")
+        );
+        assert_eq!(
+            ruby("delegate :name, :email, to: :owner", "email"),
+            Usage::UnknownReceiver("")
+        );
+        assert_eq!(
+            ruby("delegate :name, :email, to: :owner", "owner"),
+            Usage::Symbol
+        );
         assert_eq!(
             classify_usage(Some("case KIND_INVOICE:"), "KIND_INVOICE", false),
             Usage::Bare

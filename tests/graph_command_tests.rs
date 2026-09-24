@@ -750,6 +750,75 @@ end
 }
 
 #[test]
+fn ruby_callbacks_and_conditions_link_to_their_methods() {
+    let ws = workspace();
+    ws.write(
+        "app/models/order.rb",
+        r#"class Order
+  before_save :normalize_number, if: :draft?
+  validate :check_total
+  delegate :display_name, to: :customer
+
+  def customer
+    Customer.new
+  end
+
+  def item_names
+    items.map(&:display_name)
+  end
+
+  private
+
+  def normalize_number
+    1
+  end
+
+  def draft?
+    true
+  end
+
+  def check_total
+    2
+  end
+end
+"#,
+    );
+    ws.write(
+        "app/models/customer.rb",
+        "class Customer\n  def display_name\n    \"x\"\n  end\nend\n",
+    );
+    ws.write(
+        "app/models/label.rb",
+        "class Label\n  def display_name\n    \"y\"\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    let usages = ws.run(&["usages", "check_total"]);
+    assert!(usages.contains("app/models/order.rb:3"), "{usages}");
+
+    ws.run(&["graph", "build"]);
+    for (method, source) in [
+        ("normalize_number", "Order"),
+        ("draft?", "Order"),
+        ("check_total", "Order"),
+        ("customer", "delegate :display_name"),
+    ] {
+        let report = ws.json(&["graph", "dependents", method, "--in-file", "order.rb"]);
+        let edge = find_other(&report, source);
+        assert_eq!(edge["confidence"], "local", "{method}: {report:#}");
+    }
+    // What `delegate` forwards and a block argument are calls on another
+    // object: never resolved to the class's own methods.
+    let forwarded = ws.json(&[
+        "graph",
+        "dependents",
+        "display_name",
+        "--in-file",
+        "customer.rb",
+    ]);
+    assert_eq!(forwarded["resolved_edges"], 0, "{forwarded:#}");
+}
+
+#[test]
 fn a_project_vendor_directory_is_part_of_the_graph() {
     let ws = workspace();
     ws.write(

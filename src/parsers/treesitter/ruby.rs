@@ -86,9 +86,12 @@ impl RubyParser {
 
         // Most Ruby calls are written without parentheses: `recv.name`,
         // `name arg`, a bare `name`. The tree sees them all.
+        // A method named by a symbol is called too: `before_save :normalize`,
+        // `if: :paid?`, `list.map(&:total)`.
         let mut seen: std::collections::HashSet<(String, usize)> =
             refs.iter().map(|r| (r.name.clone(), r.line)).collect();
-        for (name, line) in calls {
+        let named = symbol_method_refs(content, tree.root_node());
+        for (name, line) in calls.into_iter().chain(named) {
             if name.len() <= 2 || UNTRACKED_RUBY_CALLS.contains(name) {
                 continue;
             }
@@ -271,6 +274,111 @@ fn method_call_refs<'a>(content: &'a str, root: tree_sitter::Node) -> Vec<(&'a s
                     .is_some_and(|(_, locals)| locals.contains(name));
                 if !local {
                     out.push((name, node_line(&node)));
+                }
+            }
+            _ => {}
+        }
+        WalkControl::Continue
+    });
+    out
+}
+
+/// Class-body calls whose symbol arguments name methods of the class: Active
+/// Record, Action Controller and Active Job callbacks, custom validators, view
+/// helpers and `alias_method` (its second argument only).
+static METHOD_NAMING_CALLS: LazyLock<std::collections::HashSet<&str>> = LazyLock::new(|| {
+    "before_validation after_validation before_save around_save after_save before_create
+     around_create after_create before_update around_update after_update before_destroy
+     around_destroy after_destroy after_commit after_rollback after_create_commit
+     after_update_commit after_destroy_commit after_save_commit after_initialize after_find
+     after_touch before_action after_action around_action skip_before_action
+     skip_after_action skip_around_action prepend_before_action prepend_after_action
+     prepend_around_action append_before_action append_after_action append_around_action
+     before_filter after_filter around_filter skip_before_filter before_perform
+     after_perform around_perform before_enqueue after_enqueue around_enqueue validate
+     helper_method"
+        .split_whitespace()
+        .collect()
+});
+
+/// Methods a symbol names, with their lines: a callback or custom validator
+/// (`before_save :normalize`, `validate :check_total`), an attribute a
+/// validation reads (`validates :email`), a condition (`if: :paid?`,
+/// `unless: [:draft?, :locked?]`), a `rescue_from ... with: :handler`, the
+/// original of `alias_method`, what `delegate` forwards and where
+/// (`delegate :name, to: :owner`), and a block argument (`map(&:total)`).
+/// Other symbols are data (`on: :create`, `status: :active`).
+fn symbol_method_refs<'a>(content: &'a str, root: tree_sitter::Node) -> Vec<(&'a str, usize)> {
+    let mut out = Vec::new();
+    let mut push = |node: tree_sitter::Node| {
+        if node.kind() != "simple_symbol" {
+            return;
+        }
+        let name = &node_text(content, &node)[1..];
+        let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name
+                .trim_end_matches(['?', '!'])
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if valid {
+            out.push((name, node_line(&node)));
+        }
+    };
+    walk_tree_preorder(&root, |node| {
+        match node.kind() {
+            "block_argument" => {
+                if let Some(symbol) = node.named_child(0) {
+                    push(symbol);
+                }
+            }
+            "call" => {
+                let Some(args) = node.child_by_field_name("arguments") else {
+                    return WalkControl::Continue;
+                };
+                let method = node
+                    .child_by_field_name("method")
+                    .map_or("", |method| node_text(content, &method));
+                let on_self = node
+                    .child_by_field_name("receiver")
+                    .is_none_or(|receiver| receiver.kind() == "self");
+                let positional = on_self
+                    && (METHOD_NAMING_CALLS.contains(method)
+                        || method == "delegate"
+                        || method == "validates"
+                        || (method.starts_with("validates_") && method.ends_with("_of")));
+                let mut cursor = args.walk();
+                for (index, arg) in args.named_children(&mut cursor).enumerate() {
+                    match arg.kind() {
+                        "simple_symbol"
+                            if positional || (method == "alias_method" && index == 1) =>
+                        {
+                            push(arg)
+                        }
+                        "pair" => {
+                            let key = arg
+                                .child_by_field_name("key")
+                                .map_or("", |key| node_text(content, &key));
+                            let key = key.trim_start_matches(':');
+                            let names_method = matches!(key, "if" | "unless")
+                                || (key == "to" && method == "delegate")
+                                || (key == "with" && method == "rescue_from");
+                            let Some(value) = arg.child_by_field_name("value") else {
+                                continue;
+                            };
+                            if !names_method {
+                                continue;
+                            }
+                            if value.kind() == "array" {
+                                let mut items = value.walk();
+                                for item in value.named_children(&mut items) {
+                                    push(item);
+                                }
+                            } else {
+                                push(value);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -1877,6 +1985,51 @@ end
             refs.iter().any(|r| r.name == "success?"),
             "should find 'success?' reference"
         );
+    }
+
+    #[test]
+    fn test_extract_refs_symbols_naming_methods() {
+        let content = r#"class Invoice < ApplicationRecord
+  before_save :normalize_number, if: :draft?
+  after_commit :notify, unless: [:silent?, :imported?]
+  validate :check_total
+  validates :customer_email, presence: true, on: :create
+  delegate :full_name, to: :customer
+  alias_method :amount, :total_amount
+  rescue_from Timeout, with: :handle_timeout
+  enum status: { open: 0 }
+
+  def lines_total
+    lines.map(&:subtotal).sum
+  end
+end
+"#;
+        let refs = RUBY_PARSER.extract_refs(content, &[]).unwrap();
+        let at = |name: &str| -> Vec<usize> {
+            refs.iter()
+                .filter(|r| r.name == name)
+                .map(|r| r.line)
+                .collect()
+        };
+        for (name, line) in [
+            ("normalize_number", 2),
+            ("draft?", 2),
+            ("notify", 3),
+            ("silent?", 3),
+            ("imported?", 3),
+            ("check_total", 4),
+            ("customer_email", 5),
+            ("full_name", 6),
+            ("customer", 6),
+            ("total_amount", 7),
+            ("handle_timeout", 8),
+            ("subtotal", 12),
+        ] {
+            assert_eq!(at(name), vec![line], "{name}: {refs:?}");
+        }
+        for data in ["create", "amount", "status", "open"] {
+            assert!(at(data).is_empty(), "{data} is data: {refs:?}");
+        }
     }
 
     #[test]
