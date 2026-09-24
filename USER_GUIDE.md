@@ -488,6 +488,11 @@ Billing::LedgerImporter` lists the references to `LedgerImporter` on lines that
 spell out `Billing::LedgerImporter` (and says so); `usages LedgerImporter`
 lists all of them. `unused-symbols` looks references up the same way.
 
+`usages` and the usages section of `refs` list references in production files
+first and in test files (**Test files** under ranking below) after them, each
+group by path and line, so a page shows the code that uses a name before its
+specs. In JSON a reference in a test file carries `"test": true`.
+
 Use JSON for scripts or agents:
 
 ```bash
@@ -730,8 +735,9 @@ every file, so a file's score does not change with the flag; `hotspots
 
 One test-path rule serves `search --rank`, `hotspots` and `graph top` with
 `--exclude-tests`, the graph (code outside tests never resolves into them),
-`explore` (test files rank below source) and the plain `search` order (test
-symbols follow the other partial matches). A file is a test when its name
+`explore` (test files rank below source), the plain `search` order (test
+symbols follow the other partial matches) and `usages` (test files after
+production code). A file is a test when its name
 follows a test convention — `*_test.*`, `*_spec.*`, `*.test.*`, `*.spec.*`,
 `test_*.py`, `conftest.py`, and `FooTest` / `FooTests` / `FooSpec` in Java,
 Kotlin, Scala, Groovy, Swift, Objective-C, C#, PHP and C++ — or when it sits in

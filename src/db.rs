@@ -7259,6 +7259,10 @@ pub struct RefResult {
     pub path: String,
     #[serde(skip_serializing)]
     pub root_path: Option<String>,
+    /// The reference sits in a test file ([`crate::commands::is_test_path`]);
+    /// only serialized when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub test: bool,
 }
 
 fn row_to_ref_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<RefResult> {
@@ -7267,44 +7271,79 @@ fn row_to_ref_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<RefResult> {
     } else {
         None
     };
+    let path: String = row.get(3)?;
     Ok(RefResult {
         name: row.get(0)?,
         line: row.get(1)?,
         context: row.get(2)?,
-        path: row.get(3)?,
+        test: crate::commands::is_test_path(&path),
+        path,
         root_path,
     })
 }
 
-/// Find references (usages) of a symbol
-pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Vec<RefResult>> {
-    // Early materialization: filter and sort refs using covering index BEFORE
-    // joining with files. Avoids SQLite planner choosing full scan on large
-    // tables (~12M rows) when ORDER BY references the joined table. See #19.
-    //
-    // Inner ORDER BY (file_id, line) is free because idx_refs_name_file_line
-    // has exactly this sort order. Outer ORDER BY f.path reshuffles the tiny
-    // result set (bounded by LIMIT) so output is stable for users.
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT r.name, r.line, r.context, f.path, f.root_path
-        FROM (
-            SELECT name, file_id, line, context
-            FROM refs
-            WHERE name = ?1
-            ORDER BY file_id, line
-            LIMIT ?2
-        ) r
-        JOIN files f ON f.id = r.file_id
-        ORDER BY f.path, r.line
-        "#,
-    )?;
-
+/// The first `limit` references matching `condition` (over `refs r0`, with
+/// `values` bound in order): production files first, test files
+/// ([`crate::commands::is_test_path`]) after them, each group by path and
+/// line, so the references of one file stay together.
+///
+/// The page is picked from `(name, file_id, line)` of
+/// `idx_refs_name_file_line` plus the file path — refs drive the join
+/// (`CROSS JOIN`), so the planner never scans every file or ref (see #19) —
+/// and only the rows on the page read their context.
+fn find_references_where(
+    conn: &Connection,
+    condition: &str,
+    mut values: Vec<String>,
+    limit: usize,
+) -> Result<Vec<RefResult>> {
+    ensure_test_functions(conn)?;
+    let order =
+        |r: &str, f: &str| format!("{IS_TEST_PATH_FN}({f}.path), {f}.path, {r}.file_id, {r}.line");
+    let sql = format!(
+        "SELECT r.name, r.line, r.context, f.path, f.root_path
+         FROM (
+             SELECT r0.id AS id
+             FROM refs r0 CROSS JOIN files f0
+             WHERE {condition} AND f0.id = r0.file_id
+             ORDER BY {inner}
+             LIMIT ?
+         ) page
+         CROSS JOIN refs r CROSS JOIN files f
+         WHERE r.id = page.id AND f.id = r.file_id
+         ORDER BY {outer}",
+        inner = order("r0", "f0"),
+        outer = order("r", "f"),
+    );
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
     let results = stmt
-        .query_map(params![name, limit as i64], row_to_ref_result)?
+        .query_map(params.as_slice(), row_to_ref_result)?
         .collect::<Result<Vec<_>, _>>()?;
-
     Ok(results)
+}
+
+/// `AND` condition on `r0.file_id` for `scope`, and its values.
+fn ref_scope_condition(scope: &SearchScope) -> (String, Vec<String>) {
+    let (scope_clause, scope_params) = scope.path_condition();
+    if scope_clause.is_empty() {
+        return (String::new(), scope_params);
+    }
+    let bare_conditions = scope_clause.trim_start_matches(" AND ");
+    (
+        format!(" AND r0.file_id IN (SELECT id FROM files f WHERE {bare_conditions})"),
+        scope_params,
+    )
+}
+
+/// Find references (usages) of a symbol, production code first
+/// ([`find_references_where`]).
+pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Vec<RefResult>> {
+    find_references_where(conn, "r0.name = ?", vec![name.to_string()], limit)
 }
 
 pub fn count_references_scoped(
@@ -8819,68 +8858,23 @@ pub fn find_class_like_scoped(
     Ok(results)
 }
 
-/// Find references with scope filtering
+/// Find references with scope filtering, production code first
+/// ([`find_references_where`]).
 pub fn find_references_scoped(
     conn: &Connection,
     name: &str,
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<RefResult>> {
-    if scope.is_empty() {
-        return find_references(conn, name, limit);
-    }
-
-    let (scope_clause, scope_params) = scope.path_condition();
-
-    // Early materialization with scope pushed into the subquery via IN clause.
-    // Avoids materializing millions of refs when scope narrows by path. See #19.
-    //
-    // Scope filter is applied at files table (small, ~tens of thousands),
-    // producing a small file_id set, then refs are filtered by both name
-    // AND file_id — both covered by idx_refs_name_file_line.
-    let scope_subquery = if scope_clause.is_empty() {
-        String::new()
-    } else {
-        // Strip leading " AND " and wrap in file_id IN subselect
-        let bare_conditions = scope_clause.trim_start_matches(" AND ");
-        format!(
-            " AND file_id IN (SELECT id FROM files f WHERE {})",
-            bare_conditions
-        )
-    };
-
-    let sql = format!(
-        r#"
-        SELECT r.name, r.line, r.context, f.path, f.root_path
-        FROM (
-            SELECT name, file_id, line, context
-            FROM refs
-            WHERE name = ?1{}
-            ORDER BY file_id, line
-            LIMIT ?{}
-        ) r
-        JOIN files f ON f.id = r.file_id
-        ORDER BY f.path, r.line
-        "#,
-        scope_subquery,
-        2 + scope_params.len()
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    all_params.push(Box::new(name.to_string()));
-    for p in &scope_params {
-        all_params.push(Box::new(p.clone()));
-    }
-    all_params.push(Box::new(limit as i64));
-
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
-    let results = stmt
-        .query_map(param_refs.as_slice(), row_to_ref_result)?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(results)
+    let (scope_condition, scope_params) = ref_scope_condition(scope);
+    let mut values = vec![name.to_string()];
+    values.extend(scope_params);
+    find_references_where(
+        conn,
+        &format!("r0.name = ?{scope_condition}"),
+        values,
+        limit,
+    )
 }
 
 /// References recorded under `name` on a line that contains `mention`.
@@ -8896,27 +8890,15 @@ pub fn find_references_mentioning_scoped(
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<RefResult>> {
-    let (scope_clause, scope_params) = scope.path_condition();
-    // CROSS JOIN keeps refs, read through idx_refs_name_file_line, as the
-    // outer loop instead of a scan of every file in path order.
-    let sql = format!(
-        "SELECT r.name, r.line, r.context, f.path, f.root_path \
-         FROM refs r CROSS JOIN files f \
-         WHERE r.name = ? AND f.id = r.file_id AND instr(r.context, ?) > 0{scope_clause} \
-         ORDER BY f.path, r.line LIMIT ?"
-    );
+    let (scope_condition, scope_params) = ref_scope_condition(scope);
     let mut values = vec![name.to_string(), mention.to_string()];
     values.extend(scope_params);
-    values.push(limit.to_string());
-    let params: Vec<&dyn rusqlite::types::ToSql> = values
-        .iter()
-        .map(|value| value as &dyn rusqlite::types::ToSql)
-        .collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let results = stmt
-        .query_map(params.as_slice(), row_to_ref_result)?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(results)
+    find_references_where(
+        conn,
+        &format!("r0.name = ? AND instr(r0.context, ?) > 0{scope_condition}"),
+        values,
+        limit,
+    )
 }
 
 /// How many references [`find_references_mentioning_scoped`] would list

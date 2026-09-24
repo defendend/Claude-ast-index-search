@@ -205,6 +205,10 @@ ast-index usages "Repository" --module "features/auth" --limit 100
 ast-index usages "parse_config"      # snake_case calls: Python, Rust, Go, C, PHP, ...
 ```
 
+Usages (here and in `refs`) list production files first and test files after
+them, each group by path and line; in JSON a test reference carries
+`"test": true`.
+
 Indexed usages are capitalized names and calls written `name(`, snake_case and
 `_private` names included. Reserved words (`sizeof (x)`, `#if defined(X)`, Go's
 `func (r *T)`, Python's `None`) are never recorded.
