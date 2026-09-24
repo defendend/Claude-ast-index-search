@@ -6,8 +6,9 @@ use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{
-    line_text, node_end_line, node_line, node_text, parse_tree, signature_line, walk_tree_preorder,
-    LanguageParser, WalkControl,
+    extract_refs_masked, is_constant_path, line_text, mask_non_code, node_end_line, node_line,
+    node_text, parse_tree, signature_line, walk_tree_preorder, LanguageParser, NonCode,
+    WalkControl,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -43,11 +44,11 @@ impl RubyParser {
     ) -> Result<Vec<super::super::ParsedRef>> {
         let calls = method_call_refs(content, tree.root_node());
         let called: std::collections::HashSet<(&str, usize)> = calls.iter().copied().collect();
+        let masked = mask_non_code(content, tree.root_node(), &RUBY_NON_CODE);
 
         // A lowercase `name(` the tree does not see as a call on that line
-        // sits in a comment, a string or SQL heredoc, or names the method on
-        // a `def self.name(` line.
-        let mut refs = super::super::extract_references_for_lang(content, defined, file_type)?;
+        // names the method on a `def self.name(` line.
+        let mut refs = extract_refs_masked(content, &masked, defined, file_type)?;
         refs.retain(|r| {
             r.name.starts_with(|c: char| c.is_ascii_uppercase())
                 || called.contains(&(r.name.as_str(), r.line))
@@ -60,15 +61,12 @@ impl RubyParser {
 
         let defined_names: std::collections::HashSet<&str> =
             defined.iter().map(|s| s.name.as_str()).collect();
+        let lines: Vec<&str> = content.lines().collect();
 
-        for (line_num, line) in content.lines().enumerate() {
+        for (line_num, line) in masked.lines().enumerate() {
             let line_num = line_num + 1;
             let trimmed = line.trim();
 
-            // Skip comments and definitions
-            if trimmed.starts_with('#') {
-                continue;
-            }
             if trimmed.starts_with("def ") || trimmed.starts_with("def self.") {
                 continue;
             }
@@ -76,10 +74,11 @@ impl RubyParser {
             for caps in RUBY_BANG_RE.captures_iter(line) {
                 let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 if !name.is_empty() && !defined_names.contains(name) && name.len() > 2 {
+                    let text = lines.get(line_num - 1).map_or("", |l| l.trim());
                     refs.push(super::super::ParsedRef {
                         name: name.to_string(),
                         line: line_num,
-                        context: super::super::truncate_context(trimmed),
+                        context: super::super::truncate_context(text),
                     });
                 }
             }
@@ -89,7 +88,6 @@ impl RubyParser {
         // `name arg`, a bare `name`. The tree sees them all.
         let mut seen: std::collections::HashSet<(String, usize)> =
             refs.iter().map(|r| (r.name.clone(), r.line)).collect();
-        let lines: Vec<&str> = content.lines().collect();
         for (name, line) in calls {
             if name.len() <= 2 || UNTRACKED_RUBY_CALLS.contains(name) {
                 continue;
@@ -112,6 +110,65 @@ impl RubyParser {
 
         Ok(refs)
     }
+}
+
+/// Comments, heredocs, regexes, word arrays and string literals; only the
+/// `#{...}` inside them is code.
+static RUBY_NON_CODE: NonCode = NonCode {
+    language: &RUBY_LANGUAGE,
+    prose: &["comment", "heredoc_beginning", "character"],
+    strings: &[
+        "string",
+        "bare_string",
+        "heredoc_body",
+        "regex",
+        "subshell",
+        "delimited_symbol",
+    ],
+    code: &["interpolation"],
+    keep: constant_names_in,
+};
+
+/// The parts of a string that name a class, kept when the string is blanked:
+/// the whole string when it is exactly a constant path (`'Invoice'`,
+/// `"Billing::Plan"`, a `%w[Event::Stage]` word) — how Rails names a class in
+/// `class_name:`, a polymorphic type or a `constantize` call — or else each
+/// quoted constant path inside it, such as an STI type in SQL
+/// (`WHERE type = 'Event::Stage'`).
+fn constant_names_in(content: &str, node: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    static QUOTED_CONSTANT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*'|"(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*""#).unwrap()
+    });
+    if names_constant(content, node) {
+        return vec![node.byte_range()];
+    }
+    if !matches!(node.kind(), "string" | "heredoc_body") {
+        return Vec::new();
+    }
+    let mut kept = Vec::new();
+    let mut cursor = node.walk();
+    for part in node.named_children(&mut cursor) {
+        if !matches!(part.kind(), "string_content" | "heredoc_content") {
+            continue;
+        }
+        let start = part.start_byte();
+        kept.extend(
+            QUOTED_CONSTANT
+                .find_iter(node_text(content, &part))
+                .map(|found| start + found.start()..start + found.end()),
+        );
+    }
+    kept
+}
+
+/// A string or `%w[]` word that is exactly a constant path.
+fn names_constant(content: &str, node: tree_sitter::Node) -> bool {
+    if !matches!(node.kind(), "string" | "bare_string") || node.named_child_count() != 1 {
+        return false;
+    }
+    node.named_child(0).is_some_and(|only| {
+        only.kind() == "string_content" && is_constant_path(node_text(content, &only))
+    })
 }
 
 /// Lines of every `ActiveRecord::Schema.define` block. A schema dump's
@@ -855,17 +912,6 @@ fn qualify_scoped_constant(content: &str, name_node: &tree_sitter::Node, text: &
         Some(assignment) => prefix_enclosing_scopes(content, assignment, text),
         None => text.to_string(),
     }
-}
-
-/// `Name`, `Scope::Name` or `::Name`: every segment a constant. Excludes
-/// `Scope::method = value`, which is a setter call, not a constant.
-fn is_constant_path(text: &str) -> bool {
-    let text = text.strip_prefix("::").unwrap_or(text);
-    !text.is_empty()
-        && text.split("::").all(|segment| {
-            segment.chars().next().is_some_and(char::is_uppercase)
-                && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
-        })
 }
 
 /// Table-block methods of a schema dump that declare no column of their own.

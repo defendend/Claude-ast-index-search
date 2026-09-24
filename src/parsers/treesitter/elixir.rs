@@ -19,7 +19,20 @@ pub static ELIXIR_PARSER: ElixirParser = ElixirParser;
 
 pub struct ElixirParser;
 
+/// Comments, strings, charlists and sigils, `@doc` heredocs included; the interpolations are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &ELIXIR_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string", "charlist", "sigil"],
+    code: &["interpolation"],
+    keep: super::keep_no_string,
+};
+
 impl LanguageParser for ElixirParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &ELIXIR_LANGUAGE)?;
         let mut symbols = Vec::new();

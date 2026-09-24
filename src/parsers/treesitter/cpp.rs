@@ -17,6 +17,7 @@ use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator};
 
 use super::{
     line_text, node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser,
+    NonCode,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -32,7 +33,65 @@ pub static CPP_PARSER: CppParser = CppParser;
 
 pub struct CppParser;
 
+/// Comments and string, character and `<header>` literals, also inside the
+/// unparsed body of a `#define`.
+static CPP_NON_CODE: NonCode = NonCode {
+    language: &CPP_LANGUAGE,
+    prose: &["comment"],
+    strings: &[
+        "string_literal",
+        "raw_string_literal",
+        "char_literal",
+        "system_lib_string",
+        "preproc_arg",
+    ],
+    code: &[],
+    keep: macro_body_code,
+};
+
+/// The grammar leaves a macro body as raw text (`preproc_arg`); keep all of it
+/// but its literals and comments, which the scan finds lexically.
+fn macro_body_code(content: &str, node: Node) -> Vec<std::ops::Range<usize>> {
+    if node.kind() != "preproc_arg" {
+        return Vec::new();
+    }
+    let start = node.start_byte();
+    let bytes = node_text(content, &node).as_bytes();
+    let mut code = Vec::new();
+    let mut from = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let end = match (bytes[at], bytes.get(at + 1)) {
+            (quote @ (b'"' | b'\''), _) => {
+                let mut close = at + 1;
+                while close < bytes.len() && bytes[close] != quote {
+                    close += if bytes[close] == b'\\' { 2 } else { 1 };
+                }
+                (close + 1).min(bytes.len())
+            }
+            (b'/', Some(b'*')) => bytes[at + 2..]
+                .windows(2)
+                .position(|pair| pair == b"*/")
+                .map_or(bytes.len(), |offset| at + 2 + offset + 2),
+            (b'/', Some(b'/')) => bytes.len(),
+            _ => {
+                at += 1;
+                continue;
+            }
+        };
+        code.push(start + from..start + at);
+        from = end;
+        at = end;
+    }
+    code.push(start + from..start + bytes.len());
+    code
+}
+
 impl LanguageParser for CppParser {
+    fn non_code(&self) -> Option<&'static NonCode> {
+        Some(&CPP_NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &CPP_LANGUAGE)?;
         let mut symbols = Vec::new();

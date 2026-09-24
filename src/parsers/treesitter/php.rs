@@ -19,7 +19,29 @@ pub static PHP_PARSER: PhpParser = PhpParser;
 
 pub struct PhpParser;
 
+/// Comments, inline HTML and string literals; the variables interpolated into a double-quoted string or heredoc are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &PHP_LANGUAGE,
+    prose: &["comment", "text"],
+    strings: &["string", "encapsed_string", "heredoc", "nowdoc"],
+    code: &[
+        "variable_name",
+        "dynamic_variable_name",
+        "member_access_expression",
+        "member_call_expression",
+        "nullsafe_member_access_expression",
+        "nullsafe_member_call_expression",
+        "subscript_expression",
+        "scoped_property_access_expression",
+    ],
+    keep: super::keep_no_string,
+};
+
 impl LanguageParser for PhpParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &PHP_LANGUAGE)?;
         let mut symbols = Vec::new();

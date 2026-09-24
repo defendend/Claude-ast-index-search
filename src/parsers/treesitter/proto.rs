@@ -19,7 +19,20 @@ pub static PROTO_PARSER: ProtoParser = ProtoParser;
 
 pub struct ProtoParser;
 
+/// Comments and string literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &PROTO_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string"],
+    code: &[],
+    keep: super::keep_no_string,
+};
+
 impl LanguageParser for ProtoParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &PROTO_LANGUAGE)?;
         let mut symbols = Vec::new();

@@ -19,7 +19,32 @@ pub static BASH_PARSER: BashParser = BashParser;
 
 pub struct BashParser;
 
+/// Comments, strings and heredocs; the expansions and command substitutions inside them are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &BASH_LANGUAGE,
+    prose: &["comment"],
+    strings: &[
+        "string",
+        "raw_string",
+        "ansi_c_string",
+        "translated_string",
+        "heredoc_body",
+    ],
+    code: &[
+        "expansion",
+        "simple_expansion",
+        "command_substitution",
+        "arithmetic_expansion",
+        "process_substitution",
+    ],
+    keep: super::keep_no_string,
+};
+
 impl LanguageParser for BashParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &BASH_LANGUAGE)?;
         let mut symbols = Vec::new();

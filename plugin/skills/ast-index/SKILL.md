@@ -22,7 +22,8 @@ Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swif
 5. **Use grep/Search ONLY when:**
    - ast-index returns empty results
    - Searching for regex patterns (ast-index uses literal match)
-   - Searching for string literals inside code (`"some text"`)
+   - Searching for string literals inside code (`"some text"`) — `usages` and
+     `refs` skip names inside strings and comments
    - Searching in comments content
 
 **Why:** ast-index is 17-69x faster than grep (1-10ms vs 200ms-3s) and returns structured, accurate results.

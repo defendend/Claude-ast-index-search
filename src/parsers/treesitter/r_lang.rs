@@ -19,7 +19,20 @@ pub static R_PARSER: RParser = RParser;
 
 pub struct RParser;
 
+/// Comments and string literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &R_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string"],
+    code: &[],
+    keep: super::keep_no_string,
+};
+
 impl LanguageParser for RParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &R_LANGUAGE)?;
         let mut symbols = Vec::new();

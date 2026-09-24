@@ -537,6 +537,21 @@ words of C/C++, Go, Python, Rust, Perl and JavaScript never count: `sizeof (x)`,
 `except (A, B):` and `None`. A reserved word used as a member
 (`map.delete(key)`) or called as a Perl `&name(...)` is still a reference.
 
+A name inside a comment, a docstring or a string literal is not a reference:
+the syntax tree tells prose from code for Ruby, Python, JavaScript/TypeScript,
+C/C++ (macro bodies included), Objective-C, Go, Rust, Java, Kotlin, C#, PHP,
+Swift, Scala, Dart, Lua, Groovy, Elixir, Bash, R, Zig and Protocol Buffers.
+Code nested in a string still counts — `#{...}`, `${...}`, f-string `{...}`,
+Swift `\(...)`, the identifiers a Rust format string captures
+(`format!("{LIMIT}")`) — and so do strings that name code: a Ruby string or
+`%w[]` word that is exactly a constant path (`class_name: 'Invoice'`,
+`'Event::Stage'`), a quoted constant path inside a Ruby string or heredoc
+(`WHERE type = 'Event::Stage'`), a Python string that is a dotted name ending
+in a class name (`"User"`, `"pkg.models.User"` in an annotation or
+`mock.patch`), the path of a JavaScript `import('./Page')` / `require()`, and a
+Groovy GString with `${...}` in it. Perl, Vue/Svelte script blocks, SQL and
+the other grammars keep the line-based comment skipping only.
+
 BSL (1C:Enterprise, OneScript) references are calls in Cyrillic or Latin
 (`ПолучитьДанные()`), a module or object before `.` (`ОбщегоНазначения.`) and
 the type after `Новый` / `New`; a plain capitalized word is a variable, and

@@ -19,7 +19,24 @@ pub static GO_PARSER: GoParser = GoParser;
 
 pub struct GoParser;
 
+/// Comments and string and rune literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &GO_LANGUAGE,
+    prose: &["comment"],
+    strings: &[
+        "interpreted_string_literal",
+        "raw_string_literal",
+        "rune_literal",
+    ],
+    code: &[],
+    keep: super::keep_no_string,
+};
+
 impl LanguageParser for GoParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &GO_LANGUAGE)?;
         let mut symbols = Vec::new();

@@ -223,7 +223,26 @@ fn extract_using_name(content: &str, node: &tree_sitter::Node) -> Option<(String
     None
 }
 
+/// Comments and string and character literals; the holes of an interpolated string are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &CSHARP_LANGUAGE,
+    prose: &["comment"],
+    strings: &[
+        "string_literal",
+        "verbatim_string_literal",
+        "raw_string_literal",
+        "character_literal",
+        "interpolated_string_expression",
+    ],
+    code: &["interpolation"],
+    keep: super::keep_no_string,
+};
+
 impl LanguageParser for CSharpParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &CSHARP_LANGUAGE)?;
         let mut symbols = Vec::new();
