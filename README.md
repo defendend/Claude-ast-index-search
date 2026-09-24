@@ -417,11 +417,10 @@ ast-index --format json hotspots --limit 10
 
 Collection is **never implicit**: `rebuild` and `update` do not run it, so
 indexing cost is unchanged for everyone who does not ask for this. The first
-`--collect` walks the whole history; every later one resumes from the stored
-commit cursor and reads only new commits. If that cursor stops being an
-ancestor of `HEAD` — branch switch, rebase, force-push, or a
-garbage-collected object — the run says so and rebuilds from scratch instead
-of failing or reporting stale numbers.
+`--collect` walks the whole history; every later one reads only what changed.
+History is stored per commit, so a branch switch, rebase, force-push or reset
+subtracts the commits `HEAD` no longer reaches and adds the new ones, and the
+numbers always equal a fresh full collection.
 
 Signals live in their own tables, keyed by project-relative path, so they
 also cover files the parsers never look at (fixtures, configs, migrations).
@@ -687,6 +686,15 @@ exclude:
 
 ### Unreleased
 
+- **`rebuild` keeps the collected Git history** — the per-commit store, the
+  per-file signals and the collection cursor are copied into the new index
+  instead of being dropped, so `hotspots` reports right after a rebuild and the
+  next `--collect` stays incremental: on a 25k-commit monorepo 0.2 s instead of
+  a full rescan of a minute or more, for about 0.4 s added to the rebuild.
+  History collected by an older version, from another working tree or scope,
+  or that cannot be read back intact is left behind with a note, and the next
+  `--collect` reads it again. `--sub-projects` / `--include` rebuilds lost it
+  too and now keep it.
 - **snake_case calls are references in every language** — the generic
   reference extractor did not allow `_` in a called name, so `usages`, `refs`
   and the graph missed `update_profile(user)` and `self._compute()` in Python,
@@ -929,12 +937,8 @@ exclude:
   something in a 300-file library and in a 30 000-file monorepo alike; raw
   numbers are printed next to every label. Text and `--format json` output,
   paginated JSON schema v2.
-- **Collection is opt-in and incremental** — `rebuild` and `update` are
-  unchanged and never walk the log. `hotspots --collect` stores a commit
-  cursor and later runs read only new commits; when that cursor stops being
-  an ancestor of `HEAD` (branch switch, rebase, force-push, pruned object)
-  the run reports why and recollects from scratch instead of serving stale
-  numbers. Signals live in their own tables, so they survive a reindex.
+- **Collection is opt-in** — `rebuild` and `update` never walk the log;
+  `hotspots --collect` does.
 
 ### 3.54.0
 

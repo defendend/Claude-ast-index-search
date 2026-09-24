@@ -55,9 +55,9 @@ index `rebuild` / `update` produce; each is collected by an explicit command.
   shell. It is deliberately **not** exposed through MCP: the first collection
   reads the whole history (about a minute on a large monorepo), longer than
   many MCP clients wait for a tool call, and the server handles one call at a
-  time. Later runs resume from a stored cursor and take seconds; a branch
-  switch or rebase that orphans the cursor triggers a full recollection. A Git
-  hook or a session-start hook is a good place for it.
+  time. Later runs take seconds, including after a branch switch, rebase or
+  `rebuild`: history is stored per commit, so only commits HEAD gained or lost
+  are read. A Git hook or a session-start hook is a good place for it.
 
 When either is missing, the tools say so and name the remedy instead of
 returning empty results; `search` with `rank` falls back to plain relevance
