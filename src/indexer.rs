@@ -1149,6 +1149,42 @@ struct ParsedFile {
     symbols: Vec<ParsedSymbol>,
     qualified_names: HashMap<(String, usize, String), String>,
     refs: Vec<ParsedRef>,
+    /// [`content_words`] of the text, when it was read.
+    words: Option<String>,
+}
+
+/// Whether `c` belongs to a word for [`content_words`] and
+/// [`literal_word_runs`]. Both sides must split text the same way.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The distinct maximal runs of word characters in `content`, sorted and
+/// joined by `\n`.
+///
+/// Every occurrence of a literal lies in the text, so each of the literal's
+/// own word runs lies inside one of these words. A file whose words hold no
+/// word containing some run of the literal cannot contain the literal, and a
+/// grep for it can skip the file without opening it.
+pub fn content_words(content: &str) -> String {
+    let mut words: Vec<&str> = content
+        .split(|c: char| !is_word_char(c))
+        .filter(|word| !word.is_empty())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    words.sort_unstable();
+    words.join("\n")
+}
+
+/// The maximal runs of word characters in `literal`, the pieces
+/// [`content_words`] can vouch for.
+pub fn literal_word_runs(literal: &str) -> Vec<String> {
+    literal
+        .split(|c: char| !is_word_char(c))
+        .filter(|run| !run.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// File scheduled by incremental update.
@@ -1202,10 +1238,12 @@ fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Par
             symbols: vec![],
             qualified_names: HashMap::new(),
             refs: vec![],
+            words: None,
         });
     }
 
     let content = fs::read_to_string(file_path)?;
+    let words = Some(content_words(&content));
 
     // Detect file type by extension, with content-based sniffing for .m files
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -1224,6 +1262,7 @@ fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Par
                 symbols: vec![],
                 qualified_names: HashMap::new(),
                 refs: vec![],
+                words,
             });
         }
     };
@@ -1285,6 +1324,7 @@ fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Par
         symbols,
         qualified_names,
         refs,
+        words,
     })
 }
 
@@ -2201,6 +2241,11 @@ fn write_batch_to_db(
         let mut ref_stmt = tx.prepare_cached(
             "INSERT INTO refs (file_id, name, line, context) VALUES (?1, ?2, ?3, ?4)",
         )?;
+        // An index created before the table existed gains it on its next write.
+        tx.execute_batch(db::CREATE_FILE_WORDS_SQL)?;
+        let mut words_stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO file_words (file_id, mtime, size, words) VALUES (?1, ?2, ?3, ?4)",
+        )?;
 
         for pf in batch {
             let ParsedFile {
@@ -2211,10 +2256,14 @@ fn write_batch_to_db(
                 symbols,
                 qualified_names,
                 refs,
+                words,
             } = pf;
 
             file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size])?;
             let file_id = tx.last_insert_rowid();
+            if let Some(words) = words {
+                words_stmt.execute(rusqlite::params![file_id, mtime, size, words])?;
+            }
             // `INSERT OR REPLACE` on `files.path` drops the previous file row first, and
             // `ON DELETE CASCADE` clears old symbols/refs automatically. Explicit deletes
             // here only add extra work, especially during full rebuilds on a fresh DB.
@@ -4865,6 +4914,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
             symbols: vec![],
             qualified_names: HashMap::new(),
             refs: vec![],
+            words: None,
         });
     }
 
@@ -4883,6 +4933,7 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
         symbols,
         qualified_names: HashMap::new(),
         refs: Vec::new(),
+        words: None,
     })
 }
 

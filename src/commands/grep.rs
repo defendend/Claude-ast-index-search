@@ -288,6 +288,11 @@ pub fn cmd_callers(
     let conn = db::open_db_leased(root)?;
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     let roots = resolver.grep_roots();
+    // Every caller idiom contains the name itself.
+    let word_index = super::WordIndex::load(root, &conn)?;
+    let prefilter = word_index
+        .as_ref()
+        .and_then(|words| words.prefilter(&[function_name]));
 
     let page = super::search_files_page_in_kept(
         root,
@@ -295,6 +300,7 @@ pub fn cmd_callers(
         &pattern,
         &ALL_SOURCE_EXTENSIONS,
         limit,
+        prefilter.as_ref(),
         &|_, line| !def_pattern.is_match(line),
         |path, line_num, line| {
             let rel_path = super::display_path(&resolver, root, path);
@@ -425,6 +431,10 @@ fn collect_tree_callers(
         return Ok(callers);
     }
     let mut files: Option<Vec<PathBuf>> = None;
+    let word_index = match conn {
+        Some(conn) => super::WordIndex::load(root, conn)?,
+        None => None,
+    };
     loop {
         let missing = walk_call_tree(function_name, max_depth, &callers, &mut |_, _, _| {});
         if missing.is_empty() {
@@ -434,7 +444,21 @@ fn collect_tree_callers(
             Some(ref files) => files,
             None => files.insert(super::project_source_files(root, &ALL_SOURCE_EXTENSIONS)?),
         };
-        let found = find_caller_functions(root, conn, files, &missing, limit, in_file)?;
+        // Skipping files that hold none of the names keeps the path order of
+        // the rest, so each name still gets the same first lines.
+        let names: Vec<&str> = missing.iter().map(String::as_str).collect();
+        let prefilter = word_index
+            .as_ref()
+            .and_then(|words| words.prefilter(&names));
+        let found = find_caller_functions(
+            root,
+            conn,
+            files,
+            &missing,
+            limit,
+            in_file,
+            prefilter.as_ref(),
+        )?;
         callers.extend(missing.into_iter().zip(found));
     }
 }
@@ -555,6 +579,7 @@ fn find_caller_functions(
     function_names: &[String],
     limit: usize,
     in_file: Option<&str>,
+    prefilter: Option<&super::WordPrefilter<'_>>,
 ) -> Result<Vec<CallerSites>> {
     let patterns: Vec<(String, String)> = function_names
         .iter()
@@ -579,11 +604,12 @@ fn find_caller_functions(
         function_names.iter().map(|_| BTreeMap::new()).collect();
 
     // First pass: find all files and line numbers with calls
-    super::search_files_limited_each(
+    super::search_files_limited_each_prefiltered(
         files,
         &build_any_caller_pattern(function_names),
         &patterns,
         limit * 3,
+        prefilter,
         |index, path, line| {
             !def_patterns[index].is_match(line)
                 && in_file.map_or(true, |filter| relative_path(root, path).contains(filter))

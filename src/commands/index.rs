@@ -213,11 +213,22 @@ pub fn cmd_search(
         regex::escape(query)
     };
 
-    let content_page = search_files_page(
+    // The pattern is the query, or each comma-separated term, as a literal.
+    let literals: Vec<&str> = if terms.len() > 1 {
+        terms.clone()
+    } else {
+        vec![query]
+    };
+    let word_index = super::WordIndex::load(root, &conn)?;
+    let prefilter = word_index
+        .as_ref()
+        .and_then(|words| words.prefilter(&literals));
+    let content_page = super::search_files_page_prefiltered(
         root,
         &pattern,
         &super::grep::ALL_SOURCE_EXTENSIONS,
         limit,
+        prefilter.as_ref(),
         |path, line_num, line| {
             let rel_path = super::relative_path(root, path);
             // Apply scope filter for grep results

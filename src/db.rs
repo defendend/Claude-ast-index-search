@@ -4453,6 +4453,7 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
     )?;
     conn.execute_batch(CREATE_GIT_SIGNALS_SQL)?;
     conn.execute_batch(CREATE_SYMBOL_GRAPH_SQL)?;
+    conn.execute_batch(CREATE_FILE_WORDS_SQL)?;
     Ok(())
 }
 
@@ -4680,6 +4681,23 @@ pub(crate) const CREATE_SYMBOL_GRAPH_SQL: &str = r#"
         pagerank REAL NOT NULL,
         pagerank_pct REAL NOT NULL
     );
+"#;
+/// The distinct words of each indexed file's text, comments and strings
+/// included, sorted and joined by newlines; see
+/// [`crate::indexer::content_words`]. Grep-based commands use it to skip
+/// files that cannot contain the literal they search for.
+///
+/// `mtime` and `size` repeat the `files` row the words were read with, so
+/// words that outlived their file row, or were written by a build that knew
+/// another version of the file, are never trusted. An index without this
+/// table, or a file without a row in it, is simply searched in full.
+pub(crate) const CREATE_FILE_WORDS_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS file_words (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        mtime INTEGER NOT NULL,
+        size INTEGER NOT NULL,
+        words TEXT NOT NULL
+    )
 "#;
 const CREATE_QUALIFIED_NAME_INDEX_SQL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
@@ -6980,8 +6998,10 @@ pub struct DbStats {
 
 /// Clear all data from the database
 pub fn clear_db(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CREATE_FILE_WORDS_SQL)?;
     conn.execute_batch(
         r#"
+        DELETE FROM file_words;
         DELETE FROM ios_asset_usages;
         DELETE FROM ios_assets;
         DELETE FROM storyboard_usages;
@@ -6998,6 +7018,29 @@ pub fn clear_db(conn: &Connection) -> Result<()> {
         "#,
     )?;
     Ok(())
+}
+
+/// `(path, mtime, size, words)` of every file indexed under `root_key`
+/// whose words were read from the version its `files` row describes. `None`
+/// when the index keeps no words at all.
+pub fn load_file_words(
+    conn: &Connection,
+    root_key: &str,
+) -> Result<Option<Vec<(String, i64, i64, String)>>> {
+    if !table_exists(conn, "file_words")? {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT f.path, f.mtime, f.size, w.words
+         FROM files f JOIN file_words w ON w.file_id = f.id
+         WHERE f.root_path = ?1 AND w.mtime = f.mtime AND w.size = f.size",
+    )?;
+    let rows = stmt
+        .query_map(params![root_key], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(rows))
 }
 
 /// Reference result

@@ -434,7 +434,122 @@ pub fn search_files_in<F>(
 where
     F: FnMut(&Path, usize, &str),
 {
-    search_files_in_kept(root, roots, pattern, extensions, &|_, _| true, handler)
+    search_files_in_kept(
+        root,
+        roots,
+        pattern,
+        extensions,
+        None,
+        &|_, _| true,
+        handler,
+    )
+}
+
+/// The words of every indexed file of the primary root, for telling files
+/// that cannot contain a literal apart without opening them: see
+/// [`crate::indexer::content_words`].
+pub struct WordIndex {
+    root: PathBuf,
+    /// Primary-root relative path -> (mtime, size, words) as indexed.
+    files: HashMap<String, (i64, i64, String)>,
+}
+
+impl WordIndex {
+    /// `None` when the index keeps no words.
+    pub fn load(root: &Path, conn: &Connection) -> Result<Option<Self>> {
+        let root_key = db::normalize_root_for_storage(root);
+        let Some(rows) = db::load_file_words(conn, &root_key)? else {
+            return Ok(None);
+        };
+        let files = rows
+            .into_iter()
+            .map(|(path, mtime, size, words)| (path, (mtime, size, words)))
+            .collect();
+        Ok(Some(Self {
+            root: root.to_path_buf(),
+            files,
+        }))
+    }
+
+    /// A filter for files that may contain one of `literals`. `None` when a
+    /// literal has no word runs (`->`), since nothing can be skipped then.
+    pub fn prefilter(&self, literals: &[&str]) -> Option<WordPrefilter<'_>> {
+        let mut runs: Vec<String> = Vec::new();
+        let mut literal_runs = Vec::new();
+        for literal in literals {
+            let own = crate::indexer::literal_word_runs(literal);
+            if own.is_empty() {
+                return None;
+            }
+            literal_runs.push(
+                own.into_iter()
+                    .map(|run| match runs.iter().position(|known| *known == run) {
+                        Some(at) => at,
+                        None => {
+                            runs.push(run);
+                            runs.len() - 1
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if literal_runs.is_empty() {
+            return None;
+        }
+        let runs = regex::RegexSet::new(runs.iter().map(|run| regex::escape(run))).ok()?;
+        Some(WordPrefilter {
+            index: self,
+            runs,
+            literal_runs,
+        })
+    }
+}
+
+/// Files of a [`WordIndex`] that cannot contain any of some literals.
+///
+/// A file is skipped only while it is exactly the version the index read
+/// (same mtime and size) and, for every literal, one of the literal's word
+/// runs occurs in none of its words. Files the index does not hold, changed
+/// files and files under attached subtrees are searched as before, so a
+/// search over the tree finds what it found without the filter.
+pub struct WordPrefilter<'a> {
+    index: &'a WordIndex,
+    runs: regex::RegexSet,
+    /// For each literal, the indices of its runs in `runs`.
+    literal_runs: Vec<Vec<usize>>,
+}
+
+impl WordPrefilter<'_> {
+    /// Whether `path` has to be searched.
+    pub fn may_contain(&self, path: &Path) -> bool {
+        let Some(rel) = path
+            .strip_prefix(&self.index.root)
+            .ok()
+            .and_then(Path::to_str)
+        else {
+            return true;
+        };
+        let Some((mtime, size, words)) = self.index.files.get(rel) else {
+            return true;
+        };
+        let found = self.runs.matches(words);
+        if self
+            .literal_runs
+            .iter()
+            .any(|runs| runs.iter().all(|&run| found.matched(run)))
+        {
+            return true;
+        }
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return true;
+        };
+        let current_mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        current_mtime != Some(*mtime) || metadata.len() as i64 != *size
+    }
 }
 
 /// [`search_files_in`] with a line filter that runs on the search threads.
@@ -448,6 +563,7 @@ pub fn search_files_in_kept<F>(
     roots: &[PathBuf],
     pattern: &str,
     extensions: &[&str],
+    prefilter: Option<&WordPrefilter<'_>>,
     keep: &(dyn Fn(&Path, &str) -> bool + Sync),
     mut handler: F,
 ) -> Result<()>
@@ -509,7 +625,9 @@ where
                         let path = entry.path();
                         if let Some(ext) = path.extension() {
                             // Fast O(1) HashSet lookup
-                            if extensions.contains(ext.to_str().unwrap_or("")) {
+                            if extensions.contains(ext.to_str().unwrap_or(""))
+                                && prefilter.map_or(true, |filter| filter.may_contain(path))
+                            {
                                 let path_arc: Arc<Path> = Arc::from(path);
 
                                 let _ = searcher.search_path(
@@ -577,6 +695,30 @@ where
     )
 }
 
+/// [`search_files_page`] skipping files `prefilter` rules out.
+pub fn search_files_page_prefiltered<T, F>(
+    root: &Path,
+    pattern: &str,
+    extensions: &[&str],
+    limit: usize,
+    prefilter: Option<&WordPrefilter<'_>>,
+    filter_map: F,
+) -> Result<Page<T>>
+where
+    F: FnMut(&Path, usize, &str) -> Option<T>,
+{
+    search_files_page_in_kept(
+        root,
+        std::slice::from_ref(&root.to_path_buf()),
+        pattern,
+        extensions,
+        limit,
+        prefilter,
+        &|_, _| true,
+        filter_map,
+    )
+}
+
 /// `search_files_page` over several roots; see [`search_files_in`].
 pub fn search_files_page_in<T, F>(
     root: &Path,
@@ -595,6 +737,7 @@ where
         pattern,
         extensions,
         limit,
+        None,
         &|_, _| true,
         filter_map,
     )
@@ -602,12 +745,14 @@ where
 
 /// [`search_files_page_in`] with a `keep` filter run on the search threads;
 /// see [`search_files_in_kept`].
+#[allow(clippy::too_many_arguments)]
 pub fn search_files_page_in_kept<T, F>(
     root: &Path,
     roots: &[PathBuf],
     pattern: &str,
     extensions: &[&str],
     limit: usize,
+    prefilter: Option<&WordPrefilter<'_>>,
     keep: &(dyn Fn(&Path, &str) -> bool + Sync),
     mut filter_map: F,
 ) -> Result<Page<T>>
@@ -621,6 +766,7 @@ where
         roots,
         pattern,
         extensions,
+        prefilter,
         keep,
         |path, line_num, line| {
             if let Some(item) = filter_map(path, line_num, line) {
@@ -789,6 +935,25 @@ pub fn search_files_limited_each<K, F>(
     patterns: &[(String, String)],
     limit: usize,
     keep: K,
+    handler: F,
+) -> Result<()>
+where
+    K: Fn(usize, &Path, &str) -> bool + Sync,
+    F: FnMut(usize, &Path, usize, &str),
+{
+    search_files_limited_each_prefiltered(files, candidates, patterns, limit, None, keep, handler)
+}
+
+/// [`search_files_limited_each`] skipping, without opening them, the files
+/// `prefilter` rules out. A skipped file counts as searched with no lines,
+/// so the order in which lines are taken stays the same.
+pub fn search_files_limited_each_prefiltered<K, F>(
+    files: &[PathBuf],
+    candidates: &str,
+    patterns: &[(String, String)],
+    limit: usize,
+    prefilter: Option<&WordPrefilter<'_>>,
+    keep: K,
     mut handler: F,
 ) -> Result<()>
 where
@@ -831,6 +996,12 @@ where
                         break;
                     };
                     let mut hits = Vec::new();
+                    if prefilter.is_some_and(|filter| !filter.may_contain(path)) {
+                        if tx.send((index, hits)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     // Lines past a pattern's `limit` in one file can never be
                     // taken. A pattern already satisfied by earlier files is
                     // skipped too: every file before this one had been
