@@ -1987,7 +1987,29 @@ const SORT_KEYS: [&str; 7] = [
     "recent",
 ];
 
+/// Lower bound of the 95% Wilson score interval for `fixes` bugfixes out of
+/// `commits`: the bugfix share discounted by how little history backs it, so
+/// 2 of 2 stays below 11 of 17.
+fn fix_share_lower_bound(fixes: i64, commits: i64) -> f64 {
+    if commits <= 0 {
+        return 0.0;
+    }
+    const Z: f64 = 1.96;
+    let n = commits as f64;
+    let share = fixes as f64 / n;
+    let z2 = Z * Z;
+    let centre = share + z2 / (2.0 * n);
+    let margin = Z * (share * (1.0 - share) / n + z2 / (4.0 * n * n)).sqrt();
+    (centre - margin) / (1.0 + z2 / n)
+}
+
 fn sort_hotspots(hotspots: &mut [Hotspot], sort: &str) {
+    let fixes_key = |hotspot: &Hotspot| {
+        (
+            hotspot.commits >= MIN_COMMITS_FOR_FIX_LABEL,
+            fix_share_lower_bound(hotspot.fix_commits, hotspot.commits),
+        )
+    };
     let compare = |left: &Hotspot, right: &Hotspot| -> std::cmp::Ordering {
         let ordering = match sort {
             "commits" => right.commits.cmp(&left.commits),
@@ -1997,11 +2019,16 @@ fn sort_hotspots(hotspots: &mut [Hotspot], sort: &str) {
                 .unwrap_or(0.0)
                 .partial_cmp(&left.relative_churn.unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal),
-            "fixes" => right
-                .fix_ratio
-                .partial_cmp(&left.fix_ratio)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| right.fix_commits.cmp(&left.fix_commits)),
+            // Files too young for a `fixes:*` label follow the rest, so the
+            // top of the list is the files that label speaks about.
+            "fixes" => {
+                let (left_eligible, left_bound) = fixes_key(left);
+                let (right_eligible, right_bound) = fixes_key(right);
+                right_eligible
+                    .cmp(&left_eligible)
+                    .then_with(|| right_bound.total_cmp(&left_bound))
+                    .then_with(|| right.fix_commits.cmp(&left.fix_commits))
+            }
             "authors" => right.authors.cmp(&left.authors),
             "recent" => right.last_commit_at.cmp(&left.last_commit_at),
             _ => right.score_exact.total_cmp(&left.score_exact),
@@ -2344,6 +2371,42 @@ mod tests {
         assert!(hotspots[0].score_exact > hotspots[1].score_exact);
         assert_eq!(hotspots[0].path, "steady.rs");
         assert_eq!(hotspots[1].path, "churny.rs");
+    }
+
+    #[test]
+    fn fixes_order_discounts_a_share_with_little_history() {
+        let rows = vec![
+            signal_row("two_of_two.rs", 2, 2, 10),
+            signal_row("three_of_three.rs", 3, 3, 10),
+            signal_row("steady_fixer.rs", 17, 11, 10),
+            signal_row("half.rs", 10, 5, 10),
+            signal_row("rarely_fixed.rs", 40, 2, 10),
+        ];
+        let mut hotspots = build_hotspots(rows, 0);
+        sort_hotspots(&mut hotspots, "fixes");
+        let order: Vec<&str> = hotspots
+            .iter()
+            .map(|hotspot| hotspot.path.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "steady_fixer.rs",
+                "half.rs",
+                "rarely_fixed.rs",
+                "three_of_three.rs",
+                "two_of_two.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn fix_share_lower_bound_grows_with_evidence() {
+        assert_eq!(fix_share_lower_bound(0, 0), 0.0);
+        assert!(fix_share_lower_bound(0, 10).abs() < 1e-12);
+        assert!((fix_share_lower_bound(5, 5) - 0.566).abs() < 0.001);
+        assert!(fix_share_lower_bound(2, 2) < fix_share_lower_bound(20, 20));
+        assert!(fix_share_lower_bound(2, 2) < fix_share_lower_bound(11, 17));
     }
 
     #[test]

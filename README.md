@@ -442,9 +442,10 @@ Git hotspots — 289 file(s) with history, 370 commit(s) analyzed, HEAD 50db069d
 ```
 
 Labels: `churn:high` / `churn:elevated`, `rewritten-often` (high churn per
-current line), `fixes:high` / `fixes:elevated` (only for files with at least
-four commits, so 1-of-1 is never "100% bugs"), `authors:many`, `veteran`.
-`score` is the mean of the commit, churn and bugfix-ratio percentiles.
+current line, only for files of 10+ lines), `fixes:high` / `fixes:elevated`
+(only for files with at least four commits, so 1-of-1 is never "100% bugs"),
+`authors:many`, `veteran`. `score` is the mean of the commit, churn and
+bugfix-ratio percentiles.
 
 Bugfix detection is a heuristic over commit subjects: a leading tracker key
 (`[ABC-123]`, `ABC-123:`, `#42`) is stripped first, then English and Russian
@@ -453,8 +454,11 @@ bugfix vocabulary is matched on word boundaries — so `prefix` is not a fix and
 history recorded under the old path moves onto the new one.
 
 `--sort` accepts `score` (default), `commits`, `churn`, `relative-churn`,
-`fixes`, `authors`, `recent`. `--subtree` is rejected: the signals describe the
-project's own working tree.
+`fixes`, `authors`, `recent`. `fixes` orders by the bugfix share discounted
+for thin history — the lower bound of its 95% Wilson interval, so 11 fixes in
+17 commits rank above 2 in 2 — and lists files with fewer than four commits
+after the rest. `--subtree` is rejected: the signals describe the project's own
+working tree.
 
 ### Module analysis
 

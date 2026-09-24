@@ -427,9 +427,12 @@ content — one-line bundles, fixtures, gutted views), `fixes:high` /
 `--sort` takes `score` (default), `commits`, `churn`, `relative-churn`,
 `fixes`, `authors`, `recent`. `score` is printed rounded; the order (and
 `score_exact` in JSON) uses the unrounded mean of the percentiles, so the top
-of a large repository does not collapse into ties. Bugfix detection is a
-commit-subject heuristic (English and Russian, tracker key stripped first);
-merge commits are excluded and renames carry history onto the new path.
+of a large repository does not collapse into ties. `fixes` orders by the
+bugfix share discounted for thin history (lower bound of its 95% Wilson
+interval: 11 of 17 above 2 of 2), files under 4 commits last. Bugfix
+detection is a commit-subject heuristic (English and Russian, tracker key
+stripped first); merge commits are excluded and renames carry history onto
+the new path.
 
 ### Public API
 
