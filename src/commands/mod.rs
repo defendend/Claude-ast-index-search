@@ -429,6 +429,26 @@ pub fn search_files_in<F>(
     roots: &[PathBuf],
     pattern: &str,
     extensions: &[&str],
+    handler: F,
+) -> Result<()>
+where
+    F: FnMut(&Path, usize, &str),
+{
+    search_files_in_kept(root, roots, pattern, extensions, &|_, _| true, handler)
+}
+
+/// [`search_files_in`] with a line filter that runs on the search threads.
+///
+/// `keep` sees the same trimmed line `handler` would, and a line it rejects
+/// never reaches `handler`. Filtering there instead of in `handler` spreads a
+/// costly per-line check (a capturing regex) over every search thread rather
+/// than serialising it on the one thread that drains the results.
+pub fn search_files_in_kept<F>(
+    root: &Path,
+    roots: &[PathBuf],
+    pattern: &str,
+    extensions: &[&str],
+    keep: &(dyn Fn(&Path, &str) -> bool + Sync),
     mut handler: F,
 ) -> Result<()>
 where
@@ -496,11 +516,15 @@ where
                                     &matcher,
                                     path,
                                     UTF8(|line_num, line| {
+                                        let line = line.trim_end();
+                                        if !keep(path, line) {
+                                            return Ok(true);
+                                        }
                                         if tx
                                             .send((
                                                 Arc::clone(&path_arc),
                                                 line_num as usize,
-                                                line.trim_end().to_string(),
+                                                line.to_string(),
                                             ))
                                             .is_err()
                                         {
@@ -560,6 +584,31 @@ pub fn search_files_page_in<T, F>(
     pattern: &str,
     extensions: &[&str],
     limit: usize,
+    filter_map: F,
+) -> Result<Page<T>>
+where
+    F: FnMut(&Path, usize, &str) -> Option<T>,
+{
+    search_files_page_in_kept(
+        root,
+        roots,
+        pattern,
+        extensions,
+        limit,
+        &|_, _| true,
+        filter_map,
+    )
+}
+
+/// [`search_files_page_in`] with a `keep` filter run on the search threads;
+/// see [`search_files_in_kept`].
+pub fn search_files_page_in_kept<T, F>(
+    root: &Path,
+    roots: &[PathBuf],
+    pattern: &str,
+    extensions: &[&str],
+    limit: usize,
+    keep: &(dyn Fn(&Path, &str) -> bool + Sync),
     mut filter_map: F,
 ) -> Result<Page<T>>
 where
@@ -567,14 +616,21 @@ where
 {
     let mut items = Vec::with_capacity(limit.min(1024));
     let mut total = 0usize;
-    search_files_in(root, roots, pattern, extensions, |path, line_num, line| {
-        if let Some(item) = filter_map(path, line_num, line) {
-            total = total.saturating_add(1);
-            if items.len() < limit {
-                items.push(item);
+    search_files_in_kept(
+        root,
+        roots,
+        pattern,
+        extensions,
+        keep,
+        |path, line_num, line| {
+            if let Some(item) = filter_map(path, line_num, line) {
+                total = total.saturating_add(1);
+                if items.len() < limit {
+                    items.push(item);
+                }
             }
-        }
-    })?;
+        },
+    )?;
     Ok(Page::new(items, total, limit))
 }
 

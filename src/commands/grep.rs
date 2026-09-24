@@ -166,13 +166,25 @@ const KEYWORDS_BEFORE_CALL: [&str; 33] = [
 ];
 
 /// Lines that define one particular function, as opposed to calling it.
-struct DefinitionPattern(Regex);
+struct DefinitionPattern {
+    full: Regex,
+    /// Matches every line `full` matches and is cheap to run: no captures,
+    /// no word boundaries, no `\w`, so the lazy DFA handles it on any input.
+    candidate: Regex,
+}
 
 impl DefinitionPattern {
     fn is_match(&self, line: &str) -> bool {
+        // Nearly every line a caller scan hands over is a call, not a
+        // definition, and `full` needs the PikeVM for its captures and its
+        // Unicode word boundaries. Run on every call line of a name as
+        // common as `call`, it was what `callers` spent its time on.
+        if !self.candidate.is_match(line) {
+            return false;
+        }
         // `regex` has no lookaround, so the word in return-type position is
         // captured and a keyword there is ruled out here instead.
-        self.0.captures_iter(line).any(|caps| {
+        self.full.captures_iter(line).any(|caps| {
             caps.name("type")
                 .map_or(true, |word| !KEYWORDS_BEFORE_CALL.contains(&word.as_str()))
         })
@@ -183,19 +195,25 @@ impl DefinitionPattern {
 fn build_def_skip_pattern(function_name: &str) -> DefinitionPattern {
     let fn_escaped = regex::escape(function_name);
     let tb = trailing_boundary(function_name);
-    DefinitionPattern(
-        Regex::new(&format!(
-            concat!(
-                r"\b(?:fun|func|sub)\s+{fn}\s*[<({{\[]",           // Kotlin/Swift/Perl
-                r"|\bdef\s+(?:self\.)?{fn}{tb}",                    // Ruby: def method / def self.method
-                r"|\b(?:(?:public|private|protected|static|final|abstract|synchronized|override)\s+)*",
-                r"(?:void|int|long|boolean|char|byte|short|float|double|(?P<type>[\w.]+)(?:<[^{{;]*>)?(?:\[\])*)\s+{fn}\s*\(", // Java
-            ),
-            fn = fn_escaped,
-            tb = tb
-        ))
-        .expect("Invalid def skip pattern"),
-    )
+    let full = Regex::new(&format!(
+        concat!(
+            r"\b(?:fun|func|sub)\s+{fn}\s*[<({{\[]",           // Kotlin/Swift/Perl
+            r"|\bdef\s+(?:self\.)?{fn}{tb}",                    // Ruby: def method / def self.method
+            r"|\b(?:(?:public|private|protected|static|final|abstract|synchronized|override)\s+)*",
+            r"(?:void|int|long|boolean|char|byte|short|float|double|(?P<type>[\w.]+)(?:<[^{{;]*>)?(?:\[\])*)\s+{fn}\s*\(", // Java
+        ),
+        fn = fn_escaped,
+        tb = tb
+    ))
+    .expect("Invalid def skip pattern");
+    // The Kotlin/Swift/Perl and Java branches both put whitespace right
+    // before the name and one of `<({[` after it; the Ruby branch needs `def`.
+    let candidate = Regex::new(&format!(
+        r"\s{fn}\s*[<({{\[]|def\s+(?:self\.)?{fn}",
+        fn = fn_escaped
+    ))
+    .expect("Invalid def skip candidate pattern");
+    DefinitionPattern { full, candidate }
 }
 
 /// Find TODO/FIXME/HACK comments
@@ -271,17 +289,14 @@ pub fn cmd_callers(
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     let roots = resolver.grep_roots();
 
-    let page = super::search_files_page_in(
+    let page = super::search_files_page_in_kept(
         root,
         &roots,
         &pattern,
         &ALL_SOURCE_EXTENSIONS,
         limit,
+        &|_, line| !def_pattern.is_match(line),
         |path, line_num, line| {
-            if def_pattern.is_match(line) {
-                return None;
-            } // Skip definitions
-
             let rel_path = super::display_path(&resolver, root, path);
             if let Some(filter) = in_file {
                 if !rel_path.contains(filter) {
@@ -1746,6 +1761,37 @@ mod tests {
     }
 
     // --- build_def_skip_pattern tests ---
+
+    #[test]
+    fn def_skip_candidate_covers_every_full_match() {
+        let lines = [
+            "  def call",
+            "\tdef self.call(params)",
+            "def call!",
+            "  fun call(x: Int)",
+            "func call<T>(x: T)",
+            "sub call {",
+            "  public static void call(String s) {",
+            "  private List<Map<String, Integer>> call(int x)",
+            "  int[] call (int x)",
+            "  Foo.Bar call(x)",
+            "  return call(x)",
+            "  await call(x)",
+            "  Строка call(x)",
+            "  x = call(y)",
+            "  obj.call(x)",
+            "  :call",
+        ];
+        for name in ["call", "call!", "valid?", "call_me"] {
+            let pat = build_def_skip_pattern(name);
+            for line in lines {
+                let line = line.replace("call", name);
+                if pat.full.is_match(&line) {
+                    assert!(pat.candidate.is_match(&line), "{name}: {line}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_def_skip_ruby_bang_method() {
