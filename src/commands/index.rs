@@ -14,7 +14,7 @@ use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 
-use super::graph::is_test_path;
+use super::is_test_path;
 use super::rank::{self, PoolSummary, Preset, RankContext, RankSummary, RankedFile, RankedSymbol};
 use super::{
     print_truncation_notice, relative_path, search_files_page, Page, Pagination, PathResolver,

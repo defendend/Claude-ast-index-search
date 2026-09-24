@@ -8,7 +8,7 @@ use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
-use crate::parsers::{ParsedRef, ParsedSymbol};
+use crate::parsers::{truncate_context, FileType, ParsedRef, ParsedSymbol};
 
 // Link the tree-sitter-bsl C library (compiled via build.rs)
 unsafe extern "C" {
@@ -411,8 +411,20 @@ impl LanguageParser for BslParser {
         Ok(symbols)
     }
 
+    fn extract_refs_for_lang(
+        &self,
+        content: &str,
+        defined: &[ParsedSymbol],
+        _file_type: FileType,
+    ) -> Result<Vec<ParsedRef>> {
+        self.extract_refs(content, defined)
+    }
+
     fn extract_refs(&self, content: &str, defined: &[ParsedSymbol]) -> Result<Vec<ParsedRef>> {
-        let defined_names: HashSet<&str> = defined.iter().map(|s| s.name.as_str()).collect();
+        // Only the line a symbol is declared on is skipped: a procedure called
+        // further down its own module is a real usage.
+        let declarations: HashSet<(&str, usize)> =
+            defined.iter().map(|s| (s.name.as_str(), s.line)).collect();
 
         // Match identifiers: Cyrillic (А-яЁё) and Latin (A-Za-z), digits, underscores
         static BSL_IDENT_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -423,7 +435,7 @@ impl LanguageParser for BslParser {
             Regex::new(r"(?:^|[\s=,;(])([A-ZА-ЯЁ][A-Za-z0-9\p{Cyrillic}_]*)").unwrap()
         });
 
-        static BSL_KEYWORDS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+        static BSL_KEYWORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
             [
                 // Russian keywords (per 1C:Enterprise 8.3.27 docs, section 4.2.4.6)
                 "Если",
@@ -508,8 +520,11 @@ impl LanguageParser for BslParser {
                 "RemoveHandler",
             ]
             .into_iter()
+            .map(str::to_lowercase)
             .collect()
         });
+        // BSL keywords are case-insensitive: `НЕ` and `ИЛИ` are as common as
+        // `Не` and `Или`.
         let keywords = &*BSL_KEYWORDS;
 
         let mut refs = Vec::new();
@@ -526,39 +541,50 @@ impl LanguageParser for BslParser {
                 continue;
             }
 
-            // Function/procedure calls
-            for caps in BSL_IDENT_RE.captures_iter(line) {
-                let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                if !name.is_empty() && !keywords.contains(name) && !defined_names.contains(name) {
-                    let key = (name.to_string(), line_num);
-                    if seen.insert(key) {
-                        refs.push(ParsedRef {
-                            name: name.to_string(),
-                            line: line_num,
-                            context: "call".to_string(),
-                        });
-                    }
+            // Calls first, then type references (CamelCase / Cyrillic
+            // uppercase start); a name is recorded once per line. Procedures
+            // and functions are not values in BSL, so a name without `(` is
+            // only a reference as a module or object (`ЮТест.ОжидаетЧто`) or
+            // as the type after `Новый`; any other capitalized word is a
+            // variable or a parameter, however many modules define it.
+            let calls = BSL_IDENT_RE.captures_iter(line).filter_map(|c| c.get(1));
+            let types = BSL_TYPE_RE
+                .captures_iter(line)
+                .filter_map(|c| c.get(1))
+                .filter(|m| {
+                    line[m.end()..].trim_start().starts_with('.') || follows_new(&line[..m.start()])
+                });
+            for found in calls.chain(types) {
+                let name = found.as_str();
+                if name.is_empty()
+                    || keywords.contains(&name.to_lowercase())
+                    || declarations.contains(&(name, line_num))
+                {
+                    continue;
                 }
-            }
-
-            // Type references (CamelCase / Cyrillic uppercase start)
-            for caps in BSL_TYPE_RE.captures_iter(line) {
-                let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                if !name.is_empty() && !keywords.contains(name) && !defined_names.contains(name) {
-                    let key = (name.to_string(), line_num);
-                    if seen.insert(key) {
-                        refs.push(ParsedRef {
-                            name: name.to_string(),
-                            line: line_num,
-                            context: "type".to_string(),
-                        });
-                    }
+                if seen.insert((name.to_string(), line_num)) {
+                    refs.push(ParsedRef {
+                        name: name.to_string(),
+                        line: line_num,
+                        context: truncate_context(trimmed),
+                    });
                 }
             }
         }
 
         Ok(refs)
     }
+}
+
+/// Whether `before` ends with the `Новый` / `New` keyword, so the next word
+/// names a type: `Новый Структура`, `New Array`.
+fn follows_new(before: &str) -> bool {
+    let word = before
+        .trim_end()
+        .rsplit(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or("");
+    word.to_lowercase() == "новый" || word.eq_ignore_ascii_case("new")
 }
 
 /// Find a capture by index in a match

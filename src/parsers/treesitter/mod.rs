@@ -43,14 +43,15 @@ pub trait LanguageParser: Send + Sync {
     /// Parse symbols from source code
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>>;
 
-    /// Extract references from source code.
+    /// Extract references from source code without a file type.
     /// Default implementation uses the existing regex-based generic logic.
     fn extract_refs(&self, content: &str, defined: &[ParsedSymbol]) -> Result<Vec<ParsedRef>> {
         extract_references(content, defined)
     }
 
-    /// Extract references with language-specific keyword filtering.
-    /// Parsers that override extract_refs get their custom logic; others get language-aware filtering.
+    /// Extract references with language-specific keyword filtering. This is
+    /// what indexing calls, and the default never consults `extract_refs`: a
+    /// parser with its own extraction must override this method as well.
     fn extract_refs_for_lang(
         &self,
         content: &str,

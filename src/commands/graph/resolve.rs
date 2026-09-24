@@ -15,9 +15,10 @@ use serde::Serialize;
 use super::metrics::compute_metrics;
 use super::schema::{column_candidates, link_models, underscore, ModelClass, SchemaLinkSummary};
 use super::{
-    is_container_kind, is_node_kind, is_path_suffix, is_schema_kind, is_test_path, language_family,
-    short_name, Confidence, AMBIGUITY_CAP, DEPENDENTS_DEPTH,
+    is_container_kind, is_node_kind, is_path_suffix, is_schema_kind, language_family, short_name,
+    Confidence, AMBIGUITY_CAP, DEPENDENTS_DEPTH,
 };
+use crate::commands::is_test_path;
 use crate::db::{self, SymbolEdgeRow};
 
 /// Inheritance chains deeper than this are cut; real hierarchies are shallow

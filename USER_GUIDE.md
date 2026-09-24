@@ -497,17 +497,32 @@ number of candidates. Installed packages (files under `node_modules`) are
 never part of the graph; everything else in the index is project code,
 including a `vendor/` directory and the project's own `.d.ts` files — keep
 vendored third-party code out with `exclude` in `.ast-index.yaml`. Code
-outside test directories never resolves to a definition inside one (a spec helper that reopens a class to stub a method is
-not what production code calls). Metrics count resolved edges only;
+outside tests never resolves to a definition inside them (a spec helper that
+reopens a class to stub a method is not what production code calls; see
+**Test files** below for what counts as a test). Metrics count resolved edges only;
 `--include-ambiguous` lists the rest. After `update` changes the index the graph reports itself as
 stale until `graph build` (or a query with `--refresh`) runs again.
+
+References are capitalized names and calls written `name(` — snake_case and
+`_private` names included (`update_profile(user)`, `self._compute()`). Reserved
+words of C/C++, Go, Python, Rust, Perl and JavaScript never count: `sizeof (x)`,
+`#if defined(X)`, Go's `func (r *T)`, Rust's `pub(crate)`, Python's
+`except (A, B):` and `None`. A reserved word used as a member
+(`map.delete(key)`) or called as a Perl `&name(...)` is still a reference.
+
+BSL (1C:Enterprise, OneScript) references are calls in Cyrillic or Latin
+(`ПолучитьДанные()`), a module or object before `.` (`ОбщегоНазначения.`) and
+the type after `Новый` / `New`; a plain capitalized word is a variable, and
+keywords are skipped in any letter case (`НЕ`, `Не`). Stylesheets (CSS, SCSS,
+Less) record no references.
 
 Ruby references include calls without parentheses (`recv.name`, `name arg`,
 a bare `name` that is not a local variable), so the graph also links a method
 to the instance methods and attribute readers it calls on `self`, and an RSpec
 example to the `let` helpers it uses. Calls on a receiver of unknown type stay
 `ambiguous`, and core Ruby collection/string methods called without
-parentheses are not recorded at all.
+parentheses are not recorded at all. A lowercase `name(` counts only where the
+syntax tree has a call: in a comment, a string or a heredoc it does not.
 
 In a Rails application `db/schema.rb` is indexed even when it is gitignored:
 each `create_table` becomes a `table` symbol and each column a `column` symbol
@@ -634,11 +649,22 @@ their tier, marked `unscored`.
 
 **Test files.** Specs churn and get fixed by nature, so they crowd the top of
 `hotspots` and `risky`. `--exclude-tests` leaves them out of the ranked files
-and symbols sections and their totals (the same test-path rule as `graph top
---exclude-tests`: `spec/`, `test/`, `tests/`, `__tests__/`, `_spec.`, `_test.`,
-`.spec.`, `.test.`). Percentiles are still computed against every file, so a
-file's score does not change with the flag; `hotspots --exclude-tests` works
-the same way.
+and symbols sections and their totals. Percentiles are still computed against
+every file, so a file's score does not change with the flag; `hotspots
+--exclude-tests` works the same way.
+
+One test-path rule serves `search --rank`, `hotspots` and `graph top` with
+`--exclude-tests`, the graph (code outside tests never resolves into them) and
+`explore` (test files rank below source). A file is a test when its name
+follows a test convention — `*_test.*`, `*_spec.*`, `*.test.*`, `*.spec.*`,
+`test_*.py`, `conftest.py`, and `FooTest` / `FooTests` / `FooSpec` in Java,
+Kotlin, Scala, Groovy, Swift, Objective-C, C#, PHP and C++ — or when it sits in
+a `spec/`, `test/`, `tests/` or `__tests__/` directory. Two exceptions keep
+production code in: in JavaScript / TypeScript those directory names count in
+lowercase only (`components/Test/` is a component), and a Ruby file under
+`app/` or `lib/` is namespaced code (`app/jobs/tests/` is
+`module Tests`), as is a Ruby file in a `tests/` directory, which no Ruby test
+framework uses. `latest.rb`, `contest.py` and `Testimonial.kt` are not tests.
 
 **Output.** Each file and symbol carries its dossier: the preset score and its
 terms, the relevance position and tier, the raw history numbers with their

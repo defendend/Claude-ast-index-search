@@ -9,7 +9,7 @@ use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
 use crate::db::SymbolKind;
-use crate::parsers::{ParsedRef, ParsedSymbol};
+use crate::parsers::{FileType, ParsedRef, ParsedSymbol};
 
 static CSS_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_css::LANGUAGE.into());
 
@@ -33,6 +33,15 @@ impl LanguageParser for CssParser {
         // `name(` calls — it produces only noise for kebab-case CSS selectors.
         // Skip refs entirely for now; revisit when adding cross-file usages.
         Ok(Vec::new())
+    }
+
+    fn extract_refs_for_lang(
+        &self,
+        content: &str,
+        defined: &[ParsedSymbol],
+        _file_type: FileType,
+    ) -> Result<Vec<ParsedRef>> {
+        self.extract_refs(content, defined)
     }
 }
 
