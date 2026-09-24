@@ -18,6 +18,7 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -38,11 +39,10 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("cannot determine default project root"))?;
 
     let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-    let mut line = String::new();
+    let stdout = Arc::new(Mutex::new(io::stdout()));
+    let mut calls = Vec::new();
 
     for raw in stdin.lock().lines() {
-        line.clear();
         let raw = raw.context("stdin read failed")?;
         if raw.trim().is_empty() {
             continue;
@@ -56,16 +56,40 @@ fn main() -> Result<()> {
             }
         };
 
-        let response = handle_request(request, &ast_index_bin, &default_root);
+        // A tool call runs an `ast-index` process, from milliseconds to
+        // seconds. Answering calls one at a time made an agent that sends
+        // several at once wait for their sum; each call now answers on its
+        // own thread as soon as its process is done, matched by `id`.
+        if request.method == "tools/call" {
+            let (bin, root, stdout) = (ast_index_bin.clone(), default_root.clone(), stdout.clone());
+            calls.retain(|call: &std::thread::JoinHandle<()>| !call.is_finished());
+            calls.push(std::thread::spawn(move || {
+                if let Some(response) = handle_request(request, &bin, &root) {
+                    if let Err(e) = write_response(&stdout, &response) {
+                        eprintln!("[ast-index-mcp] failed to write a response: {e}");
+                    }
+                }
+            }));
+            continue;
+        }
 
         // Notifications (no `id`) produce no response. Everything else gets one.
-        if let Some(response) = response {
-            let json = serde_json::to_string(&response)?;
-            writeln!(stdout, "{json}")?;
-            stdout.flush()?;
+        if let Some(response) = handle_request(request, &ast_index_bin, &default_root) {
+            write_response(&stdout, &response)?;
         }
     }
 
+    for call in calls {
+        let _ = call.join();
+    }
+    Ok(())
+}
+
+fn write_response(stdout: &Mutex<io::Stdout>, response: &JsonRpcResponse) -> Result<()> {
+    let json = serde_json::to_string(response)?;
+    let mut stdout = stdout.lock().unwrap_or_else(|e| e.into_inner());
+    writeln!(stdout, "{json}")?;
+    stdout.flush()?;
     Ok(())
 }
 
