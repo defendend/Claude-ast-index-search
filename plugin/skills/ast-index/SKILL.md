@@ -170,6 +170,13 @@ ast-index symbol "Mapper" --in-file "payments/" --limit 10  # Scoped search
 ast-index symbol "@Service"          # Find all @Service annotations
 ```
 
+A namespaced class is found by its short or its full name: `LedgerImporter` and
+`Billing::LedgerImporter` both find `class Billing::LedgerImporter` (also in
+`class`, `refs`, `hierarchy`, `implementations`). An exact short name wins
+over namespaced ones. `usages Billing::LedgerImporter` lists references to
+`LedgerImporter` on lines that spell out the full name; `usages LedgerImporter`
+lists all of them.
+
 ### Class Search
 
 **`class`** - Find class, interface, or protocol definitions.

@@ -921,10 +921,10 @@ pub fn cmd_refs(
     let conn = db::open_db_leased(root)?;
     let definitions_total = db::count_symbols_by_name_scoped(&conn, symbol, None, scope, true)?;
     let imports_total = db::count_imports_scoped(&conn, symbol, scope)?;
-    let usages_total = db::count_references_scoped(&conn, symbol, scope)?;
+    let (usage_source, usages_total) = ReferenceSource::resolve(&conn, symbol, scope)?;
     let mut definitions = db::find_definitions_scoped(&conn, symbol, limit, scope)?;
     let mut imports = db::find_imports_scoped(&conn, symbol, limit, scope)?;
-    let mut usages = db::find_references_scoped(&conn, symbol, limit, scope)?;
+    let mut usages = usage_source.find(&conn, symbol, limit, scope)?;
 
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     definitions.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
@@ -1010,6 +1010,9 @@ pub fn cmd_refs(
             )
             .cyan()
         );
+        if let Some(note) = usage_source.note(symbol) {
+            println!("    {}", note.dimmed());
+        }
         for r in &usages_page.items {
             println!("    {}:{}", r.path.cyan(), r.line);
             if let Some(ctx) = &r.context {
@@ -1055,14 +1058,21 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
         .or(packages.first())
         .or(protocols.first());
 
-    if target.is_none() {
+    let Some(target) = target else {
         println!("{}", format!("Class '{}' not found.", name).red());
         return Ok(());
-    }
+    };
 
-    println!("{}", format!("Hierarchy for '{}':", name).bold());
+    // `LedgerImporter` finds `class Billing::LedgerImporter`, whose index
+    // name is the full one: name what was found, and read its parents by it.
+    let heading = if target.name == name {
+        name
+    } else {
+        target.display_name()
+    };
+    println!("{}", format!("Hierarchy for '{}':", heading).bold());
 
-    let parents: Vec<(String, String)> = db::find_parents_scoped(&conn, name, scope)?;
+    let parents: Vec<(String, String)> = db::find_parents_scoped(&conn, &target.name, scope)?;
 
     if !parents.is_empty() {
         println!("\n  {}", "Parents:".cyan());
@@ -1133,6 +1143,56 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
     Ok(())
 }
 
+/// Where `usages` and `refs` read the references to a symbol from.
+enum ReferenceSource<'a> {
+    /// References recorded under the name as given.
+    Name,
+    /// A qualified name no reference is recorded under: references are
+    /// recorded under the last segment (`Billing::Invoice.new` records
+    /// `Invoice`), so read those whose line spells the qualified name out.
+    Mention { segment: &'a str },
+}
+
+impl<'a> ReferenceSource<'a> {
+    fn resolve(
+        conn: &rusqlite::Connection,
+        symbol: &'a str,
+        scope: &SearchScope,
+    ) -> Result<(ReferenceSource<'a>, usize)> {
+        let total = db::count_references_scoped(conn, symbol, scope)?;
+        let segment = db::last_name_segment(symbol);
+        if total > 0 || segment == symbol {
+            return Ok((ReferenceSource::Name, total));
+        }
+        let total = db::count_references_mentioning_scoped(conn, segment, symbol, scope)?;
+        Ok((ReferenceSource::Mention { segment }, total))
+    }
+
+    fn find(
+        &self,
+        conn: &rusqlite::Connection,
+        symbol: &str,
+        limit: usize,
+        scope: &SearchScope,
+    ) -> Result<Vec<db::RefResult>> {
+        match self {
+            ReferenceSource::Name => db::find_references_scoped(conn, symbol, limit, scope),
+            ReferenceSource::Mention { segment } => {
+                db::find_references_mentioning_scoped(conn, segment, symbol, limit, scope)
+            }
+        }
+    }
+
+    fn note(&self, symbol: &str) -> Option<String> {
+        match self {
+            ReferenceSource::Name => None,
+            ReferenceSource::Mention { segment } => Some(format!(
+                "(recorded as '{segment}': lines that mention '{symbol}'; `usages {segment}` lists all)"
+            )),
+        }
+    }
+}
+
 /// Find symbol usages (indexed or grep-based)
 pub fn cmd_usages(
     root: &Path,
@@ -1147,13 +1207,10 @@ pub fn cmd_usages(
     if db_path.exists() {
         let conn = db::open_db_leased(root)?;
 
-        // Check if refs table has data
-        let refs_count = db::count_references_scoped(&conn, symbol, scope)?;
+        let (source, total) = ReferenceSource::resolve(&conn, symbol, scope)?;
 
-        if refs_count > 0 {
-            // Use indexed references with scope filtering
-            let total = db::count_references_scoped(&conn, symbol, scope)?;
-            let mut refs = db::find_references_scoped(&conn, symbol, limit, scope)?;
+        if total > 0 {
+            let mut refs = source.find(&conn, symbol, limit, scope)?;
             let resolver = PathResolver::try_from_conn(root, &conn)?;
             refs.retain(|r| resolver.matches_filter(r.root_path.as_deref()));
             for r in &mut refs {
@@ -1174,6 +1231,9 @@ pub fn cmd_usages(
                 )
                 .bold()
             );
+            if let Some(note) = source.note(symbol) {
+                println!("  {}", note.dimmed());
+            }
 
             for r in &page.items {
                 println!("  {}:{}", r.path.cyan(), r.line);

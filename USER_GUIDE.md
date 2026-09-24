@@ -478,6 +478,16 @@ ast-index map                           # compact project map
 ast-index conventions                   # detected frameworks and patterns
 ```
 
+`symbol`, `class`, `refs`, `hierarchy` and `implementations` find a class
+under a namespace by its short name or its full name: `LedgerImporter` and
+`Billing::LedgerImporter` both find `class Billing::LedgerImporter`. A short
+name looks for that exact name first and only then for names whose last `::`
+or `.` segment it is, so a top-level `LedgerImporter` wins over namespaced
+ones. References are recorded under the last segment, so `usages
+Billing::LedgerImporter` lists the references to `LedgerImporter` on lines that
+spell out `Billing::LedgerImporter` (and says so); `usages LedgerImporter`
+lists all of them. `unused-symbols` looks references up the same way.
+
 Use JSON for scripts or agents:
 
 ```bash

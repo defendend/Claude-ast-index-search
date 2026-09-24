@@ -109,11 +109,12 @@ pub fn cmd_unused_symbols(
     let mut unused: Vec<&db::SearchResult> = Vec::new();
 
     for sym in &symbols {
-        // Check refs table
+        // References are recorded under the last segment of a qualified name,
+        // and Ruby indexes `class Billing::Invoice` under its full name.
         let ref_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM refs WHERE name = ?1 LIMIT 1",
-                params![sym.name],
+                params![db::last_name_segment(&sym.name)],
                 |row| row.get(0),
             )
             .unwrap_or(0);
