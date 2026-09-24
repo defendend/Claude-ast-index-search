@@ -19,7 +19,32 @@ pub static GROOVY_PARSER: GroovyParser = GroovyParser;
 
 pub struct GroovyParser;
 
+/// Comments and string and character literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &GROOVY_LANGUAGE,
+    prose: &["line_comment", "block_comment"],
+    strings: &["string_literal", "character_literal"],
+    code: &[],
+    keep: gstring,
+    declared: super::declares_nothing,
+};
+
+/// A double-quoted string with `$` in it, kept whole: the grammar reads a
+/// GString's `${expr}` as plain text, and the expression is code.
+fn gstring(content: &str, string: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    let text = node_text(content, &string);
+    if text.starts_with('"') && text.contains('$') {
+        vec![string.byte_range()]
+    } else {
+        Vec::new()
+    }
+}
+
 impl LanguageParser for GroovyParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &GROOVY_LANGUAGE)?;
         let mut symbols = Vec::new();

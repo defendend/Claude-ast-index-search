@@ -19,7 +19,21 @@ pub static OBJC_PARSER: ObjcParser = ObjcParser;
 
 pub struct ObjcParser;
 
+/// Comments and string, character and `<header>` literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &OBJC_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string_literal", "char_literal", "system_lib_string"],
+    code: &[],
+    keep: super::keep_no_string,
+    declared: super::cpp::declared_function_name,
+};
+
 impl LanguageParser for ObjcParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &OBJC_LANGUAGE)?;
         let mut symbols = Vec::new();

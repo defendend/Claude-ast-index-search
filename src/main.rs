@@ -569,10 +569,14 @@ enum Commands {
         #[arg(long)]
         module: Option<String>,
     },
-    /// Show symbols in a file
+    /// Show symbols in a file with the lines they span
     Outline {
         /// File path
         file: String,
+        /// List every symbol: schema dump columns are otherwise folded into a
+        /// count on their table
+        #[arg(long)]
+        full: bool,
     },
     /// Show imports in a file
     Imports {
@@ -1501,7 +1505,9 @@ fn main() -> Result<()> {
             exact,
             limit,
         } => commands::files::cmd_file(&root, &pattern, exact, limit, format),
-        Commands::Outline { file } => commands::files::cmd_outline(&root, &file),
+        Commands::Outline { file, full } => {
+            commands::files::cmd_outline(&root, &file, full, format)
+        }
         Commands::Imports { file } => commands::files::cmd_imports(&root, &file),
         Commands::Api { module_path, limit } => {
             commands::files::cmd_api(&root, &module_path, limit)

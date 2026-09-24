@@ -67,6 +67,11 @@ ast-index outline "main.py"
 ast-index usages "UserService"
 ```
 
+`usages` skips names in comments, docstrings and strings, except a string that
+is a dotted name ending in a class name (`"UserService"`,
+`"app.services.UserService"` in a forward-referenced annotation or a
+`mock.patch` target) and the `{...}` of an f-string.
+
 ## Indexed Python Patterns
 
 ### Class Definition

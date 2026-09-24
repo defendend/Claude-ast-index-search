@@ -31,11 +31,13 @@ ast-index supports parsing and indexing Ruby source files (`.rb`).
 `db/schema.rb` (and `db/<name>_schema.rb`) is indexed even when `.gitignore`
 lists it: it is the only place that declares a model's columns. Only
 `create_table` blocks inside `ActiveRecord::Schema.define` count; migrations
-do not produce tables or columns.
+do not produce tables or columns. The schema block itself yields no
+references, so `usages string` does not list its `t.string` lines.
 
 ```bash
 ast-index search first_name -t column       # every table with that column
-ast-index outline db/schema.rb              # tables and their columns
+ast-index outline db/schema.rb              # tables with line ranges and column counts
+ast-index outline db/schema.rb --full       # every column as its own row
 ast-index graph dependents users.email      # model code reading the column (after graph build)
 ```
 
@@ -233,9 +235,20 @@ Indexed as:
 (parameters, assignments, block parameters and `rescue => e` are locals).
 Core Ruby and Active Support methods of strings, numbers and collections
 (`each`, `map`, `to_s`, `count`, `merge`, ...) are not recorded when called
-without parentheses. A lowercase `name(` inside a comment, a string or a
-heredoc is not a call and is not recorded. RSpec `let(:name)` /
+without parentheses. Nothing inside a comment, a string, a heredoc or a regex
+is recorded, except `#{...}` interpolation and strings that name a class: a
+string or `%w[]` word that is exactly a constant path (`class_name:
+'Invoice'`, `%w[Event::Stage]`) and a quoted constant path inside a string or
+heredoc (`WHERE type = 'Event::Stage'`). RSpec `let(:name)` /
 `subject(:name)` helpers are graph targets named `name` inside their spec file.
+
+A symbol naming a method is a reference too: callbacks and custom validators
+(`before_save :normalize`, `before_action :authorize`, `validate :check`),
+validated attributes (`validates :email`, `validates_presence_of :email`),
+`if:` / `unless:` conditions, `rescue_from ... with: :handler`,
+`helper_method`, the original of `alias_method`, `delegate :name, to: :owner`
+(both names) and block arguments (`map(&:total)`). Other symbols
+(`on: :create`, enum values) are data.
 
 ## Import Handling
 

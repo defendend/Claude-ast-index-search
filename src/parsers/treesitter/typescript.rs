@@ -6,7 +6,8 @@ use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{
-    line_text, node_end_line, node_line, node_text, parse_tree, signature_line, LanguageParser,
+    extract_refs_masked, line_text, mask_non_code, node_end_line, node_line, node_text, parse_tree,
+    signature_line, LanguageParser, NonCode,
 };
 use crate::db::SymbolKind;
 use crate::parsers::{truncate_context, FileType, ParsedRef, ParsedSymbol};
@@ -1046,7 +1047,8 @@ impl TypeScriptParser {
     ) -> Result<Vec<ParsedRef>> {
         // Keep the existing generic extraction as a baseline; add AST-aware refs
         // for TypeScript-specific constructs it cannot see, then deduplicate.
-        let mut refs = super::super::extract_references_for_lang(content, defined, file_type)?;
+        let masked = mask_non_code(content, tree.root_node(), &TS_NON_CODE);
+        let mut refs = extract_refs_masked(content, &masked, defined, file_type)?;
 
         let mut bindings: HashMap<String, Vec<AliasBinding>> = HashMap::new();
         collect_alias_bindings(content, &tree.root_node(), &mut bindings);
@@ -1054,6 +1056,45 @@ impl TypeScriptParser {
         dedup_refs(&mut refs);
         Ok(refs)
     }
+}
+
+/// Comments, JSX text, regexes and string literals; only the `${...}` of a
+/// template string is code.
+static TS_NON_CODE: NonCode = NonCode {
+    language: &TS_LANGUAGE,
+    prose: &["comment", "jsx_text", "regex"],
+    strings: &["string", "template_string"],
+    code: &["template_substitution"],
+    keep: module_specifier,
+    declared: super::declares_nothing,
+};
+
+/// The module path of a dynamic `import('./Page')` or a `require('./Page')`,
+/// kept whole: it names the file of a component loaded lazily.
+fn module_specifier(content: &str, string: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    if is_module_specifier(content, string) {
+        vec![string.byte_range()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn is_module_specifier(content: &str, string: tree_sitter::Node) -> bool {
+    let Some(call) = string
+        .parent()
+        .filter(|arguments| arguments.kind() == "arguments")
+        .and_then(|arguments| arguments.parent())
+    else {
+        return false;
+    };
+    call.kind() == "call_expression"
+        && call
+            .child_by_field_name("function")
+            .is_some_and(|function| {
+                function.kind() == "import"
+                    || (function.kind() == "identifier"
+                        && node_text(content, &function) == "require")
+            })
 }
 
 /// Check if a node is inside a class_body (class member, not object literal method)

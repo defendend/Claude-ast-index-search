@@ -502,7 +502,13 @@ Paginated search commands use JSON schema v2. Single-result-set commands return
 `refs` keep named arrays with per-array pagination metadata. Clients written
 for bare arrays must unwrap `items`, and every client should check `truncated`
 before treating results as complete. Increase `--limit` to request more rows.
-The `changed` command remains on its independent schema v1.
+The `changed` command remains on its independent schema v1. `outline --format
+json` reads one file and has no limit, so it uses its own schema v1 as well:
+`{ schema_version, file, symbols: [{ name, kind, line, end_line }] }`, plus
+`skipped` (`not_found`, `minified` or `unsupported`) when it parsed nothing.
+A schema table carries `columns` (the folded count) unless `--full` is given.
+`end_line` is `null` where the parser reports no range; the text form prints
+a multi-line definition as `:line-end_line`.
 
 ## Advanced
 
@@ -574,6 +580,27 @@ words of C/C++, Go, Python, Rust, Perl and JavaScript never count: `sizeof (x)`,
 `except (A, B):` and `None`. A reserved word used as a member
 (`map.delete(key)`) or called as a Perl `&name(...)` is still a reference.
 
+A name inside a comment, a docstring or a string literal is not a reference:
+the syntax tree tells prose from code for Ruby, Python, JavaScript/TypeScript,
+C/C++ (macro bodies included), Objective-C, Go, Rust, Java, Kotlin, C#, PHP,
+Swift, Scala, Dart, Lua, Groovy, Elixir, Bash, R, Zig and Protocol Buffers.
+Code nested in a string still counts — `#{...}`, `${...}`, f-string `{...}`,
+Swift `\(...)`, the identifiers a Rust format string captures
+(`format!("{LIMIT}")`) — and so do strings that name code: a Ruby string or
+`%w[]` word that is exactly a constant path (`class_name: 'Invoice'`,
+`'Event::Stage'`), a quoted constant path inside a Ruby string or heredoc
+(`WHERE type = 'Event::Stage'`), a Python string that is a dotted name ending
+in a class name (`"User"`, `"pkg.models.User"` in an annotation or
+`mock.patch`), the path of a JavaScript `import('./Page')` / `require()`, and a
+Groovy GString with `${...}` in it. Perl, Vue/Svelte script blocks, SQL and
+the other grammars keep the line-based comment skipping only.
+
+In C, C++ and Objective-C a function declaration outside a function body —
+a header prototype (`int send_alert(SSL *s);`, also behind `__owur` or
+similar attribute macros), a `static` forward declaration, a method declared
+in a class, a function-pointer field or typedef — declares its name and is not
+a use of it; the parameter types on that line still are.
+
 BSL (1C:Enterprise, OneScript) references are calls in Cyrillic or Latin
 (`ПолучитьДанные()`), a module or object before `.` (`ОбщегоНазначения.`) and
 the type after `Новый` / `New`; a plain capitalized word is a variable, and
@@ -588,10 +615,29 @@ example to the `let` helpers it uses. Calls on a receiver of unknown type stay
 parentheses are not recorded at all. A lowercase `name(` counts only where the
 syntax tree has a call: in a comment, a string or a heredoc it does not.
 
+A symbol that names a method is a reference to it: a callback or custom
+validator (`before_save :normalize`, `before_action :authorize`, `validate
+:check_total`, and the other Active Record, Action Controller and Active Job
+callbacks), an attribute a validation reads (`validates :email`,
+`validates_presence_of :email` — inside a model that resolves to the column),
+a condition (`if: :paid?`, `unless: [:draft?, :locked?]`), `rescue_from ...
+with: :handler`, `helper_method :current_user`, the original of `alias_method`,
+and what `delegate :name, to: :owner` forwards and where. The class links to
+those methods, so `graph dependents normalize` shows the model that registers
+the callback. `map(&:total)` and the forwarded `name` are calls on another
+object and resolve like `value.total`; other symbols (`on: :create`, `status:
+:active`) are data.
+
 In a Rails application `db/schema.rb` is indexed even when it is gitignored:
 each `create_table` becomes a `table` symbol and each column a `column` symbol
 named `table.column` (`ast-index search email -t column` lists the columns
-named `email` before `email_confirmed` and the like). `graph build`
+named `email` before `email_confirmed` and the like). The lines of the
+`ActiveRecord::Schema.define` block are not references: `t.string` and
+`t.integer` name column types, not the project's `string` or `integer`
+methods. `outline db/schema.rb` prints each table with its line range and
+column count (`:96-149 orders [table] 33 columns`) instead of thousands of
+column rows; `outline --full` lists every column, and `ast-index symbol --type
+column --pattern 'orders.*'` lists one table's. `graph build`
 matches tables to models by Active Record's rules — `self.table_name`,
 single-table inheritance, a model nested in another model, a namespace's
 `table_name_prefix` or engine `isolate_namespace`, then the pluralized class

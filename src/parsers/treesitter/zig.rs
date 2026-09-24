@@ -28,7 +28,21 @@ pub static ZIG_PARSER: ZigParser = ZigParser;
 
 pub struct ZigParser;
 
+/// Comments and string and character literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &ZIG_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string", "multiline_string", "character"],
+    code: &[],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for ZigParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &ZIG_LANGUAGE)?;
         let mut symbols = Vec::new();

@@ -19,7 +19,21 @@ pub static LUA_PARSER: LuaParser = LuaParser;
 
 pub struct LuaParser;
 
+/// Comments and string literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &LUA_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string"],
+    code: &[],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for LuaParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &LUA_LANGUAGE)?;
         let mut symbols = Vec::new();

@@ -22,7 +22,26 @@ pub static SWIFT_PARSER: SwiftParser = SwiftParser;
 
 pub struct SwiftParser;
 
+/// Comments, string and regex literals; the interpolations of a string are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &SWIFT_LANGUAGE,
+    prose: &["comment", "multiline_comment"],
+    strings: &[
+        "line_string_literal",
+        "multi_line_string_literal",
+        "raw_string_literal",
+        "regex_literal",
+    ],
+    code: &["interpolated_expression", "raw_str_interpolation"],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for SwiftParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &SWIFT_LANGUAGE)?;
         let mut symbols = Vec::new();

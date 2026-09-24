@@ -62,7 +62,21 @@ const SIGNIFICANT_ANNOTATIONS: &[&str] = &[
     "Log4j2",
 ];
 
+/// Comments and string and character literals; a string template's embedded expressions are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &JAVA_LANGUAGE,
+    prose: &["line_comment", "block_comment"],
+    strings: &["string_literal", "character_literal"],
+    code: &["string_interpolation"],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for JavaParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &JAVA_LANGUAGE)?;
         let mut symbols = Vec::new();

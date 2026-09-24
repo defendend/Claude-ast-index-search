@@ -22,7 +22,8 @@ Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swif
 5. **Use grep/Search ONLY when:**
    - ast-index returns empty results
    - Searching for regex patterns (ast-index uses literal match)
-   - Searching for string literals inside code (`"some text"`)
+   - Searching for string literals inside code (`"some text"`) — `usages` and
+     `refs` skip names inside strings and comments
    - Searching in comments content
 
 **Why:** ast-index is 17-69x faster than grep (1-10ms vs 200ms-3s) and returns structured, accurate results.
@@ -356,7 +357,18 @@ ast-index outline "PaymentFragment.kt"    # Show Kotlin fragment structure
 ast-index outline "UserController.java"   # Show Java controller methods
 ast-index outline "App.tsx"               # Show TypeScript/React components and functions
 ast-index outline "handler.rs"            # Show Rust structs, impls, functions
+ast-index outline --format json "app.rb"  # {schema_version: 1, file, symbols: [{name, kind, line, end_line}]}
 ```
+
+Rows are in source order. A definition spanning several lines prints its range
+(`:12-40 Invoice [class]`), so `Read` can take exactly that slice; a one-line
+definition prints `:12`. `end_line` is `null` in JSON where the parser reports
+no range.
+
+In a schema dump (`db/schema.rb`) the columns are folded into their table's
+row (`:96-149 orders [table] 33 columns`) so the outline stays small; `--full`
+lists every column, and `symbol --type column --pattern 'users.*'` lists one
+table's.
 
 ### Code Quality
 

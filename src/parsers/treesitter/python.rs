@@ -6,6 +6,7 @@ use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{
     line_text, node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser,
+    NonCode,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -21,7 +22,48 @@ pub static PYTHON_PARSER: PythonParser = PythonParser;
 
 pub struct PythonParser;
 
+/// Comments and string literals, docstrings included; only the `{...}` of
+/// an f-string is code.
+static PY_NON_CODE: NonCode = NonCode {
+    language: &PY_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string"],
+    code: &["interpolation"],
+    keep: names_class,
+    declared: super::declares_nothing,
+};
+
+/// A string that is exactly a dotted name ending in a class-like name
+/// (`"Config"`, `"pkg.models.User"`), kept whole: a forward-referenced
+/// annotation, an `__all__` entry, a `mock.patch` target. Upper-case
+/// strings (`"GET"`, `"M"`) are data.
+fn names_class(content: &str, string: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    let mut cursor = string.walk();
+    let mut parts = string
+        .named_children(&mut cursor)
+        .filter(|part| !matches!(part.kind(), "string_start" | "string_end"));
+    let (Some(only), None) = (parts.next(), parts.next()) else {
+        return Vec::new();
+    };
+    let text = node_text(content, &only);
+    let dotted = text.split('.').all(|segment| {
+        segment.starts_with(|c: char| c.is_alphabetic() || c == '_')
+            && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
+    });
+    let last = text.rsplit('.').next().unwrap_or(text);
+    let class_like = last.starts_with(char::is_uppercase) && last.chars().any(char::is_lowercase);
+    if only.kind() == "string_content" && dotted && class_like {
+        vec![string.byte_range()]
+    } else {
+        Vec::new()
+    }
+}
+
 impl LanguageParser for PythonParser {
+    fn non_code(&self) -> Option<&'static NonCode> {
+        Some(&PY_NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &PY_LANGUAGE)?;
         let mut symbols = Vec::new();

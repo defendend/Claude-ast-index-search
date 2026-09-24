@@ -17,7 +17,21 @@ pub static DART_PARSER: DartParser = DartParser;
 
 pub struct DartParser;
 
+/// Comments and string literals; the interpolations of a string are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &DART_LANGUAGE,
+    prose: &["comment", "block_comment", "documentation_block_comment"],
+    strings: &["string_literal"],
+    code: &["template_substitution"],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for DartParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &DART_LANGUAGE)?;
         let mut symbols = Vec::new();

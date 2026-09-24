@@ -17,6 +17,7 @@ use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator};
 
 use super::{
     line_text, node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser,
+    NonCode,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -32,7 +33,117 @@ pub static CPP_PARSER: CppParser = CppParser;
 
 pub struct CppParser;
 
+/// Comments and string, character and `<header>` literals, also inside the
+/// unparsed body of a `#define`.
+static CPP_NON_CODE: NonCode = NonCode {
+    language: &CPP_LANGUAGE,
+    prose: &["comment"],
+    strings: &[
+        "string_literal",
+        "raw_string_literal",
+        "char_literal",
+        "system_lib_string",
+        "preproc_arg",
+    ],
+    code: &[],
+    keep: macro_body_code,
+    declared: declared_function_name,
+};
+
+/// The function a declarator names: `int send_alert(SSL *s);` in a header
+/// declares `send_alert` and does not use it (the parameter types stay
+/// references). The same holds for a definition, a method declared in a
+/// class, a function-pointer field or parameter and a function typedef.
+/// Inside a function body the grammar also reads macro calls and code after
+/// a broken `#if` as declarations (`LHASH_OF(int) *h = ...;`), so only
+/// declarations outside bodies count; where the grammar recovers from an
+/// error (`DEPRECATEDIN_1_1_0(int f(void))`), an upper-case name is a macro
+/// call, not a declared function.
+pub(crate) fn declared_function_name(content: &str, node: Node) -> Option<std::ops::Range<usize>> {
+    if node.kind() != "function_declarator" {
+        return None;
+    }
+    let mut recovered = false;
+    let mut ancestor = node.parent();
+    while let Some(outer) = ancestor {
+        match outer.kind() {
+            "compound_statement" => return None,
+            "ERROR" => recovered = true,
+            _ => {}
+        }
+        ancestor = outer.parent();
+    }
+    let name = declarator_name(node)?;
+    let macro_like = content[name.clone()]
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    (!(recovered && macro_like)).then_some(name)
+}
+
+fn declarator_name(node: Node) -> Option<std::ops::Range<usize>> {
+    let mut name = node.child_by_field_name("declarator")?;
+    loop {
+        let inner = match name.kind() {
+            "pointer_declarator" => name.child_by_field_name("declarator"),
+            "parenthesized_declarator" | "reference_declarator" | "attributed_declarator" => {
+                name.named_child(0)
+            }
+            "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "qualified_identifier"
+            | "destructor_name"
+            | "operator_name"
+            | "template_function" => return Some(name.byte_range()),
+            _ => return None,
+        };
+        name = inner?;
+    }
+}
+
+/// The grammar leaves a macro body as raw text (`preproc_arg`); keep all of it
+/// but its literals and comments, which the scan finds lexically.
+fn macro_body_code(content: &str, node: Node) -> Vec<std::ops::Range<usize>> {
+    if node.kind() != "preproc_arg" {
+        return Vec::new();
+    }
+    let start = node.start_byte();
+    let bytes = node_text(content, &node).as_bytes();
+    let mut code = Vec::new();
+    let mut from = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let end = match (bytes[at], bytes.get(at + 1)) {
+            (quote @ (b'"' | b'\''), _) => {
+                let mut close = at + 1;
+                while close < bytes.len() && bytes[close] != quote {
+                    close += if bytes[close] == b'\\' { 2 } else { 1 };
+                }
+                (close + 1).min(bytes.len())
+            }
+            (b'/', Some(b'*')) => bytes[at + 2..]
+                .windows(2)
+                .position(|pair| pair == b"*/")
+                .map_or(bytes.len(), |offset| at + 2 + offset + 2),
+            (b'/', Some(b'/')) => bytes.len(),
+            _ => {
+                at += 1;
+                continue;
+            }
+        };
+        code.push(start + from..start + at);
+        from = end;
+        at = end;
+    }
+    code.push(start + from..start + bytes.len());
+    code
+}
+
 impl LanguageParser for CppParser {
+    fn non_code(&self) -> Option<&'static NonCode> {
+        Some(&CPP_NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &CPP_LANGUAGE)?;
         let mut symbols = Vec::new();

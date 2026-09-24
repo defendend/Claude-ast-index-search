@@ -22,7 +22,21 @@ pub static SCALA_PARSER: ScalaParser = ScalaParser;
 
 pub struct ScalaParser;
 
+/// Comments and string and character literals; the interpolations of a string are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &SCALA_LANGUAGE,
+    prose: &["comment", "block_comment"],
+    strings: &["string", "interpolated_string", "character_literal"],
+    code: &["interpolation"],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for ScalaParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &SCALA_LANGUAGE)?;
         let mut symbols = Vec::new();

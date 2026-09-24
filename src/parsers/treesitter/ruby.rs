@@ -6,8 +6,9 @@ use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{
-    line_text, node_end_line, node_line, node_text, parse_tree, signature_line, walk_tree_preorder,
-    LanguageParser, WalkControl,
+    extract_refs_masked, is_constant_path, line_text, mask_non_code, node_end_line, node_line,
+    node_text, parse_tree, signature_line, walk_tree_preorder, LanguageParser, NonCode,
+    WalkControl,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -43,11 +44,11 @@ impl RubyParser {
     ) -> Result<Vec<super::super::ParsedRef>> {
         let calls = method_call_refs(content, tree.root_node());
         let called: std::collections::HashSet<(&str, usize)> = calls.iter().copied().collect();
+        let masked = mask_non_code(content, tree.root_node(), &RUBY_NON_CODE);
 
         // A lowercase `name(` the tree does not see as a call on that line
-        // sits in a comment, a string or SQL heredoc, or names the method on
-        // a `def self.name(` line.
-        let mut refs = super::super::extract_references_for_lang(content, defined, file_type)?;
+        // names the method on a `def self.name(` line.
+        let mut refs = extract_refs_masked(content, &masked, defined, file_type)?;
         refs.retain(|r| {
             r.name.starts_with(|c: char| c.is_ascii_uppercase())
                 || called.contains(&(r.name.as_str(), r.line))
@@ -60,15 +61,12 @@ impl RubyParser {
 
         let defined_names: std::collections::HashSet<&str> =
             defined.iter().map(|s| s.name.as_str()).collect();
+        let lines: Vec<&str> = content.lines().collect();
 
-        for (line_num, line) in content.lines().enumerate() {
+        for (line_num, line) in masked.lines().enumerate() {
             let line_num = line_num + 1;
             let trimmed = line.trim();
 
-            // Skip comments and definitions
-            if trimmed.starts_with('#') {
-                continue;
-            }
             if trimmed.starts_with("def ") || trimmed.starts_with("def self.") {
                 continue;
             }
@@ -76,10 +74,11 @@ impl RubyParser {
             for caps in RUBY_BANG_RE.captures_iter(line) {
                 let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 if !name.is_empty() && !defined_names.contains(name) && name.len() > 2 {
+                    let text = lines.get(line_num - 1).map_or("", |l| l.trim());
                     refs.push(super::super::ParsedRef {
                         name: name.to_string(),
                         line: line_num,
-                        context: super::super::truncate_context(trimmed),
+                        context: super::super::truncate_context(text),
                     });
                 }
             }
@@ -87,10 +86,12 @@ impl RubyParser {
 
         // Most Ruby calls are written without parentheses: `recv.name`,
         // `name arg`, a bare `name`. The tree sees them all.
+        // A method named by a symbol is called too: `before_save :normalize`,
+        // `if: :paid?`, `list.map(&:total)`.
         let mut seen: std::collections::HashSet<(String, usize)> =
             refs.iter().map(|r| (r.name.clone(), r.line)).collect();
-        let lines: Vec<&str> = content.lines().collect();
-        for (name, line) in calls {
+        let named = symbol_method_refs(content, tree.root_node());
+        for (name, line) in calls.into_iter().chain(named) {
             if name.len() <= 2 || UNTRACKED_RUBY_CALLS.contains(name) {
                 continue;
             }
@@ -105,8 +106,106 @@ impl RubyParser {
             });
         }
 
+        let schema = schema_definition_lines(content, tree.root_node());
+        if !schema.is_empty() {
+            refs.retain(|r| !schema.iter().any(|lines| lines.contains(&r.line)));
+        }
+
         Ok(refs)
     }
+}
+
+/// Comments, heredocs, regexes, word arrays and string literals; only the
+/// `#{...}` inside them is code.
+static RUBY_NON_CODE: NonCode = NonCode {
+    language: &RUBY_LANGUAGE,
+    prose: &["comment", "heredoc_beginning", "character"],
+    strings: &[
+        "string",
+        "bare_string",
+        "heredoc_body",
+        "regex",
+        "subshell",
+        "delimited_symbol",
+    ],
+    code: &["interpolation"],
+    keep: constant_names_in,
+    declared: super::declares_nothing,
+};
+
+/// The parts of a string that name a class, kept when the string is blanked:
+/// the whole string when it is exactly a constant path (`'Invoice'`,
+/// `"Billing::Plan"`, a `%w[Event::Stage]` word) — how Rails names a class in
+/// `class_name:`, a polymorphic type or a `constantize` call — or else each
+/// quoted constant path inside it, such as an STI type in SQL
+/// (`WHERE type = 'Event::Stage'`).
+fn constant_names_in(content: &str, node: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    static QUOTED_CONSTANT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*'|"(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*""#).unwrap()
+    });
+    if names_constant(content, node) {
+        return vec![node.byte_range()];
+    }
+    if !matches!(node.kind(), "string" | "heredoc_body") {
+        return Vec::new();
+    }
+    let mut kept = Vec::new();
+    let mut cursor = node.walk();
+    for part in node.named_children(&mut cursor) {
+        if !matches!(part.kind(), "string_content" | "heredoc_content") {
+            continue;
+        }
+        let start = part.start_byte();
+        kept.extend(
+            QUOTED_CONSTANT
+                .find_iter(node_text(content, &part))
+                .map(|found| start + found.start()..start + found.end()),
+        );
+    }
+    kept
+}
+
+/// A string or `%w[]` word that is exactly a constant path.
+fn names_constant(content: &str, node: tree_sitter::Node) -> bool {
+    if !matches!(node.kind(), "string" | "bare_string") || node.named_child_count() != 1 {
+        return false;
+    }
+    node.named_child(0).is_some_and(|only| {
+        only.kind() == "string_content" && is_constant_path(node_text(content, &only))
+    })
+}
+
+/// Lines of every `ActiveRecord::Schema.define` block. A schema dump's
+/// `t.string` / `t.integer` / `create_table` calls are column types, not uses
+/// of the project's own `string` or `integer` methods; the tables and columns
+/// are symbols of their own.
+fn schema_definition_lines(
+    content: &str,
+    root: tree_sitter::Node,
+) -> Vec<std::ops::RangeInclusive<usize>> {
+    let mut lines = Vec::new();
+    if !content.contains("ActiveRecord::Schema") {
+        return lines;
+    }
+    walk_tree_preorder(&root, |node| {
+        if node.kind() != "call" {
+            return WalkControl::Continue;
+        }
+        let defines_schema = node
+            .child_by_field_name("method")
+            .is_some_and(|method| node_text(content, &method) == "define")
+            && node
+                .child_by_field_name("receiver")
+                .is_some_and(|receiver| {
+                    node_text(content, &receiver).starts_with("ActiveRecord::Schema")
+                });
+        if defines_schema {
+            lines.push(node_line(&node)..=node_end_line(&node));
+            return WalkControl::SkipChildren;
+        }
+        WalkControl::Continue
+    });
+    lines
 }
 
 /// Calls not recorded as references: keywords in method form, and core Ruby
@@ -175,6 +274,111 @@ fn method_call_refs<'a>(content: &'a str, root: tree_sitter::Node) -> Vec<(&'a s
                     .is_some_and(|(_, locals)| locals.contains(name));
                 if !local {
                     out.push((name, node_line(&node)));
+                }
+            }
+            _ => {}
+        }
+        WalkControl::Continue
+    });
+    out
+}
+
+/// Class-body calls whose symbol arguments name methods of the class: Active
+/// Record, Action Controller and Active Job callbacks, custom validators, view
+/// helpers and `alias_method` (its second argument only).
+static METHOD_NAMING_CALLS: LazyLock<std::collections::HashSet<&str>> = LazyLock::new(|| {
+    "before_validation after_validation before_save around_save after_save before_create
+     around_create after_create before_update around_update after_update before_destroy
+     around_destroy after_destroy after_commit after_rollback after_create_commit
+     after_update_commit after_destroy_commit after_save_commit after_initialize after_find
+     after_touch before_action after_action around_action skip_before_action
+     skip_after_action skip_around_action prepend_before_action prepend_after_action
+     prepend_around_action append_before_action append_after_action append_around_action
+     before_filter after_filter around_filter skip_before_filter before_perform
+     after_perform around_perform before_enqueue after_enqueue around_enqueue validate
+     helper_method"
+        .split_whitespace()
+        .collect()
+});
+
+/// Methods a symbol names, with their lines: a callback or custom validator
+/// (`before_save :normalize`, `validate :check_total`), an attribute a
+/// validation reads (`validates :email`), a condition (`if: :paid?`,
+/// `unless: [:draft?, :locked?]`), a `rescue_from ... with: :handler`, the
+/// original of `alias_method`, what `delegate` forwards and where
+/// (`delegate :name, to: :owner`), and a block argument (`map(&:total)`).
+/// Other symbols are data (`on: :create`, `status: :active`).
+fn symbol_method_refs<'a>(content: &'a str, root: tree_sitter::Node) -> Vec<(&'a str, usize)> {
+    let mut out = Vec::new();
+    let mut push = |node: tree_sitter::Node| {
+        if node.kind() != "simple_symbol" {
+            return;
+        }
+        let name = &node_text(content, &node)[1..];
+        let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name
+                .trim_end_matches(['?', '!'])
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if valid {
+            out.push((name, node_line(&node)));
+        }
+    };
+    walk_tree_preorder(&root, |node| {
+        match node.kind() {
+            "block_argument" => {
+                if let Some(symbol) = node.named_child(0) {
+                    push(symbol);
+                }
+            }
+            "call" => {
+                let Some(args) = node.child_by_field_name("arguments") else {
+                    return WalkControl::Continue;
+                };
+                let method = node
+                    .child_by_field_name("method")
+                    .map_or("", |method| node_text(content, &method));
+                let on_self = node
+                    .child_by_field_name("receiver")
+                    .is_none_or(|receiver| receiver.kind() == "self");
+                let positional = on_self
+                    && (METHOD_NAMING_CALLS.contains(method)
+                        || method == "delegate"
+                        || method == "validates"
+                        || (method.starts_with("validates_") && method.ends_with("_of")));
+                let mut cursor = args.walk();
+                for (index, arg) in args.named_children(&mut cursor).enumerate() {
+                    match arg.kind() {
+                        "simple_symbol"
+                            if positional || (method == "alias_method" && index == 1) =>
+                        {
+                            push(arg)
+                        }
+                        "pair" => {
+                            let key = arg
+                                .child_by_field_name("key")
+                                .map_or("", |key| node_text(content, &key));
+                            let key = key.trim_start_matches(':');
+                            let names_method = matches!(key, "if" | "unless")
+                                || (key == "to" && method == "delegate")
+                                || (key == "with" && method == "rescue_from");
+                            let Some(value) = arg.child_by_field_name("value") else {
+                                continue;
+                            };
+                            if !names_method {
+                                continue;
+                            }
+                            if value.kind() == "array" {
+                                let mut items = value.walk();
+                                for item in value.named_children(&mut items) {
+                                    push(item);
+                                }
+                            } else {
+                                push(value);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -817,17 +1021,6 @@ fn qualify_scoped_constant(content: &str, name_node: &tree_sitter::Node, text: &
         Some(assignment) => prefix_enclosing_scopes(content, assignment, text),
         None => text.to_string(),
     }
-}
-
-/// `Name`, `Scope::Name` or `::Name`: every segment a constant. Excludes
-/// `Scope::method = value`, which is a setter call, not a constant.
-fn is_constant_path(text: &str) -> bool {
-    let text = text.strip_prefix("::").unwrap_or(text);
-    !text.is_empty()
-        && text.split("::").all(|segment| {
-            segment.chars().next().is_some_and(char::is_uppercase)
-                && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
-        })
 }
 
 /// Table-block methods of a schema dump that declare no column of their own.
@@ -1594,6 +1787,54 @@ end
     }
 
     #[test]
+    fn test_schema_dump_has_symbols_but_no_refs() {
+        let content = r#"# Generated from the current state of the Database.
+ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do
+  create_table "invoices", force: :cascade do |t|
+    t.integer "number"
+    t.string "state"
+    t.boolean "paid?"
+  end
+  add_foreign_key "invoices", "people"
+end
+"#;
+        let (symbols, refs) = RUBY_PARSER
+            .parse_symbols_and_refs(content, crate::parsers::FileType::Ruby)
+            .unwrap();
+        assert!(symbols.iter().any(|s| s.name == "invoices.number"));
+        assert!(
+            refs.iter().all(|r| r.line == 1),
+            "refs inside the schema block: {refs:?}"
+        );
+        assert!(!refs
+            .iter()
+            .any(|r| r.name == "integer" || r.name == "string"));
+    }
+
+    #[test]
+    fn test_schema_block_in_a_helper_keeps_the_code_around_it() {
+        let content = r#"module TestDatabase
+  def self.setup
+    ActiveRecord::Schema.define do
+      create_table :widgets do |t|
+        t.string :name
+      end
+    end
+    seed_widgets(Widget)
+  end
+end
+"#;
+        let refs = RUBY_PARSER
+            .extract_refs_for_lang(content, &[], crate::parsers::FileType::Ruby)
+            .unwrap();
+        assert!(!refs
+            .iter()
+            .any(|r| r.name == "string" || r.name == "create_table"));
+        assert!(refs.iter().any(|r| r.name == "seed_widgets" && r.line == 8));
+        assert!(refs.iter().any(|r| r.name == "Widget" && r.line == 8));
+    }
+
+    #[test]
     fn test_create_table_in_a_migration_is_not_a_schema() {
         let content = r#"class CreateInvoices < ActiveRecord::Migration[7.1]
   def change
@@ -1744,6 +1985,51 @@ end
             refs.iter().any(|r| r.name == "success?"),
             "should find 'success?' reference"
         );
+    }
+
+    #[test]
+    fn test_extract_refs_symbols_naming_methods() {
+        let content = r#"class Invoice < ApplicationRecord
+  before_save :normalize_number, if: :draft?
+  after_commit :notify, unless: [:silent?, :imported?]
+  validate :check_total
+  validates :customer_email, presence: true, on: :create
+  delegate :full_name, to: :customer
+  alias_method :amount, :total_amount
+  rescue_from Timeout, with: :handle_timeout
+  enum status: { open: 0 }
+
+  def lines_total
+    lines.map(&:subtotal).sum
+  end
+end
+"#;
+        let refs = RUBY_PARSER.extract_refs(content, &[]).unwrap();
+        let at = |name: &str| -> Vec<usize> {
+            refs.iter()
+                .filter(|r| r.name == name)
+                .map(|r| r.line)
+                .collect()
+        };
+        for (name, line) in [
+            ("normalize_number", 2),
+            ("draft?", 2),
+            ("notify", 3),
+            ("silent?", 3),
+            ("imported?", 3),
+            ("check_total", 4),
+            ("customer_email", 5),
+            ("full_name", 6),
+            ("customer", 6),
+            ("total_amount", 7),
+            ("handle_timeout", 8),
+            ("subtotal", 12),
+        ] {
+            assert_eq!(at(name), vec![line], "{name}: {refs:?}");
+        }
+        for data in ["create", "amount", "status", "open"] {
+            assert!(at(data).is_empty(), "{data} is data: {refs:?}");
+        }
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub mod typescript;
 pub mod zig;
 
 use anyhow::Result;
+use std::sync::LazyLock;
 use tree_sitter::{Language, Parser, Tree};
 
 use super::{extract_references, extract_references_for_lang, FileType, ParsedRef, ParsedSymbol};
@@ -58,7 +59,20 @@ pub trait LanguageParser: Send + Sync {
         defined: &[ParsedSymbol],
         file_type: FileType,
     ) -> Result<Vec<ParsedRef>> {
-        extract_references_for_lang(content, defined, Some(file_type))
+        match self.non_code() {
+            Some(kinds) => {
+                let tree = parse_tree(content, kinds.language)?;
+                masked_refs(content, &tree, kinds, defined, file_type)
+            }
+            None => extract_references_for_lang(content, defined, Some(file_type)),
+        }
+    }
+
+    /// The comment and string kinds of this parser's grammar. With them, the
+    /// default reference extraction reads the file with comments and strings
+    /// blanked out (see [`mask_non_code`]).
+    fn non_code(&self) -> Option<&'static NonCode> {
+        None
     }
 
     /// Symbols and references of one file, as indexing reads them. A parser
@@ -69,8 +83,18 @@ pub trait LanguageParser: Send + Sync {
         content: &str,
         file_type: FileType,
     ) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
+        forget_last_tree();
         let symbols = self.parse_symbols(content)?;
-        let refs = self.extract_refs_for_lang(content, &symbols, file_type)?;
+        let refs = match self.non_code() {
+            Some(kinds) => {
+                let tree = match reuse_tree(content, kinds.language) {
+                    Some(tree) => tree,
+                    None => parse_tree(content, kinds.language)?,
+                };
+                masked_refs(content, &tree, kinds, &symbols, file_type)?
+            }
+            None => self.extract_refs_for_lang(content, &symbols, file_type)?,
+        };
         Ok((symbols, refs))
     }
 }
@@ -119,15 +143,49 @@ fn parse_tree(content: &str, language: &Language) -> Result<Tree> {
         parser
             .set_language(language)
             .map_err(|e| anyhow::anyhow!("Failed to set language: {}", e))?;
-        parser
+        let tree = parser
             .parse(content, None)
-            .ok_or_else(|| anyhow::anyhow!("tree-sitter parse returned None"))
+            .ok_or_else(|| anyhow::anyhow!("tree-sitter parse returned None"))?;
+        LAST_TREE.with(|last| {
+            *last.borrow_mut() = Some((text_key(content), tree.clone()));
+        });
+        Ok(tree)
     })
+}
+
+/// The tree [`parse_tree`] last built, when it was built from `content` itself
+/// with `language`: symbol extraction parses a file, and reference
+/// extraction reads the same tree instead of parsing the file again.
+fn reuse_tree(content: &str, language: &Language) -> Option<Tree> {
+    LAST_TREE.with(|last| {
+        let mut last = last.borrow_mut();
+        let fits = last
+            .as_ref()
+            .is_some_and(|(key, tree)| *key == text_key(content) && *tree.language() == *language);
+        if fits {
+            last.take().map(|(_, tree)| tree)
+        } else {
+            None
+        }
+    })
+}
+
+/// Drop the tree [`reuse_tree`] would hand out: a freed text's address can
+/// come back with a new text of the same length.
+fn forget_last_tree() {
+    LAST_TREE.with(|last| last.borrow_mut().take());
+}
+
+/// A text by its address and length, as long as it is alive.
+fn text_key(content: &str) -> (usize, usize) {
+    (content.as_ptr() as usize, content.len())
 }
 
 // Thread-local parser for reuse (tree-sitter Parser is not Send)
 thread_local! {
     static PARSER: std::cell::RefCell<Parser> = std::cell::RefCell::new(Parser::new());
+    static LAST_TREE: std::cell::RefCell<Option<((usize, usize), Tree)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Helper to get text from a node
@@ -240,6 +298,130 @@ fn signature_line(content: &str, line: usize) -> String {
         end += 1;
     }
     text[..end].to_string()
+}
+
+/// Syntax node kinds of one grammar whose text is not code.
+pub struct NonCode {
+    pub language: &'static LazyLock<Language>,
+    /// Blanked whole: comments, heredoc openers, JSX text.
+    pub prose: &'static [&'static str],
+    /// String-like literals, blanked except for the code nested in them.
+    pub strings: &'static [&'static str],
+    /// That nested code: `#{...}`, `${...}`, an f-string's `{...}`.
+    pub code: &'static [&'static str],
+    /// The byte ranges of a string that stay as written, because the string
+    /// names code (`class_name: 'Invoice'`, `import('./Page')`). The string's
+    /// own range keeps it whole; an empty list blanks it.
+    pub keep: fn(&str, tree_sitter::Node) -> Vec<std::ops::Range<usize>>,
+    /// The name a declaration node declares (a C prototype's function), which
+    /// is no reference to itself.
+    pub declared: fn(&str, tree_sitter::Node) -> Option<std::ops::Range<usize>>,
+}
+
+/// A [`NonCode::declared`] for grammars whose declarations the symbol lines
+/// already cover.
+pub(crate) fn declares_nothing(_: &str, _: tree_sitter::Node) -> Option<std::ops::Range<usize>> {
+    None
+}
+
+/// A [`NonCode::keep`] for grammars whose strings never name code.
+pub(crate) fn keep_no_string(_: &str, _: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    Vec::new()
+}
+
+/// `content` with every comment and string literal blanked byte for byte
+/// (newlines kept), so the line-based reference extraction reads only code
+/// and a name in prose (`# see MergeService`, `"User not found"`, a
+/// docstring) is no reference.
+pub(crate) fn mask_non_code(content: &str, root: tree_sitter::Node, kinds: &NonCode) -> String {
+    let original = content.as_bytes();
+    let mut masked = original.to_vec();
+    let blank = |bytes: &mut [u8], range: std::ops::Range<usize>| {
+        for byte in &mut bytes[range] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    walk_tree_preorder(&root, |node| {
+        if let Some(name) = (kinds.declared)(content, node) {
+            blank(&mut masked, name.clone());
+            // A `;` where the name ended keeps the return type from reading
+            // as a call once the name is gone: `size_t        (`.
+            if let Some(last) = name.end.checked_sub(1).filter(|&last| last >= name.start) {
+                masked[last] = b';';
+            }
+        }
+        let kind = node.kind();
+        if kinds.prose.contains(&kind) {
+            blank(&mut masked, node.byte_range());
+            return WalkControl::SkipChildren;
+        }
+        if !kinds.strings.contains(&kind) {
+            return WalkControl::Continue;
+        }
+        let mut kept = (kinds.keep)(content, node);
+        if kept.first() == Some(&node.byte_range()) {
+            return WalkControl::SkipChildren;
+        }
+        blank(&mut masked, node.byte_range());
+        if !kinds.code.is_empty() {
+            walk_tree_preorder(&node, |inner| {
+                if kinds.code.contains(&inner.kind()) {
+                    kept.push(inner.byte_range());
+                    return WalkControl::SkipChildren;
+                }
+                WalkControl::Continue
+            });
+        }
+        for range in kept {
+            masked[range.clone()].copy_from_slice(&original[range]);
+        }
+        // Strings and comments nested in the restored code are blanked when
+        // the walk reaches them.
+        WalkControl::Continue
+    });
+    String::from_utf8(masked).unwrap_or_else(|_| content.to_string())
+}
+
+/// Generic reference extraction over `masked` (see [`mask_non_code`]), each
+/// reference keeping its line of the original text as context.
+pub(crate) fn extract_refs_masked(
+    content: &str,
+    masked: &str,
+    defined: &[ParsedSymbol],
+    file_type: Option<FileType>,
+) -> Result<Vec<ParsedRef>> {
+    let mut refs = extract_references_for_lang(masked, defined, file_type)?;
+    let lines: Vec<&str> = content.lines().collect();
+    for reference in &mut refs {
+        if let Some(line) = lines.get(reference.line.saturating_sub(1)) {
+            reference.context = super::truncate_context(line.trim());
+        }
+    }
+    Ok(refs)
+}
+
+fn masked_refs(
+    content: &str,
+    tree: &Tree,
+    kinds: &NonCode,
+    defined: &[ParsedSymbol],
+    file_type: FileType,
+) -> Result<Vec<ParsedRef>> {
+    let masked = mask_non_code(content, tree.root_node(), kinds);
+    extract_refs_masked(content, &masked, defined, Some(file_type))
+}
+
+/// `Name`, `Scope::Name` or `::Name`: every segment a constant. Excludes
+/// Ruby's `Scope::method = value`, which is a setter call, not a constant.
+pub(crate) fn is_constant_path(text: &str) -> bool {
+    let text = text.strip_prefix("::").unwrap_or(text);
+    !text.is_empty()
+        && text.split("::").all(|segment| {
+            segment.chars().next().is_some_and(char::is_uppercase)
+                && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
+        })
 }
 
 /// Controls iterative pre-order tree walking.

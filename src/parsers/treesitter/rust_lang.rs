@@ -55,7 +55,49 @@ fn is_significant_attr(name: &str) -> bool {
     )
 }
 
+/// Comments, doc comments included, and string and character literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &RUST_LANGUAGE,
+    prose: &["line_comment", "block_comment"],
+    strings: &["string_literal", "raw_string_literal", "char_literal"],
+    code: &[],
+    keep: captured_format_args,
+    declared: super::declares_nothing,
+};
+
+/// The identifiers a format string captures (`format!("{LIMIT} of {total:>4}")`):
+/// inside a macro call, `{name}` reads the variable or constant `name`.
+fn captured_format_args(content: &str, string: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    static PLACEHOLDER: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\{([A-Za-z_][A-Za-z0-9_]*)(?::[^{}]*)?\}").unwrap());
+    let mut in_macro = false;
+    let mut current = string.parent();
+    while let Some(node) = current {
+        if node.kind() == "macro_invocation" {
+            in_macro = true;
+            break;
+        }
+        if node.kind() != "token_tree" {
+            break;
+        }
+        current = node.parent();
+    }
+    if !in_macro {
+        return Vec::new();
+    }
+    let start = string.start_byte();
+    PLACEHOLDER
+        .captures_iter(node_text(content, &string))
+        .filter_map(|found| found.get(1))
+        .map(|name| start + name.start()..start + name.end())
+        .collect()
+}
+
 impl LanguageParser for RustParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &RUST_LANGUAGE)?;
         let mut symbols = Vec::new();

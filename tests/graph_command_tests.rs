@@ -563,8 +563,31 @@ fn schema_columns_are_indexed_even_when_the_dump_is_gitignored() {
     assert!(columns.contains("people.first_name"), "{columns}");
     assert!(columns.contains("clients.first_name"), "{columns}");
     let outline = ws.run(&["outline", "db/schema.rb"]);
-    assert!(outline.contains("people [table]"), "{outline}");
-    assert!(outline.contains("people.archived [column]"), "{outline}");
+    assert!(
+        outline.contains(":2-6 people [table] 3 columns"),
+        "{outline}"
+    );
+    assert!(
+        outline.contains(":20-22 audits [table] 1 column"),
+        "{outline}"
+    );
+    assert!(!outline.contains("[column]"), "{outline}");
+    assert!(
+        outline.contains("7 columns folded into 5 tables: --full lists them"),
+        "{outline}"
+    );
+    let full = ws.run(&["outline", "db/schema.rb", "--full"]);
+    assert!(full.contains(":4 people.archived [column]"), "{full}");
+    assert!(!full.contains("folded"), "{full}");
+    let folded = ws.json(&["outline", "db/schema.rb"]);
+    let rows = folded["symbols"].as_array().unwrap();
+    assert_eq!(rows.len(), 5, "{folded:#}");
+    assert_eq!(rows[0]["name"], "people");
+    assert_eq!(rows[0]["columns"], 3);
+    let listed = ws.json(&["outline", "db/schema.rb", "--full"]);
+    let rows = listed["symbols"].as_array().unwrap();
+    assert_eq!(rows.len(), 12, "{listed:#}");
+    assert!(rows[0].get("columns").is_none(), "{listed:#}");
 
     ws.write(
         "db/schema.rb",
@@ -575,6 +598,26 @@ fn schema_columns_are_indexed_even_when_the_dump_is_gitignored() {
     assert!(updated.contains("people.nickname"), "{updated}");
     let gone = ws.run(&["search", "archived", "-t", "column"]);
     assert!(!gone.contains("people.archived"), "{gone}");
+}
+
+#[test]
+fn schema_dump_column_types_are_not_references() {
+    let ws = rails_schema_project();
+    ws.write(
+        "app/services/cast.rb",
+        "class Cast\n  def string(value)\n    value.to_s\n  end\n\n  def integer(value)\n    value.to_i\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    let usages = ws.run(&["usages", "string"]);
+    assert!(!usages.contains("db/schema.rb"), "{usages}");
+    let columns = ws.run(&["search", "quantity", "-t", "column"]);
+    assert!(columns.contains("order_lines.quantity"), "{columns}");
+
+    ws.run(&["graph", "build"]);
+    for method in ["string", "integer"] {
+        let report = ws.json(&["graph", "dependents", method, "--include-ambiguous"]);
+        assert!(items(&report).is_empty(), "{report:#}");
+    }
 }
 
 #[test]
@@ -727,6 +770,75 @@ end
     assert_eq!(items(&helper).len(), 1, "{helper:#}");
     let example = find_other(&helper, "it \"builds\"");
     assert_eq!(example["confidence"], "local");
+}
+
+#[test]
+fn ruby_callbacks_and_conditions_link_to_their_methods() {
+    let ws = workspace();
+    ws.write(
+        "app/models/order.rb",
+        r#"class Order
+  before_save :normalize_number, if: :draft?
+  validate :check_total
+  delegate :display_name, to: :customer
+
+  def customer
+    Customer.new
+  end
+
+  def item_names
+    items.map(&:display_name)
+  end
+
+  private
+
+  def normalize_number
+    1
+  end
+
+  def draft?
+    true
+  end
+
+  def check_total
+    2
+  end
+end
+"#,
+    );
+    ws.write(
+        "app/models/customer.rb",
+        "class Customer\n  def display_name\n    \"x\"\n  end\nend\n",
+    );
+    ws.write(
+        "app/models/label.rb",
+        "class Label\n  def display_name\n    \"y\"\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    let usages = ws.run(&["usages", "check_total"]);
+    assert!(usages.contains("app/models/order.rb:3"), "{usages}");
+
+    ws.run(&["graph", "build"]);
+    for (method, source) in [
+        ("normalize_number", "Order"),
+        ("draft?", "Order"),
+        ("check_total", "Order"),
+        ("customer", "delegate :display_name"),
+    ] {
+        let report = ws.json(&["graph", "dependents", method, "--in-file", "order.rb"]);
+        let edge = find_other(&report, source);
+        assert_eq!(edge["confidence"], "local", "{method}: {report:#}");
+    }
+    // What `delegate` forwards and a block argument are calls on another
+    // object: never resolved to the class's own methods.
+    let forwarded = ws.json(&[
+        "graph",
+        "dependents",
+        "display_name",
+        "--in-file",
+        "customer.rb",
+    ]);
+    assert_eq!(forwarded["resolved_edges"], 0, "{forwarded:#}");
 }
 
 #[test]
