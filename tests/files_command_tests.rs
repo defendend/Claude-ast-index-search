@@ -88,7 +88,7 @@ fn file_cli_emits_json_when_requested() {
 #[test]
 fn cmd_outline_handles_missing_file_gracefully() {
     let dir = TempDir::new().unwrap();
-    cmd_outline(dir.path(), "does/not/exist.kt")
+    cmd_outline(dir.path(), "does/not/exist.kt", "text")
         .expect("missing file must print a hint, not error");
 }
 
@@ -98,7 +98,7 @@ fn cmd_outline_parses_a_kotlin_file() {
     let src = dir.path().join("Foo.kt");
     fs::write(&src, "package demo\n\nclass Foo {\n  fun bar() {}\n}\n").unwrap();
 
-    cmd_outline(dir.path(), "Foo.kt").expect("outline of valid Kotlin must succeed");
+    cmd_outline(dir.path(), "Foo.kt", "text").expect("outline of valid Kotlin must succeed");
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn outline_names_an_anonymous_default_export_after_its_file() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout={stdout}");
-    assert!(stdout.contains(":3 useMap [function]"), "stdout={stdout}");
+    assert!(stdout.contains(":3-5 useMap [function]"), "stdout={stdout}");
     assert!(!stdout.contains(" default "), "stdout={stdout}");
 }
 
@@ -132,8 +132,79 @@ fn cmd_outline_handles_unsupported_extension() {
     let src = dir.path().join("notes.unknown_ext_xyz");
     fs::write(&src, "hello\n").unwrap();
 
-    cmd_outline(dir.path(), "notes.unknown_ext_xyz")
+    cmd_outline(dir.path(), "notes.unknown_ext_xyz", "text")
         .expect("unknown extension must print a hint, not error");
+}
+
+fn run_outline(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_ast-index"))
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .arg("outline")
+        .args(args)
+        .output()
+        .expect("ast-index binary must run");
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn outline_prints_the_line_range_of_multi_line_definitions() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("billing.rb"),
+        "class Invoice\n  def total\n    1\n  end\n\n  def paid?; true; end\nend\n",
+    )
+    .unwrap();
+
+    let stdout = run_outline(dir.path(), &["billing.rb"]);
+    assert!(stdout.contains("  :1-7 Invoice [class]"), "{stdout}");
+    assert!(stdout.contains("  :2-4 total [function]"), "{stdout}");
+    assert!(stdout.contains("  :6 paid? [function]"), "{stdout}");
+}
+
+#[test]
+fn outline_json_lists_symbols_with_end_lines() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("billing.rb"),
+        "require 'json'\n\nclass Invoice\n  def total\n    1\n  end\nend\n",
+    )
+    .unwrap();
+
+    let stdout = run_outline(dir.path(), &["billing.rb", "--format", "json"]);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "JSON must be uncoloured: {stdout}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["file"], "billing.rb");
+    assert!(doc.get("skipped").is_none(), "{doc:#}");
+    let rows = doc["symbols"].as_array().unwrap();
+    // Imports stay out of the outline, as in the text form.
+    assert_eq!(rows.len(), 2, "{doc:#}");
+    assert_eq!(rows[0]["name"], "Invoice");
+    assert_eq!(rows[0]["kind"], "class");
+    assert_eq!(rows[0]["line"], 3);
+    assert_eq!(rows[0]["end_line"], 7);
+    assert_eq!(rows[1]["name"], "total");
+    assert_eq!(rows[1]["end_line"], 6);
+}
+
+#[test]
+fn outline_json_says_why_it_lists_nothing() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("notes.unknown_ext_xyz"), "hello\n").unwrap();
+    for (file, reason) in [
+        ("missing.rb", "not_found"),
+        ("notes.unknown_ext_xyz", "unsupported"),
+    ] {
+        let stdout = run_outline(dir.path(), &[file, "--format", "json"]);
+        let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(doc["skipped"], reason, "{doc:#}");
+        assert_eq!(doc["symbols"].as_array().unwrap().len(), 0);
+    }
 }
 
 // ----------------------------------------------------------------------

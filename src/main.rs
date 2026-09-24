@@ -569,7 +569,7 @@ enum Commands {
         #[arg(long)]
         module: Option<String>,
     },
-    /// Show symbols in a file
+    /// Show symbols in a file with the lines they span
     Outline {
         /// File path
         file: String,
@@ -1495,7 +1495,7 @@ fn main() -> Result<()> {
             exact,
             limit,
         } => commands::files::cmd_file(&root, &pattern, exact, limit, format),
-        Commands::Outline { file } => commands::files::cmd_outline(&root, &file),
+        Commands::Outline { file } => commands::files::cmd_outline(&root, &file, format),
         Commands::Imports { file } => commands::files::cmd_imports(&root, &file),
         Commands::Api { module_path, limit } => {
             commands::files::cmd_api(&root, &module_path, limit)

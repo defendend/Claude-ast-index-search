@@ -19,35 +19,6 @@ use crate::db::SymbolKind;
 use super::{relative_path, search_files};
 use crate::db;
 
-/// Outline helper: parse file with tree-sitter and print symbols, skipping specified kinds.
-/// Returns true if any symbols were printed.
-fn outline_via_treesitter(
-    content: &str,
-    file_type: crate::parsers::FileType,
-    skip_kinds: &[SymbolKind],
-) -> Result<bool> {
-    let (symbols, _refs) = crate::parsers::parse_file_symbols(content, file_type)?;
-    Ok(print_outline(&symbols, skip_kinds))
-}
-
-/// Prints outline rows, skipping specified kinds. Returns true if any were printed.
-fn print_outline(symbols: &[crate::parsers::ParsedSymbol], skip_kinds: &[SymbolKind]) -> bool {
-    let mut found = false;
-    for sym in symbols {
-        if skip_kinds.contains(&sym.kind) {
-            continue;
-        }
-        println!(
-            "  {} {} [{}]",
-            format!(":{}", sym.line).dimmed(),
-            sym.name.cyan(),
-            sym.kind.as_str()
-        );
-        found = true;
-    }
-    found
-}
-
 fn print_minified_notice() {
     println!(
         "  Skipped: minified file, not analysed (set {}=0 to include minified files).",
@@ -98,9 +69,123 @@ pub fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize, format: &
     Ok(())
 }
 
+/// Version of the `outline --format json` document. Outline reads one file
+/// and has no limit, so it has its own schema instead of the paginated one.
+pub const OUTLINE_JSON_SCHEMA_VERSION: u8 = 1;
+
+/// One outline row of `outline --format json`.
+#[derive(Debug, serde::Serialize)]
+struct OutlineRow<'a> {
+    name: &'a str,
+    kind: &'a str,
+    line: usize,
+    /// Last line of the definition; `null` where the parser reports none.
+    end_line: Option<usize>,
+}
+
+/// Why an outline lists no symbols without having parsed the file.
+#[derive(Clone, Copy)]
+enum OutlineSkip {
+    NotFound,
+    Minified,
+    Unsupported,
+}
+
+impl OutlineSkip {
+    fn as_str(self) -> &'static str {
+        match self {
+            OutlineSkip::NotFound => "not_found",
+            OutlineSkip::Minified => "minified",
+            OutlineSkip::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Symbols of `content` as outline shows them, or `None` for an extension no
+/// parser handles. Kinds the outline of that language leaves out are removed.
+fn outline_symbols(
+    content: &str,
+    ext: &str,
+    file: &str,
+) -> Result<Option<Vec<crate::parsers::ParsedSymbol>>> {
+    use crate::parsers::FileType;
+    let (file_type, skip_kinds): (FileType, &[SymbolKind]) = match ext {
+        "pm" | "pl" | "t" => (FileType::Perl, &[SymbolKind::Import]),
+        "py" => (
+            FileType::Python,
+            &[SymbolKind::Import, SymbolKind::Property],
+        ),
+        // .h may be C++, C or ObjC — sniff content
+        "h" if crate::parsers::detect_h_file_objc(content) => {
+            (FileType::ObjC, &[SymbolKind::Import])
+        }
+        "kts" => (FileType::Kotlin, &[SymbolKind::Import]),
+        "dart" => (FileType::Dart, &[SymbolKind::Import, SymbolKind::Property]),
+        "java" => (
+            FileType::Java,
+            &[SymbolKind::Import, SymbolKind::Annotation],
+        ),
+        "proto" | "bsl" | "os" => (
+            FileType::from_extension(ext).unwrap_or(FileType::Proto),
+            &[],
+        ),
+        "m" => (FileType::detect_m_file_type(content), &[SymbolKind::Import]),
+        "mm" => (FileType::ObjC, &[SymbolKind::Import]),
+        _ => match FileType::from_extension(ext) {
+            Some(file_type) => (file_type, &[SymbolKind::Import]),
+            None => return Ok(None),
+        },
+    };
+    let mut symbols = crate::parsers::parse_file_symbols_only(content, file_type)?;
+    if file_type == FileType::TypeScript {
+        // Name the anonymous default export after the file exactly as the
+        // index does.
+        crate::parsers::treesitter::typescript::name_default_export(&mut symbols, file);
+    }
+    symbols.retain(|sym| !skip_kinds.contains(&sym.kind));
+    // Parsers emit definitions in query-match order, which can put a method
+    // before the class around it; an outline reads top to bottom.
+    symbols.sort_by_key(|sym| (sym.line, std::cmp::Reverse(sym.end_line)));
+    Ok(Some(symbols))
+}
+
+/// `:line` or `:line-end_line` for a definition spanning several lines.
+fn outline_position(sym: &crate::parsers::ParsedSymbol) -> String {
+    match sym.end_line {
+        Some(end) if end > sym.line => format!(":{}-{}", sym.line, end),
+        _ => format!(":{}", sym.line),
+    }
+}
+
+fn print_outline_json(
+    file: &str,
+    symbols: &[crate::parsers::ParsedSymbol],
+    skipped: Option<OutlineSkip>,
+) -> Result<()> {
+    let rows: Vec<OutlineRow> = symbols
+        .iter()
+        .map(|sym| OutlineRow {
+            name: &sym.name,
+            kind: sym.kind.as_str(),
+            line: sym.line,
+            end_line: sym.end_line,
+        })
+        .collect();
+    let mut document = serde_json::json!({
+        "schema_version": OUTLINE_JSON_SCHEMA_VERSION,
+        "file": file,
+        "symbols": rows,
+    });
+    if let Some(skipped) = skipped {
+        document["skipped"] = serde_json::Value::from(skipped.as_str());
+    }
+    println!("{}", serde_json::to_string_pretty(&document)?);
+    Ok(())
+}
+
 /// Show file symbols outline
-pub fn cmd_outline(root: &Path, file: &str) -> Result<()> {
-    // Find the file
+pub fn cmd_outline(root: &Path, file: &str, format: &str) -> Result<()> {
+    let json = format == "json";
     let file_path = if file.starts_with('/') {
         PathBuf::from(file)
     } else {
@@ -108,153 +193,49 @@ pub fn cmd_outline(root: &Path, file: &str) -> Result<()> {
     };
 
     if !file_path.exists() {
+        if json {
+            return print_outline_json(file, &[], Some(OutlineSkip::NotFound));
+        }
         println!("{}", format!("File not found: {}", file).red());
         return Ok(());
     }
 
     let header = format!("Outline of {}:", file);
     if crate::minified::skip(&file_path, None) {
+        if json {
+            return print_outline_json(file, &[], Some(OutlineSkip::Minified));
+        }
         println!("{}", header.bold());
         print_minified_notice();
         return Ok(());
     }
 
     let content = std::fs::read_to_string(&file_path)?;
-
-    // Detect file type
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let symbols = outline_symbols(&content, ext, file)?;
+
+    if json {
+        let skipped = symbols.is_none().then_some(OutlineSkip::Unsupported);
+        return print_outline_json(file, symbols.as_deref().unwrap_or(&[]), skipped);
+    }
 
     println!("{}", header.bold());
-
-    let mut found = false;
-
-    if ext == "pm" || ext == "pl" || ext == "t" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Perl,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "py" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Python,
-            &[SymbolKind::Import, SymbolKind::Property],
-        )?;
-    } else if ext == "go" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Go,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "cpp" || ext == "cc" || ext == "c" || ext == "hpp" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Cpp,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "h" {
-        // .h may be C++, C or ObjC — sniff content
-        let ft = if crate::parsers::detect_h_file_objc(&content) {
-            crate::parsers::FileType::ObjC
-        } else {
-            crate::parsers::FileType::Cpp
-        };
-        found = outline_via_treesitter(&content, ft, &[SymbolKind::Import])?;
-    } else if ext == "kt" || ext == "kts" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Kotlin,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "dart" {
-        // Dart — delegate to tree-sitter parser for correct results
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Dart,
-            &[SymbolKind::Import, SymbolKind::Property],
-        )?;
-    } else if ext == "java" {
-        // Java — delegate to tree-sitter
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Java,
-            &[SymbolKind::Import, SymbolKind::Annotation],
-        )?;
-    } else if crate::parsers::FileType::from_extension(ext)
-        == Some(crate::parsers::FileType::TypeScript)
-    {
-        // TypeScript/JavaScript — delegate to tree-sitter, naming the anonymous
-        // default export after the file exactly as the index does.
-        let (mut symbols, _refs) =
-            crate::parsers::parse_file_symbols(&content, crate::parsers::FileType::TypeScript)?;
-        crate::parsers::treesitter::typescript::name_default_export(&mut symbols, file);
-        found = print_outline(&symbols, &[SymbolKind::Import]);
-    } else if ext == "vue" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Vue,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "svelte" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Svelte,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "swift" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Swift,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "rb" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Ruby,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "rs" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Rust,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "scala" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::Scala,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "cs" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::CSharp,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "proto" {
-        found = outline_via_treesitter(&content, crate::parsers::FileType::Proto, &[])?;
-    } else if ext == "m" {
-        let ft = crate::parsers::FileType::detect_m_file_type(&content);
-        found = outline_via_treesitter(&content, ft, &[SymbolKind::Import])?;
-    } else if ext == "mm" {
-        found = outline_via_treesitter(
-            &content,
-            crate::parsers::FileType::ObjC,
-            &[SymbolKind::Import],
-        )?;
-    } else if ext == "bsl" || ext == "os" {
-        found = outline_via_treesitter(&content, crate::parsers::FileType::Bsl, &[])?;
-    } else if let Some(ft) = crate::parsers::FileType::from_extension(ext) {
-        // Any remaining language known to FileType::from_extension
-        found = outline_via_treesitter(&content, ft, &[SymbolKind::Import])?;
-    } else {
+    let Some(symbols) = symbols else {
         println!("  Unsupported file type: .{}", ext);
+        println!("  No symbols found.");
+        return Ok(());
+    };
+    for sym in &symbols {
+        println!(
+            "  {} {} [{}]",
+            outline_position(sym).dimmed(),
+            sym.name.cyan(),
+            sym.kind.as_str()
+        );
     }
-
-    if !found {
+    if symbols.is_empty() {
         println!("  No symbols found.");
     }
-
     Ok(())
 }
 
@@ -478,7 +459,10 @@ fn swift_public_api(
         return Ok(vec![]);
     };
     let conn = crate::db::open_db_leased(root)?;
-    let dir = module_dir.strip_prefix(root).unwrap_or(module_dir).to_string_lossy();
+    let dir = module_dir
+        .strip_prefix(root)
+        .unwrap_or(module_dir)
+        .to_string_lossy();
     let mut items = vec![];
     for sym in crate::db::find_symbols_under(&conn, &dir, ".swift")? {
         if items.len() >= limit {
@@ -486,7 +470,11 @@ fn swift_public_api(
         }
         let signature = sym.signature.unwrap_or_default();
         if sym.kind != "import" && is_swift_public_declaration(&signature) {
-            items.push((sym.path, sym.line as usize, signature.chars().take(100).collect()));
+            items.push((
+                sym.path,
+                sym.line as usize,
+                signature.chars().take(100).collect(),
+            ));
         }
     }
     Ok(items)
@@ -496,8 +484,19 @@ fn swift_public_api(
 /// (`@MainActor public final class X`, `open override func f()`).
 fn is_swift_public_declaration(signature: &str) -> bool {
     const DECLARATION_KEYWORDS: &[&str] = &[
-        "class", "struct", "enum", "protocol", "actor", "extension", "func", "init", "var",
-        "let", "typealias", "subscript", "case",
+        "class",
+        "struct",
+        "enum",
+        "protocol",
+        "actor",
+        "extension",
+        "func",
+        "init",
+        "var",
+        "let",
+        "typealias",
+        "subscript",
+        "case",
     ];
     signature
         .split_whitespace()

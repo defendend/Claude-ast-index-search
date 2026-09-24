@@ -489,7 +489,12 @@ Paginated search commands use JSON schema v2. Single-result-set commands return
 `refs` keep named arrays with per-array pagination metadata. Clients written
 for bare arrays must unwrap `items`, and every client should check `truncated`
 before treating results as complete. Increase `--limit` to request more rows.
-The `changed` command remains on its independent schema v1.
+The `changed` command remains on its independent schema v1. `outline --format
+json` reads one file and has no limit, so it uses its own schema v1 as well:
+`{ schema_version, file, symbols: [{ name, kind, line, end_line }] }`, plus
+`skipped` (`not_found`, `minified` or `unsupported`) when it parsed nothing.
+`end_line` is `null` where the parser reports no range; the text form prints
+a multi-line definition as `:line-end_line`.
 
 ## Advanced
 

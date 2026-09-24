@@ -307,7 +307,13 @@ ast-index outline "PaymentFragment.kt"    # Show Kotlin fragment structure
 ast-index outline "UserController.java"   # Show Java controller methods
 ast-index outline "App.tsx"               # Show TypeScript/React components and functions
 ast-index outline "handler.rs"            # Show Rust structs, impls, functions
+ast-index outline --format json "app.rb"  # {schema_version: 1, file, symbols: [{name, kind, line, end_line}]}
 ```
+
+Rows are in source order. A definition spanning several lines prints its range
+(`:12-40 Invoice [class]`), so `Read` can take exactly that slice; a one-line
+definition prints `:12`. `end_line` is `null` in JSON where the parser reports
+no range.
 
 ### Code Quality
 
