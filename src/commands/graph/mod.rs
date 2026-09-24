@@ -126,9 +126,10 @@ fn max_confidence(include_ambiguous: bool) -> u8 {
 
 /// Imports and annotations (`include Foo`, decorators) are lines inside a
 /// definition, not definitions: references on them belong to the enclosing
-/// symbol and they are never edge targets.
+/// symbol and they are never edge targets. The same rule picks the owner of
+/// a line everywhere else ([`db::is_owner_kind`]).
 fn is_node_kind(kind: &str) -> bool {
-    !matches!(kind, "import" | "annotation")
+    db::is_owner_kind(kind)
 }
 
 fn is_container_kind(kind: &str) -> bool {

@@ -510,7 +510,11 @@ caller with its file, same-named definitions of other files included (two
 `it "works"` blocks are two callers). Callers are looked up by name, so each
 name is expanded once: a later caller of that name is marked
 `(expanded above)`, and `(recursive)` marks only a definition already on its
-own path — a real cycle.
+own path — a real cycle. A call belongs to the definition around it, never to
+an import or annotation line (`use`, `import`, `include Mod`, a Rails
+callback, a multi-line RSpec `include(...)` matcher), and a line that
+declares the function itself (a Go method `func (s *Server) Handle(`, a
+JavaScript method `handle(event) {`, `let(:handle)`) is not a call of it.
 
 Build the symbol dependency graph when you need to know who really depends on
 a definition, how central it is, or what a change would reach transitively:

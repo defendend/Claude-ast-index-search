@@ -22,6 +22,7 @@ use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 
+use super::graph::short_name;
 use super::{print_truncation_notice, relative_path, search_files_limited, PathResolver};
 use crate::db;
 
@@ -664,22 +665,31 @@ fn find_caller_functions(
     let root_key = db::normalize_root_for_storage(root);
     Ok(files_with_calls
         .into_iter()
-        .map(|files| attribute_call_lines(root, &root_key, conn, files, limit, &func_def_re))
+        .zip(function_names)
+        .map(|(files, name)| {
+            attribute_call_lines(root, &root_key, conn, name, files, limit, &func_def_re)
+        })
         .collect())
 }
 
 /// Second pass of [`find_caller_functions`]: the function containing each
-/// call line, at most `limit` distinct ones, the first in path order.
+/// call line of `function_name`, at most `limit` distinct ones, the first in
+/// path order. A line the index knows to declare a definition of that name
+/// is skipped: the match there is the definition, in a form the textual
+/// definition filter does not know (`func (s *Server) Handle(`, a JavaScript
+/// method `handle(event) {`, `attr_reader :handle`), not a call.
 ///
 /// Every file lies under the primary root `root`, stored as `root_key`.
 fn attribute_call_lines(
     root: &Path,
     root_key: &str,
     conn: Option<&rusqlite::Connection>,
+    function_name: &str,
     files_with_calls: BTreeMap<PathBuf, Vec<usize>>,
     limit: usize,
     func_def_re: &Regex,
 ) -> CallerSites {
+    let defined_name = short_name(function_name).unwrap_or(function_name);
     let mut results: CallerSites = vec![];
 
     for (file_path, call_lines) in files_with_calls {
@@ -710,6 +720,15 @@ fn attribute_call_lines(
         for call_line in call_lines {
             if results.len() >= limit {
                 break;
+            }
+            let declares_target = conn.is_some_and(|conn| {
+                db::find_definitions_on_line(conn, Some(root_key), &rel_path, call_line as i64)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|name| short_name(name).unwrap_or(name) == defined_name)
+            });
+            if declares_target {
+                continue;
             }
 
             let owner = conn

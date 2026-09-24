@@ -7188,13 +7188,26 @@ pub fn file_has_symbol_ranges(
     Ok(has_ranges)
 }
 
+/// Whether a symbol of `kind` is a definition that owns the references in
+/// its range. Imports (`use`, `from … import`, `require`) and annotations
+/// (`include Mod`, a decorator, a Rails callback or validation) are lines
+/// inside a definition: a reference on one belongs to the definition around
+/// it, or to none at module level. The SQL of [`find_owning_symbol`] and
+/// [`find_definitions_on_line`] spells out the same two kinds.
+pub fn is_owner_kind(kind: &str) -> bool {
+    !matches!(kind, "import" | "annotation")
+}
+
 /// The symbol whose body contains `line` in `path`, narrowest range first.
 ///
 /// Nested definitions all contain the line, so the ordering picks the method
 /// over the class that encloses it. A symbol without `end_line` is treated as
 /// spanning its own declaration line only, which keeps one-line declarations
-/// (constants, `scope`, `include`) eligible for a reference sitting on them
-/// without letting them claim the rest of the file.
+/// (constants, `scope`, `attr_reader`) eligible for a reference sitting on
+/// them without letting them claim the rest of the file. Imports and
+/// annotations own nothing ([`is_owner_kind`]): `use super::helper;` is no
+/// caller of `helper`, and a multi-line `include(...)` matcher in a spec
+/// does not stand in for the example around it.
 ///
 /// Languages whose parsers report no range at all would then never match, so
 /// files with no `end_line` data fall back to the historical heuristic — the
@@ -7217,6 +7230,7 @@ pub fn find_owning_symbol(
          WHERE f.path = ?1
            AND s.line <= ?2
            AND COALESCE(s.end_line, s.line) >= ?2
+           AND s.kind NOT IN ('import', 'annotation')
            AND ",
         file_under_root_sql!("?3"),
         " ORDER BY COALESCE(s.end_line, s.line) - s.line ASC, s.line DESC
@@ -7236,6 +7250,7 @@ pub fn find_owning_symbol(
          JOIN files f ON s.file_id = f.id
          WHERE f.path = ?1
            AND s.line <= ?2
+           AND s.kind NOT IN ('import', 'annotation')
            AND NOT EXISTS (
                SELECT 1 FROM symbols r
                WHERE r.file_id = s.file_id AND r.end_line IS NOT NULL
@@ -7248,6 +7263,34 @@ pub fn find_owning_symbol(
     Ok(fallback
         .query_row(params![path, line, root_path], row_to_search_result)
         .optional()?)
+}
+
+/// Names of the definitions declared on `line` of `path`, imports and
+/// annotations left out ([`is_owner_kind`]): a text match of one of these
+/// names on that line is the definition itself, not a use of it.
+/// `root_path` is read as in [`get_file_symbols`].
+pub fn find_definitions_on_line(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+    line: i64,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.name
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1
+           AND s.line = ?2
+           AND s.kind NOT IN ('import', 'annotation')
+           AND ",
+        file_under_root_sql!("?3"),
+    ))?;
+    let names = stmt
+        .query_map(params![path, line, root_path.unwrap_or("")], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names)
 }
 
 /// Search references by name (prefix match, grouped by unique name)

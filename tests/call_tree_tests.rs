@@ -472,3 +472,103 @@ fn callers_find_bare_predicate_and_bang_calls_but_not_definitions() {
         )
     );
 }
+
+fn write_project(files: &[(&str, &str)]) -> (TempDir, TempDir) {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    for (path, content) in files {
+        let path = project.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    (project, cache)
+}
+
+/// `leaf` is named by a Rails callback, inside a multi-line RSpec `include`
+/// matcher and on a Python import line; the parsers index the callback and
+/// the matcher as annotations and the import as an import.
+#[test]
+fn call_tree_attributes_import_and_annotation_lines_to_the_definition_around_them() {
+    let (project, cache) = write_project(&[
+        (
+            "lib/record.rb",
+            "class Record\n  before_save :leaf\n\n  def leaf\n    1\n  end\nend\n",
+        ),
+        (
+            "spec/record_spec.rb",
+            concat!(
+                "describe Record do\n",
+                "  it \"keeps fields\" do\n",
+                "    expect(attrs).to include(\n",
+                "      name: subject.leaf\n",
+                "    )\n",
+                "  end\n",
+                "end\n",
+            ),
+        ),
+        (
+            "tools/report.py",
+            "import lib.leaf.tools\n\n\ndef report():\n    return leaf.value()\n",
+        ),
+    ]);
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    let output = run(
+        project.path(),
+        cache.path(),
+        &["call-tree", "leaf", "--depth", "1"],
+    );
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "Call tree for 'leaf':\n",
+            "  leaf\n",
+            "    ← Record (lib/record.rb:1)\n",
+            "    ← it \"keeps fields\" (spec/record_spec.rb:2)\n",
+            "    ← report (tools/report.py:4)\n",
+        )
+    );
+}
+
+/// A Go method with a receiver and a JavaScript class method are declared
+/// in a form the textual definition filter reads as a call.
+#[test]
+fn call_tree_skips_the_definition_line_of_the_function_it_looks_up() {
+    let (project, cache) = write_project(&[
+        (
+            "server/handler.go",
+            concat!(
+                "package server\n\n",
+                "type Server struct{}\n\n",
+                "func (s *Server) Handle(path string) error {\n",
+                "\treturn nil\n",
+                "}\n\n",
+                "func Serve(s *Server) error {\n",
+                "\treturn s.Handle(\"/\")\n",
+                "}\n",
+            ),
+        ),
+        (
+            "web/widget.js",
+            concat!(
+                "export class Widget {\n",
+                "  handle(event) {\n",
+                "    return event;\n",
+                "  }\n\n",
+                "  click(event) {\n",
+                "    return this.handle(event);\n",
+                "  }\n",
+                "}\n",
+            ),
+        ),
+    ]);
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    let tree = |name: &str| stdout(&run(project.path(), cache.path(), &["call-tree", name]));
+    assert_eq!(
+        tree("Handle"),
+        "Call tree for 'Handle':\n  Handle\n    ← Serve (server/handler.go:9)\n"
+    );
+    assert_eq!(
+        tree("handle"),
+        "Call tree for 'handle':\n  handle\n    ← click (web/widget.js:6)\n"
+    );
+}

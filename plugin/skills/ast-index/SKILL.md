@@ -245,7 +245,9 @@ Every caller is printed with its file, including same-named definitions of
 other files (two `it "works"` blocks are two callers). Callers are looked up
 by name, so each name is expanded once: a later caller of that name is marked
 `(expanded above)`, and `(recursive)` marks only a definition already on its
-own path — a real cycle.
+own path — a real cycle. Imports and annotations (`use`, `include Mod`, Rails
+callbacks) never own a call — the definition around them does — and the line
+declaring the function itself is not a call of it.
 
 ### Symbol Dependency Graph
 

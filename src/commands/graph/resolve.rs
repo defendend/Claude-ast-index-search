@@ -1694,8 +1694,8 @@ impl Builder {
 
     /// Same rule as [`db::find_owning_symbol`] — narrowest enclosing range,
     /// later start on ties, last-declared fallback only for files without any
-    /// range — except that import and annotation lines are skipped in favour
-    /// of the definition around them.
+    /// range, import and annotation lines skipped in favour of the definition
+    /// around them.
     fn owner(&self, file: &FileNode, line: i64) -> Option<u32> {
         let mut best: Option<(i64, i64, u32)> = None;
         for &s in &file.symbols {
@@ -2333,14 +2333,18 @@ mod tests {
             )
             .unwrap();
         }
-        let symbols: [(i64, &str, &str, i64, Option<i64>); 13] = [
+        let symbols: [(i64, &str, &str, i64, Option<i64>); 17] = [
+            (1, "json", "import", 0, Some(0)),
             (1, "Outer", "class", 1, Some(30)),
             (1, "first", "function", 3, Some(9)),
+            (1, "include(name: 1)", "annotation", 5, Some(7)),
             (1, "Inner", "class", 11, Some(25)),
+            (1, "include Helpers", "annotation", 12, Some(12)),
             (1, "second", "function", 13, Some(18)),
             (1, "LIMIT", "constant", 20, Some(20)),
             (2, "Widget", "class", 1, None),
             (2, "render", "function", 5, None),
+            (2, "Printable", "annotation", 11, None),
             (2, "paint", "function", 12, None),
             (3, "Twins", "class", 1, Some(12)),
             (3, "left", "function", 3, Some(6)),
@@ -2384,21 +2388,24 @@ mod tests {
     }
 
     #[test]
-    fn owner_skips_annotation_lines_for_the_enclosing_definition() {
+    fn owner_skips_import_and_annotation_lines_for_the_enclosing_definition() {
         let conn = owner_fixture();
-        conn.execute(
-            "INSERT INTO symbols (file_id, name, kind, line, end_line)
-             VALUES (1, 'include Helpers', 'annotation', 12, 12)",
-            [],
-        )
-        .unwrap();
         let builder = Builder::load(&conn, Path::new("/nonexistent")).unwrap();
-        let file = builder
-            .files
-            .iter()
-            .find(|file| file.path == "app/ranged.rb")
-            .unwrap();
-        let owner = builder.owner(file, 12).unwrap();
-        assert_eq!(builder.syms[owner as usize].name, "Inner");
+        let file = |path: &str| {
+            builder
+                .files
+                .iter()
+                .find(|file| file.path == path && file.symbols.len() > 2)
+                .unwrap()
+        };
+        let owner = |path: &str, line: i64| {
+            builder
+                .owner(file(path), line)
+                .map(|s| builder.syms[s as usize].name.as_str())
+        };
+        assert_eq!(owner("app/ranged.rb", 0), None);
+        assert_eq!(owner("app/ranged.rb", 6), Some("first"));
+        assert_eq!(owner("app/ranged.rb", 12), Some("Inner"));
+        assert_eq!(owner("lib/rangeless.kt", 11), Some("render"));
     }
 }
