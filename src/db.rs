@@ -5909,17 +5909,22 @@ const VENDOR_PATH_SQL: &str = "(substr(f.path, 1, 13) = 'node_modules/' \
 
 const NAME_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
 
-/// Whether `name` is a namespaced name whose last `::` segment is `term`, as
+/// Whether `name` is a qualified name whose last segment is `term`, as
 /// `Billing::Importers::LedgerImporter` is for `LedgerImporter`.
 ///
+/// Segments are separated by `::` or `.`: the index records a Rails schema
+/// column as `users.email`, a Ruby singleton method as `self.build`, a
+/// nested protobuf message as `Outer.Inner` and a C# namespace as
+/// `MyApp.Services`.
+///
 /// Statements the index records as symbols — `include Foo::Bar`,
-/// `extend ActiveSupport::Concern` — contain whitespace and are not a name
-/// under a namespace, so they never qualify.
+/// `extend ActiveSupport::Concern`, `describe ".call"` — contain whitespace
+/// and are not a name under a namespace, so they never qualify.
 pub fn is_last_name_segment(name: &str, term: &str) -> bool {
     !name.contains(NAME_WHITESPACE)
         && name
             .strip_suffix(term)
-            .is_some_and(|namespace| namespace.ends_with("::"))
+            .is_some_and(|namespace| namespace.ends_with("::") || namespace.ends_with('.'))
 }
 
 /// [`is_last_name_segment`] over `s.name` for any of `placeholders`. `substr`
@@ -5929,7 +5934,10 @@ fn last_name_segment_sql(placeholders: &[&str]) -> String {
     let suffixes = placeholders
         .iter()
         .map(|placeholder| {
-            format!("substr(s.name, -length({placeholder}) - 2) = '::' || {placeholder}")
+            format!(
+                "substr(s.name, -length({placeholder}) - 2) = '::' || {placeholder} \
+                 OR substr(s.name, -length({placeholder}) - 1) = '.' || {placeholder}"
+            )
         })
         .collect::<Vec<_>>()
         .join(" OR ");
@@ -5976,11 +5984,12 @@ const IMPORT_LAST_SQL: &str = "s.kind = 'import'";
 /// `Applicant` the class lands above `applicant` the accessor for a
 /// capitalised query.
 ///
-/// Right below come names whose last `::` segment equals a term
+/// Right below come names whose last `::` or `.` segment equals a term
 /// ([`is_last_segment_match`]): Ruby indexes `class A::B::MergeService` under
 /// its full name, so `MergeService` has no exact row, and bm25 alone put a
 /// spec's `describe "A::B::MergeService"` — a shorter document — above the
-/// class itself. Imports never enter that tier.
+/// class itself; `users.email` had the same problem against every longer
+/// column that merely starts with `email`. Imports never enter that tier.
 ///
 /// bm25 is then suppressed for the rows of those tiers. They all carry the
 /// same name or last segment, so what is left for the score to measure is
@@ -10814,6 +10823,16 @@ mod tests {
             ("Scopes::Größe", "Größe"),
             ("A::B", "A::B"),
             ("X::A::B", "A::B"),
+            ("users.email", "email"),
+            ("events.email_communicator_email_id", "email"),
+            ("users.email", "Email"),
+            ("self.build", "build"),
+            ("Outer.Inner", "Inner"),
+            ("MyApp.Services", "Services"),
+            ("describe \".call\"", "call"),
+            ("users_email", "email"),
+            ("email", "email"),
+            ("Größe.Maß", "Maß"),
         ];
         for (name, term) in cases {
             let in_sql: bool = conn
@@ -10835,6 +10854,10 @@ mod tests {
         assert!(is_last_name_segment("A::B::Merge", "Merge"));
         assert!(!is_last_name_segment("A::B::AutoMerge", "Merge"));
         assert!(!is_last_name_segment("include A::Merge", "Merge"));
+        assert!(is_last_name_segment("users.email", "email"));
+        assert!(is_last_name_segment("self.build", "build"));
+        assert!(!is_last_name_segment("users.primary_email", "email"));
+        assert!(!is_last_name_segment("describe \".call\"", "call"));
     }
 
     #[test]

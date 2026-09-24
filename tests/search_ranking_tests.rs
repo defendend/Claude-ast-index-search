@@ -305,6 +305,60 @@ fn an_exact_name_still_leads_a_namespaced_one() {
     );
 }
 
+#[test]
+fn a_column_named_after_the_query_leads_longer_columns() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // Rails schema columns are indexed as `table.column`. The longer columns
+    // are shorter FTS documents per match and sort before `users/` by path.
+    let schema = db::upsert_file(&conn, "db/schema.rb", 0, 100).unwrap();
+    for (line, (name, signature)) in [
+        (
+            "events.email_communicator_email_id",
+            "t.bigint \"email_communicator_email_id\"",
+        ),
+        ("accounts.email_confirmed", "t.boolean \"email_confirmed\""),
+        (
+            "users.email",
+            "t.string \"email\", null: false, default: \"\"",
+        ),
+        ("customers.email", "t.string \"email\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        db::insert_symbol(
+            &conn,
+            schema,
+            name,
+            SymbolKind::Column,
+            line + 1,
+            Some(signature),
+        )
+        .unwrap();
+    }
+    // A Ruby singleton method is indexed as `self.email`.
+    insert_with_signature(
+        &conn,
+        "app/models/user.rb",
+        "self.email",
+        SymbolKind::Function,
+        "def self.email(value)",
+    );
+
+    let none = SearchScope::none();
+    let columns =
+        db::search_symbol_terms_scoped(&conn, &["email"], Some("column"), 10, &none, false)
+            .unwrap();
+    assert_eq!(names(&columns)[..2], ["users.email", "customers.email"]);
+    assert_eq!(columns.len(), 4);
+    let all = db::search_symbol_terms_scoped(&conn, &["email"], None, 3, &none, false).unwrap();
+    assert_eq!(
+        names(&all),
+        ["self.email", "users.email", "customers.email"]
+    );
+}
+
 // ----------------------------------------------------------------------
 // Definitions before imports
 // ----------------------------------------------------------------------

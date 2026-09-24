@@ -762,8 +762,8 @@ const FILE_TIERS: [&str; 3] = ["file_stem", "file_name", "directory"];
 
 /// Relevance tier of a symbol hit, mirroring what the plain order ranks
 /// first: the name is a term (case-sensitively, then folded; fuzzy search
-/// does not tell case apart), the last `::` segment of the name is a term
-/// (not under `--fuzzy`, never for an import), a word of the name starts
+/// does not tell case apart), the last `::` or `.` segment of the name is a
+/// term (not under `--fuzzy`, never for an import), a word of the name starts
 /// with a term (what FTS prefix matching found; a substring under
 /// `--fuzzy`), or only the signature matched.
 fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
@@ -1264,6 +1264,9 @@ mod tests {
         assert_eq!(symbol_tier(&symbol("AutoMerge"), &terms, false), 4);
         assert_eq!(symbol_tier(&symbol("AutoMerge"), &terms, true), 3);
         assert_eq!(symbol_tier(&symbol("MERGE"), &terms, true), 0);
+        assert_eq!(symbol_tier(&symbol("self.Merge"), &terms, false), 2);
+        assert_eq!(symbol_tier(&symbol("jobs.Merge"), &terms, false), 2);
+        assert_eq!(symbol_tier(&symbol("jobs.Merged"), &terms, false), 3);
     }
 
     #[test]

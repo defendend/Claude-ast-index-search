@@ -108,8 +108,9 @@ ast-index search "@RestController"   # Find Spring REST controllers (annotation 
 ast-index search "@GetMapping"       # Find GET endpoint mappings
 ```
 
-Symbols come in tiers: exact name, then a name whose last `::` segment is the
-query (`Billing::Invoice` for `Invoice`), then partial matches. Inside each
+Symbols come in tiers: exact name, then a name whose last `::` or `.` segment
+is the query (`Billing::Invoice` for `Invoice`, the schema column `users.email`
+for `email`), then partial matches. Inside each
 tier definitions come before imports and project code before `node_modules`.
 
 **`search --rank <preset>`** - Re-rank the Files and Symbols sections by the

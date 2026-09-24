@@ -553,7 +553,8 @@ syntax tree has a call: in a comment, a string or a heredoc it does not.
 
 In a Rails application `db/schema.rb` is indexed even when it is gitignored:
 each `create_table` becomes a `table` symbol and each column a `column` symbol
-named `table.column` (`ast-index search email -t column`). `graph build`
+named `table.column` (`ast-index search email -t column` lists the columns
+named `email` before `email_confirmed` and the like). `graph build`
 matches tables to models by Active Record's rules — `self.table_name`,
 single-table inheritance, a model nested in another model, a namespace's
 `table_name_prefix` or engine `isolate_namespace`, then the pluralized class
@@ -640,8 +641,10 @@ in the 12 months after T, for T = 12, 24 and 36 months before HEAD.
 1. The pool is the top 100 project symbols of the plain relevance order (or
    `--limit` + 1 if larger) and up to 2000 project files matching the path.
 2. Symbol tiers are hard: exact name (case-sensitive), exact name ignoring
-   case, last `::` segment of the name equal to the query (case-sensitive, not
-   with `--fuzzy`; `Billing::LedgerImporter` for `LedgerImporter`), a word of
+   case, last `::` or `.` segment of the name equal to the query
+   (case-sensitive, not with `--fuzzy`; `Billing::LedgerImporter` for
+   `LedgerImporter`, the schema column `users.email` or the singleton method
+   `self.email` for `email`), a word of
    the name starting with the query (a substring with `--fuzzy`, where case is
    not told apart), signature-only match. The plain order uses the same tiers.
    A preset only re-orders inside a tier, so an exact match is never pushed
