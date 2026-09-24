@@ -553,7 +553,10 @@ syntax tree has a call: in a comment, a string or a heredoc it does not.
 
 In a Rails application `db/schema.rb` is indexed even when it is gitignored:
 each `create_table` becomes a `table` symbol and each column a `column` symbol
-named `table.column` (`ast-index search email -t column`). `graph build`
+named `table.column` (`ast-index search email -t column`). The lines of the
+`ActiveRecord::Schema.define` block are not references: `t.string` and
+`t.integer` name column types, not the project's `string` or `integer`
+methods. `graph build`
 matches tables to models by Active Record's rules — `self.table_name`,
 single-table inheritance, a model nested in another model, a namespace's
 `table_name_prefix` or engine `isolate_namespace`, then the pluralized class

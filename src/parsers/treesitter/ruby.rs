@@ -105,8 +105,46 @@ impl RubyParser {
             });
         }
 
+        let schema = schema_definition_lines(content, tree.root_node());
+        if !schema.is_empty() {
+            refs.retain(|r| !schema.iter().any(|lines| lines.contains(&r.line)));
+        }
+
         Ok(refs)
     }
+}
+
+/// Lines of every `ActiveRecord::Schema.define` block. A schema dump's
+/// `t.string` / `t.integer` / `create_table` calls are column types, not uses
+/// of the project's own `string` or `integer` methods; the tables and columns
+/// are symbols of their own.
+fn schema_definition_lines(
+    content: &str,
+    root: tree_sitter::Node,
+) -> Vec<std::ops::RangeInclusive<usize>> {
+    let mut lines = Vec::new();
+    if !content.contains("ActiveRecord::Schema") {
+        return lines;
+    }
+    walk_tree_preorder(&root, |node| {
+        if node.kind() != "call" {
+            return WalkControl::Continue;
+        }
+        let defines_schema = node
+            .child_by_field_name("method")
+            .is_some_and(|method| node_text(content, &method) == "define")
+            && node
+                .child_by_field_name("receiver")
+                .is_some_and(|receiver| {
+                    node_text(content, &receiver).starts_with("ActiveRecord::Schema")
+                });
+        if defines_schema {
+            lines.push(node_line(&node)..=node_end_line(&node));
+            return WalkControl::SkipChildren;
+        }
+        WalkControl::Continue
+    });
+    lines
 }
 
 /// Calls not recorded as references: keywords in method form, and core Ruby
@@ -1591,6 +1629,54 @@ end
                 ("people.full_name", 13, Some(13)),
             ]
         );
+    }
+
+    #[test]
+    fn test_schema_dump_has_symbols_but_no_refs() {
+        let content = r#"# Generated from the current state of the Database.
+ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do
+  create_table "invoices", force: :cascade do |t|
+    t.integer "number"
+    t.string "state"
+    t.boolean "paid?"
+  end
+  add_foreign_key "invoices", "people"
+end
+"#;
+        let (symbols, refs) = RUBY_PARSER
+            .parse_symbols_and_refs(content, crate::parsers::FileType::Ruby)
+            .unwrap();
+        assert!(symbols.iter().any(|s| s.name == "invoices.number"));
+        assert!(
+            refs.iter().all(|r| r.line == 1),
+            "refs inside the schema block: {refs:?}"
+        );
+        assert!(!refs
+            .iter()
+            .any(|r| r.name == "integer" || r.name == "string"));
+    }
+
+    #[test]
+    fn test_schema_block_in_a_helper_keeps_the_code_around_it() {
+        let content = r#"module TestDatabase
+  def self.setup
+    ActiveRecord::Schema.define do
+      create_table :widgets do |t|
+        t.string :name
+      end
+    end
+    seed_widgets(Widget)
+  end
+end
+"#;
+        let refs = RUBY_PARSER
+            .extract_refs_for_lang(content, &[], crate::parsers::FileType::Ruby)
+            .unwrap();
+        assert!(!refs
+            .iter()
+            .any(|r| r.name == "string" || r.name == "create_table"));
+        assert!(refs.iter().any(|r| r.name == "seed_widgets" && r.line == 8));
+        assert!(refs.iter().any(|r| r.name == "Widget" && r.line == 8));
     }
 
     #[test]

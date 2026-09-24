@@ -578,6 +578,26 @@ fn schema_columns_are_indexed_even_when_the_dump_is_gitignored() {
 }
 
 #[test]
+fn schema_dump_column_types_are_not_references() {
+    let ws = rails_schema_project();
+    ws.write(
+        "app/services/cast.rb",
+        "class Cast\n  def string(value)\n    value.to_s\n  end\n\n  def integer(value)\n    value.to_i\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    let usages = ws.run(&["usages", "string"]);
+    assert!(!usages.contains("db/schema.rb"), "{usages}");
+    let columns = ws.run(&["search", "quantity", "-t", "column"]);
+    assert!(columns.contains("order_lines.quantity"), "{columns}");
+
+    ws.run(&["graph", "build"]);
+    for method in ["string", "integer"] {
+        let report = ws.json(&["graph", "dependents", method, "--include-ambiguous"]);
+        assert!(items(&report).is_empty(), "{report:#}");
+    }
+}
+
+#[test]
 fn model_code_resolves_to_the_columns_of_its_table() {
     let ws = rails_schema_project();
     let summary = ws.json(&["graph", "build"]);

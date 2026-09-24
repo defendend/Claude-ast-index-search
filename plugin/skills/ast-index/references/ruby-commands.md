@@ -31,7 +31,8 @@ ast-index supports parsing and indexing Ruby source files (`.rb`).
 `db/schema.rb` (and `db/<name>_schema.rb`) is indexed even when `.gitignore`
 lists it: it is the only place that declares a model's columns. Only
 `create_table` blocks inside `ActiveRecord::Schema.define` count; migrations
-do not produce tables or columns.
+do not produce tables or columns. The schema block itself yields no
+references, so `usages string` does not list its `t.string` lines.
 
 ```bash
 ast-index search first_name -t column       # every table with that column
