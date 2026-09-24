@@ -5941,6 +5941,30 @@ fn last_name_segment_sql(placeholders: &[&str]) -> String {
     format!("({no_whitespace} AND ({suffixes}))")
 }
 
+/// Whether a symbol of `kind` named `name` belongs to the last-segment tier
+/// for `term`: [`is_last_name_segment`], and not an import.
+///
+/// Imports are indexed under the path they bring in (`use anyhow::Result`
+/// as `anyhow::Result`, `import a.b.C` as `a.b.C`). They name a definition
+/// that lives elsewhere, so a query for `Result` must not rank every file
+/// that imports one above the project's own `SearchResult`.
+pub fn is_last_segment_match(name: &str, kind: &str, term: &str) -> bool {
+    kind != "import" && is_last_name_segment(name, term)
+}
+
+/// [`is_last_segment_match`] over `s.kind` and `s.name`.
+fn last_segment_match_sql(placeholders: &[&str]) -> String {
+    format!(
+        "(s.kind <> 'import' AND {})",
+        last_name_segment_sql(placeholders)
+    )
+}
+
+/// Sort key that puts definitions before imports inside a relevance tier.
+/// An import matches by name exactly like the definition it brings in, and
+/// a class imported in eleven files would otherwise bury the class itself.
+const IMPORT_LAST_SQL: &str = "s.kind = 'import'";
+
 /// Deterministic ordering for a query that matches `symbols_fts`.
 ///
 /// `exact_name_placeholders` bind the raw query terms, and each one is read
@@ -5953,10 +5977,10 @@ fn last_name_segment_sql(placeholders: &[&str]) -> String {
 /// capitalised query.
 ///
 /// Right below come names whose last `::` segment equals a term
-/// ([`is_last_name_segment`]): Ruby indexes `class A::B::MergeService` under
+/// ([`is_last_segment_match`]): Ruby indexes `class A::B::MergeService` under
 /// its full name, so `MergeService` has no exact row, and bm25 alone put a
 /// spec's `describe "A::B::MergeService"` — a shorter document — above the
-/// class itself.
+/// class itself. Imports never enter that tier.
 ///
 /// bm25 is then suppressed for the rows of those tiers. They all carry the
 /// same name or last segment, so what is left for the score to measure is
@@ -5966,15 +5990,16 @@ fn last_name_segment_sql(placeholders: &[&str]) -> String {
 /// s.line` decide instead, which also makes repeated runs return the same
 /// page.
 ///
-/// Inside each tier the project's own code leads third-party code
-/// ([`is_vendor_path`]). Without that, the path tie-break decided, and
-/// `node_modules/…` sorts ahead of `spec/` or `system/`. The tier still comes
-/// first: a library's exact `useState` stays above a project's partial
-/// `useStateModal`, because the library name is what was typed.
+/// Inside each tier definitions lead imports ([`IMPORT_LAST_SQL`]), and the
+/// project's own code leads third-party code ([`is_vendor_path`]). Without
+/// that, the path tie-break decided, and `node_modules/…` sorts ahead of
+/// `spec/` or `system/`. The tier still comes first: a library's exact
+/// `useState` stays above a project's partial `useStateModal`, because the
+/// library name is what was typed.
 fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
     let tail = "length(COALESCE(s.qualified_name, s.name)), f.path, s.line";
     if exact_name_placeholders.is_empty() {
-        return format!(" ORDER BY {VENDOR_PATH_SQL}, {FTS_RANK}, {tail}");
+        return format!(" ORDER BY {IMPORT_LAST_SQL}, {VENDOR_PATH_SQL}, {FTS_RANK}, {tail}");
     }
     let cased = exact_name_placeholders.join(", ");
     let folded = exact_name_placeholders
@@ -5982,12 +6007,13 @@ fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
         .map(|placeholder| format!("lower({placeholder})"))
         .collect::<Vec<_>>()
         .join(", ");
-    let last_segment = last_name_segment_sql(exact_name_placeholders);
+    let last_segment = last_segment_match_sql(exact_name_placeholders);
     format!(
         " ORDER BY \
          CASE WHEN s.name IN ({cased}) THEN 0 \
          WHEN lower(s.name) IN ({folded}) THEN 1 \
          WHEN {last_segment} THEN 2 ELSE 3 END, \
+         {IMPORT_LAST_SQL}, \
          {VENDOR_PATH_SQL}, \
          CASE WHEN lower(s.name) IN ({folded}) OR {last_segment} THEN 0.0 ELSE {FTS_RANK} END, \
          {tail}"
@@ -8070,9 +8096,21 @@ pub fn search_symbol_terms_scoped_with_ids(
         values.push(kind.to_string());
     }
     if fuzzy {
+        // Fuzzy matching does not tell case apart, so its tiers are a name
+        // equal to a term ignoring case, then any other match.
+        let first = values.len() + 1;
+        let folded = (0..terms.len())
+            .map(|offset| format!("lower(?{})", first + offset))
+            .collect::<Vec<_>>()
+            .join(", ");
         sql.push_str(&format!(
-            " ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), {VENDOR_PATH_SQL}, f.path, s.line"
+            " ORDER BY CASE WHEN lower(s.name) IN ({folded}) THEN 0 ELSE 1 END, {IMPORT_LAST_SQL}, length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), {VENDOR_PATH_SQL}, f.path, s.line"
         ));
+        values.extend(
+            terms
+                .iter()
+                .map(|term| term.trim_end_matches('*').to_string()),
+        );
     } else {
         let first = values.len() + 1;
         let placeholders = (0..terms.len())
@@ -8158,7 +8196,7 @@ pub fn search_symbols_for_command(
             sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
         }
         sql.push_str(&format!(
-            " ORDER BY CASE WHEN {column} = ? THEN 0 WHEN {column} LIKE ? THEN 1 ELSE 2 END, length({column}) LIMIT ?"
+            " ORDER BY CASE WHEN {column} = ? THEN 0 WHEN {column} LIKE ? THEN 1 ELSE 2 END, {IMPORT_LAST_SQL}, length({column}) LIMIT ?"
         ));
         if let Some(kind) = kind {
             values.push(kind.to_string());
@@ -10797,6 +10835,41 @@ mod tests {
         assert!(is_last_name_segment("A::B::Merge", "Merge"));
         assert!(!is_last_name_segment("A::B::AutoMerge", "Merge"));
         assert!(!is_last_name_segment("include A::Merge", "Merge"));
+    }
+
+    #[test]
+    fn last_segment_match_leaves_imports_out() {
+        let conn = Connection::open_in_memory().unwrap();
+        let cases = [
+            ("anyhow::Result", "import", "Result"),
+            ("anyhow::Result", "typealias", "Result"),
+            ("Billing::LedgerImporter", "class", "LedgerImporter"),
+            ("Billing::LedgerImporter", "import", "LedgerImporter"),
+            ("Result", "import", "Result"),
+        ];
+        for (name, kind, term) in cases {
+            let in_sql: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM (SELECT ?1 AS name, ?2 AS kind) s",
+                        last_segment_match_sql(&["?3"])
+                    ),
+                    params![name, kind, term],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                in_sql,
+                is_last_segment_match(name, kind, term),
+                "{name:?} [{kind}] / {term:?}"
+            );
+        }
+        assert!(!is_last_segment_match("anyhow::Result", "import", "Result"));
+        assert!(is_last_segment_match(
+            "anyhow::Result",
+            "typealias",
+            "Result"
+        ));
     }
 
     #[test]

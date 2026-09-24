@@ -645,7 +645,10 @@ in the 12 months after T, for T = 12, 24 and 36 months before HEAD.
    the name starting with the query (a substring with `--fuzzy`, where case is
    not told apart), signature-only match. The plain order uses the same tiers.
    A preset only re-orders inside a tier, so an exact match is never pushed
-   below a partial one.
+   below a partial one. Imports never take the last-segment tier (`use
+   anyhow::Result` is indexed as `anyhow::Result`), and inside every tier
+   definitions come before imports, whatever their scores: a class imported
+   in eleven files is listed before those eleven imports.
 3. Inside a tier the sort key is `0.9 × score + 0.1 × relevance`, where
    relevance is `1 / (1 + position / 20)` and position is the candidate's place
    in the tier's plain order. The weight was swept over 11 queries: 0.9

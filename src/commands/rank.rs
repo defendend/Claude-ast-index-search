@@ -675,6 +675,9 @@ struct Candidate<T> {
     item: T,
     relevance_rank: usize,
     tier: u8,
+    /// Sub-tier: candidates of a tier with a higher demotion go after those
+    /// with a lower one whatever their scores ([`symbol_demotion`]).
+    demotion: u8,
     dossier: Dossier,
 }
 
@@ -732,6 +735,7 @@ fn order<T>(candidates: &mut [Candidate<T>], grading: Grading) {
         vendor(left)
             .cmp(&vendor(right))
             .then_with(|| hard_tier(left).cmp(&hard_tier(right)))
+            .then_with(|| left.demotion.cmp(&right.demotion))
             .then_with(|| match (left.dossier.blended, right.dossier.blended) {
                 (Some(a), Some(b)) => b.total_cmp(&a),
                 (Some(_), None) => std::cmp::Ordering::Less,
@@ -759,9 +763,9 @@ const FILE_TIERS: [&str; 3] = ["file_stem", "file_name", "directory"];
 /// Relevance tier of a symbol hit, mirroring what the plain order ranks
 /// first: the name is a term (case-sensitively, then folded; fuzzy search
 /// does not tell case apart), the last `::` segment of the name is a term
-/// (not under `--fuzzy`), a word of the name starts with a term (what FTS
-/// prefix matching found; a substring under `--fuzzy`), or only the
-/// signature matched.
+/// (not under `--fuzzy`, never for an import), a word of the name starts
+/// with a term (what FTS prefix matching found; a substring under
+/// `--fuzzy`), or only the signature matched.
 fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
     let name = result.name.as_str();
     let terms: Vec<&str> = terms.iter().map(|t| t.trim_end_matches('*')).collect();
@@ -776,7 +780,7 @@ fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
     if !fuzzy
         && terms
             .iter()
-            .any(|term| db::is_last_name_segment(name, term))
+            .any(|term| db::is_last_segment_match(name, &result.kind, term))
     {
         return 2;
     }
@@ -797,6 +801,13 @@ fn symbol_tier(result: &SearchResult, terms: &[&str], fuzzy: bool) -> u8 {
     } else {
         4
     }
+}
+
+/// Sub-tier of a symbol hit, as the plain order sorts it: an import goes
+/// after every definition of its tier, whatever the preset thinks of the
+/// file it sits in.
+fn symbol_demotion(result: &SearchResult) -> u8 {
+    u8::from(result.kind == "import")
 }
 
 /// Relevance tier of a path hit: the file name without extension is a term,
@@ -890,6 +901,7 @@ pub fn rank_symbols(
             fill(ctx, &mut dossier, &result.path, primary, graph);
         }
         candidates.push(Candidate {
+            demotion: symbol_demotion(&result),
             item: result,
             relevance_rank: position + 1,
             tier,
@@ -964,6 +976,7 @@ pub fn rank_files(
             item: file,
             relevance_rank: position + 1,
             tier,
+            demotion: 0,
             dossier,
         });
     }
@@ -1254,6 +1267,48 @@ mod tests {
     }
 
     #[test]
+    fn imports_never_take_the_last_segment_tier_and_follow_definitions() {
+        let import = SearchResult {
+            kind: "import".to_string(),
+            ..symbol("anyhow::Result")
+        };
+        let terms = ["Result"];
+        assert_eq!(symbol_tier(&import, &terms, false), 3);
+        assert_eq!(symbol_tier(&symbol("anyhow::Result"), &terms, false), 2);
+        assert_eq!(symbol_demotion(&import), 1);
+        assert_eq!(symbol_demotion(&symbol("SearchResult")), 0);
+
+        let dossier = |score: f64| Dossier {
+            score: Some(score),
+            blended: None,
+            relevance_rank: None,
+            tier: "exact_name",
+            unscored: None,
+            components: Vec::new(),
+            history: None,
+            graph: None,
+        };
+        let mut candidates = vec![
+            Candidate {
+                item: "import-hot",
+                relevance_rank: 1,
+                tier: 0,
+                demotion: 1,
+                dossier: dossier(0.9),
+            },
+            Candidate {
+                item: "class-cold",
+                relevance_rank: 2,
+                tier: 0,
+                demotion: 0,
+                dossier: dossier(0.1),
+            },
+        ];
+        order(&mut candidates, Grading::Positional);
+        assert_eq!(candidates[0].item, "class-cold");
+    }
+
+    #[test]
     fn file_tiers_prefer_the_file_name() {
         let terms = ["merge"];
         assert_eq!(file_tier("app/services/merge.rb", &terms), 0);
@@ -1314,12 +1369,14 @@ mod tests {
                 item: "vendor-exact",
                 relevance_rank: 1,
                 tier: 0,
+                demotion: 0,
                 dossier: vendor,
             },
             Candidate {
                 item: "project-signature",
                 relevance_rank: 2,
                 tier: 3,
+                demotion: 0,
                 dossier: project,
             },
         ];
@@ -1343,6 +1400,7 @@ mod tests {
             item,
             relevance_rank: rank,
             tier,
+            demotion: 0,
             dossier: dossier(score),
         };
         let mut candidates = vec![
@@ -1375,6 +1433,7 @@ mod tests {
             item,
             relevance_rank: rank,
             tier,
+            demotion: 0,
             dossier: dossier(score),
         };
         let mut candidates = vec![

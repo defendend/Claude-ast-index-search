@@ -108,6 +108,10 @@ ast-index search "@RestController"   # Find Spring REST controllers (annotation 
 ast-index search "@GetMapping"       # Find GET endpoint mappings
 ```
 
+Symbols come in tiers: exact name, then a name whose last `::` segment is the
+query (`Billing::Invoice` for `Invoice`), then partial matches. Inside each
+tier definitions come before imports and project code before `node_modules`.
+
 **`search --rank <preset>`** - Re-rank the Files and Symbols sections by the
 file's Git history and the symbol's place in the dependency graph, with a
 dossier next to every result explaining its position. Use it when the question

@@ -306,6 +306,109 @@ fn an_exact_name_still_leads_a_namespaced_one() {
 }
 
 // ----------------------------------------------------------------------
+// Definitions before imports
+// ----------------------------------------------------------------------
+
+/// A Python class imported by eleven modules whose paths all sort before
+/// the one that defines it.
+fn seed_imported_class(conn: &rusqlite::Connection) {
+    for i in 0..11 {
+        insert_with_signature(
+            conn,
+            &format!("pkg/a{i:02}.py"),
+            "InstallRequirement",
+            SymbolKind::Import,
+            "from pkg.req.req_install import InstallRequirement",
+        );
+    }
+    insert_with_signature(
+        conn,
+        "pkg/req/req_install.py",
+        "InstallRequirement",
+        SymbolKind::Class,
+        "class InstallRequirement:",
+    );
+}
+
+#[test]
+fn a_definition_leads_the_imports_of_its_tier() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_imported_class(&conn);
+
+    let none = SearchScope::none();
+    let pages = [
+        db::search_symbols(&conn, "InstallRequirement", 5).unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["InstallRequirement"], None, 5, &none, false)
+            .unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["InstallRequirement"], None, 5, &none, true)
+            .unwrap(),
+        db::search_symbols_scoped(&conn, "InstallRequirement", 5, &module_scope("pkg")).unwrap(),
+        db::search_symbols_for_command(&conn, "InstallRequirement", None, 5, &none, false, false)
+            .unwrap(),
+        db::search_symbols_for_command(&conn, "InstallRequirement", None, 5, &none, true, false)
+            .unwrap(),
+    ];
+    for page in &pages {
+        assert_eq!(
+            located(page).first().map(String::as_str),
+            Some("InstallRequirement:pkg/req/req_install.py:3"),
+            "{:?}",
+            located(page)
+        );
+        assert_eq!(page.len(), 5);
+    }
+}
+
+#[test]
+fn an_import_path_is_not_a_namespaced_definition() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // `use std::path::Path` is indexed as `std::path::Path`, whose last
+    // segment is the query; the project's own types only start with it.
+    for i in 0..12 {
+        insert_with_signature(
+            &conn,
+            &format!("src/commands/c{i:02}.rs"),
+            "std::path::Path",
+            SymbolKind::Import,
+            "use std::path::Path;",
+        );
+    }
+    insert_with_signature(
+        &conn,
+        "src/resolve.rs",
+        "PathResolver",
+        SymbolKind::Class,
+        "pub struct PathResolver {",
+    );
+    insert_with_signature(
+        &conn,
+        "src/walk.rs",
+        "PathWalker",
+        SymbolKind::Class,
+        "pub struct PathWalker {",
+    );
+
+    let none = SearchScope::none();
+    for fuzzy in [false, true] {
+        let page = db::search_symbol_terms_scoped(&conn, &["Path"], None, 4, &none, fuzzy).unwrap();
+        let mut definitions = names(&page)[..2].to_vec();
+        definitions.sort_unstable();
+        assert_eq!(
+            definitions,
+            ["PathResolver", "PathWalker"],
+            "fuzzy: {fuzzy}"
+        );
+        assert_eq!(
+            names(&page)[2..],
+            ["std::path::Path", "std::path::Path"],
+            "fuzzy: {fuzzy}"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
 // Project code before third-party code
 // ----------------------------------------------------------------------
 
