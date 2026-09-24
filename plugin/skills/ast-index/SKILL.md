@@ -69,6 +69,8 @@ The index is stored at `~/Library/Caches/ast-index/<project-hash>/index.db` (mac
 
 Project type is auto-detected by marker files (build.gradle.kts, Package.swift, Makefile.PL, etc.). Python, Go, Proto, WSDL, and C++ files are indexed alongside main project type.
 
+Minified JavaScript/CSS is never indexed or searched: `.js`/`.mjs`/`.cjs`/`.css` files named `*.min.*` or `*-min.*`, or whose first 64 KiB is minifier output (lines averaging 1000+ bytes of code, not one long string). Grep-based commands skip them too, and `outline`/`imports` on such a file print `Skipped: minified file` instead of parsing it. `AST_INDEX_SKIP_MINIFIED=0` turns the filter off.
+
 ## Core Commands
 
 ### Explore (one-shot context)

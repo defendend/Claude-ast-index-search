@@ -128,6 +128,20 @@ ast-index rebuild
 Use `include` when you only want selected directories from a larger tree. Use
 `exclude` for generated or vendored folders that should never enter the index.
 
+Minified JavaScript and CSS is left out without any configuration: it never
+enters the index, the grep-based commands (`search` file contents, `callers`,
+`call-tree`, `todo`, …) never read it, and `outline` / `imports` on such a file
+answer `Skipped: minified file` instead of parsing it. A `.js`, `.mjs`, `.cjs`
+or `.css` file counts as minified when its name ends in `.min` or `-min` before
+the extension (`app.min.js`, `vendor-min.css`), or when its first 64 KiB has
+lines of 1000 bytes or more on average, at least 100 of them outside string
+literals. Source with a few long lines — an inline SVG path, a data URI, an
+HTML or legal-text template in a string — stays below that. TypeScript, JSX,
+SCSS and `.d.ts` files are never judged. Set `AST_INDEX_SKIP_MINIFIED=0` to index
+and search minified files like any other source; the variable applies to
+whichever command runs with it, so keep it set for `update` and the grep-based
+commands too.
+
 ## Keeping The Index Fresh
 
 Use three commands for the index lifecycle:
@@ -154,6 +168,13 @@ tree and compares each file's current `mtime` with the stored one:
 - path exists in the database but is no longer found on disk: delete it from the
   index;
 - current `mtime` is the same or older: leave the existing index rows as-is.
+
+A new or changed file that is minified is not indexed, and one that is already
+in the index is removed like a deleted file. An index written by an older
+version (or with `AST_INDEX_SKIP_MINIFIED=0`) may still hold minified files
+whose `mtime` has not moved; the first `update` after that also checks the
+unchanged `.js` / `.mjs` / `.cjs` / `.css` files once, so no `rebuild` is
+needed to clear them.
 
 `update` does not use `git diff` and does not hash file contents, so it also
 works after ordinary file edits, generated file changes, branch checkouts, and
