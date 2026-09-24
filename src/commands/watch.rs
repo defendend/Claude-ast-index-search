@@ -11,7 +11,7 @@ use notify::RecursiveMode;
 use notify_debouncer_mini::new_debouncer;
 
 use crate::commands::{self, management::ScopedEnvVar};
-use crate::{db, indexer, parsers};
+use crate::{db, indexer, minified, parsers};
 
 fn open_watch_lock(root: &Path) -> Result<std::fs::File> {
     let lock_path = db::get_db_path(root)?.with_extension("watch.lock");
@@ -121,6 +121,9 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
                                 return false;
                             }
                         } else {
+                            return false;
+                        }
+                        if minified::skip_by_name(path) {
                             return false;
                         }
                         // Skip excluded directories

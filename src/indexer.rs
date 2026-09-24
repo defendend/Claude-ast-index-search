@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::db;
+use crate::minified;
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
 
 /// File-size cap for parsing. Larger files are recorded in the `files`
@@ -1201,16 +1202,24 @@ enum PendingUpdateFile {
     },
 }
 
-/// Parse a single file without DB access (thread-safe)
+/// Parse a single file without DB access (thread-safe). `None` for a
+/// minified file, which stays out of the index altogether.
 #[cfg(test)]
-fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
+fn parse_file(root: &Path, file_path: &Path) -> Result<Option<ParsedFile>> {
     parse_file_keyed(root, &db::normalize_root_for_storage(root), file_path)
 }
 
 /// [`parse_file`] with the storage key of `root` computed by the caller.
 /// The key costs a thread and a `realpath` per call, which a walk over tens
 /// of thousands of files must not pay per file.
-fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<ParsedFile> {
+fn parse_file_keyed(
+    root: &Path,
+    root_key: &str,
+    file_path: &Path,
+) -> Result<Option<ParsedFile>> {
+    if minified::skip_by_name(file_path) {
+        return Ok(None);
+    }
     let metadata = fs::metadata(file_path)?;
     let mtime = metadata
         .modified()?
@@ -1230,7 +1239,10 @@ fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Par
     // never read into memory or parsed — that's how a single 200 MB vendor
     // bundle used to push rebuild to 20+ GB RSS.
     if (size as u64) > max_file_size_bytes() {
-        return Ok(ParsedFile {
+        if minified::skip(file_path, None) {
+            return Ok(None);
+        }
+        return Ok(Some(ParsedFile {
             rel_path,
             root_path,
             mtime,
@@ -1239,10 +1251,13 @@ fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Par
             qualified_names: HashMap::new(),
             refs: vec![],
             words: None,
-        });
+        }));
     }
 
     let content = fs::read_to_string(file_path)?;
+    if minified::skip(file_path, Some(content.as_bytes())) {
+        return Ok(None);
+    }
     let words = Some(content_words(&content));
 
     // Detect file type by extension, with content-based sniffing for .m files
@@ -1254,7 +1269,7 @@ fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Par
     } {
         Some(ft) => ft,
         None => {
-            return Ok(ParsedFile {
+            return Ok(Some(ParsedFile {
                 rel_path,
                 root_path,
                 mtime,
@@ -1263,7 +1278,7 @@ fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Par
                 qualified_names: HashMap::new(),
                 refs: vec![],
                 words,
-            });
+            }));
         }
     };
 
@@ -1316,7 +1331,7 @@ fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Par
         }
     }
 
-    Ok(ParsedFile {
+    Ok(Some(ParsedFile {
         rel_path,
         root_path,
         mtime,
@@ -1325,7 +1340,7 @@ fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Par
         qualified_names,
         refs,
         words,
-    })
+    }))
 }
 
 /// Directories to always exclude from indexing (regardless of .gitignore).
@@ -2080,6 +2095,7 @@ fn index_directory_scoped_with_max_depth(
 
     let mut total_count = 0;
     let parsed_global = Arc::new(AtomicUsize::new(0));
+    let minified_skipped = AtomicUsize::new(0);
     if verbose {
         eprintln!("[verbose] using {} threads for parsing", num_threads);
     }
@@ -2091,7 +2107,14 @@ fn index_directory_scoped_with_max_depth(
         num_threads,
         chunk_size,
         &|path: &PathBuf| {
-            let result = parse_file_keyed(root, &root_key, path).ok();
+            let result = match parse_file_keyed(root, &root_key, path) {
+                Ok(Some(parsed)) => Some(parsed),
+                Ok(None) => {
+                    minified_skipped.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+                Err(_) => None,
+            };
             let c = parsed_global.fetch_add(1, Ordering::Relaxed) + 1;
             if progress && c % 2000 == 0 {
                 eprintln!("Parsed {} / {} files...", c, total_files);
@@ -2113,6 +2136,17 @@ fn index_directory_scoped_with_max_depth(
         );
     }
 
+    let minified_skipped = minified_skipped.into_inner();
+    if progress && minified_skipped > 0 {
+        eprintln!(
+            "Skipped {} minified file{} (set {}=0 to index them)",
+            minified_skipped,
+            if minified_skipped == 1 { "" } else { "s" },
+            minified::SKIP_ENV
+        );
+    }
+    record_minified_filter(conn)?;
+
     Ok(WalkResult {
         file_count: total_count,
         module_files,
@@ -2122,6 +2156,19 @@ fn index_directory_scoped_with_max_depth(
         res_files,
         aborted_by_cap: false,
     })
+}
+
+/// Metadata key present while no minified file is left in the index. An index
+/// written by an older version or with the filter off lacks it, and the next
+/// `update` then checks unchanged files too, dropping the minified ones.
+const MINIFIED_FILTER_KEY: &str = "minified_filter";
+
+fn record_minified_filter(conn: &Connection) -> Result<()> {
+    if minified::enabled() {
+        db::set_metadata_value(conn, MINIFIED_FILTER_KEY, "1")
+    } else {
+        db::delete_metadata_value(conn, MINIFIED_FILTER_KEY)
+    }
 }
 
 /// Parse `items` on `threads` workers and write the results to `conn` in
@@ -2375,6 +2422,13 @@ pub fn update_directory_incremental(
         eprintln!("Loaded {} files from index", existing_files.len());
     }
 
+    // Files already in the index are only re-read when they change, so a
+    // minified file an older index kept would never be noticed; until the
+    // filter has run over every file once, unchanged files are checked too.
+    let minified_filter_recorded =
+        db::get_metadata_value(conn, MINIFIED_FILTER_KEY)?.as_deref() == Some("1");
+    let check_unchanged_for_minified = minified::enabled() && !minified_filter_recorded;
+
     // 2. Build the list of (walk_dir, path_anchor) pairs. `path_anchor` is the
     //    base used for `strip_prefix` when computing rel_path — keeping it equal
     //    to the outer root for include sub-paths means the DB stays consistent
@@ -2487,11 +2541,19 @@ pub fn update_directory_incremental(
             if current_paths.contains(&key) {
                 continue;
             }
+            // Left out of `current_paths`, a minified file already in the
+            // index is removed below like a deleted one.
+            if minified::skip_by_name(&file_path) {
+                continue;
+            }
 
             let need_parse = match existing_files.get(&key) {
                 Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
                 None => true,
             };
+            if (need_parse || check_unchanged_for_minified) && minified::skip(&file_path, None) {
+                continue;
+            }
 
             if need_parse {
                 files_to_parse.push(PendingUpdateFile::Regular {
@@ -2588,14 +2650,13 @@ pub fn update_directory_incremental(
                             root,
                             root_key,
                             path,
-                        } => parse_file_keyed(root, root_key, path),
+                        } => parse_file_keyed(root, root_key, path).ok().flatten(),
                         PendingUpdateFile::NodeModulesDts {
                             path,
                             rel_path,
                             root_path,
-                        } => parse_dts_file(path, rel_path, root_path),
-                    }
-                    .ok();
+                        } => parse_dts_file(path, rel_path, root_path).ok(),
+                    };
                     let c = parsed_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
                     if progress && c % 500 == 0 {
                         eprintln!("Parsed {} / {} changed files...", c, total_files);
@@ -2621,6 +2682,9 @@ pub fn update_directory_incremental(
     let all_planned_files_written = updated_count == files_to_parse.len();
     if all_planned_files_written && (has_planned_mutations || was_dirty) {
         db::complete_index_update(conn)?;
+    }
+    if minified::enabled() != minified_filter_recorded {
+        record_minified_filter(conn)?;
     }
 
     Ok((updated_count, files_to_parse.len(), deleted_paths.len()))
@@ -5121,7 +5185,7 @@ no_ignore: true
         let content = "a".repeat(1_100_000);
         fs::write(&large_file, &content).unwrap();
 
-        let result = parse_file(dir.path(), &large_file).unwrap();
+        let result = parse_file(dir.path(), &large_file).unwrap().unwrap();
         assert!(result.symbols.is_empty(), "should skip large files");
         assert!(result.refs.is_empty());
     }
@@ -5132,7 +5196,7 @@ no_ignore: true
         let kt_file = dir.path().join("Test.kt");
         fs::write(&kt_file, "class TestClass {\n    fun doSomething() {}\n}\n").unwrap();
 
-        let result = parse_file(dir.path(), &kt_file).unwrap();
+        let result = parse_file(dir.path(), &kt_file).unwrap().unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "TestClass"));
         assert!(result.symbols.iter().any(|s| s.name == "doSomething"));
     }
@@ -5147,7 +5211,7 @@ no_ignore: true
         )
         .unwrap();
 
-        let result = parse_file(dir.path(), &swift_file).unwrap();
+        let result = parse_file(dir.path(), &swift_file).unwrap().unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "MyView"));
         assert!(result.symbols.iter().any(|s| s.name == "setup"));
     }
@@ -5162,7 +5226,7 @@ no_ignore: true
         )
         .unwrap();
 
-        let result = parse_file(dir.path(), &py_file).unwrap();
+        let result = parse_file(dir.path(), &py_file).unwrap().unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "Service"));
         assert!(result.symbols.iter().any(|s| s.name == "process"));
     }

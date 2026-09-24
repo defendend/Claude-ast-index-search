@@ -48,6 +48,13 @@ fn print_outline(symbols: &[crate::parsers::ParsedSymbol], skip_kinds: &[SymbolK
     found
 }
 
+fn print_minified_notice() {
+    println!(
+        "  Skipped: minified file, not analysed (set {}=0 to include minified files).",
+        crate::minified::SKIP_ENV
+    );
+}
+
 /// Find files by pattern
 pub fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize, format: &str) -> Result<()> {
     if !db::db_exists(root) {
@@ -105,12 +112,19 @@ pub fn cmd_outline(root: &Path, file: &str) -> Result<()> {
         return Ok(());
     }
 
+    let header = format!("Outline of {}:", file);
+    if crate::minified::skip(&file_path, None) {
+        println!("{}", header.bold());
+        print_minified_notice();
+        return Ok(());
+    }
+
     let content = std::fs::read_to_string(&file_path)?;
 
     // Detect file type
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    println!("{}", format!("Outline of {}:", file).bold());
+    println!("{}", header.bold());
 
     let mut found = false;
 
@@ -257,6 +271,13 @@ pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
         return Ok(());
     }
 
+    let header = format!("Imports in {}:", file);
+    if crate::minified::skip(&file_path, None) {
+        println!("{}", header.bold());
+        print_minified_notice();
+        return Ok(());
+    }
+
     let content = std::fs::read_to_string(&file_path)?;
 
     // Detect file type by extension
@@ -268,7 +289,7 @@ pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
     let is_typescript =
         crate::parsers::FileType::from_extension(ext) == Some(crate::parsers::FileType::TypeScript);
 
-    println!("{}", format!("Imports in {}:", file).bold());
+    println!("{}", header.bold());
 
     let mut imports: Vec<String> = vec![];
 

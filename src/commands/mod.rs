@@ -43,7 +43,7 @@ use grep_regex::RegexMatcher;
 use grep_searcher::MmapChoice;
 use grep_searcher::{
     sinks::{Bytes, UTF8},
-    SearcherBuilder,
+    Searcher, SearcherBuilder, Sink,
 };
 use ignore::WalkBuilder;
 use rusqlite::{Connection, OptionalExtension};
@@ -406,7 +406,8 @@ pub fn relative_path(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
-/// Fast parallel file search using grep-searcher and ignore crates
+/// Fast parallel file search using grep-searcher and ignore crates. Like
+/// every grep-based walk here, it never reads minified files.
 pub fn search_files<F>(root: &Path, pattern: &str, extensions: &[&str], handler: F) -> Result<()>
 where
     F: FnMut(&Path, usize, &str),
@@ -630,7 +631,8 @@ where
                             {
                                 let path_arc: Arc<Path> = Arc::from(path);
 
-                                let _ = searcher.search_path(
+                                search_source_file(
+                                    &mut searcher,
                                     &matcher,
                                     path,
                                     UTF8(|line_num, line| {
@@ -780,6 +782,26 @@ where
     Ok(Page::new(items, total, limit))
 }
 
+/// Runs `searcher` over `path` unless it is minified. A file type minifiers
+/// emit is read once, and the same bytes are both judged and searched.
+fn search_source_file<S: Sink>(
+    searcher: &mut Searcher,
+    matcher: &RegexMatcher,
+    path: &Path,
+    sink: S,
+) {
+    if crate::minified::judged_by_content(path) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        if !crate::minified::skip(path, Some(&bytes)) {
+            let _ = searcher.search_slice(matcher, &bytes, sink);
+        }
+    } else if !crate::minified::skip_by_name(path) {
+        let _ = searcher.search_path(matcher, path, sink);
+    }
+}
+
 /// Fast parallel file search with early termination support
 pub fn search_files_limited<F>(
     root: &Path,
@@ -830,7 +852,8 @@ where
                         let found_count = Arc::clone(&found_count);
                         let should_stop = Arc::clone(&should_stop);
 
-                        let _ = searcher.search_path(
+                        search_source_file(
+                            &mut searcher,
                             &matcher,
                             path,
                             UTF8(|line_num, line| {
@@ -929,6 +952,8 @@ struct PatternHit {
 /// patterns matches; each candidate line is then tested against the patterns
 /// one by one. A pattern comes with a literal that all of its matches contain,
 /// checked first because a substring test is far cheaper than the pattern.
+///
+/// Minified files among `files` are passed over without a hit.
 pub fn search_files_limited_each<K, F>(
     files: &[PathBuf],
     candidates: &str,
@@ -1011,7 +1036,8 @@ where
                     // first non-UTF-8 line it matched; this marks the patterns
                     // that did.
                     let mut abandoned = vec![false; exact.len()];
-                    let _ = searcher.search_path(
+                    search_source_file(
+                        &mut searcher,
                         matcher,
                         path,
                         Bytes(|line_num, bytes| {

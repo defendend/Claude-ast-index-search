@@ -226,6 +226,7 @@ keys:
 | `last_update_at` | Unix timestamp in milliseconds for the last completed file-index update. |
 | `index_update_dirty_at` | Unix timestamp in milliseconds marking an incremental update that may be partial; removed when completion is published. |
 | `last_modules_indexed_at` | Unix timestamp in milliseconds for completed module indexing. |
+| `minified_filter` | `1` while no minified JavaScript/CSS file is in `files`, written by `rebuild` and `update` with the filter on. An index from an older version or built with `AST_INDEX_SKIP_MINIFIED=0` lacks it; the next `update` with the filter on then checks unchanged files too and drops the minified ones. |
 | `git_signals_head`, `git_signals_repo_root`, `git_signals_scope`, `git_signals_collected_at` | Commit cursor and bookkeeping of the last `hotspots --collect`. |
 | `git_signals_commits` | Live commits that changed the project (the analysed history). |
 | `git_signals_paths` | Paths that carry history once renames are followed, deleted ones included. |
