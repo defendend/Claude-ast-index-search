@@ -603,6 +603,11 @@ struct Builder {
     /// Table definition -> its columns by column name.
     table_columns: HashMap<u32, HashMap<String, u32>>,
     schema: Option<SchemaLinkSummary>,
+    /// Per importing file: whether one of its imports points at a file,
+    /// keyed by that file. Every reference to a common name asks this for
+    /// the same candidate files again, and each answer is a scan of the
+    /// file's import specifiers.
+    import_memo: Vec<std::sync::Mutex<HashMap<u32, bool>>>,
 }
 
 fn absolute_file_path(root: &Path, root_path: &str, path: &str) -> std::path::PathBuf {
@@ -684,7 +689,9 @@ impl Builder {
             });
         }
 
+        let import_memo = files.iter().map(|_| Default::default()).collect();
         let mut builder = Builder {
+            import_memo,
             files,
             file_index,
             syms,
@@ -1099,12 +1106,18 @@ impl Builder {
         if imports.is_empty() {
             return Vec::new();
         }
+        let mut memo = self.import_memo[file as usize]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cands
             .iter()
             .copied()
             .filter(|&c| {
-                let stem = self.stem_of(c);
-                imports.iter().any(|target| target.matches(stem))
+                let target_file = self.syms[c as usize].file;
+                *memo.entry(target_file).or_insert_with(|| {
+                    let stem = &self.files[target_file as usize].stem;
+                    imports.iter().any(|target| target.matches(stem))
+                })
             })
             .collect()
     }
@@ -1824,6 +1837,96 @@ pub struct SchemaSummary {
     pub column_references: u64,
 }
 
+/// References of one file: `(name, line, context)` rows.
+type FileRefs = (i64, Vec<(String, i64, Option<String>)>);
+
+/// References held in memory at once while files resolve in parallel.
+const RESOLVE_GROUP_REFS: usize = 200_000;
+
+/// What resolving one file's references contributes to the graph.
+#[derive(Default)]
+struct FileResolution {
+    edges: HashMap<(u32, u32), EdgeAcc>,
+    refs_by_level: HashMap<Confidence, u64>,
+    dropped: HashMap<DropReason, u64>,
+    references_seen: u64,
+    column_references: u64,
+}
+
+fn resolve_file(
+    builder: &Builder,
+    file_id: i64,
+    mut batch: Vec<(String, i64, Option<String>)>,
+) -> FileResolution {
+    let mut out = FileResolution::default();
+    let Some(&file) = builder.file_index.get(&file_id) else {
+        return out;
+    };
+    let file_node = &builder.files[file as usize];
+    if file_node.vendor {
+        return out;
+    }
+    batch.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+    batch.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    for (name, line, context) in batch {
+        out.references_seen += 1;
+        let Some(source) = builder.owner(file_node, line) else {
+            *out.dropped.entry(DropReason::NoOwner).or_default() += 1;
+            continue;
+        };
+        let outcome = builder
+            .resolve_reference(file, source, &name, line, context.as_deref())
+            .and_then(|mut resolution| {
+                resolution.targets.retain(|&t| t != source);
+                if resolution.targets.is_empty() {
+                    Err(DropReason::SelfReference)
+                } else if !resolution.confidence.is_resolved()
+                    && resolution.targets.len() > AMBIGUITY_CAP
+                {
+                    Err(DropReason::TooAmbiguous)
+                } else {
+                    Ok(resolution)
+                }
+            });
+        match outcome {
+            Err(reason) => *out.dropped.entry(reason).or_default() += 1,
+            Ok(resolution) => {
+                *out.refs_by_level.entry(resolution.confidence).or_default() += 1;
+                if resolution.confidence.is_resolved()
+                    && builder.syms[resolution.targets[0] as usize].kind == "column"
+                {
+                    out.column_references += 1;
+                }
+                let candidates = if resolution.confidence.is_resolved() {
+                    1
+                } else {
+                    resolution.targets.len() as u32
+                };
+                for target in resolution.targets {
+                    let entry = out.edges.entry((source, target)).or_insert(EdgeAcc {
+                        confidence: resolution.confidence,
+                        candidates,
+                        refs: 0,
+                        line,
+                    });
+                    if resolution.confidence < entry.confidence {
+                        entry.confidence = resolution.confidence;
+                        entry.candidates = candidates;
+                    }
+                    entry.refs += 1;
+                    entry.line = entry.line.min(line);
+                }
+            }
+        }
+    }
+    // The memo only serves the file that is resolving.
+    builder.import_memo[file as usize]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    out
+}
+
 /// Build (or rebuild) the stored symbol graph from the current index.
 pub fn build_symbol_graph(
     conn: &mut Connection,
@@ -1848,86 +1951,64 @@ pub fn build_symbol_graph(
     let mut dropped: HashMap<DropReason, u64> = HashMap::new();
     let mut references_seen = 0u64;
     let mut column_references = 0u64;
-    let mut pending: Vec<(String, i64, Option<String>)> = Vec::new();
-    let mut pending_file: Option<i64> = None;
 
-    let mut flush = |file_id: i64, batch: &mut Vec<(String, i64, Option<String>)>| {
-        let Some(&file) = builder.file_index.get(&file_id) else {
-            batch.clear();
-            return;
-        };
-        let file_node = &builder.files[file as usize];
-        if file_node.vendor {
-            batch.clear();
-            return;
+    // Files resolve independently, so each is resolved on its own thread and
+    // the results are folded in file order. Folding an edge keeps the lowest
+    // confidence with the candidate count of the first reference that
+    // reached it, exactly as one pass over the references in order does.
+    let mut merge = |resolved: FileResolution| {
+        references_seen += resolved.references_seen;
+        column_references += resolved.column_references;
+        for (level, count) in resolved.refs_by_level {
+            *refs_by_level.entry(level).or_default() += count;
         }
-        batch.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
-        batch.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-        for (name, line, context) in batch.drain(..) {
-            references_seen += 1;
-            let Some(source) = builder.owner(file_node, line) else {
-                *dropped.entry(DropReason::NoOwner).or_default() += 1;
-                continue;
-            };
-            let outcome = builder
-                .resolve_reference(file, source, &name, line, context.as_deref())
-                .and_then(|mut resolution| {
-                    resolution.targets.retain(|&t| t != source);
-                    if resolution.targets.is_empty() {
-                        Err(DropReason::SelfReference)
-                    } else if !resolution.confidence.is_resolved()
-                        && resolution.targets.len() > AMBIGUITY_CAP
-                    {
-                        Err(DropReason::TooAmbiguous)
-                    } else {
-                        Ok(resolution)
+        for (reason, count) in resolved.dropped {
+            *dropped.entry(reason).or_default() += count;
+        }
+        for (key, acc) in resolved.edges {
+            match edges.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(acc);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let entry = slot.get_mut();
+                    if acc.confidence < entry.confidence {
+                        entry.confidence = acc.confidence;
+                        entry.candidates = acc.candidates;
                     }
-                });
-            match outcome {
-                Err(reason) => *dropped.entry(reason).or_default() += 1,
-                Ok(resolution) => {
-                    *refs_by_level.entry(resolution.confidence).or_default() += 1;
-                    if resolution.confidence.is_resolved()
-                        && builder.syms[resolution.targets[0] as usize].kind == "column"
-                    {
-                        column_references += 1;
-                    }
-                    let candidates = if resolution.confidence.is_resolved() {
-                        1
-                    } else {
-                        resolution.targets.len() as u32
-                    };
-                    for target in resolution.targets {
-                        let entry = edges.entry((source, target)).or_insert(EdgeAcc {
-                            confidence: resolution.confidence,
-                            candidates,
-                            refs: 0,
-                            line,
-                        });
-                        if resolution.confidence < entry.confidence {
-                            entry.confidence = resolution.confidence;
-                            entry.candidates = candidates;
-                        }
-                        entry.refs += 1;
-                        entry.line = entry.line.min(line);
-                    }
+                    entry.refs += acc.refs;
+                    entry.line = entry.line.min(acc.line);
                 }
             }
         }
     };
+    let resolve_group = |group: Vec<FileRefs>| -> Vec<FileResolution> {
+        group
+            .into_par_iter()
+            .map(|(file_id, batch)| resolve_file(&builder, file_id, batch))
+            .collect()
+    };
 
+    let mut group: Vec<FileRefs> = Vec::new();
+    let mut group_refs = 0usize;
     db::for_each_graph_ref(conn, |file_id, name, line, context| {
-        if pending_file != Some(file_id) {
-            if let Some(previous) = pending_file {
-                flush(previous, &mut pending);
+        if group.last().map(|(id, _)| *id) != Some(file_id) {
+            if group_refs >= RESOLVE_GROUP_REFS {
+                for resolved in resolve_group(std::mem::take(&mut group)) {
+                    merge(resolved);
+                }
+                group_refs = 0;
             }
-            pending_file = Some(file_id);
+            group.push((file_id, Vec::new()));
         }
-        pending.push((name.to_string(), line, context.map(str::to_string)));
+        if let Some((_, batch)) = group.last_mut() {
+            batch.push((name.to_string(), line, context.map(str::to_string)));
+        }
+        group_refs += 1;
         Ok(())
     })?;
-    if let Some(previous) = pending_file {
-        flush(previous, &mut pending);
+    for resolved in resolve_group(group) {
+        merge(resolved);
     }
 
     if verbose {
