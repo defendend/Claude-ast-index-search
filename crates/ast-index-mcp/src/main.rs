@@ -166,7 +166,7 @@ fn handle_request(
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION
                 },
-                "instructions": "Prefer these ast-index tools over grep/ripgrep and over reading whole files for any code or symbol search in this project. They query a precomputed index of definitions, references and files: structural, language-aware, and far cheaper in tokens and round-trips. Rules of thumb: `explore` FIRST to understand an area or answer 'how does X work' (one call returns ranked source + callers/subclasses + tests); `search` for broad discovery; `usages`/`refs`/`callers` for a named symbol; `outline` before reading a file over ~500 lines; `graph_dependents` before changing a symbol; `search` with `rank` to pick which of several matches to copy or to treat with care. Reach for raw grep/Read only for plain text, regex, or non-code files, or to confirm a detail these tools did not cover."
+                "instructions": "Prefer these ast-index tools over grep/ripgrep and over reading whole files for any code or symbol search in this project. They query a precomputed index of definitions, references and files: structural, language-aware, and far cheaper in tokens and round-trips. Rules of thumb: `explore` FIRST to understand an area or answer 'how does X work' (one call returns ranked symbols with an outline or source + callers/subclasses + tests); `search` for broad discovery; `usages`/`refs`/`callers` for a named symbol; `outline` before reading a file over ~500 lines; `graph_dependents` before changing a symbol; `search` with `rank` to pick which of several matches to copy or to treat with care. Reach for raw grep/Read only for plain text, regex, or non-code files, or to confirm a detail these tools did not cover."
             }),
         ),
         "tools/list" => ok(id, json!({ "tools": tool_descriptors() })),
@@ -198,7 +198,7 @@ fn tool_descriptors() -> Vec<Value> {
     vec![
         json!({
             "name": "explore",
-            "description": "Call this FIRST for 'how does X work', 'where/what is X' or an area survey: one call returns the ranked source of the relevant symbols (read fresh from disk), their callers/subclasses and tests found by path convention — instead of a grep + read loop. Dependencies' .d.ts and cross-stack matches rank lower.",
+            "description": "Call this FIRST for 'how does X work', 'where/what is X' or an area survey: one call returns the relevant symbols ranked, an outline with line ranges of the best types/modules and the source of the best functions (read fresh from disk), their callers/subclasses and tests found by path convention — instead of a grep + read loop. Dependencies' .d.ts and cross-stack matches rank lower.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

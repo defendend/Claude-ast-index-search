@@ -1,6 +1,5 @@
 {
   "dominant_language": "rb",
-  "fallback": "explore",
   "files": [
     {
       "line": 2,
@@ -61,7 +60,6 @@
   ],
   "neighbours": [],
   "query": "charge invoice gateway",
-  "reason": "no literal matches for a multi-word query; results are ranked by relevance",
   "symbols": [
     {
       "kind": "function",

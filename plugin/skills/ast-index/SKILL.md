@@ -76,11 +76,14 @@ Minified JavaScript/CSS is never indexed or searched: `.js`/`.mjs`/`.cjs`/`.css`
 
 ### Explore (one-shot context)
 
-**`explore`** - Rank the symbols most relevant to a query, print their source
-(read fresh from disk), list graph neighbours (callers/subclasses), and locate
-tests by path convention — in a single call. Prefer this over a search + read
-loop when you want to understand an area. Language-agnostic and vendor-aware
-(`node_modules` `.d.ts` and cross-stack matches are down-ranked, never deleted).
+**`explore`** - Rank the symbols most relevant to a query, show the best files
+— an outline with line ranges for a type or module (the definitions inside it,
+the chosen one marked `→`), the source (read fresh from disk) for a function —
+list graph neighbours (callers/subclasses), and locate tests by path convention
+— in a single call. Prefer this over a search + read loop when you want to
+understand an area; read the slice an outline row points at next.
+Language-agnostic and vendor-aware (`node_modules` `.d.ts` and cross-stack
+matches are down-ranked, never deleted).
 
 ```bash
 ast-index explore applicant merge MergeService   # bag of symbol/file names
@@ -90,7 +93,12 @@ ast-index explore Repository --max-files 8        # cap source files shown (defa
 ast-index explore Session request --rwr --format json
 ```
 
-- Default (Stage A) ranks by lexical match + multi-term corroboration.
+- Default (Stage A) ranks by lexical match + multi-term corroboration. The
+  words of a question are also read run together (`pdf to html service` finds
+  `PdfToHtmlService`) and against file paths, so a CamelCase class is found
+  from its words; the type a file is named after ranks above helpers, and
+  statements (`has_many :x`, `scope`, `include`) and namespace-only modules
+  rank below definitions. Question words (`how`, `does`, `work`) are ignored.
 - `--rwr` (Stage B) builds a call/inheritance graph in memory and re-ranks by
   personalized PageRank, surfacing callers/subclasses in a "Graph neighbours"
   section. Slightly slower; best when you care about who-calls-what.
