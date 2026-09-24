@@ -87,11 +87,14 @@ compact text format reliably.
 shared by every symbol in it, so a symbol whose file was already described
 says `history and graph: as above` instead of repeating the numbers.
 
+`explore` answers with a text report under an `explore: <query>` line: the
+source of the best functions and an outline (`:start-end name [kind]` rows)
+of the best types and modules, the ranked symbols, graph neighbours and tests
+found by path convention.
+
 A multi-word `search` without literal matches answers with `explore` results.
 The text starts with `fallback: explore — <reason>` and carries the same
-report `explore` returns: the source of the best functions and an outline
-(`:start-end name [kind]` rows) of the best types and modules, the ranked
-symbols, graph neighbours and tests found by path convention.
+report.
 
 ## Install
 

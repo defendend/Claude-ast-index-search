@@ -747,6 +747,11 @@ exclude:
   `→`, at most 40 rows) instead of the first lines of its source; functions
   keep their source. JSON `files[]` carry `outline` and `outline_hidden` in
   place of `source` for those, and the MCP `search` fallback renders them.
+- **MCP `explore` answers in compact text** — the tool returned the raw CLI
+  JSON, with source escaped into strings, although its description promised
+  text by default; it now renders the report the `search` fallback prints under
+  an `explore: <query>` line, less than half the size. `format: "json"` still
+  returns the JSON.
 - **Definitions rank above imports** — inside every relevance tier of `search`
   (plain, `--fuzzy`, `--rank`) definitions now come before imports, and imports
   never enter the last-segment tier: `search InstallRequirement` in pip lists

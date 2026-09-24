@@ -34,6 +34,7 @@ pub fn to_compact(tool: &str, raw_json: &str) -> String {
 
     let mut out = String::with_capacity(raw_json.len() / 2);
     let rendered = match tool {
+        "explore" => render_explore(&value, &mut out),
         "search" => render_search(&value, &mut out),
         "refs" => render_refs(&value, &mut out),
         "usages" | "callers" => render_ref_list(&value, &mut out),
@@ -156,8 +157,21 @@ fn write_search_content(
 }
 
 // ---------------------------------------------------------------------------
-// search falling back to explore
+// explore, and search falling back to it
 // ---------------------------------------------------------------------------
+
+/// `explore`: the report under a line naming the query.
+fn render_explore(v: &Value, out: &mut String) -> bool {
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    if !obj.get("symbols").is_some_and(Value::is_array) {
+        return false;
+    }
+    let query = obj.get("query").and_then(Value::as_str).unwrap_or("");
+    writeln!(out, "explore: {query}").ok();
+    render_explore_report(obj, out)
+}
 
 /// A multi-word `search` without literal matches answers with the `explore`
 /// report instead, marked `fallback: "explore"`.
@@ -1806,7 +1820,7 @@ mod tests {
     // `graph build` / `hotspots --collect` ran. `search_explore_fallback.json`
     // is a multi-word `search` without literal matches over a small Ruby
     // billing repository: functions come with their source, the `Invoice`
-    // class with an outline.
+    // class with an outline; `explore.json` is `explore` on the same query.
 
     macro_rules! fixture {
         ($name:literal) => {
@@ -2180,6 +2194,42 @@ mod tests {
         ));
         assert!(out.contains("  app/models/invoice.rb ← no test file found by convention"));
         assert!(out.len() < json.len(), "not compact: {out}");
+    }
+
+    #[test]
+    fn explore_renders_as_compact_text_not_json() {
+        let json = fixture!("explore");
+        let out = to_compact("explore", json);
+        assert!(
+            out.starts_with("explore: charge invoice gateway\n\nSource:\n"),
+            "{out}"
+        );
+        assert!(out.contains(concat!(
+            "  app/services/billing/charge_service.rb:12 gateway\n",
+            "       12\t    def gateway\n",
+        )));
+        assert!(out.contains(concat!(
+            "  app/models/invoice.rb:1 Invoice\n",
+            "    :1-13 Invoice [class]\n",
+            "    :2-4 paid? [function]\n",
+        )));
+        assert!(out.contains(
+            "\nSymbols (by relevance):\n  charge [function] app/models/payment_gateway.rb:2\n"
+        ));
+        assert!(out.contains(
+            "  app/services/billing/charge_service.rb ← spec/services/billing/charge_service_spec.rb\n"
+        ));
+        assert!(!out.contains("fallback"), "{out}");
+        assert!(serde_json::from_str::<Value>(&out).is_err(), "{out}");
+        assert!(out.len() < json.len() / 2, "not compact: {out}");
+    }
+
+    #[test]
+    fn explore_of_an_unknown_shape_falls_back_to_compact_json() {
+        let json = r#"{"query":"x","files":[]}"#;
+        let rendered: Value = serde_json::from_str(&to_compact("explore", json)).unwrap();
+        let original: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(rendered, original);
     }
 
     #[test]
