@@ -60,6 +60,19 @@ pub trait LanguageParser: Send + Sync {
     ) -> Result<Vec<ParsedRef>> {
         extract_references_for_lang(content, defined, Some(file_type))
     }
+
+    /// Symbols and references of one file, as indexing reads them. A parser
+    /// whose reference extraction walks the syntax tree overrides this to
+    /// parse the file once instead of once per step.
+    fn parse_symbols_and_refs(
+        &self,
+        content: &str,
+        file_type: FileType,
+    ) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
+        let symbols = self.parse_symbols(content)?;
+        let refs = self.extract_refs_for_lang(content, &symbols, file_type)?;
+        Ok((symbols, refs))
+    }
 }
 
 /// Get a tree-sitter parser for the given file type, if available

@@ -674,9 +674,7 @@ pub fn parse_file_symbols(
 
     // Try tree-sitter parser first
     if let Some(ts_parser) = treesitter::get_treesitter_parser(effective_type) {
-        let symbols = ts_parser.parse_symbols(content)?;
-        let refs = ts_parser.extract_refs_for_lang(content, &symbols, effective_type)?;
-        return Ok((symbols, refs));
+        return ts_parser.parse_symbols_and_refs(content, effective_type);
     }
 
     // Fallback: regex-based parsing for unsupported languages

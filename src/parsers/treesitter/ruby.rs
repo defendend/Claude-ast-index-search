@@ -31,6 +31,16 @@ impl RubyParser {
         file_type: Option<super::super::FileType>,
     ) -> Result<Vec<super::super::ParsedRef>> {
         let tree = parse_tree(content, &RUBY_LANGUAGE)?;
+        self.ruby_extract_refs_in(content, &tree, defined, file_type)
+    }
+
+    fn ruby_extract_refs_in(
+        &self,
+        content: &str,
+        tree: &tree_sitter::Tree,
+        defined: &[ParsedSymbol],
+        file_type: Option<super::super::FileType>,
+    ) -> Result<Vec<super::super::ParsedRef>> {
         let calls = method_call_refs(content, tree.root_node());
         let called: std::collections::HashSet<(&str, usize)> = calls.iter().copied().collect();
 
@@ -272,6 +282,23 @@ impl LanguageParser for RubyParser {
 
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &RUBY_LANGUAGE)?;
+        self.symbols_in(content, &tree)
+    }
+
+    fn parse_symbols_and_refs(
+        &self,
+        content: &str,
+        file_type: super::super::FileType,
+    ) -> Result<(Vec<ParsedSymbol>, Vec<super::super::ParsedRef>)> {
+        let tree = parse_tree(content, &RUBY_LANGUAGE)?;
+        let symbols = self.symbols_in(content, &tree)?;
+        let refs = self.ruby_extract_refs_in(content, &tree, &symbols, Some(file_type))?;
+        Ok((symbols, refs))
+    }
+}
+
+impl RubyParser {
+    fn symbols_in(&self, content: &str, tree: &tree_sitter::Tree) -> Result<Vec<ParsedSymbol>> {
         let mut symbols = Vec::new();
         let query = &*RUBY_QUERY;
         let mut cursor = QueryCursor::new();

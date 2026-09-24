@@ -287,6 +287,23 @@ impl LanguageParser for TypeScriptParser {
 
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &TS_LANGUAGE)?;
+        self.symbols_in(content, &tree)
+    }
+
+    fn parse_symbols_and_refs(
+        &self,
+        content: &str,
+        file_type: FileType,
+    ) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
+        let tree = parse_tree(content, &TS_LANGUAGE)?;
+        let symbols = self.symbols_in(content, &tree)?;
+        let refs = self.typescript_extract_refs_in(content, &tree, &symbols, Some(file_type))?;
+        Ok((symbols, refs))
+    }
+}
+
+impl TypeScriptParser {
+    fn symbols_in(&self, content: &str, tree: &tree_sitter::Tree) -> Result<Vec<ParsedSymbol>> {
         let mut symbols = Vec::new();
         let query = &*TS_QUERY;
         let mut cursor = QueryCursor::new();
@@ -1016,10 +1033,20 @@ impl TypeScriptParser {
         defined: &[ParsedSymbol],
         file_type: Option<FileType>,
     ) -> Result<Vec<ParsedRef>> {
+        let tree = parse_tree(content, &TS_LANGUAGE)?;
+        self.typescript_extract_refs_in(content, &tree, defined, file_type)
+    }
+
+    fn typescript_extract_refs_in(
+        &self,
+        content: &str,
+        tree: &tree_sitter::Tree,
+        defined: &[ParsedSymbol],
+        file_type: Option<FileType>,
+    ) -> Result<Vec<ParsedRef>> {
         // Keep the existing generic extraction as a baseline; add AST-aware refs
         // for TypeScript-specific constructs it cannot see, then deduplicate.
         let mut refs = super::super::extract_references_for_lang(content, defined, file_type)?;
-        let tree = parse_tree(content, &TS_LANGUAGE)?;
 
         let mut bindings: HashMap<String, Vec<AliasBinding>> = HashMap::new();
         collect_alias_bindings(content, &tree.root_node(), &mut bindings);
