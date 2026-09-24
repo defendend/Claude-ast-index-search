@@ -67,8 +67,58 @@ const FULL_TREE: &str = concat!(
     "    ← alpha (lib/callers.rb:2)\n",
     "      ← top (lib/top.rb:2)\n",
     "    ← beta (lib/callers.rb:6)\n",
-    "      ← top (recursive)\n",
+    "      ← top (lib/top.rb:2)\n",
 );
+
+/// Two spec files hold an example of the same name calling `leaf`, two
+/// classes a `build` method calling it, and `run` calls a `build`.
+#[test]
+fn call_tree_shows_same_named_callers_of_every_file() {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let files = [
+        ("lib/leaf.rb", "class Leaf\n  def leaf\n    1\n  end\nend\n"),
+        (
+            "lib/a.rb",
+            "class A\n  def build\n    Leaf.new.leaf\n  end\nend\n",
+        ),
+        (
+            "lib/b.rb",
+            "class B\n  def build\n    Leaf.new.leaf\n  end\nend\n",
+        ),
+        (
+            "lib/run.rb",
+            "class Run\n  def run\n    A.new.build\n  end\nend\n",
+        ),
+        (
+            "spec/a_spec.rb",
+            "describe A do\n  it \"works\" do\n    Leaf.new.leaf\n  end\nend\n",
+        ),
+        (
+            "spec/b_spec.rb",
+            "describe B do\n  it \"works\" do\n    Leaf.new.leaf\n  end\nend\n",
+        ),
+    ];
+    for (path, content) in files {
+        let path = project.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    let output = run(project.path(), cache.path(), &["call-tree", "leaf"]);
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "Call tree for 'leaf':\n",
+            "  leaf\n",
+            "    ← build (lib/a.rb:2)\n",
+            "      ← run (lib/run.rb:2)\n",
+            "    ← build (lib/b.rb:2) (expanded above)\n",
+            "    ← it \"works\" (spec/a_spec.rb:2)\n",
+            "    ← it \"works\" (spec/b_spec.rb:2)\n",
+        )
+    );
+}
 
 #[test]
 fn call_tree_prints_every_level_depth_first() {

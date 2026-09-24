@@ -505,6 +505,13 @@ ast-index query "
 "
 ```
 
+`call-tree` finds callers by text search at query time and prints every
+caller with its file, same-named definitions of other files included (two
+`it "works"` blocks are two callers). Callers are looked up by name, so each
+name is expanded once: a later caller of that name is marked
+`(expanded above)`, and `(recursive)` marks only a definition already on its
+own path — a real cycle.
+
 Build the symbol dependency graph when you need to know who really depends on
 a definition, how central it is, or what a change would reach transitively:
 

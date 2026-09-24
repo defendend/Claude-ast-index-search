@@ -387,17 +387,25 @@ pub fn cmd_call_tree(
         function_name,
         max_depth,
         &callers,
-        &mut |depth, caller, site| {
+        &mut |depth, (caller, file_path, line_num), node| {
             let indent = "  ".repeat(depth + 1);
-            match site {
-                Some((file_path, line_num)) => println!(
+            match node {
+                TreeNode::Shown => println!(
                     "{}← {} ({}:{})",
                     indent,
                     caller.yellow(),
                     file_path,
                     line_num
                 ),
-                None => println!("{}← {} (recursive)", indent, caller.dimmed()),
+                TreeNode::ExpandedAbove => println!(
+                    "{}← {} ({}:{}) {}",
+                    indent,
+                    caller.yellow(),
+                    file_path,
+                    line_num,
+                    "(expanded above)".dimmed()
+                ),
+                TreeNode::Recursive => println!("{}← {} (recursive)", indent, caller.dimmed()),
             }
         },
     );
@@ -405,8 +413,24 @@ pub fn cmd_call_tree(
     Ok(())
 }
 
-/// Calling functions of one function: `(caller, file, line of the caller)`.
-type CallerSites = Vec<(String, String, usize)>;
+/// A calling function: `(caller, file, line of the caller)`.
+type CallerSite = (String, String, usize);
+
+/// Calling functions of one function.
+type CallerSites = Vec<CallerSite>;
+
+/// How one edge of the call tree is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeNode {
+    /// With its callers below it, when it has any within the depth limit.
+    Shown,
+    /// Callers are looked up by name, so a caller named like a function the
+    /// tree already expanded has the very callers shown there; repeating
+    /// them would only copy that subtree.
+    ExpandedAbove,
+    /// The same definition as a function on the path above it: a cycle.
+    Recursive,
+}
 
 /// Callers of every function the printed tree expands.
 ///
@@ -464,68 +488,83 @@ fn collect_tree_callers(
 }
 
 /// Visit the call tree depth-first, in print order, handing every edge to
-/// `visit` as `(depth, caller, Some((file, line)))`, or `None` for a caller
-/// already shown. A caller whose name no code can call is shown but not
-/// expanded; see [`is_callable_name`].
+/// `visit` as `(depth, caller, node)`.
+///
+/// Every caller is a definition of its own, shown with its file even when a
+/// function of the same name from another file is already in the tree: two
+/// `it "works"` blocks are two callers. Callers are found by name, though,
+/// so each name is expanded once, at its first node; a later node of that
+/// name is [`TreeNode::ExpandedAbove`], and one that is the very definition
+/// of a function on its own path is [`TreeNode::Recursive`]. A caller whose
+/// name no code can call is shown but not expanded; see [`is_callable_name`].
 ///
 /// Returns the functions whose callers the walk needed but `callers` lacks;
 /// their subtrees are skipped, so a walk with anything missing is only a
 /// draft of the final one.
-fn walk_call_tree(
-    function_name: &str,
+fn walk_call_tree<'a>(
+    function_name: &'a str,
     max_depth: usize,
-    callers: &HashMap<String, CallerSites>,
-    visit: &mut dyn FnMut(usize, &str, Option<(&str, usize)>),
+    callers: &'a HashMap<String, CallerSites>,
+    visit: &mut dyn FnMut(usize, &'a CallerSite, TreeNode),
 ) -> Vec<String> {
-    let mut visited = std::collections::HashSet::new();
-    visited.insert(function_name.to_string());
-    let mut missing = Vec::new();
-    walk_callers_of(
-        function_name,
-        1,
+    let mut walk = TreeWalk {
         max_depth,
         callers,
-        &mut visited,
-        &mut missing,
+        expanded: std::collections::HashSet::from([function_name]),
+        path: Vec::new(),
+        missing: Vec::new(),
         visit,
-    );
-    missing
+    };
+    walk.callers_of(function_name, 1);
+    walk.missing
 }
 
-fn walk_callers_of(
-    function_name: &str,
-    depth: usize,
+struct TreeWalk<'a, 'v> {
     max_depth: usize,
-    callers: &HashMap<String, CallerSites>,
-    visited: &mut std::collections::HashSet<String>,
-    missing: &mut Vec<String>,
-    visit: &mut dyn FnMut(usize, &str, Option<(&str, usize)>),
-) {
-    if depth > max_depth {
-        return;
-    }
-    let Some(sites) = callers.get(function_name) else {
-        if !missing.iter().any(|name| name == function_name) {
-            missing.push(function_name.to_string());
+    callers: &'a HashMap<String, CallerSites>,
+    /// Names whose callers the tree shows already.
+    expanded: std::collections::HashSet<&'a str>,
+    /// Callers from the root down to the node being expanded.
+    path: Vec<&'a CallerSite>,
+    missing: Vec<String>,
+    visit: &'v mut dyn FnMut(usize, &'a CallerSite, TreeNode),
+}
+
+impl<'a> TreeWalk<'a, '_> {
+    fn callers_of(&mut self, function_name: &str, depth: usize) {
+        if depth > self.max_depth {
+            return;
         }
-        return;
-    };
-    for (caller, file_path, line_num) in sites {
-        if visited.insert(caller.clone()) {
-            visit(depth, caller, Some((file_path, *line_num)));
-            if is_callable_name(caller) {
-                walk_callers_of(
-                    caller,
-                    depth + 1,
-                    max_depth,
-                    callers,
-                    visited,
-                    missing,
-                    visit,
-                );
+        let callers = self.callers;
+        let Some(sites) = callers.get(function_name) else {
+            if !self.missing.iter().any(|name| name == function_name) {
+                self.missing.push(function_name.to_string());
             }
-        } else {
-            visit(depth, caller, None);
+            return;
+        };
+        for site in sites {
+            let caller = site.0.as_str();
+            if self.path.contains(&site) {
+                (self.visit)(depth, site, TreeNode::Recursive);
+                continue;
+            }
+            let expandable = depth < self.max_depth && is_callable_name(caller);
+            if expandable && self.expanded.insert(caller) {
+                (self.visit)(depth, site, TreeNode::Shown);
+                self.path.push(site);
+                self.callers_of(caller, depth + 1);
+                self.path.pop();
+                continue;
+            }
+            // Expanded earlier, so its callers are known unless this walk is
+            // still a draft; a name without callers leaves nothing out.
+            let above = expandable && callers.get(caller).is_some_and(|sites| !sites.is_empty());
+            let node = if above {
+                TreeNode::ExpandedAbove
+            } else {
+                TreeNode::Shown
+            };
+            (self.visit)(depth, site, node);
         }
     }
 }
@@ -1652,14 +1691,22 @@ mod tests {
             function_name,
             max_depth,
             callers,
-            &mut |depth, caller, site| {
-                edges.push(match site {
-                    Some((file, line)) => format!("{depth} {caller} {file}:{line}"),
-                    None => format!("{depth} {caller} recursive"),
+            &mut |depth, (caller, file, line), node| {
+                edges.push(match node {
+                    TreeNode::Shown => format!("{depth} {caller} {file}:{line}"),
+                    TreeNode::ExpandedAbove => format!("{depth} {caller} {file}:{line} above"),
+                    TreeNode::Recursive => format!("{depth} {caller} recursive"),
                 });
             },
         );
         (edges, missing)
+    }
+
+    fn tree(entries: Vec<(&str, CallerSites)>) -> HashMap<String, CallerSites> {
+        entries
+            .into_iter()
+            .map(|(name, sites)| (name.to_string(), sites))
+            .collect()
     }
 
     #[test]
@@ -1679,25 +1726,86 @@ mod tests {
     }
 
     #[test]
-    fn walk_call_tree_marks_callers_already_shown_as_recursive() {
-        let callers: HashMap<String, CallerSites> = [
-            ("leaf", sites(&[("alpha", "a.rb", 2), ("beta", "b.rb", 6)])),
-            ("alpha", sites(&[("top", "t.rb", 2), ("leaf", "a.rb", 9)])),
-            ("beta", sites(&[("top", "t.rb", 2)])),
-            ("top", sites(&[])),
-        ]
-        .into_iter()
-        .map(|(name, sites)| (name.to_string(), sites))
-        .collect();
-        let (edges, missing) = walk("leaf", 3, &callers);
+    fn walk_call_tree_marks_only_a_definition_on_its_own_path_as_recursive() {
+        let callers = tree(vec![
+            ("leaf", sites(&[("alpha", "a.rb", 2)])),
+            ("alpha", sites(&[("beta", "b.rb", 6)])),
+            ("beta", sites(&[("alpha", "a.rb", 2), ("alpha", "c.rb", 4)])),
+        ]);
+        let (edges, missing) = walk("leaf", 4, &callers);
         assert_eq!(
             edges,
             [
                 "1 alpha a.rb:2",
+                "2 beta b.rb:6",
+                "3 alpha recursive",
+                "3 alpha c.rb:4 above",
+            ]
+        );
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn walk_call_tree_shows_same_named_callers_of_other_files_with_their_path() {
+        let callers = tree(vec![
+            (
+                "leaf",
+                sites(&[
+                    ("it \"works\"", "a_spec.rb", 3),
+                    ("it \"works\"", "b_spec.rb", 7),
+                    ("export", "a.rb", 2),
+                    ("export", "b.rb", 5),
+                    ("leaf", "c.rb", 9),
+                    ("alpha", "d.rb", 1),
+                    ("beta", "e.rb", 1),
+                ]),
+            ),
+            ("export", sites(&[("run", "r.rb", 4)])),
+            ("run", sites(&[])),
+            ("alpha", sites(&[("top", "t.rb", 2)])),
+            ("beta", sites(&[("top", "t.rb", 2), ("bottom", "u.rb", 3)])),
+            ("top", sites(&[("main", "m.rb", 1)])),
+            ("bottom", sites(&[])),
+        ]);
+        let (edges, missing) = walk("leaf", 3, &callers);
+        assert_eq!(
+            edges,
+            [
+                "1 it \"works\" a_spec.rb:3",
+                "1 it \"works\" b_spec.rb:7",
+                "1 export a.rb:2",
+                "2 run r.rb:4",
+                "1 export b.rb:5 above",
+                "1 leaf c.rb:9 above",
+                "1 alpha d.rb:1",
                 "2 top t.rb:2",
-                "2 leaf recursive",
-                "1 beta b.rb:6",
-                "2 top recursive",
+                "3 main m.rb:1",
+                "1 beta e.rb:1",
+                "2 top t.rb:2 above",
+                "2 bottom u.rb:3",
+            ]
+        );
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn walk_call_tree_expands_a_name_first_met_at_the_depth_limit_further_up() {
+        let callers = tree(vec![
+            (
+                "leaf",
+                sites(&[("alpha", "a.rb", 2), ("helper", "h.rb", 9)]),
+            ),
+            ("alpha", sites(&[("helper", "h.rb", 1)])),
+            ("helper", sites(&[("main", "m.rb", 1)])),
+        ]);
+        let (edges, missing) = walk("leaf", 2, &callers);
+        assert_eq!(
+            edges,
+            [
+                "1 alpha a.rb:2",
+                "2 helper h.rb:1",
+                "1 helper h.rb:9",
+                "2 main m.rb:1",
             ]
         );
         assert!(missing.is_empty());
@@ -1717,17 +1825,14 @@ mod tests {
 
     #[test]
     fn walk_call_tree_shows_uncallable_callers_without_expanding_them() {
-        let callers: HashMap<String, CallerSites> = [(
+        let callers = tree(vec![(
             "leaf",
             sites(&[
                 ("it \"works\"", "leaf_spec.rb", 2),
                 ("let(:user)", "leaf_spec.rb", 5),
                 ("save!", "record.rb", 3),
             ]),
-        )]
-        .into_iter()
-        .map(|(name, sites)| (name.to_string(), sites))
-        .collect();
+        )]);
         let (edges, missing) = walk("leaf", 3, &callers);
         assert_eq!(
             edges,

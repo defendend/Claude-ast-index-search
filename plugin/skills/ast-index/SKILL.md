@@ -241,6 +241,12 @@ ast-index call-tree "processPayment" --depth 3 --limit 10
 ast-index call-tree "getUsers"       # Java: finds callers of getUsers() method
 ```
 
+Every caller is printed with its file, including same-named definitions of
+other files (two `it "works"` blocks are two callers). Callers are looked up
+by name, so each name is expanded once: a later caller of that name is marked
+`(expanded above)`, and `(recursive)` marks only a definition already on its
+own path — a real cycle.
+
 ### Symbol Dependency Graph
 
 **`graph`** - A directed symbol-to-symbol graph built from the index: an edge
