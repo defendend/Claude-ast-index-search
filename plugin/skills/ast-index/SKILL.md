@@ -232,6 +232,12 @@ ast-index callers "onClick"          # Find all onClick calls
 ast-index callers "fetchUser"        # Find API call sites
 ```
 
+A Ruby symbol naming the method counts as a call site (`before_save :name`,
+`validate :name`, `delegate :name`, `map(&:name)`); `:name?`, `:name!` and
+`:name=` name other methods and do not, and neither does a `::name` path
+(`use super::name;`, `Billing::Name`) unless it is called (`Mod::name(`,
+`Billing::Name.new`).
+
 ### Call Tree
 
 **`call-tree`** - Show the call hierarchy going UP: the function each call sits in, then its callers. Works in every indexed language: the caller is the innermost definition whose line range encloses the call for the tree-sitter languages (Ruby, TypeScript/JavaScript, Python, Go, Rust, Java, Kotlin, Swift, C#, C/C++, PHP, …); the regex-based parsers without ranges (Perl, WSDL/XSD) fall back to the nearest definition above the call.
@@ -240,6 +246,14 @@ ast-index callers "fetchUser"        # Find API call sites
 ast-index call-tree "processPayment" --depth 3 --limit 10
 ast-index call-tree "getUsers"       # Java: finds callers of getUsers() method
 ```
+
+Every caller is printed with its file, including same-named definitions of
+other files (two `it "works"` blocks are two callers). Callers are looked up
+by name, so each name is expanded once: a later caller of that name is marked
+`(expanded above)`, and `(recursive)` marks only a definition already on its
+own path — a real cycle. Imports and annotations (`use`, `include Mod`, Rails
+callbacks) never own a call — the definition around them does — and the line
+declaring the function itself is not a call of it.
 
 ### Symbol Dependency Graph
 
@@ -253,6 +267,7 @@ ast-index graph build                                 # Build/refresh the graph 
 ast-index graph status                                # Built? Stale? Edge counts per confidence
 ast-index graph dependents ApplicationService         # Who depends on it (incoming edges)
 ast-index graph dependents "Billing::Invoice#total"   # A member of one class
+ast-index graph dependents MergeService --exclude-tests  # Production dependents only (also on impact)
 ast-index graph dependencies CheckoutController --members  # What a class and its methods use
 ast-index graph impact PaymentGateway --depth 3       # Blast radius: dependents per depth, files
 ast-index graph path OrdersController Invoice         # Shortest dependency path(s) between two symbols
@@ -271,11 +286,25 @@ dependents and PageRank count **resolved edges only**; ambiguous edges are
 counted separately and listed with `--include-ambiguous` (on `impact` that
 gives an upper bound next to the resolved-only number).
 
+Rust paths resolve like the compiler reads them: a file is a module
+(`src/db.rs` is `db`), `crate::` / `super::` / `self::` walk the module tree,
+and `use` declarations (grouped, aliased, globbed, `pub use` re-exports) bind
+names, so `db::open_db(...)` is a `scoped` edge to `src/db.rs` and a name
+imported with `use` an `import` edge. Another workspace crate is reached by
+its `Cargo.toml` library name; `std::` and dependency paths never resolve to
+a same-named project definition.
+
 A class symbol only owns its class-level references (superclass, mixins);
 pass `--members` to `dependents` / `dependencies` / `impact` to cover the
 definitions inside it. `path` always treats a class as itself plus its
 members and may step from a class into a member (shown as `contains`),
 because dispatch like `Service.call` -> `process` is not statically visible.
+
+A bare name can match many definitions (`call`, or `Applicant` as a model,
+TypeScript types and spec stubs): `dependents` / `dependencies` / `impact`
+then merge their edges, say how many definitions matched, list at most
+`--limit` of them and suggest `Outer::Name`, `Class#member`, `--in-file` or
+`--kind`.
 
 In a Rails app the tables of `db/schema.rb` are matched to models
 (`self.table_name`, single-table inheritance, `table_name_prefix` /
@@ -284,8 +313,9 @@ or attribute method called inside the model (`status`, `self.status`,
 `status?`, `saved_change_to_status?`) resolves as a `scoped` edge to the
 column: `ast-index graph dependents applicants.first_name` (or
 `applicants#first_name`). A call on another receiver (`applicant.first_name`)
-never guesses a column. `graph build` reports tables without a model and
-models without a table.
+never guesses a column, so most reads of a column are not its edges — the
+answer says so; `ast-index usages first_name` lists every read. `graph build`
+reports tables without a model and models without a table.
 
 The graph is not rebuilt by `rebuild` / `update`. After an update changes the
 index, queries print a stale warning (`"stale": true` in JSON); rerun

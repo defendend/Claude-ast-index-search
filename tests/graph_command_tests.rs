@@ -757,3 +757,260 @@ fn a_project_vendor_directory_is_part_of_the_graph() {
     let charge = ws.json(&["graph", "dependents", "BillingClient#charge"]);
     assert_eq!(other_names(&charge), vec!["run"], "{charge:#}");
 }
+
+/// A Rust crate whose calls reach other modules through their paths, `use`
+/// bindings, a re-export and the library's name from an integration test.
+/// `legacy` defines a second `open_db`, and a `HashMap` type with a `new`.
+fn rust_crate_project() -> Workspace {
+    let ws = workspace();
+    ws.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\n",
+    );
+    ws.write(
+        "src/lib.rs",
+        "pub mod commands;\npub mod db;\npub mod legacy;\n",
+    );
+    ws.write(
+        "src/db.rs",
+        concat!(
+            "pub struct Scope;\n\n",
+            "impl Scope {\n",
+            "    pub fn none() -> Scope {\n",
+            "        Scope\n",
+            "    }\n",
+            "}\n\n",
+            "pub fn open_db() -> u8 {\n",
+            "    1\n",
+            "}\n",
+        ),
+    );
+    ws.write(
+        "src/legacy.rs",
+        concat!(
+            "pub struct HashMap;\n\n",
+            "impl HashMap {\n",
+            "    pub fn new() -> HashMap {\n",
+            "        HashMap\n",
+            "    }\n",
+            "}\n\n",
+            "pub fn open_db() -> u8 {\n",
+            "    2\n",
+            "}\n",
+        ),
+    );
+    ws.write(
+        "src/commands/mod.rs",
+        concat!(
+            "pub mod grep;\n",
+            "mod paths;\n\n",
+            "pub use paths::is_test_path;\n\n",
+            "pub fn helper() -> u8 {\n",
+            "    3\n",
+            "}\n",
+        ),
+    );
+    ws.write(
+        "src/commands/paths.rs",
+        concat!(
+            "pub fn is_test_path(path: &str) -> bool {\n",
+            "    path.is_empty()\n",
+            "}\n\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    use super::*;\n\n",
+            "    #[test]\n",
+            "    fn detects() {\n",
+            "        assert!(is_test_path(\"\"));\n",
+            "    }\n",
+            "}\n",
+        ),
+    );
+    ws.write(
+        "src/commands/grep.rs",
+        concat!(
+            "use std::collections::HashMap;\n\n",
+            "use super::is_test_path;\n",
+            "use crate::db::{self, Scope as DbScope};\n\n",
+            "pub fn run() -> usize {\n",
+            "    let conn = db::open_db();\n",
+            "    let scope = DbScope::none();\n",
+            "    let helped = super::helper();\n",
+            "    let map: HashMap<u8, u8> = HashMap::new();\n",
+            "    usize::from(is_test_path(\"x\")) + map.len() + usize::from(conn + helped)\n",
+            "}\n",
+        ),
+    );
+    ws.write(
+        "tests/api.rs",
+        concat!(
+            "use demo_app::db;\n\n",
+            "#[test]\n",
+            "fn opens() {\n",
+            "    assert_eq!(db::open_db(), 1);\n",
+            "}\n",
+        ),
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+    ws
+}
+
+#[test]
+fn rust_paths_resolve_through_file_modules_and_use_declarations() {
+    let ws = rust_crate_project();
+    let run = ws.json(&["graph", "dependencies", "run"]);
+    let target = |name: &str| -> (String, String) {
+        let edge = find_other(&run, name);
+        (
+            edge["other"]["path"].as_str().unwrap().to_string(),
+            edge["confidence"].as_str().unwrap().to_string(),
+        )
+    };
+    assert_eq!(target("open_db"), ("src/db.rs".into(), "scoped".into()));
+    assert_eq!(target("none"), ("src/db.rs".into(), "scoped".into()));
+    assert_eq!(
+        target("helper"),
+        ("src/commands/mod.rs".into(), "scoped".into())
+    );
+    assert_eq!(
+        target("is_test_path"),
+        ("src/commands/paths.rs".into(), "import".into())
+    );
+    assert!(
+        !other_names(&run).contains(&"new".to_string()),
+        "std's HashMap::new is not the project's: {run:#}"
+    );
+
+    let open_db = ws.json(&["graph", "dependents", "open_db", "--in-file", "src/db.rs"]);
+    let mut callers = other_names(&open_db);
+    callers.sort();
+    assert_eq!(callers, vec!["opens", "run"], "{open_db:#}");
+    let legacy = ws.json(&["graph", "dependents", "open_db", "--in-file", "legacy"]);
+    assert!(items(&legacy).is_empty(), "{legacy:#}");
+
+    let detects = ws.json(&["graph", "dependencies", "detects"]);
+    assert_eq!(find_other(&detects, "is_test_path")["confidence"], "local");
+}
+
+/// `MergeService` is called from one production method and from specs, and
+/// that method is itself exercised by a spec.
+fn merge_service_project() -> Workspace {
+    let ws = workspace();
+    ws.write(
+        "app/services/merge_service.rb",
+        "class MergeService\n  def self.call\n    1\n  end\nend\n",
+    );
+    ws.write(
+        "app/services/dedupe.rb",
+        "class Dedupe\n  def run\n    MergeService.call\n  end\nend\n",
+    );
+    ws.write(
+        "spec/services/merge_service_spec.rb",
+        "describe MergeService do\n  it \"merges\" do\n    MergeService.call\n  end\nend\n",
+    );
+    ws.write(
+        "spec/services/dedupe_spec.rb",
+        "describe Dedupe do\n  it \"runs\" do\n    Dedupe.new.run\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+    ws
+}
+
+#[test]
+fn exclude_tests_leaves_test_dependents_out_of_dependents_and_impact() {
+    let ws = merge_service_project();
+    let all = ws.json(&["graph", "dependents", "MergeService"]);
+    assert!(
+        items(&all)
+            .iter()
+            .any(|item| item["other"]["path"].as_str().unwrap().starts_with("spec/")),
+        "{all:#}"
+    );
+    let production = ws.json(&["graph", "dependents", "MergeService", "--exclude-tests"]);
+    assert_eq!(other_names(&production), vec!["run"], "{production:#}");
+    assert_eq!(production["exclude_tests"], true);
+    assert!(production["excluded_test_edges"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        production["resolved_edges"].as_u64().unwrap() as usize,
+        items(&production).len()
+    );
+    let text = ws.run(&["graph", "dependents", "MergeService", "--exclude-tests"]);
+    assert!(text.contains("from test files left out"), "{text}");
+
+    let impact = ws.json(&["graph", "impact", "MergeService", "--depth", "3"]);
+    assert!(impact["total_symbols"].as_u64().unwrap() > 1, "{impact:#}");
+    let impact = ws.json(&[
+        "graph",
+        "impact",
+        "MergeService",
+        "--depth",
+        "3",
+        "--exclude-tests",
+    ]);
+    let names: Vec<&str> = items(&impact)
+        .iter()
+        .map(|item| item["symbol"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["run"], "{impact:#}");
+    assert_eq!(impact["total_symbols"], 1);
+    assert!(
+        impact["excluded_test_symbols"].as_u64().unwrap() >= 2,
+        "{impact:#}"
+    );
+}
+
+#[test]
+fn several_matched_definitions_are_capped_by_limit_and_announced() {
+    let ws = billing_project();
+    ws.run(&["graph", "build"]);
+    let text = ws.run(&["graph", "dependents", "refresh", "--limit", "1"]);
+    assert!(
+        text.contains("2 definitions match 'refresh' and their edges are merged"),
+        "{text}"
+    );
+    assert!(text.contains("'Class#refresh'"), "{text}");
+    assert_eq!(text.matches("refresh [function]").count(), 1, "{text}");
+    assert!(text.contains("… and 1 more definition(s)"), "{text}");
+    let impact = ws.run(&["graph", "impact", "refresh", "--limit", "1"]);
+    assert!(impact.contains("2 definitions match 'refresh'"), "{impact}");
+
+    let single = ws.run(&["graph", "dependents", "Alpha#refresh"]);
+    assert!(!single.contains("definitions match"), "{single}");
+}
+
+#[test]
+fn column_dependents_say_that_reads_elsewhere_are_not_edges() {
+    let ws = rails_schema_project();
+    ws.run(&["graph", "build"]);
+    let report = ws.json(&["graph", "dependents", "people.first_name"]);
+    let notes = report["notes"].as_array().expect("notes");
+    assert_eq!(notes.len(), 1, "{report:#}");
+    let note = notes[0].as_str().unwrap();
+    assert!(note.contains("reads inside the model"), "{note}");
+    assert!(note.contains("ast-index usages first_name"), "{note}");
+    let text = ws.run(&["graph", "dependents", "clients.first_name"]);
+    assert!(text.contains("record.first_name"), "{text}");
+
+    let class = ws.json(&["graph", "dependents", "Person"]);
+    assert!(class.get("notes").is_none(), "{class:#}");
+}
+
+#[test]
+fn deleting_a_file_or_reindexing_symbols_marks_the_graph_stale() {
+    let ws = billing_project();
+    ws.run(&["graph", "build"]);
+    fs::remove_file(ws.root.join("lib/ping.rb")).unwrap();
+    assert_success(&ws.ast_index(&["update"]));
+    assert_eq!(ws.json(&["graph", "status"])["graph"]["stale"], true);
+
+    ws.run(&["graph", "build"]);
+    assert_eq!(ws.json(&["graph", "status"])["graph"]["stale"], false);
+    assert_success(&ws.ast_index(&["update"]));
+    assert_eq!(ws.json(&["graph", "status"])["graph"]["stale"], false);
+    assert_success(&ws.ast_index(&["rebuild", "--type", "symbols"]));
+    let status = ws.json(&["graph", "status"]);
+    assert_eq!(status["graph"]["built"], true, "{status:#}");
+    assert_eq!(status["graph"]["stale"], true, "{status:#}");
+}

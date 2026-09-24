@@ -900,6 +900,9 @@ enum GraphAction {
         /// For a class, also cover every definition inside it
         #[arg(long)]
         members: bool,
+        /// Leave out dependents defined in test files
+        #[arg(long)]
+        exclude_tests: bool,
         /// Max edges to list
         #[arg(short, long, default_value = "50")]
         limit: usize,
@@ -941,6 +944,9 @@ enum GraphAction {
         /// For a class, also seed with every definition inside it
         #[arg(long)]
         members: bool,
+        /// Neither count nor follow dependents defined in test files
+        #[arg(long)]
+        exclude_tests: bool,
         /// Max affected symbols to list
         #[arg(short, long, default_value = "50")]
         limit: usize,
@@ -1540,6 +1546,7 @@ fn main() -> Result<()> {
                 filter,
                 include_ambiguous,
                 members,
+                exclude_tests,
                 limit,
                 refresh,
             } => commands::graph::cmd_graph_edges(
@@ -1548,6 +1555,7 @@ fn main() -> Result<()> {
                 commands::graph::Direction::Dependents,
                 include_ambiguous,
                 members,
+                exclude_tests,
                 &filter.filter(),
                 limit,
                 refresh,
@@ -1566,6 +1574,7 @@ fn main() -> Result<()> {
                 commands::graph::Direction::Dependencies,
                 include_ambiguous,
                 members,
+                false,
                 &filter.filter(),
                 limit,
                 refresh,
@@ -1577,6 +1586,7 @@ fn main() -> Result<()> {
                 depth,
                 include_ambiguous,
                 members,
+                exclude_tests,
                 limit,
                 refresh,
             } => commands::graph::cmd_graph_impact(
@@ -1585,6 +1595,7 @@ fn main() -> Result<()> {
                 depth,
                 include_ambiguous,
                 members,
+                exclude_tests,
                 &filter.filter(),
                 limit,
                 refresh,

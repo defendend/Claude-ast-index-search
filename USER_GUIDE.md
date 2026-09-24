@@ -503,6 +503,21 @@ ast-index query "
 "
 ```
 
+`call-tree` finds callers by text search at query time and prints every
+caller with its file, same-named definitions of other files included (two
+`it "works"` blocks are two callers). Callers are looked up by name, so each
+name is expanded once: a later caller of that name is marked
+`(expanded above)`, and `(recursive)` marks only a definition already on its
+own path — a real cycle. A call belongs to the definition around it, never to
+an import or annotation line (`use`, `import`, `include Mod`, a Rails
+callback, a multi-line RSpec `include(...)` matcher), and a line that
+declares the function itself (a Go method `func (s *Server) Handle(`, a
+JavaScript method `handle(event) {`, `let(:handle)`) is not a call of it.
+`callers` and `call-tree` count a Ruby symbol naming the method as a call
+(`before_save :handle`, `delegate :handle`, `map(&:handle)`), but not
+`:handle?` / `:handle!` / `:handle=` (other methods) and not a `::handle`
+path (`use super::handle;`, `Billing::Handle`) that nothing calls.
+
 Build the symbol dependency graph when you need to know who really depends on
 a definition, how central it is, or what a change would reach transitively:
 
@@ -527,6 +542,15 @@ reopens a class to stub a method is not what production code calls; see
 **Test files** below for what counts as a test). Metrics count resolved edges only;
 `--include-ambiguous` lists the rest. After `update` changes the index the graph reports itself as
 stale until `graph build` (or a query with `--refresh`) runs again.
+
+Rust paths resolve the way the compiler reads them: a file is a module
+(`src/db.rs` is `db`, `src/commands/mod.rs` is `commands`, `src/lib.rs` and
+`src/main.rs` the crate root), `crate::`, `super::` and `self::` walk that
+tree, and `use` declarations — grouped, aliased, globbed, re-exported with
+`pub use` — bind the names a file uses. Another crate of the workspace is
+reached by its library name from `Cargo.toml` (`my_crate::db::open_db` in
+`tests/`). A path that leaves the project (`std::`, a dependency, or a name a
+`use` binds to one) never resolves to a project definition of the same name.
 
 References are capitalized names and calls written `name(` — snake_case and
 `_private` names included (`update_profile(user)`, `self._compute()`). Reserved
@@ -566,6 +590,14 @@ as a `scoped` edge to the column; a call on any other receiver
 ```bash
 ast-index graph dependents users.email       # or users#email
 ```
+
+Most reads of a column therefore are no edges of it, and a query about a
+column says so (`notes` in JSON); `ast-index usages email` lists every read.
+A bare name that matches several definitions — `call`, or `Applicant` as a
+model, TypeScript types and spec stubs — merges their edges; `dependents`,
+`dependencies` and `impact` say how many definitions matched, list at most
+`--limit` of them and suggest `Outer::Name`, `Class#member`, `--in-file` or
+`--kind` to narrow the query.
 
 ### Ranking search results by history and structure
 
@@ -678,8 +710,9 @@ and symbols sections and their totals. Percentiles are still computed against
 every file, so a file's score does not change with the flag; `hotspots
 --exclude-tests` works the same way.
 
-One test-path rule serves `search --rank`, `hotspots` and `graph top` with
-`--exclude-tests`, the graph (code outside tests never resolves into them) and
+One test-path rule serves `search --rank`, `hotspots`, `graph top`, `graph
+dependents` and `graph impact` with `--exclude-tests` (`impact` does not follow
+test dependents either), the graph (code outside tests never resolves into them) and
 `explore` (test files rank below source). A file is a test when its name
 follows a test convention — `*_test.*`, `*_spec.*`, `*.test.*`, `*.spec.*`,
 `test_*.py`, `conftest.py`, and `FooTest` / `FooTests` / `FooSpec` in Java,

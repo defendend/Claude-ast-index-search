@@ -67,8 +67,58 @@ const FULL_TREE: &str = concat!(
     "    ← alpha (lib/callers.rb:2)\n",
     "      ← top (lib/top.rb:2)\n",
     "    ← beta (lib/callers.rb:6)\n",
-    "      ← top (recursive)\n",
+    "      ← top (lib/top.rb:2)\n",
 );
+
+/// Two spec files hold an example of the same name calling `leaf`, two
+/// classes a `build` method calling it, and `run` calls a `build`.
+#[test]
+fn call_tree_shows_same_named_callers_of_every_file() {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let files = [
+        ("lib/leaf.rb", "class Leaf\n  def leaf\n    1\n  end\nend\n"),
+        (
+            "lib/a.rb",
+            "class A\n  def build\n    Leaf.new.leaf\n  end\nend\n",
+        ),
+        (
+            "lib/b.rb",
+            "class B\n  def build\n    Leaf.new.leaf\n  end\nend\n",
+        ),
+        (
+            "lib/run.rb",
+            "class Run\n  def run\n    A.new.build\n  end\nend\n",
+        ),
+        (
+            "spec/a_spec.rb",
+            "describe A do\n  it \"works\" do\n    Leaf.new.leaf\n  end\nend\n",
+        ),
+        (
+            "spec/b_spec.rb",
+            "describe B do\n  it \"works\" do\n    Leaf.new.leaf\n  end\nend\n",
+        ),
+    ];
+    for (path, content) in files {
+        let path = project.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    let output = run(project.path(), cache.path(), &["call-tree", "leaf"]);
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "Call tree for 'leaf':\n",
+            "  leaf\n",
+            "    ← build (lib/a.rb:2)\n",
+            "      ← run (lib/run.rb:2)\n",
+            "    ← build (lib/b.rb:2) (expanded above)\n",
+            "    ← it \"works\" (spec/a_spec.rb:2)\n",
+            "    ← it \"works\" (spec/b_spec.rb:2)\n",
+        )
+    );
+}
 
 #[test]
 fn call_tree_prints_every_level_depth_first() {
@@ -420,5 +470,105 @@ fn callers_find_bare_predicate_and_bang_calls_but_not_definitions() {
             "  next_page?\n",
             "    ← each_page (lib/pager.rb:6)\n",
         )
+    );
+}
+
+fn write_project(files: &[(&str, &str)]) -> (TempDir, TempDir) {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    for (path, content) in files {
+        let path = project.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    (project, cache)
+}
+
+/// `leaf` is named by a Rails callback, inside a multi-line RSpec `include`
+/// matcher and on a Python import line; the parsers index the callback and
+/// the matcher as annotations and the import as an import.
+#[test]
+fn call_tree_attributes_import_and_annotation_lines_to_the_definition_around_them() {
+    let (project, cache) = write_project(&[
+        (
+            "lib/record.rb",
+            "class Record\n  before_save :leaf\n\n  def leaf\n    1\n  end\nend\n",
+        ),
+        (
+            "spec/record_spec.rb",
+            concat!(
+                "describe Record do\n",
+                "  it \"keeps fields\" do\n",
+                "    expect(attrs).to include(\n",
+                "      name: subject.leaf\n",
+                "    )\n",
+                "  end\n",
+                "end\n",
+            ),
+        ),
+        (
+            "tools/report.py",
+            "import lib.leaf.tools\n\n\ndef report():\n    return leaf.value()\n",
+        ),
+    ]);
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    let output = run(
+        project.path(),
+        cache.path(),
+        &["call-tree", "leaf", "--depth", "1"],
+    );
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "Call tree for 'leaf':\n",
+            "  leaf\n",
+            "    ← Record (lib/record.rb:1)\n",
+            "    ← it \"keeps fields\" (spec/record_spec.rb:2)\n",
+            "    ← report (tools/report.py:4)\n",
+        )
+    );
+}
+
+/// A Go method with a receiver and a JavaScript class method are declared
+/// in a form the textual definition filter reads as a call.
+#[test]
+fn call_tree_skips_the_definition_line_of_the_function_it_looks_up() {
+    let (project, cache) = write_project(&[
+        (
+            "server/handler.go",
+            concat!(
+                "package server\n\n",
+                "type Server struct{}\n\n",
+                "func (s *Server) Handle(path string) error {\n",
+                "\treturn nil\n",
+                "}\n\n",
+                "func Serve(s *Server) error {\n",
+                "\treturn s.Handle(\"/\")\n",
+                "}\n",
+            ),
+        ),
+        (
+            "web/widget.js",
+            concat!(
+                "export class Widget {\n",
+                "  handle(event) {\n",
+                "    return event;\n",
+                "  }\n\n",
+                "  click(event) {\n",
+                "    return this.handle(event);\n",
+                "  }\n",
+                "}\n",
+            ),
+        ),
+    ]);
+    stdout(&run(project.path(), cache.path(), &["rebuild"]));
+    let tree = |name: &str| stdout(&run(project.path(), cache.path(), &["call-tree", name]));
+    assert_eq!(
+        tree("Handle"),
+        "Call tree for 'Handle':\n  Handle\n    ← Serve (server/handler.go:9)\n"
+    );
+    assert_eq!(
+        tree("handle"),
+        "Call tree for 'handle':\n  handle\n    ← click (web/widget.js:6)\n"
     );
 }

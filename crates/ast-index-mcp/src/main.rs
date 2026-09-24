@@ -498,6 +498,7 @@ fn tool_descriptors() -> Vec<Value> {
                     "depth":             { "type": "integer", "description": "1 (default): direct dependents. 2+: transitive impact per hop." },
                     "members":           { "type": "boolean", "description": "For a class, also cover the definitions inside it (the class alone owns only superclass/mixin references)." },
                     "include_ambiguous": { "type": "boolean", "description": "Also list/follow references whose name matched several definitions (upper bound)." },
+                    "exclude_tests":     { "type": "boolean", "description": "Leave out dependents defined in test files (spec/, tests/, *_test.*, *.spec.*); with depth 2+ they are not followed either." },
                     "in_file":           { "type": "string",  "description": "Only definitions whose path contains this substring." },
                     "kind":              { "type": "string",  "description": "Only definitions of this kind: class, function, property, ..." },
                     "limit":             { "type": "integer", "description": "Max rows (default 50)." },
@@ -879,6 +880,7 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
                 argv.extend(["dependents".into(), symbol]);
             }
             push_graph_symbol_filters(&mut argv, arguments);
+            push_if_flag(&mut argv, arguments, "exclude_tests", "--exclude-tests");
         }
         "graph_dependencies" => {
             argv.extend([
@@ -1205,7 +1207,7 @@ mod tests {
             &json!({
                 "symbol": "Billing::Invoice#total", "depth": 3, "members": true,
                 "include_ambiguous": true, "in_file": "app/models", "kind": "class",
-                "limit": 10, "refresh": true
+                "limit": 10, "refresh": true, "exclude_tests": true
             }),
         )
         .unwrap();
@@ -1226,8 +1228,29 @@ mod tests {
                 "--limit",
                 "10",
                 "--refresh",
+                "--exclude-tests",
                 "--format",
                 "json",
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_dependents_forwards_exclude_tests_to_direct_edges() {
+        let argv = build_argv(
+            "graph_dependents",
+            &json!({"symbol": "MergeService", "exclude_tests": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "graph",
+                "dependents",
+                "MergeService",
+                "--exclude-tests",
+                "--format",
+                "json"
             ]
         );
     }
@@ -1236,7 +1259,7 @@ mod tests {
     fn graph_dependents_false_flags_are_not_forwarded() {
         let argv = build_argv(
             "graph_dependents",
-            &json!({"symbol": "X", "members": false, "refresh": false}),
+            &json!({"symbol": "X", "members": false, "refresh": false, "exclude_tests": false}),
         )
         .unwrap();
         assert_eq!(argv, vec!["graph", "dependents", "X", "--format", "json"]);

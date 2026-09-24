@@ -22,6 +22,7 @@ use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 
+use super::graph::short_name;
 use super::{print_truncation_notice, relative_path, search_files_limited, PathResolver};
 use crate::db;
 
@@ -77,10 +78,18 @@ fn trailing_boundary(function_name: &str) -> &str {
     }
 }
 
+/// A Ruby symbol naming the method: `before_save :name`, `validate :name`,
+/// `delegate :name`, `map(&:name)`, `send(:name)`. The symbol has to end
+/// where the name does, since `:name?`, `:name!` and `:name=` name other
+/// methods (`authorize(record, :update?)` is about `update?`, not `update`),
+/// and a `::` in front is a path, not a symbol (`use super::name;`,
+/// `Billing::Invoice`, `std::mem::take`).
+const SYMBOL_REF_IDIOM: &str = r"(?:^|[^:]):{fn}(?:[^\w?!=]|$)";
+
 /// Call idioms recognised across languages, joined into one alternation.
-/// `{fn}` stands for the escaped function name and `{tb}` for its trailing
-/// boundary. Every idiom contains `{fn}`, so a line that matches always
-/// contains the name verbatim; the batched call-tree scan relies on that.
+/// `{fn}` stands for the escaped function name. Every idiom contains `{fn}`,
+/// so a line that matches always contains the name verbatim; the batched
+/// call-tree scan relies on that.
 const CALLER_IDIOMS: [&str; 13] = [
     r"[.>]{fn}\s*\(",                // obj.func( or obj->func(
     r"\b{fn}\s*\(",                  // bare func( anywhere in line
@@ -89,7 +98,7 @@ const CALLER_IDIOMS: [&str; 13] = [
     r"this\.{fn}\s*\(",              // this.func(
     r"super\.{fn}\s*\(",             // super.func(
     r"\.{fn}(?:\s|$)",               // Ruby: obj.method (no parens)
-    r":{fn}{tb}",                    // Ruby: :method_name (symbol ref in callbacks)
+    SYMBOL_REF_IDIOM,                // Ruby: :method_name (callbacks, delegate, &:name)
     r"\b{fn}\.",                     // Ruby: bare method.chain (e.g. scope.where)
     r"\bawait\s+{fn}\s*\(",          // TS: await func(
     r"\bawait\s+[\w.]+\.{fn}\s*\(",  // TS: await obj.func(
@@ -115,10 +124,10 @@ fn is_predicate_or_bang_name(function_name: &str) -> bool {
         })
 }
 
-fn caller_pattern(fn_pattern: &str, trailing: &str) -> String {
+fn caller_pattern(fn_pattern: &str) -> String {
     CALLER_IDIOMS
         .iter()
-        .map(|idiom| idiom.replace("{fn}", fn_pattern).replace("{tb}", trailing))
+        .map(|idiom| idiom.replace("{fn}", fn_pattern))
         .collect::<Vec<_>>()
         .join("|")
 }
@@ -126,7 +135,7 @@ fn caller_pattern(fn_pattern: &str, trailing: &str) -> String {
 /// Build regex pattern that matches function/method calls across languages
 fn build_caller_pattern(function_name: &str) -> String {
     let escaped = regex::escape(function_name);
-    let mut pattern = caller_pattern(&escaped, trailing_boundary(function_name));
+    let mut pattern = caller_pattern(&escaped);
     if is_predicate_or_bang_name(function_name) {
         pattern.push('|');
         pattern.push_str(&BARE_PREDICATE_CALL_IDIOM.replace("{fn}", &escaped));
@@ -135,15 +144,15 @@ fn build_caller_pattern(function_name: &str) -> String {
 }
 
 /// A pattern matching every line that [`build_caller_pattern`] matches for
-/// at least one of `function_names`. Dropping the trailing boundary only
-/// widens the `:symbol` idiom, and the bare name at a word boundary widens
-/// the bare predicate idiom, so the superset holds for every name.
+/// at least one of `function_names`. Every idiom holds the alternation of
+/// the names where one name stood, and the bare name at a word boundary
+/// widens the bare predicate idiom, so the superset holds for every name.
 fn build_any_caller_pattern(function_names: &[String]) -> String {
     let names: Vec<String> = function_names
         .iter()
         .map(|name| regex::escape(name))
         .collect();
-    let mut pattern = caller_pattern(&format!("(?:{})", names.join("|")), "");
+    let mut pattern = caller_pattern(&format!("(?:{})", names.join("|")));
     let predicates: Vec<String> = function_names
         .iter()
         .filter(|name| is_predicate_or_bang_name(name))
@@ -387,17 +396,25 @@ pub fn cmd_call_tree(
         function_name,
         max_depth,
         &callers,
-        &mut |depth, caller, site| {
+        &mut |depth, (caller, file_path, line_num), node| {
             let indent = "  ".repeat(depth + 1);
-            match site {
-                Some((file_path, line_num)) => println!(
+            match node {
+                TreeNode::Shown => println!(
                     "{}← {} ({}:{})",
                     indent,
                     caller.yellow(),
                     file_path,
                     line_num
                 ),
-                None => println!("{}← {} (recursive)", indent, caller.dimmed()),
+                TreeNode::ExpandedAbove => println!(
+                    "{}← {} ({}:{}) {}",
+                    indent,
+                    caller.yellow(),
+                    file_path,
+                    line_num,
+                    "(expanded above)".dimmed()
+                ),
+                TreeNode::Recursive => println!("{}← {} (recursive)", indent, caller.dimmed()),
             }
         },
     );
@@ -405,8 +422,24 @@ pub fn cmd_call_tree(
     Ok(())
 }
 
-/// Calling functions of one function: `(caller, file, line of the caller)`.
-type CallerSites = Vec<(String, String, usize)>;
+/// A calling function: `(caller, file, line of the caller)`.
+type CallerSite = (String, String, usize);
+
+/// Calling functions of one function.
+type CallerSites = Vec<CallerSite>;
+
+/// How one edge of the call tree is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeNode {
+    /// With its callers below it, when it has any within the depth limit.
+    Shown,
+    /// Callers are looked up by name, so a caller named like a function the
+    /// tree already expanded has the very callers shown there; repeating
+    /// them would only copy that subtree.
+    ExpandedAbove,
+    /// The same definition as a function on the path above it: a cycle.
+    Recursive,
+}
 
 /// Callers of every function the printed tree expands.
 ///
@@ -464,68 +497,83 @@ fn collect_tree_callers(
 }
 
 /// Visit the call tree depth-first, in print order, handing every edge to
-/// `visit` as `(depth, caller, Some((file, line)))`, or `None` for a caller
-/// already shown. A caller whose name no code can call is shown but not
-/// expanded; see [`is_callable_name`].
+/// `visit` as `(depth, caller, node)`.
+///
+/// Every caller is a definition of its own, shown with its file even when a
+/// function of the same name from another file is already in the tree: two
+/// `it "works"` blocks are two callers. Callers are found by name, though,
+/// so each name is expanded once, at its first node; a later node of that
+/// name is [`TreeNode::ExpandedAbove`], and one that is the very definition
+/// of a function on its own path is [`TreeNode::Recursive`]. A caller whose
+/// name no code can call is shown but not expanded; see [`is_callable_name`].
 ///
 /// Returns the functions whose callers the walk needed but `callers` lacks;
 /// their subtrees are skipped, so a walk with anything missing is only a
 /// draft of the final one.
-fn walk_call_tree(
-    function_name: &str,
+fn walk_call_tree<'a>(
+    function_name: &'a str,
     max_depth: usize,
-    callers: &HashMap<String, CallerSites>,
-    visit: &mut dyn FnMut(usize, &str, Option<(&str, usize)>),
+    callers: &'a HashMap<String, CallerSites>,
+    visit: &mut dyn FnMut(usize, &'a CallerSite, TreeNode),
 ) -> Vec<String> {
-    let mut visited = std::collections::HashSet::new();
-    visited.insert(function_name.to_string());
-    let mut missing = Vec::new();
-    walk_callers_of(
-        function_name,
-        1,
+    let mut walk = TreeWalk {
         max_depth,
         callers,
-        &mut visited,
-        &mut missing,
+        expanded: std::collections::HashSet::from([function_name]),
+        path: Vec::new(),
+        missing: Vec::new(),
         visit,
-    );
-    missing
+    };
+    walk.callers_of(function_name, 1);
+    walk.missing
 }
 
-fn walk_callers_of(
-    function_name: &str,
-    depth: usize,
+struct TreeWalk<'a, 'v> {
     max_depth: usize,
-    callers: &HashMap<String, CallerSites>,
-    visited: &mut std::collections::HashSet<String>,
-    missing: &mut Vec<String>,
-    visit: &mut dyn FnMut(usize, &str, Option<(&str, usize)>),
-) {
-    if depth > max_depth {
-        return;
-    }
-    let Some(sites) = callers.get(function_name) else {
-        if !missing.iter().any(|name| name == function_name) {
-            missing.push(function_name.to_string());
+    callers: &'a HashMap<String, CallerSites>,
+    /// Names whose callers the tree shows already.
+    expanded: std::collections::HashSet<&'a str>,
+    /// Callers from the root down to the node being expanded.
+    path: Vec<&'a CallerSite>,
+    missing: Vec<String>,
+    visit: &'v mut dyn FnMut(usize, &'a CallerSite, TreeNode),
+}
+
+impl<'a> TreeWalk<'a, '_> {
+    fn callers_of(&mut self, function_name: &str, depth: usize) {
+        if depth > self.max_depth {
+            return;
         }
-        return;
-    };
-    for (caller, file_path, line_num) in sites {
-        if visited.insert(caller.clone()) {
-            visit(depth, caller, Some((file_path, *line_num)));
-            if is_callable_name(caller) {
-                walk_callers_of(
-                    caller,
-                    depth + 1,
-                    max_depth,
-                    callers,
-                    visited,
-                    missing,
-                    visit,
-                );
+        let callers = self.callers;
+        let Some(sites) = callers.get(function_name) else {
+            if !self.missing.iter().any(|name| name == function_name) {
+                self.missing.push(function_name.to_string());
             }
-        } else {
-            visit(depth, caller, None);
+            return;
+        };
+        for site in sites {
+            let caller = site.0.as_str();
+            if self.path.contains(&site) {
+                (self.visit)(depth, site, TreeNode::Recursive);
+                continue;
+            }
+            let expandable = depth < self.max_depth && is_callable_name(caller);
+            if expandable && self.expanded.insert(caller) {
+                (self.visit)(depth, site, TreeNode::Shown);
+                self.path.push(site);
+                self.callers_of(caller, depth + 1);
+                self.path.pop();
+                continue;
+            }
+            // Expanded earlier, so its callers are known unless this walk is
+            // still a draft; a name without callers leaves nothing out.
+            let above = expandable && callers.get(caller).is_some_and(|sites| !sites.is_empty());
+            let node = if above {
+                TreeNode::ExpandedAbove
+            } else {
+                TreeNode::Shown
+            };
+            (self.visit)(depth, site, node);
         }
     }
 }
@@ -625,22 +673,31 @@ fn find_caller_functions(
     let root_key = db::normalize_root_for_storage(root);
     Ok(files_with_calls
         .into_iter()
-        .map(|files| attribute_call_lines(root, &root_key, conn, files, limit, &func_def_re))
+        .zip(function_names)
+        .map(|(files, name)| {
+            attribute_call_lines(root, &root_key, conn, name, files, limit, &func_def_re)
+        })
         .collect())
 }
 
 /// Second pass of [`find_caller_functions`]: the function containing each
-/// call line, at most `limit` distinct ones, the first in path order.
+/// call line of `function_name`, at most `limit` distinct ones, the first in
+/// path order. A line the index knows to declare a definition of that name
+/// is skipped: the match there is the definition, in a form the textual
+/// definition filter does not know (`func (s *Server) Handle(`, a JavaScript
+/// method `handle(event) {`, `attr_reader :handle`), not a call.
 ///
 /// Every file lies under the primary root `root`, stored as `root_key`.
 fn attribute_call_lines(
     root: &Path,
     root_key: &str,
     conn: Option<&rusqlite::Connection>,
+    function_name: &str,
     files_with_calls: BTreeMap<PathBuf, Vec<usize>>,
     limit: usize,
     func_def_re: &Regex,
 ) -> CallerSites {
+    let defined_name = short_name(function_name).unwrap_or(function_name);
     let mut results: CallerSites = vec![];
 
     for (file_path, call_lines) in files_with_calls {
@@ -671,6 +728,15 @@ fn attribute_call_lines(
         for call_line in call_lines {
             if results.len() >= limit {
                 break;
+            }
+            let declares_target = conn.is_some_and(|conn| {
+                db::find_definitions_on_line(conn, Some(root_key), &rel_path, call_line as i64)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|name| short_name(name).unwrap_or(name) == defined_name)
+            });
+            if declares_target {
+                continue;
             }
 
             let owner = conn
@@ -1487,6 +1553,36 @@ mod tests {
             &pat,
             "  after_create :set_timestamps, if: :active?"
         ));
+        for line in [
+            "  validate :set_timestamps",
+            "  delegate :set_timestamps, to: :record",
+            "  records.each(&:set_timestamps)",
+            "  send(:set_timestamps)",
+            "  alias_method :touch, :set_timestamps",
+            "  only: %i[a] + [:set_timestamps]",
+            ":set_timestamps",
+        ] {
+            assert!(matches(&pat, line), "{line}");
+        }
+    }
+
+    #[test]
+    fn symbol_ref_ends_with_the_name_and_is_no_path() {
+        let pat = build_caller_pattern("update");
+        for line in [
+            "    authorize(@job, :update?)",
+            "  permissions :update! do",
+            "  alias_method :update=, :write",
+            "  :updated_at",
+            "use super::update;",
+            "  Billing::update",
+            "  mem::update",
+        ] {
+            assert!(!matches(&pat, line), "{line}");
+        }
+        assert!(matches(&pat, "  before_action :update, only: :show"));
+        let pat = build_caller_pattern("valid?");
+        assert!(matches(&pat, "  validate :valid?, on: :create"));
     }
 
     #[test]
@@ -1652,14 +1748,22 @@ mod tests {
             function_name,
             max_depth,
             callers,
-            &mut |depth, caller, site| {
-                edges.push(match site {
-                    Some((file, line)) => format!("{depth} {caller} {file}:{line}"),
-                    None => format!("{depth} {caller} recursive"),
+            &mut |depth, (caller, file, line), node| {
+                edges.push(match node {
+                    TreeNode::Shown => format!("{depth} {caller} {file}:{line}"),
+                    TreeNode::ExpandedAbove => format!("{depth} {caller} {file}:{line} above"),
+                    TreeNode::Recursive => format!("{depth} {caller} recursive"),
                 });
             },
         );
         (edges, missing)
+    }
+
+    fn tree(entries: Vec<(&str, CallerSites)>) -> HashMap<String, CallerSites> {
+        entries
+            .into_iter()
+            .map(|(name, sites)| (name.to_string(), sites))
+            .collect()
     }
 
     #[test]
@@ -1679,25 +1783,86 @@ mod tests {
     }
 
     #[test]
-    fn walk_call_tree_marks_callers_already_shown_as_recursive() {
-        let callers: HashMap<String, CallerSites> = [
-            ("leaf", sites(&[("alpha", "a.rb", 2), ("beta", "b.rb", 6)])),
-            ("alpha", sites(&[("top", "t.rb", 2), ("leaf", "a.rb", 9)])),
-            ("beta", sites(&[("top", "t.rb", 2)])),
-            ("top", sites(&[])),
-        ]
-        .into_iter()
-        .map(|(name, sites)| (name.to_string(), sites))
-        .collect();
-        let (edges, missing) = walk("leaf", 3, &callers);
+    fn walk_call_tree_marks_only_a_definition_on_its_own_path_as_recursive() {
+        let callers = tree(vec![
+            ("leaf", sites(&[("alpha", "a.rb", 2)])),
+            ("alpha", sites(&[("beta", "b.rb", 6)])),
+            ("beta", sites(&[("alpha", "a.rb", 2), ("alpha", "c.rb", 4)])),
+        ]);
+        let (edges, missing) = walk("leaf", 4, &callers);
         assert_eq!(
             edges,
             [
                 "1 alpha a.rb:2",
+                "2 beta b.rb:6",
+                "3 alpha recursive",
+                "3 alpha c.rb:4 above",
+            ]
+        );
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn walk_call_tree_shows_same_named_callers_of_other_files_with_their_path() {
+        let callers = tree(vec![
+            (
+                "leaf",
+                sites(&[
+                    ("it \"works\"", "a_spec.rb", 3),
+                    ("it \"works\"", "b_spec.rb", 7),
+                    ("export", "a.rb", 2),
+                    ("export", "b.rb", 5),
+                    ("leaf", "c.rb", 9),
+                    ("alpha", "d.rb", 1),
+                    ("beta", "e.rb", 1),
+                ]),
+            ),
+            ("export", sites(&[("run", "r.rb", 4)])),
+            ("run", sites(&[])),
+            ("alpha", sites(&[("top", "t.rb", 2)])),
+            ("beta", sites(&[("top", "t.rb", 2), ("bottom", "u.rb", 3)])),
+            ("top", sites(&[("main", "m.rb", 1)])),
+            ("bottom", sites(&[])),
+        ]);
+        let (edges, missing) = walk("leaf", 3, &callers);
+        assert_eq!(
+            edges,
+            [
+                "1 it \"works\" a_spec.rb:3",
+                "1 it \"works\" b_spec.rb:7",
+                "1 export a.rb:2",
+                "2 run r.rb:4",
+                "1 export b.rb:5 above",
+                "1 leaf c.rb:9 above",
+                "1 alpha d.rb:1",
                 "2 top t.rb:2",
-                "2 leaf recursive",
-                "1 beta b.rb:6",
-                "2 top recursive",
+                "3 main m.rb:1",
+                "1 beta e.rb:1",
+                "2 top t.rb:2 above",
+                "2 bottom u.rb:3",
+            ]
+        );
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn walk_call_tree_expands_a_name_first_met_at_the_depth_limit_further_up() {
+        let callers = tree(vec![
+            (
+                "leaf",
+                sites(&[("alpha", "a.rb", 2), ("helper", "h.rb", 9)]),
+            ),
+            ("alpha", sites(&[("helper", "h.rb", 1)])),
+            ("helper", sites(&[("main", "m.rb", 1)])),
+        ]);
+        let (edges, missing) = walk("leaf", 2, &callers);
+        assert_eq!(
+            edges,
+            [
+                "1 alpha a.rb:2",
+                "2 helper h.rb:1",
+                "1 helper h.rb:9",
+                "2 main m.rb:1",
             ]
         );
         assert!(missing.is_empty());
@@ -1717,17 +1882,14 @@ mod tests {
 
     #[test]
     fn walk_call_tree_shows_uncallable_callers_without_expanding_them() {
-        let callers: HashMap<String, CallerSites> = [(
+        let callers = tree(vec![(
             "leaf",
             sites(&[
                 ("it \"works\"", "leaf_spec.rb", 2),
                 ("let(:user)", "leaf_spec.rb", 5),
                 ("save!", "record.rb", 3),
             ]),
-        )]
-        .into_iter()
-        .map(|(name, sites)| (name.to_string(), sites))
-        .collect();
+        )]);
         let (edges, missing) = walk("leaf", 3, &callers);
         assert_eq!(
             edges,

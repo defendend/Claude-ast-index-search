@@ -13,6 +13,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use super::metrics::compute_metrics;
+use super::rust::{crate_name, module_location, parse_uses, FileUses, ModuleScope};
 use super::schema::{column_candidates, link_models, underscore, ModelClass, SchemaLinkSummary};
 use super::{
     is_container_kind, is_node_kind, is_path_suffix, is_schema_kind, language_family, short_name,
@@ -235,6 +236,14 @@ fn parse_module_imports(
         }
     }
     imports
+}
+
+/// What `graph build` reads from a file's source besides the index: the
+/// import bindings of a JavaScript / TypeScript module, the `use`
+/// declarations of a Rust file.
+enum ParsedSource {
+    Js(ModuleImports, Vec<ImportTarget>),
+    Rust(FileUses),
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +559,40 @@ struct FileNode {
     /// names to the module, so a name that is neither defined in the file nor
     /// imported cannot denote another file's definition.
     module: Option<ModuleImports>,
+    /// Rust only: the crate ([`RustIndex::crates`]) and the module path the
+    /// file is (`commands::graph` for `src/commands/graph/mod.rs`). Its
+    /// top-level definitions live in that namespace.
+    rust_crate: Option<u32>,
+    namespace: String,
+}
+
+/// Rust crates and the `use` scope of every module, read from source.
+#[derive(Default)]
+struct RustIndex {
+    /// Crate key ([`super::rust::ModuleLocation::crate_key`], per root) -> id.
+    crates: HashMap<String, u32>,
+    /// Library name other crates write (`ast_index`) -> crate id.
+    by_name: HashMap<String, u32>,
+    /// `(crate, module path)` of every module: each file's, the modules its
+    /// path goes through, and inline `mod` blocks.
+    modules: HashSet<(u32, String)>,
+    scopes: HashMap<(u32, String), ModuleScope>,
+}
+
+/// Rust paths that never name a definition of the project.
+fn is_external_rust_root(segment: &str) -> bool {
+    matches!(segment, "std" | "core" | "alloc")
+}
+
+fn join_path(base: &str, rest: &[&str]) -> String {
+    let mut path = base.to_string();
+    for segment in rest {
+        if !path.is_empty() {
+            path.push_str("::");
+        }
+        path.push_str(segment);
+    }
+    path
 }
 
 struct SymNode {
@@ -603,6 +646,7 @@ struct Builder {
     /// Table definition -> its columns by column name.
     table_columns: HashMap<u32, HashMap<String, u32>>,
     schema: Option<SchemaLinkSummary>,
+    rust: RustIndex,
     /// Per importing file: whether one of its imports points at a file,
     /// keyed by that file. Every reference to a common name asks this for
     /// the same candidate files again, and each answer is a scan of the
@@ -621,29 +665,62 @@ fn absolute_file_path(root: &Path, root_path: &str, path: &str) -> std::path::Pa
 impl Builder {
     fn load(conn: &Connection, root: &Path) -> Result<Builder> {
         let file_rows = db::load_graph_files(conn)?;
-        let parsed: Vec<Option<(ModuleImports, Vec<ImportTarget>)>> = file_rows
+        let parsed: Vec<Option<ParsedSource>> = file_rows
             .par_iter()
             .map(|row| {
-                if language_family(&row.path) != "js" || db::is_third_party_path(&row.path) {
+                let family = language_family(&row.path);
+                if !matches!(family, "js" | "rust") || db::is_third_party_path(&row.path) {
                     return None;
                 }
                 let content =
                     std::fs::read_to_string(absolute_file_path(root, &row.root_path, &row.path))
                         .ok()?;
+                if family == "rust" {
+                    return parse_uses(&content).map(ParsedSource::Rust);
+                }
                 let mut imports = Vec::new();
                 let module = parse_module_imports(&row.path, &content, &mut imports);
-                Some((module, imports))
+                Some(ParsedSource::Js(module, imports))
             })
             .collect();
         let mut files = Vec::with_capacity(file_rows.len());
         let mut file_index = HashMap::with_capacity(file_rows.len());
+        let mut rust = RustIndex::default();
+        let mut rust_uses: Vec<(u32, FileUses)> = Vec::new();
         for (row, parsed) in file_rows.into_iter().zip(parsed) {
-            file_index.insert(row.id, files.len() as u32);
+            let index = files.len() as u32;
+            file_index.insert(row.id, index);
             let family = language_family(&row.path);
             let vendor = db::is_third_party_path(&row.path);
             let (module, imports) = match parsed {
-                Some((module, imports)) => (Some(module), imports),
+                Some(ParsedSource::Js(module, imports)) => (Some(module), imports),
+                Some(ParsedSource::Rust(uses)) => {
+                    rust_uses.push((index, uses));
+                    (None, Vec::new())
+                }
                 None => (None, Vec::new()),
+            };
+            let (rust_crate, namespace) = if family == "rust" && !vendor {
+                let location = module_location(&row.path);
+                let key = format!("{}\0{}", row.root_path, location.crate_key);
+                let next = rust.crates.len() as u32;
+                let id = *rust.crates.entry(key).or_insert(next);
+                if id == next {
+                    if let Some(name) = location.package.as_deref().and_then(|package| {
+                        crate_name(&absolute_file_path(root, &row.root_path, ""), package)
+                    }) {
+                        rust.by_name.entry(name).or_insert(id);
+                    }
+                }
+                let mut prefix = String::new();
+                rust.modules.insert((id, String::new()));
+                for segment in location.module.split("::").filter(|s| !s.is_empty()) {
+                    prefix = join_path(&prefix, &[segment]);
+                    rust.modules.insert((id, prefix.clone()));
+                }
+                (Some(id), location.module)
+            } else {
+                (None, String::new())
             };
             files.push(FileNode {
                 stem: strip_source_extension(&row.path).to_string(),
@@ -655,6 +732,8 @@ impl Builder {
                 symbols: Vec::new(),
                 imports,
                 module,
+                rust_crate,
+                namespace,
             });
         }
 
@@ -702,8 +781,10 @@ impl Builder {
             model_tables: HashMap::new(),
             table_columns: HashMap::new(),
             schema: None,
+            rust,
         };
         builder.assign_containers();
+        builder.assign_rust_scopes(rust_uses);
         builder.index_short_names();
         builder.resolve_parents(conn)?;
         builder.link_schema();
@@ -719,6 +800,7 @@ impl Builder {
                 continue;
             }
             let ruby = file.family == "ruby";
+            let namespace = file.namespace.clone();
             let mut order = file.symbols.clone();
             order.sort_by_key(|&s| {
                 let sym = &self.syms[s as usize];
@@ -768,7 +850,7 @@ impl Builder {
                     } else if let Some(c) = container {
                         format!("{}::{}", self.syms[c as usize].qual, own)
                     } else {
-                        own.to_string()
+                        join_path(&namespace, &[own])
                     }
                 };
                 let file_private = container.is_some_and(|c| {
@@ -784,6 +866,55 @@ impl Builder {
                 if is_container_kind(&sym.kind) && sym.has_range {
                     stack.push(s);
                 }
+            }
+        }
+    }
+
+    /// File a Rust file's `use` declarations under the module they sit in —
+    /// the file's own, or the inline `mod` block around them — and record
+    /// inline modules as modules.
+    fn assign_rust_scopes(&mut self, uses: Vec<(u32, FileUses)>) {
+        for file in &self.files {
+            let Some(krate) = file.rust_crate else {
+                continue;
+            };
+            for &s in &file.symbols {
+                let sym = &self.syms[s as usize];
+                if sym.kind == "package" {
+                    self.rust.modules.insert((krate, sym.qual.clone()));
+                }
+            }
+        }
+        for (file, file_uses) in uses {
+            let node = &self.files[file as usize];
+            let Some(krate) = node.rust_crate else {
+                continue;
+            };
+            let module_at = |line: i64| -> String {
+                node.symbols
+                    .iter()
+                    .map(|&s| &self.syms[s as usize])
+                    .filter(|sym| sym.kind == "package" && sym.line < line && sym.end >= line)
+                    .min_by_key(|sym| sym.end - sym.line)
+                    .map(|sym| sym.qual.clone())
+                    .unwrap_or_else(|| node.namespace.clone())
+            };
+            for binding in file_uses.bindings {
+                self.rust
+                    .scopes
+                    .entry((krate, module_at(binding.line)))
+                    .or_default()
+                    .bindings
+                    .entry(binding.local)
+                    .or_insert(binding.path);
+            }
+            for (line, glob) in file_uses.globs {
+                self.rust
+                    .scopes
+                    .entry((krate, module_at(line)))
+                    .or_default()
+                    .globs
+                    .push(glob);
             }
         }
     }
@@ -829,10 +960,11 @@ impl Builder {
             };
             // `class A::B < C` resolves `C` where the `class` keyword sits,
             // not inside `A::B` itself.
-            let namespace = self.syms[child as usize]
+            let child_sym = &self.syms[child as usize];
+            let namespace = child_sym
                 .container
                 .map(|c| self.syms[c as usize].qual.clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|| self.files[child_sym.file as usize].namespace.clone());
             links.push((child, parent_name, namespace, true));
         }
         for sym in &self.syms {
@@ -1030,7 +1162,8 @@ impl Builder {
             || !self.files[self.syms[candidate as usize].file as usize].test
     }
 
-    /// Namespace a reference inside `scope` is looked up from.
+    /// Namespace a reference inside `scope` is looked up from: the class or
+    /// module around it, else the file's own module (Rust), else the top.
     fn namespace_of(&self, scope: u32) -> &str {
         let sym = &self.syms[scope as usize];
         if is_container_kind(&sym.kind) {
@@ -1038,7 +1171,7 @@ impl Builder {
         }
         match sym.container {
             Some(container) => &self.syms[container as usize].qual,
-            None => "",
+            None => &self.files[sym.file as usize].namespace,
         }
     }
 
@@ -1568,6 +1701,9 @@ impl Builder {
                 .or_else(|| self.resolve_in_class_scope(source, name))
                 .ok_or(DropReason::External),
             Usage::Qualified { absolute, path } => {
+                if let Some(outcome) = self.resolve_rust_path(file, source, path, name) {
+                    return outcome;
+                }
                 let rel = if path.is_empty() {
                     name.to_string()
                 } else {
@@ -1603,6 +1739,9 @@ impl Builder {
                     if let Some(resolution) = self.resolve_local(file, source, &cands) {
                         return Ok(resolution);
                     }
+                    if let Some(outcome) = self.resolve_rust_use(file, source, name) {
+                        return outcome;
+                    }
                 }
                 if ruby && constant {
                     // A class name in a string (`'Job'`, `class_name: 'Job'`)
@@ -1635,6 +1774,206 @@ impl Builder {
                 self.resolve_by_name(file, source, &cands, weak)
             }
         }
+    }
+
+    /// The Rust module code in `source` runs in: the inline `mod` block around
+    /// it, else its file's module.
+    fn rust_module_of(&self, source: u32) -> &str {
+        let mut scope = Some(source);
+        while let Some(current) = scope {
+            let sym = &self.syms[current as usize];
+            if sym.kind == "package" {
+                return &sym.qual;
+            }
+            scope = sym.container;
+        }
+        &self.files[self.syms[source as usize].file as usize].namespace
+    }
+
+    /// Whether crate `krate` has a module or a definition at `path`.
+    fn rust_defines(&self, krate: u32, path: &str) -> bool {
+        self.rust.modules.contains(&(krate, path.to_string()))
+            || self.by_qual.get(path).is_some_and(|found| {
+                found.iter().any(|&c| {
+                    self.files[self.syms[c as usize].file as usize].rust_crate == Some(krate)
+                })
+            })
+    }
+
+    /// The absolute `(crate, path)` a Rust path written in `module` of
+    /// `krate` names: `crate::`, `self::` and `super::` walk the module tree,
+    /// a first segment bound by a `use` of that module stands for its target,
+    /// then come a child module or item of `module`, another crate of the
+    /// project by its library name and the modules `module` globs. `None` for
+    /// a path that leaves the project (`std::`, a dependency) or that cannot be
+    /// followed.
+    fn rust_absolute(
+        &self,
+        krate: u32,
+        module: &str,
+        segments: &[&str],
+        depth: usize,
+    ) -> Option<(u32, String)> {
+        let (&first, rest) = segments.split_first()?;
+        if depth > 4 {
+            return None;
+        }
+        match first {
+            "crate" => return Some((krate, join_path("", rest))),
+            "self" => return Some((krate, join_path(module, rest))),
+            "super" => {
+                let mut base = module;
+                let mut rest = segments;
+                while let Some((&"super", tail)) = rest.split_first() {
+                    if base.is_empty() {
+                        return None;
+                    }
+                    base = base.rsplit_once("::").map_or("", |(head, _)| head);
+                    rest = tail;
+                }
+                return Some((krate, join_path(base, rest)));
+            }
+            _ => {}
+        }
+        let scope = self.rust.scopes.get(&(krate, module.to_string()));
+        if let Some(target) = scope.and_then(|scope| scope.bindings.get(first)) {
+            let target: Vec<&str> = target.iter().map(String::as_str).collect();
+            let (target_crate, base) = self.rust_absolute(krate, module, &target, depth + 1)?;
+            return Some((target_crate, join_path(&base, rest)));
+        }
+        let local = join_path(module, &[first]);
+        if self.rust_defines(krate, &local) {
+            return Some((krate, join_path(&local, rest)));
+        }
+        if let Some(&other) = self.rust.by_name.get(first) {
+            return Some((other, join_path("", rest)));
+        }
+        for glob in scope.map(|scope| scope.globs.as_slice()).unwrap_or(&[]) {
+            let glob: Vec<&str> = glob.iter().map(String::as_str).collect();
+            if let Some((glob_crate, base)) = self.rust_absolute(krate, module, &glob, depth + 1) {
+                let candidate = join_path(&base, &[first]);
+                if self.rust_defines(glob_crate, &candidate) {
+                    return Some((glob_crate, join_path(&candidate, rest)));
+                }
+            }
+        }
+        None
+    }
+
+    /// Rust definitions at `path` of `krate` visible from `file`, following
+    /// the `use` bindings and globs of the parent module when it only
+    /// re-exports the name (`pub use test_paths::is_test_path;`).
+    fn rust_lookup(&self, file: u32, krate: u32, path: &str, depth: usize) -> Vec<u32> {
+        let hits: Vec<u32> = self
+            .by_qual
+            .get(path)
+            .map(|found| {
+                found
+                    .iter()
+                    .copied()
+                    .filter(|&c| {
+                        self.files[self.syms[c as usize].file as usize].rust_crate == Some(krate)
+                            && self.visible_from(file, c)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !hits.is_empty() || depth > 4 {
+            return hits;
+        }
+        let (parent, last) = path.rsplit_once("::").unwrap_or(("", path));
+        let Some(scope) = self.rust.scopes.get(&(krate, parent.to_string())) else {
+            return Vec::new();
+        };
+        if let Some(target) = scope.bindings.get(last) {
+            let target: Vec<&str> = target.iter().map(String::as_str).collect();
+            return match self.rust_absolute(krate, parent, &target, 0) {
+                Some((target_crate, target)) => {
+                    self.rust_lookup(file, target_crate, &target, depth + 1)
+                }
+                None => Vec::new(),
+            };
+        }
+        for glob in &scope.globs {
+            let glob: Vec<&str> = glob.iter().map(String::as_str).collect();
+            if let Some((glob_crate, base)) = self.rust_absolute(krate, parent, &glob, 0) {
+                let found =
+                    self.rust_lookup(file, glob_crate, &join_path(&base, &[last]), depth + 1);
+                if !found.is_empty() {
+                    return found;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// A Rust path `path::name` resolved the way the compiler does it.
+    /// `None` leaves the reference to the name-based rules: the path may name
+    /// something the index does not hold (an enum variant, a macro) or hold
+    /// under another namespace (an `impl` in another module than its type).
+    fn resolve_rust_path(
+        &self,
+        file: u32,
+        source: u32,
+        path: &str,
+        name: &str,
+    ) -> Option<Result<Resolution, DropReason>> {
+        let krate = self.files[file as usize].rust_crate?;
+        let module = self.rust_module_of(source);
+        let mut segments: Vec<&str> = path.split("::").filter(|s| !s.is_empty()).collect();
+        segments.push(name);
+        match self.rust_absolute(krate, module, &segments, 0) {
+            Some((target_crate, absolute)) => {
+                let hits = self.rust_lookup(file, target_crate, &absolute, 0);
+                self.pick(source, hits, Confidence::Scoped).map(Ok)
+            }
+            // `std::mem::take`, or `HashMap::new` under `use std::collections::HashMap`:
+            // no definition of the project, whatever shares the last name.
+            None if is_external_rust_root(segments[0])
+                || self
+                    .rust
+                    .scopes
+                    .get(&(krate, module.to_string()))
+                    .is_some_and(|scope| scope.bindings.contains_key(segments[0])) =>
+            {
+                Some(Err(DropReason::QualifiedUnresolved))
+            }
+            None => None,
+        }
+    }
+
+    /// A bare Rust name that a `use` of the module around `source` binds,
+    /// directly or through a glob. A name bound to a path outside the project
+    /// is no reference to the project's definition of that name.
+    fn resolve_rust_use(
+        &self,
+        file: u32,
+        source: u32,
+        name: &str,
+    ) -> Option<Result<Resolution, DropReason>> {
+        let krate = self.files[file as usize].rust_crate?;
+        let module = self.rust_module_of(source);
+        let scope = self.rust.scopes.get(&(krate, module.to_string()))?;
+        if let Some(target) = scope.bindings.get(name) {
+            let target: Vec<&str> = target.iter().map(String::as_str).collect();
+            return match self.rust_absolute(krate, module, &target, 0) {
+                Some((target_crate, absolute)) => {
+                    let hits = self.rust_lookup(file, target_crate, &absolute, 0);
+                    self.pick(source, hits, Confidence::Import).map(Ok)
+                }
+                None => Some(Err(DropReason::External)),
+            };
+        }
+        for glob in &scope.globs {
+            let glob: Vec<&str> = glob.iter().map(String::as_str).collect();
+            if let Some((glob_crate, base)) = self.rust_absolute(krate, module, &glob, 0) {
+                let hits = self.rust_lookup(file, glob_crate, &join_path(&base, &[name]), 0);
+                if let Some(resolution) = self.pick(source, hits, Confidence::Import) {
+                    return Some(Ok(resolution));
+                }
+            }
+        }
+        None
     }
 
     /// Module-scoped languages (JavaScript / TypeScript): a name is either
@@ -1694,8 +2033,8 @@ impl Builder {
 
     /// Same rule as [`db::find_owning_symbol`] — narrowest enclosing range,
     /// later start on ties, last-declared fallback only for files without any
-    /// range — except that import and annotation lines are skipped in favour
-    /// of the definition around them.
+    /// range, import and annotation lines skipped in favour of the definition
+    /// around them.
     fn owner(&self, file: &FileNode, line: i64) -> Option<u32> {
         let mut best: Option<(i64, i64, u32)> = None;
         for &s in &file.symbols {
@@ -2283,8 +2622,9 @@ mod tests {
                 .unwrap() as u32
         };
         let new = find("new");
-        assert_eq!(builder.syms[new as usize].qual, "Point::new");
+        assert_eq!(builder.syms[new as usize].qual, "point::Point::new");
         assert!(!builder.syms[new as usize].file_private);
+        assert_eq!(builder.syms[find("main") as usize].qual, "main");
 
         let main = find("main");
         let main_file = builder.syms[main as usize].file;
@@ -2333,14 +2673,18 @@ mod tests {
             )
             .unwrap();
         }
-        let symbols: [(i64, &str, &str, i64, Option<i64>); 13] = [
+        let symbols: [(i64, &str, &str, i64, Option<i64>); 17] = [
+            (1, "json", "import", 0, Some(0)),
             (1, "Outer", "class", 1, Some(30)),
             (1, "first", "function", 3, Some(9)),
+            (1, "include(name: 1)", "annotation", 5, Some(7)),
             (1, "Inner", "class", 11, Some(25)),
+            (1, "include Helpers", "annotation", 12, Some(12)),
             (1, "second", "function", 13, Some(18)),
             (1, "LIMIT", "constant", 20, Some(20)),
             (2, "Widget", "class", 1, None),
             (2, "render", "function", 5, None),
+            (2, "Printable", "annotation", 11, None),
             (2, "paint", "function", 12, None),
             (3, "Twins", "class", 1, Some(12)),
             (3, "left", "function", 3, Some(6)),
@@ -2384,21 +2728,24 @@ mod tests {
     }
 
     #[test]
-    fn owner_skips_annotation_lines_for_the_enclosing_definition() {
+    fn owner_skips_import_and_annotation_lines_for_the_enclosing_definition() {
         let conn = owner_fixture();
-        conn.execute(
-            "INSERT INTO symbols (file_id, name, kind, line, end_line)
-             VALUES (1, 'include Helpers', 'annotation', 12, 12)",
-            [],
-        )
-        .unwrap();
         let builder = Builder::load(&conn, Path::new("/nonexistent")).unwrap();
-        let file = builder
-            .files
-            .iter()
-            .find(|file| file.path == "app/ranged.rb")
-            .unwrap();
-        let owner = builder.owner(file, 12).unwrap();
-        assert_eq!(builder.syms[owner as usize].name, "Inner");
+        let file = |path: &str| {
+            builder
+                .files
+                .iter()
+                .find(|file| file.path == path && file.symbols.len() > 2)
+                .unwrap()
+        };
+        let owner = |path: &str, line: i64| {
+            builder
+                .owner(file(path), line)
+                .map(|s| builder.syms[s as usize].name.as_str())
+        };
+        assert_eq!(owner("app/ranged.rb", 0), None);
+        assert_eq!(owner("app/ranged.rb", 6), Some("first"));
+        assert_eq!(owner("app/ranged.rb", 12), Some("Inner"));
+        assert_eq!(owner("lib/rangeless.kt", 11), Some("render"));
     }
 }
