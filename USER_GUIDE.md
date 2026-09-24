@@ -215,7 +215,9 @@ Collected Git history (`hotspots --collect`) is not refreshed by `update`. Run
 `ast-index hotspots --collect` again after switching: it subtracts the commits
 the new `HEAD` no longer reaches and adds the new ones, reusing diffs it has
 read before, so a branch switch or a rebase costs about a second instead of a
-full rescan, and the numbers match a fresh `hotspots --collect --full`.
+full rescan, and the numbers match a fresh `hotspots --collect --full`. Line
+counts come from the working tree, so an uncommitted edit to a file counts
+once a later `--collect` recomputes that file or on `--full`.
 
 `rebuild` keeps the collected history: it depends on the repository, not on
 the index, so the next `hotspots --collect` stays incremental. Only history

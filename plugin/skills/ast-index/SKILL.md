@@ -412,9 +412,11 @@ Collection is never implicit: `rebuild` and `update` do not run it. The first
 to the current `HEAD` by set difference — commits `HEAD` no longer reaches
 (branch switch, rebase, reset, force-push) are subtracted, new ones are added —
 so switching branches costs time proportional to the commits that differ, and
-switching back re-reads nothing. The numbers always equal a full recollection
-at that `HEAD`. Only a garbage-collected cursor commit, a changed project root
-or `--full` rebuild from scratch. `rebuild` keeps the collected history (it
+switching back re-reads nothing. The numbers equal a full recollection at that
+`HEAD`; line counts come from the working tree, so an uncommitted edit counts
+once a later `--collect` recomputes the file or on `--full`. Only a
+garbage-collected cursor commit, a changed project root or `--full` rebuild
+from scratch. `rebuild` keeps the collected history (it
 does not depend on the index) unless it came from an older version or another
 working tree or scope; then the next `--collect` reads it again.
 

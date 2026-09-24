@@ -420,7 +420,9 @@ indexing cost is unchanged for everyone who does not ask for this. The first
 `--collect` walks the whole history; every later one reads only what changed.
 History is stored per commit, so a branch switch, rebase, force-push or reset
 subtracts the commits `HEAD` no longer reaches and adds the new ones, and the
-numbers always equal a fresh full collection.
+numbers equal a fresh full collection at that `HEAD`. Line counts come from the
+working tree: an uncommitted edit counts once a later `--collect` recomputes
+that file (a commit or checkout changes it) or on `--full`.
 
 Signals live in their own tables, keyed by project-relative path, so they
 also cover files the parsers never look at (fixtures, configs, migrations).

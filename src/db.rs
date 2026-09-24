@@ -9654,18 +9654,22 @@ fn git_path_hash(path: &str) -> i64 {
     hash as i64
 }
 
+/// Id of a project path in the per-commit store, `None` when it is not there.
+pub fn find_git_path_id(conn: &Connection, path: &str) -> Result<Option<i64>> {
+    let hash = git_path_hash(path);
+    conn.prepare_cached("SELECT id FROM git_paths WHERE hash = ?1 AND path = ?2")?
+        .query_row(params![hash, path], |row| row.get::<_, i64>(0))
+        .optional()
+        .context("failed to read git_paths")
+}
+
 /// Id of a project path in the per-commit store, inserted when new.
 pub fn git_path_id(conn: &Connection, path: &str) -> Result<i64> {
-    let hash = git_path_hash(path);
-    if let Some(id) = conn
-        .prepare_cached("SELECT id FROM git_paths WHERE hash = ?1 AND path = ?2")?
-        .query_row(params![hash, path], |row| row.get::<_, i64>(0))
-        .optional()?
-    {
+    if let Some(id) = find_git_path_id(conn, path)? {
         return Ok(id);
     }
     conn.prepare_cached("INSERT INTO git_paths (hash, path) VALUES (?1, ?2)")?
-        .execute(params![hash, path])
+        .execute(params![git_path_hash(path), path])
         .context("failed to insert git_paths row")?;
     Ok(conn.last_insert_rowid())
 }

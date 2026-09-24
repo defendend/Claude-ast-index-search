@@ -870,6 +870,52 @@ fn branch_switches_rebases_and_merges_match_a_fresh_full_collection() {
     workspace.collect_and_compare("back on main after the orphan");
 }
 
+/// Merges are not read, so a merge that edits or deletes a file on its own
+/// touches that file in no commit of the move; its line count still changes
+/// in the working tree, and its row has to follow.
+#[test]
+fn files_changed_only_by_a_merge_match_a_fresh_full_collection() {
+    let workspace = workspace();
+    workspace.init_git();
+    workspace.commit_at(
+        "Add parser, lexer and legacy shim",
+        &[
+            ("src/a.rs", "a1\na2\na3\n"),
+            ("src/b.rs", "b\n"),
+            ("src/gone.rs", "g\n"),
+        ],
+        at(1),
+    );
+    workspace.git(&["branch", "side"]);
+    workspace.commit_at("Extend lexer", &[("src/b.rs", "b\nb2\n")], at(2));
+    workspace.git(&["checkout", "-q", "side"]);
+    workspace.commit_at("Add config", &[("src/c.rs", "c\n")], at(3));
+    workspace.git(&["checkout", "-q", "main"]);
+    workspace.rebuild();
+    workspace.hotspots_json(&["--collect"]);
+
+    workspace.git_at(&["merge", "-q", "--no-commit", "--no-ff", "side"], at(4));
+    fs::write(workspace.root.join("src/a.rs"), "a1\na2\na3\na4\na5\n").unwrap();
+    workspace.git(&["add", "src/a.rs"]);
+    workspace.git(&["rm", "-q", "src/gone.rs"]);
+    workspace.git_at(&["commit", "-q", "--no-edit"], at(4));
+    let merged = workspace.collect_and_compare("a merge that edits and deletes files");
+    assert_eq!(find_item(&merged, "src/a.rs")["current_lines"], 5);
+    assert!(merged["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["path"] != "src/gone.rs"));
+
+    workspace.git(&["checkout", "-q", "--detach", "HEAD~1"]);
+    let before = workspace.collect_and_compare("the merge's first parent");
+    assert_eq!(find_item(&before, "src/a.rs")["current_lines"], 3);
+    assert_eq!(find_item(&before, "src/gone.rs")["current_lines"], 1);
+
+    workspace.git(&["checkout", "-q", "main"]);
+    workspace.collect_and_compare("back on the merge");
+}
+
 #[test]
 fn a_project_below_the_repository_root_survives_branch_switches() {
     let workspace = workspace();

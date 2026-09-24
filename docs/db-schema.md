@@ -160,8 +160,14 @@ store, and the per-file tables are derived from it.
 
 When HEAD moves, commits only the old HEAD reaches leave the live set, commits
 only the new HEAD reaches join it, and only the paths those commits touched
-(plus paths linked to them by renames) are refolded. The result equals a
-full collection at the same HEAD row for row.
+(plus paths linked to them by renames) are refolded. Merges record no
+changes, so when one joins or leaves, every path that differs between the old
+and the new HEAD (`git diff-tree --name-only`) is refolded as well: a file
+only a merge edited or deleted gets its `current_lines` and its row from the
+working tree again. The result equals a full collection at the same HEAD row
+for row. `current_lines` is read from the working tree when a path is
+refolded, so an uncommitted edit reaches it on the next refold of that path
+or on `--full`.
 
 The history does not depend on the code index, so a full `rebuild` copies all
 five tables and every `git_signals_*` metadata key from the live generation

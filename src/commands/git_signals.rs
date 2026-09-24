@@ -224,6 +224,12 @@ struct Plan {
     records: Vec<CommitRecord>,
     restored: Vec<db::StoredGitCommit>,
     dropped: Vec<db::StoredGitCommit>,
+    /// Project paths whose content differs between the stored cursor and
+    /// HEAD, listed when a merge joined or left the history. Merges are not
+    /// read, so a file only a merge changed (a conflict resolution, an evil
+    /// merge) is touched by no commit of the move, yet its line count in the
+    /// working tree changed with it.
+    moved_paths: Vec<String>,
 }
 
 struct Applied {
@@ -515,6 +521,32 @@ impl Collector {
         )
     }
 
+    /// Project paths whose content differs between commits `from` and `to`,
+    /// both sides of a rename included; `None` when the list overflows the
+    /// captured output.
+    fn changed_paths(&self, from: &str, to: &str) -> Result<Option<Vec<String>>> {
+        let mut args = os_args(&[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            from,
+            to,
+        ]);
+        self.push_pathspec(&mut args);
+        let Some(bytes) = self.git_allow_truncation(&args)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            bytes
+                .split(|byte| *byte == 0)
+                .filter(|field| !field.is_empty())
+                .filter_map(|field| self.project_relative(&String::from_utf8_lossy(field)))
+                .collect(),
+        ))
+    }
+
     /// Plan for a store rebuilt from scratch at `head`.
     fn plan_full(&self, head: &str) -> Result<Plan> {
         let revs = vec![OsString::from(head)];
@@ -537,6 +569,7 @@ impl Collector {
             records,
             restored: Vec::new(),
             dropped: Vec::new(),
+            moved_paths: Vec::new(),
         })
     }
 
@@ -552,12 +585,23 @@ impl Collector {
             records: Vec::new(),
             restored: Vec::new(),
             dropped: Vec::new(),
+            moved_paths: Vec::new(),
         };
         if base == head {
             return Ok(Some(plan));
         }
         let arrived = self.list_graph(&os_args(&[head, "--not", base]))?;
         let departed = self.list_graph(&os_args(&[base, "--not", head]))?;
+        let merges_moved = arrived
+            .iter()
+            .chain(&departed)
+            .any(|commit| commit.parents.len() > 1);
+        if merges_moved {
+            match self.changed_paths(base, head)? {
+                Some(paths) => plan.moved_paths = paths,
+                None => return Ok(None),
+            }
+        }
 
         for commit in departed {
             match db::find_git_commit(conn, &commit.sha)? {
@@ -1122,6 +1166,10 @@ fn apply_plan(
         touched.extend(db::git_commit_touched_paths(&tx, commit.id)?);
         departed.insert(commit.id);
     }
+    // A path the store has never seen has no history to report.
+    for path in &plan.moved_paths {
+        touched.extend(db::find_git_path_id(&tx, path)?);
+    }
 
     let stored_at = started.elapsed();
     let mut authors = Authors::default();
@@ -1463,8 +1511,9 @@ pub(crate) fn history_carry_rejection(
 /// stored cursor reaches are subtracted, commits only HEAD reaches are added
 /// (read from Git unless the store still has them from an earlier visit), and
 /// only the paths those commits touched, plus paths linked to them by
-/// renames, are recomputed. The result is the same as a full collection at
-/// HEAD, row for row.
+/// renames, are recomputed; when a merge joins or leaves, so is every path
+/// whose content the move changed. The result is the same as a full
+/// collection at HEAD, row for row.
 pub fn collect_git_signals(
     project_root: &Path,
     conn: &mut Connection,
