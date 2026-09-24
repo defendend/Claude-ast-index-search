@@ -6224,6 +6224,113 @@ pub fn search_symbol_seeds(
     Ok(results)
 }
 
+/// Candidates for `explore` ranked by relevance to the whole query: symbols
+/// with a token starting with any of `terms`, ordered by bm25 over all terms
+/// at once.
+///
+/// The per-term [`search_symbol_seeds`] sample is the first rows by insertion
+/// order, so for a term that matches thousands of symbols it holds whatever
+/// the indexer happened to reach first. A single bm25 over every term favours
+/// the documents that carry several of them, and the rarer ones — the
+/// corroborated rows a re-ranker is looking for. Project code leads
+/// third-party code and definitions lead imports.
+pub fn search_symbol_seeds_ranked(
+    conn: &Connection,
+    terms: &[String],
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let query = terms
+        .iter()
+        .filter(|term| !term.trim().is_empty())
+        .map(|term| escape_fts5_query(&format!("{term}*")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    if query.is_empty() {
+        return Ok(vec![]);
+    }
+    let sql = format!(
+        r#"
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM symbols_fts fts
+        JOIN symbols s ON fts.rowid = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE symbols_fts MATCH ?1
+        ORDER BY {VENDOR_PATH_SQL}, {IMPORT_LAST_SQL}, {FTS_RANK}, s.id
+        LIMIT ?2
+        "#
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params![query, limit as i64], row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
+/// Symbols of the project files whose path contains every one of `terms`,
+/// case-insensitively: `app/services/applicant/merge_service.rb` for
+/// `applicant merge service`. At most `per_file` symbols of a file are
+/// returned — the types and modules it defines first — and shorter paths
+/// come first. Third-party files, imports and schema columns are left out.
+///
+/// Where the project names files after what they define, the path is the
+/// one place a CamelCase class name is spelled out word by word, which the
+/// full-text index cannot split.
+///
+/// `CROSS JOIN` pins `files` as the outer loop: otherwise the planner walks
+/// every symbol through its file index and tests each one's path (80 ms
+/// instead of 11 ms on a 300k-symbol index).
+pub fn search_symbols_in_matching_paths(
+    conn: &Connection,
+    terms: &[String],
+    per_file: usize,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    use rusqlite::types::Value;
+    let terms: Vec<String> = terms
+        .iter()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return Ok(vec![]);
+    }
+    let path_filter = (1..=terms.len())
+        .map(|n| format!("instr(lower(f.path), ?{n}) > 0"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let per_file_at = terms.len() + 1;
+    let limit_at = terms.len() + 2;
+    let sql = format!(
+        r#"
+        SELECT name, qualified_name, kind, line, signature, path, root_path FROM (
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY s.file_id
+                       ORDER BY CASE WHEN s.kind IN ('class', 'interface', 'object', 'enum', 'package')
+                                     THEN 0 ELSE 1 END,
+                                s.line
+                   ) AS rank_in_file
+            FROM files f
+            CROSS JOIN symbols s ON s.file_id = f.id
+            WHERE {path_filter}
+              AND NOT {VENDOR_PATH_SQL}
+              AND s.kind NOT IN ('import', 'column')
+        )
+        WHERE rank_in_file <= ?{per_file_at}
+        ORDER BY length(path), path, line
+        LIMIT ?{limit_at}
+        "#
+    );
+    let mut values: Vec<Value> = terms.into_iter().map(Value::Text).collect();
+    values.push(Value::Integer(per_file as i64));
+    values.push(Value::Integer(limit as i64));
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(rusqlite::params_from_iter(values), row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
 /// Search result
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
@@ -7409,6 +7516,45 @@ pub fn get_file_symbols(
         .query_map(params![path, root_path.unwrap_or("")], row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
+}
+
+/// A definition's name, kind and line range.
+#[derive(Debug, Clone)]
+pub struct SymbolSpan {
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+    /// `None` where the language parser reports no ranges.
+    pub end_line: Option<i64>,
+}
+
+/// Definitions of a file with their line ranges, in the order an outline
+/// reads: by line, a definition before the ones nested in it. Imports and
+/// schema columns are left out. `root_path` is read as in [`get_file_symbols`].
+pub fn get_file_outline(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+) -> Result<Vec<SymbolSpan>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.name, s.kind, s.line, s.end_line
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1 AND s.kind NOT IN ('import', 'column') AND ",
+        file_under_root_sql!("?2"),
+        " ORDER BY s.line, COALESCE(s.end_line, s.line) DESC"
+    ))?;
+    let spans = stmt
+        .query_map(params![path, root_path.unwrap_or("")], |row| {
+            Ok(SymbolSpan {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                line: row.get(2)?,
+                end_line: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(spans)
 }
 
 /// Whether the index knows line ranges for at least one symbol in this file.

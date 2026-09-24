@@ -285,7 +285,7 @@ Run `ast-index rebuild` once per project, then use `ast-index update` to keep
 the index fresh.
 
 ```bash
-ast-index explore <QUERY...>       # One-shot context: ranked source + neighbours + tests (--rwr for graph)
+ast-index explore <QUERY...>       # One-shot context: ranked symbols, outline/source, neighbours, tests (--rwr for graph)
 ast-index search <QUERY>           # Universal structural search
 ast-index search <QUERY> --rank <PRESET>  # Re-rank by history + graph: proven, hotspots, risky, central
 ast-index file <PATTERN>           # Find files
@@ -729,6 +729,24 @@ exclude:
 
 ### Unreleased
 
+- **`explore` finds the class a question names** — candidates now also come
+  from one bm25 ranking over all query words, from the words run together
+  (`pdf to html service` is the `PdfToHtmlService` token the full-text index
+  keeps whole) and from files whose path holds every word; before, each word
+  sampled its first 40 matches in index order, so a common word such as
+  `application` never reached `ApplicationService`. The type a file is named
+  after and the symbol the query spells out rank first, a word in a symbol's
+  own name counts above one in its namespace, and statements (`has_many :x`,
+  `scope`, `include`), namespace-only modules and question words (`how`,
+  `does`, `work`) rank low or are ignored. On a large Rails app 6 of 6 queries
+  naming a class put it first instead of 1 of 6, for about 30 ms more per
+  query on a 300k-symbol index.
+- **`explore` outlines types and modules** — a class, module or statement is
+  shown as the outline of the definition around it (`:34-53 process
+  [function]` rows with line ranges from the index, the chosen symbol marked
+  `→`, at most 40 rows) instead of the first lines of its source; functions
+  keep their source. JSON `files[]` carry `outline` and `outline_hidden` in
+  place of `source` for those, and the MCP `search` fallback renders them.
 - **Definitions rank above imports** — inside every relevance tier of `search`
   (plain, `--fuzzy`, `--rank`) definitions now come before imports, and imports
   never enter the last-segment tier: `search InstallRequirement` in pip lists

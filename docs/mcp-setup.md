@@ -17,7 +17,7 @@ tools directly — no per-agent plugin required.
 
 | Tool | Purpose |
 |---|---|
-| `explore` | One-shot answer to "how does X work": ranked source of the relevant symbols, their callers/subclasses, and tests |
+| `explore` | One-shot answer to "how does X work": the relevant symbols ranked, an outline of the best types/modules and the source of the best functions, their callers/subclasses, and tests |
 | `search` | Literal search: filenames + symbols + imports/usages + content, one call; `rank` re-orders by history and graph (see below) |
 | `outline` | Structural outline of one file (classes, functions, line numbers) — ALWAYS run before reading files > 500 lines |
 | `usages` | Every indexed reference to a symbol, matched by name |
@@ -89,8 +89,9 @@ says `history and graph: as above` instead of repeating the numbers.
 
 A multi-word `search` without literal matches answers with `explore` results.
 The text starts with `fallback: explore — <reason>` and carries the same
-report `explore` returns: source of the best definitions, the ranked symbols,
-graph neighbours and tests found by path convention.
+report `explore` returns: the source of the best functions and an outline
+(`:start-end name [kind]` rows) of the best types and modules, the ranked
+symbols, graph neighbours and tests found by path convention.
 
 ## Install
 

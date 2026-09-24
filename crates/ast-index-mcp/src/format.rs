@@ -160,16 +160,20 @@ fn write_search_content(
 // ---------------------------------------------------------------------------
 
 /// A multi-word `search` without literal matches answers with the `explore`
-/// report instead, marked `fallback: "explore"`: source of the best
-/// definitions, the ranked symbols, graph neighbours and tests found by path
-/// convention.
+/// report instead, marked `fallback: "explore"`.
 fn render_explore_fallback(obj: &serde_json::Map<String, Value>, out: &mut String) -> bool {
     let reason = obj
         .get("reason")
         .and_then(Value::as_str)
         .unwrap_or("no literal matches");
     writeln!(out, "fallback: explore — {reason}").ok();
+    render_explore_report(obj, out)
+}
 
+/// The sections of an `explore` report: the source of the best functions and
+/// an outline of the best types and modules, the ranked symbols, graph
+/// neighbours and tests found by path convention.
+fn render_explore_report(obj: &serde_json::Map<String, Value>, out: &mut String) -> bool {
     if let Some(files) = obj.get("files").and_then(Value::as_array) {
         if !files.is_empty() {
             writeln!(out, "\nSource:").ok();
@@ -183,6 +187,7 @@ fn render_explore_fallback(obj: &serde_json::Map<String, Value>, out: &mut Strin
             for code in source.lines() {
                 writeln!(out, "    {code}").ok();
             }
+            render_explore_outline(file, out);
         }
     }
 
@@ -237,6 +242,31 @@ fn render_explore_fallback(obj: &serde_json::Map<String, Value>, out: &mut Strin
         }
     }
     true
+}
+
+/// The outline `explore` gives for a type or module instead of its source:
+/// one `:start-end name [kind]` row per definition.
+fn render_explore_outline(file: &Value, out: &mut String) {
+    let Some(rows) = file.get("outline").and_then(Value::as_array) else {
+        return;
+    };
+    for row in rows {
+        let name = row.get("name").and_then(Value::as_str).unwrap_or("?");
+        let kind = row.get("kind").and_then(Value::as_str).unwrap_or("?");
+        let line = row.get("line").and_then(Value::as_i64).unwrap_or(0);
+        let position = match row.get("end_line").and_then(Value::as_i64) {
+            Some(end) if end > line => format!(":{line}-{end}"),
+            _ => format!(":{line}"),
+        };
+        writeln!(out, "    {position} {name} [{kind}]").ok();
+    }
+    let hidden = file
+        .get("outline_hidden")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if hidden > 0 {
+        writeln!(out, "    … {hidden} more").ok();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1775,7 +1805,8 @@ mod tests {
     // index, and the `*_not_*` files from the same Ruby index before
     // `graph build` / `hotspots --collect` ran. `search_explore_fallback.json`
     // is a multi-word `search` without literal matches over a small Ruby
-    // billing repository.
+    // billing repository: functions come with their source, the `Invoice`
+    // class with an outline.
 
     macro_rules! fixture {
         ($name:literal) => {
@@ -2125,6 +2156,14 @@ mod tests {
             "       13\t      @gateway ||= PaymentGateway.new\n",
             "       14\t    end\n",
         )));
+        assert!(out.contains(concat!(
+            "  app/models/invoice.rb:1 Invoice\n",
+            "    :1-13 Invoice [class]\n",
+            "    :2-4 paid? [function]\n",
+            "    :6-8 mark_paid! [function]\n",
+            "    :10-12 mark_refunded! [function]\n",
+        )));
+        assert!(!out.contains("    … "), "{out}");
         let value: Value = serde_json::from_str(json).unwrap();
         for symbol in value["symbols"].as_array().unwrap() {
             let line = format!(
@@ -2141,6 +2180,18 @@ mod tests {
         ));
         assert!(out.contains("  app/models/invoice.rb ← no test file found by convention"));
         assert!(out.len() < json.len(), "not compact: {out}");
+    }
+
+    #[test]
+    fn explore_outline_counts_the_rows_it_left_out() {
+        let json = r#"{"fallback":"explore","reason":"r","files":[{"path":"a.rb","line":1,
+            "symbol":"A","outline":[{"name":"A","kind":"class","line":1,"end_line":90},
+            {"name":"go","kind":"function","line":3,"end_line":3}],"outline_hidden":7}]}"#;
+        let out = to_compact("search", json);
+        assert!(
+            out.contains("  a.rb:1 A\n    :1-90 A [class]\n    :3 go [function]\n    … 7 more"),
+            "{out}"
+        );
     }
 
     #[test]

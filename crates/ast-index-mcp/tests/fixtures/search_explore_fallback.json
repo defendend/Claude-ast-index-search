@@ -16,21 +16,47 @@
     },
     {
       "line": 1,
+      "outline": [
+        {
+          "end_line": 13,
+          "kind": "class",
+          "line": 1,
+          "name": "Invoice"
+        },
+        {
+          "end_line": 4,
+          "kind": "function",
+          "line": 2,
+          "name": "paid?"
+        },
+        {
+          "end_line": 8,
+          "kind": "function",
+          "line": 6,
+          "name": "mark_paid!"
+        },
+        {
+          "end_line": 12,
+          "kind": "function",
+          "line": 10,
+          "name": "mark_refunded!"
+        }
+      ],
+      "outline_hidden": 0,
       "path": "app/models/invoice.rb",
-      "source": "    1\tclass Invoice\n    2\t  def paid?\n    3\t    status == \"paid\"\n    4\t  end\n    5\t\n    6\t  def mark_paid!\n    7\t    update(status: \"paid\")\n    8\t  end\n    9\t\n   10\t  def mark_refunded!\n   11\t    update(status: \"refunded\")\n   12\t  end\n   13\tend\n",
       "symbol": "Invoice"
-    },
-    {
-      "line": 2,
-      "path": "spec/services/billing/charge_service_spec.rb",
-      "source": "    2\t  it \"charges an unpaid invoice\" do\n    3\t    expect(described_class.new.call(Invoice.new)).to be_nil\n    4\t  end\n",
-      "symbol": "it \"charges an unpaid invoice\""
     },
     {
       "line": 8,
       "path": "app/services/billing/refund_service.rb",
       "source": "    8\t    def gateway\n    9\t      PaymentGateway.new\n   10\t    end\n",
       "symbol": "gateway"
+    },
+    {
+      "line": 2,
+      "path": "spec/services/billing/charge_service_spec.rb",
+      "source": "    2\t  it \"charges an unpaid invoice\" do\n    3\t    expect(described_class.new.call(Invoice.new)).to be_nil\n    4\t  end\n",
+      "symbol": "it \"charges an unpaid invoice\""
     }
   ],
   "neighbours": [],
@@ -58,7 +84,7 @@
       "line": 1,
       "name": "Invoice",
       "path": "app/models/invoice.rb",
-      "score": 65.65,
+      "score": 90.54500000000002,
       "vendor": false
     },
     {
@@ -66,7 +92,7 @@
       "line": 1,
       "name": "PaymentGateway",
       "path": "app/models/payment_gateway.rb",
-      "score": 40.3,
+      "score": 57.589999999999996,
       "vendor": false
     },
     {
@@ -74,15 +100,7 @@
       "line": 2,
       "name": "Billing::ChargeService",
       "path": "app/services/billing/charge_service.rb",
-      "score": 39.9,
-      "vendor": false
-    },
-    {
-      "kind": "function",
-      "line": 2,
-      "name": "it \"charges an unpaid invoice\"",
-      "path": "spec/services/billing/charge_service_spec.rb",
-      "score": 36.27,
+      "score": 57.07,
       "vendor": false
     },
     {
@@ -94,11 +112,19 @@
       "vendor": false
     },
     {
+      "kind": "function",
+      "line": 2,
+      "name": "it \"charges an unpaid invoice\"",
+      "path": "spec/services/billing/charge_service_spec.rb",
+      "score": 14.508000000000001,
+      "vendor": false
+    },
+    {
       "kind": "class",
       "line": 1,
       "name": "describe \"Billing::ChargeService\"",
       "path": "spec/services/billing/charge_service_spec.rb",
-      "score": 11.805,
+      "score": 13.005,
       "vendor": false
     },
     {
@@ -134,11 +160,11 @@
       "tests": []
     },
     {
-      "source": "spec/services/billing/charge_service_spec.rb",
+      "source": "app/services/billing/refund_service.rb",
       "tests": []
     },
     {
-      "source": "app/services/billing/refund_service.rb",
+      "source": "spec/services/billing/charge_service_spec.rb",
       "tests": []
     }
   ]
