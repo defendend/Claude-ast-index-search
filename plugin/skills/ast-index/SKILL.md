@@ -119,7 +119,7 @@ dossier next to every result explaining its position. Use it when the question
 is not "where is X" but "which of these X":
 
 ```bash
-ast-index search Service --fuzzy --module app/services/ --rank proven  # safe to copy as a pattern
+ast-index search Service --fuzzy --module app/services/ --rank proven  # a settled example to copy
 ast-index search Merge --rank risky                   # dangerous to touch: many dependents + unstable history
 ast-index search Import --rank hotspots               # keeps being changed and fixed
 ast-index search Import --rank hotspots --exclude-tests  # same, spec/test files left out
@@ -129,7 +129,7 @@ ast-index --format json search Merge --rank risky     # rank.applied / rank.miss
 
 | Preset | Score | Needs |
 |--------|-------|-------|
-| `proven` | mean(1 − hotspot score, file age pct, days-idle pct, used 1/0) | `hotspots --collect` + `graph build` |
+| `proven` | mean(1 − hotspot score, maturity, used 1/0) × substance (0.5 for stubs) × lineage (0.5 when the base is no longer extended) | `hotspots --collect` + `graph build` |
 | `hotspots` | file hotspot score (commits, churn, bugfix ratio pct) | `hotspots --collect` |
 | `risky` | dependents pct × hotspot score | both |
 | `central` | PageRank pct | `graph build` |
@@ -147,7 +147,10 @@ ast-index --format json search Merge --rank risky     # rank.applied / rank.miss
 - Third-party code (`node_modules`, `.d.ts`) is never scored and is listed
   after all project results.
 - Formulas were picked by backtesting next-year bugfixes on a 40k-file
-  monorepo; the numbers are in USER_GUIDE.md ("Ranking search results").
+  monorepo, `proven` also by hand-judged "which one to copy" queries; the
+  numbers are in USER_GUIDE.md ("Ranking search results"). Safe by the numbers
+  is not the same as a good example: `proven` cannot tell which of two living
+  styles the team prefers.
 
 ### File Search
 

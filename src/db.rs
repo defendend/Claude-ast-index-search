@@ -10643,6 +10643,121 @@ pub fn load_file_symbol_metrics(
     Ok(rows)
 }
 
+/// The last name segment of an inheritance parent as the source wrote it:
+/// `BaseImporter` for `Billing::BaseImporter`, `Contract` for a parametrised
+/// `Component::Contract[Query]`.
+fn inheritance_parent_segment(parent_name: &str) -> &str {
+    let name = parent_name.trim_start_matches(':');
+    let end = name
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':' || c == '.'))
+        .unwrap_or(name.len());
+    last_name_segment(&name[..end])
+}
+
+/// Superclasses of a class as the symbol graph resolved them: targets of the
+/// class's edges on its declaration line (`class A < B`) that are class-like
+/// and whose last name segment is one of the class's inheritance parents.
+/// Ambiguous edges are left out. Empty when the graph was never built.
+pub fn load_superclasses(conn: &Connection, class_id: i64) -> Result<Vec<(i64, String)>> {
+    if !table_exists(conn, "symbol_edges")? {
+        return Ok(Vec::new());
+    }
+    let parents: Vec<String> = conn
+        .prepare_cached("SELECT parent_name FROM inheritance WHERE child_id = ?1")?
+        .query_map(params![class_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if parents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let segments: Vec<&str> = parents
+        .iter()
+        .map(|parent| inheritance_parent_segment(parent))
+        .collect();
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.id, t.name FROM symbols c
+         JOIN symbol_edges e ON e.source_id = c.id AND e.line = c.line
+         JOIN symbols t ON t.id = e.target_id
+         WHERE c.id = ?1 AND e.confidence < 4
+           AND t.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')",
+    )?;
+    let targets = stmt
+        .query_map(params![class_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(targets
+        .into_iter()
+        .filter(|(_, name)| segments.contains(&last_name_segment(name)))
+        .collect())
+}
+
+/// `(root_path, path)` of the file of every class whose superclass resolves
+/// to `class_id` ([`load_superclasses`]), one entry per class.
+pub fn load_subclass_files(
+    conn: &Connection,
+    class_id: i64,
+    class_name: &str,
+) -> Result<Vec<(Option<String>, String)>> {
+    if !table_exists(conn, "symbol_edges")? {
+        return Ok(Vec::new());
+    }
+    let segment = last_name_segment(class_name);
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id, f.root_path, f.path, i.parent_name FROM symbol_edges e
+         JOIN symbols c ON c.id = e.source_id AND e.line = c.line
+         JOIN inheritance i ON i.child_id = c.id
+         JOIN files f ON f.id = c.file_id
+         WHERE e.target_id = ?1 AND e.confidence < 4",
+    )?;
+    let rows = stmt
+        .query_map(params![class_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty()),
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|(_, _, _, parent)| inheritance_parent_segment(parent) == segment)
+        .filter(|(id, _, _, _)| seen.insert(*id))
+        .map(|(_, root, path, _)| (root, path))
+        .collect())
+}
+
+/// `(kind, line, end_line)` of each of `symbol_ids`; `end_line` is `None`
+/// for parsers that record no ranges.
+pub fn load_symbol_extents(
+    conn: &Connection,
+    symbol_ids: &[i64],
+) -> Result<HashMap<i64, (String, i64, Option<i64>)>> {
+    let mut extents = HashMap::with_capacity(symbol_ids.len());
+    for chunk in symbol_ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql =
+            format!("SELECT id, kind, line, end_line FROM symbols WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(values.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                (row.get(1)?, row.get(2)?, row.get::<_, Option<i64>>(3)?),
+            ))
+        })?;
+        for row in rows {
+            let (id, extent) = row?;
+            extents.insert(id, extent);
+        }
+    }
+    Ok(extents)
+}
+
 /// Every stored metrics row (symbols touching at least one edge).
 pub fn load_all_symbol_graph_metrics(conn: &Connection) -> Result<Vec<SymbolGraphMetrics>> {
     let mut stmt = conn.prepare(
