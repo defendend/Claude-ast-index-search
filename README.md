@@ -729,6 +729,37 @@ exclude:
 
 ### Unreleased
 
+- **`call-tree` shows same-named callers with their file** — two `it "works"`
+  blocks or `export` methods of different files used to print as `(recursive)`
+  without a path and still use up `--limit`. Every caller now prints with its
+  file, a caller named like one already expanded is marked `(expanded above)`,
+  and `(recursive)` marks only a definition already on its own path.
+- **`call-tree` attributes calls to real definitions** — an import or
+  annotation line (`use`, `import`, `include Mod`, Rails callbacks) no longer
+  owns a call, and a line declaring the function itself (Go `func (s *T) Name(`,
+  a JavaScript method, `attr_reader :name`) is no longer its own caller. The
+  same owner rule serves `explore --rwr` and the symbol graph.
+- **`callers` / `call-tree` stop reading symbols and paths as calls** —
+  `authorize(record, :update?)` is no call of `update`, and `use super::name;`
+  or `Billing::Name` without a call is no call of `name`; callbacks, `delegate`
+  and `&:name` still count.
+- **The symbol graph resolves Rust paths** — files are modules, `crate::` /
+  `super::` / `self::` and `use` declarations (grouped, aliased, globbed,
+  `pub use`) are followed, and workspace crates are reached by their
+  `Cargo.toml` name. On this repository calls through a module path went from
+  0 to 1160 of 1161 resolved; `graph dependents open_db` lists 38 dependents
+  instead of none.
+- **`graph dependents` and `graph impact` take `--exclude-tests`** (MCP
+  `graph_dependents`: `exclude_tests`) — test dependents are left out of the
+  list and the counts, and `impact` does not follow them.
+- **Graph answers say what they merge and leave out** — the definitions a bare
+  name matches are capped by `--limit` with a hint to narrow the query, and a
+  column query explains that only reads inside the model are edges and points
+  to `usages`.
+- **Faster graph queries** — freshness is checked against an index write
+  generation and the highest row ids instead of counting and summing the
+  tables: about 35 ms off every graph query and `search --rank` on a large
+  monorepo.
 - **`hotspots --sort fixes` discounts thin history** — files are ordered by the
   lower bound of the 95% Wilson interval of their bugfix share, and files with
   fewer than four commits follow the rest, so 11 fixes in 17 commits rank above
