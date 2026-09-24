@@ -300,6 +300,12 @@ definitions inside it. `path` always treats a class as itself plus its
 members and may step from a class into a member (shown as `contains`),
 because dispatch like `Service.call` -> `process` is not statically visible.
 
+A bare name can match many definitions (`call`, or `Applicant` as a model,
+TypeScript types and spec stubs): `dependents` / `dependencies` / `impact`
+then merge their edges, say how many definitions matched, list at most
+`--limit` of them and suggest `Outer::Name`, `Class#member`, `--in-file` or
+`--kind`.
+
 In a Rails app the tables of `db/schema.rb` are matched to models
 (`self.table_name`, single-table inheritance, `table_name_prefix` /
 `isolate_namespace`, nesting, the pluralized class name), and a column reader
@@ -307,8 +313,9 @@ or attribute method called inside the model (`status`, `self.status`,
 `status?`, `saved_change_to_status?`) resolves as a `scoped` edge to the
 column: `ast-index graph dependents applicants.first_name` (or
 `applicants#first_name`). A call on another receiver (`applicant.first_name`)
-never guesses a column. `graph build` reports tables without a model and
-models without a table.
+never guesses a column, so most reads of a column are not its edges — the
+answer says so; `ast-index usages first_name` lists every read. `graph build`
+reports tables without a model and models without a table.
 
 The graph is not rebuilt by `rebuild` / `update`. After an update changes the
 index, queries print a stale warning (`"stale": true` in JSON); rerun

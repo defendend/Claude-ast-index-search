@@ -593,6 +593,14 @@ as a `scoped` edge to the column; a call on any other receiver
 ast-index graph dependents users.email       # or users#email
 ```
 
+Most reads of a column therefore are no edges of it, and a query about a
+column says so (`notes` in JSON); `ast-index usages email` lists every read.
+A bare name that matches several definitions — `call`, or `Applicant` as a
+model, TypeScript types and spec stubs — merges their edges; `dependents`,
+`dependencies` and `impact` say how many definitions matched, list at most
+`--limit` of them and suggest `Outer::Name`, `Class#member`, `--in-file` or
+`--kind` to narrow the query.
+
 ### Ranking search results by history and structure
 
 `search --rank <preset>` re-orders the **Files** and **Symbols** sections of a

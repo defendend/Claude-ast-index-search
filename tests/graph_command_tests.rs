@@ -960,3 +960,39 @@ fn exclude_tests_leaves_test_dependents_out_of_dependents_and_impact() {
         "{impact:#}"
     );
 }
+
+#[test]
+fn several_matched_definitions_are_capped_by_limit_and_announced() {
+    let ws = billing_project();
+    ws.run(&["graph", "build"]);
+    let text = ws.run(&["graph", "dependents", "refresh", "--limit", "1"]);
+    assert!(
+        text.contains("2 definitions match 'refresh' and their edges are merged"),
+        "{text}"
+    );
+    assert!(text.contains("'Class#refresh'"), "{text}");
+    assert_eq!(text.matches("refresh [function]").count(), 1, "{text}");
+    assert!(text.contains("… and 1 more definition(s)"), "{text}");
+    let impact = ws.run(&["graph", "impact", "refresh", "--limit", "1"]);
+    assert!(impact.contains("2 definitions match 'refresh'"), "{impact}");
+
+    let single = ws.run(&["graph", "dependents", "Alpha#refresh"]);
+    assert!(!single.contains("definitions match"), "{single}");
+}
+
+#[test]
+fn column_dependents_say_that_reads_elsewhere_are_not_edges() {
+    let ws = rails_schema_project();
+    ws.run(&["graph", "build"]);
+    let report = ws.json(&["graph", "dependents", "people.first_name"]);
+    let notes = report["notes"].as_array().expect("notes");
+    assert_eq!(notes.len(), 1, "{report:#}");
+    let note = notes[0].as_str().unwrap();
+    assert!(note.contains("reads inside the model"), "{note}");
+    assert!(note.contains("ast-index usages first_name"), "{note}");
+    let text = ws.run(&["graph", "dependents", "clients.first_name"]);
+    assert!(text.contains("record.first_name"), "{text}");
+
+    let class = ws.json(&["graph", "dependents", "Person"]);
+    assert!(class.get("notes").is_none(), "{class:#}");
+}

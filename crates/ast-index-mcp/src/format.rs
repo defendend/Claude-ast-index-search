@@ -798,6 +798,7 @@ fn render_graph_edges(obj: &serde_json::Map<String, Value>, out: &mut String) ->
         }
     )
     .ok();
+    write_graph_notes(obj, out);
 
     let per_subject = matched.len() > 1 || members;
     for item in items {
@@ -903,6 +904,7 @@ fn render_graph_impact(obj: &serde_json::Map<String, Value>, out: &mut String) -
         )
         .ok();
     }
+    write_graph_notes(obj, out);
 
     let via_is_the_seed = matched.len() == 1 && !members;
     for item in items {
@@ -923,6 +925,13 @@ fn render_graph_impact(obj: &serde_json::Map<String, Value>, out: &mut String) -
     }
     write_more_notice(obj.get("pagination"), out);
     true
+}
+
+/// The `notes` a graph report carries: what its answer leaves out.
+fn write_graph_notes(obj: &serde_json::Map<String, Value>, out: &mut String) {
+    for note in string_items(obj.get("notes")) {
+        writeln!(out, "note: {note}").ok();
+    }
 }
 
 fn render_graph_path(obj: &serde_json::Map<String, Value>, out: &mut String) -> bool {
@@ -1858,6 +1867,42 @@ mod tests {
         assert!(out.contains(
             "[scoped] Billing::ChargeService [class] app/services/billing/charge_service.rb:2 (from create, line 3)"
         ));
+    }
+
+    #[test]
+    fn graph_notes_say_what_the_answer_leaves_out() {
+        let edges = r#"{
+            "graph": {"built": true, "stale": false},
+            "direction": "dependents",
+            "matched": [{"name": "users.email", "kind": "column", "path": "db/schema.rb", "line": 9}],
+            "resolved_edges": 0, "ambiguous_edges": 0, "include_ambiguous": false,
+            "members": false, "exclude_tests": true, "excluded_test_edges": 2,
+            "notes": ["Column edges come only from reads inside the model.", "2 edge(s) from test files left out (--exclude-tests)."],
+            "items": [], "pagination": {"total": 0, "returned": 0, "truncated": false, "limit": 50}
+        }"#;
+        let out = to_compact("graph_dependents", edges);
+        assert!(
+            out.contains(concat!(
+                "0 resolved, 0 ambiguous edges\n",
+                "note: Column edges come only from reads inside the model.\n",
+                "note: 2 edge(s) from test files left out (--exclude-tests).\n"
+            )),
+            "{out}"
+        );
+        let impact = r#"{
+            "graph": {"built": true, "stale": false},
+            "matched": [{"name": "Invoice", "kind": "class", "path": "app/models/invoice.rb", "line": 1}],
+            "depth": 2, "include_ambiguous": false, "members": false,
+            "exclude_tests": true, "excluded_test_symbols": 3,
+            "notes": ["3 dependent(s) in test files left out and not followed (--exclude-tests)."],
+            "levels": [], "total_symbols": 0, "total_files": 0,
+            "items": [], "pagination": {"total": 0, "returned": 0, "truncated": false, "limit": 50}
+        }"#;
+        let out = to_compact("graph_dependents", impact);
+        assert!(
+            out.contains("note: 3 dependent(s) in test files left out and not followed"),
+            "{out}"
+        );
     }
 
     #[test]

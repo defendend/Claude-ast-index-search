@@ -424,6 +424,49 @@ fn infos_for(conn: &Connection, ids: &HashSet<i64>) -> Result<HashMap<i64, Graph
     db::load_graph_symbol_infos(conn, &list)
 }
 
+/// Print the definitions `spec` matched, at most `limit` of them, after a
+/// warning when there are several: their edges are answered as one.
+fn print_matched(spec: &str, matched: &[SymbolRef], limit: usize) {
+    let shown = limit.max(1);
+    if matched.len() > 1 {
+        let name = short_name(spec.rsplit('#').next().unwrap_or(spec)).unwrap_or(spec);
+        println!(
+            "  {}",
+            format!(
+                "{} definitions match '{spec}' and their edges are merged; narrow with \
+                 'Outer::{name}' or 'Class#{name}', --in-file or --kind.",
+                matched.len()
+            )
+            .yellow()
+        );
+    }
+    for subject in matched.iter().take(shown) {
+        println!("  {}", subject.render());
+    }
+    if matched.len() > shown {
+        println!(
+            "  … and {} more definition(s) (--limit lists more).",
+            matched.len() - shown
+        );
+    }
+}
+
+/// What a query about a schema column has to say: its edges come from reads
+/// inside the model only, so few or none of the reads in the code show up.
+fn column_note(matched: &[GraphSymbolInfo]) -> Option<String> {
+    let column = matched.iter().find(|info| info.kind == "column")?;
+    let attribute = column
+        .name
+        .split_once('.')
+        .map_or(column.name.as_str(), |(_, attribute)| attribute);
+    Some(format!(
+        "Column edges come only from reads inside the model of its table \
+         ('{attribute}', 'self.{attribute}', '{attribute}?'); a read on another receiver \
+         ('record.{attribute}') is never resolved to the column. 'ast-index usages \
+         {attribute}' lists every read."
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // graph build / status
 // ---------------------------------------------------------------------------
@@ -675,6 +718,9 @@ struct EdgeReport {
     exclude_tests: bool,
     /// Edges left out by `exclude_tests`.
     excluded_test_edges: usize,
+    /// What the answer leaves out, in words.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
     #[serde(flatten)]
     page: Page<EdgeItem>,
 }
@@ -787,6 +833,15 @@ pub fn cmd_graph_edges(
             .then_with(|| a.other.line.cmp(&b.other.line))
     });
     let total = items.len();
+    let mut notes = Vec::new();
+    if direction == Direction::Dependents {
+        notes.extend(column_note(&matched));
+    }
+    if exclude_tests {
+        notes.push(format!(
+            "{excluded_test_edges} edge(s) from test files left out (--exclude-tests)."
+        ));
+    }
     let report = EdgeReport {
         graph: GraphState::from(&state),
         direction: match direction {
@@ -803,6 +858,7 @@ pub fn cmd_graph_edges(
         members,
         exclude_tests,
         excluded_test_edges,
+        notes,
         page: Page::new(items, total, limit),
     };
     if format == "json" {
@@ -815,9 +871,7 @@ pub fn cmd_graph_edges(
         Direction::Dependencies => ("Dependencies of", "->"),
     };
     println!("{}", format!("{title} '{spec}':").bold());
-    for subject in &report.matched {
-        println!("  {}", subject.render());
-    }
+    print_matched(spec, &report.matched, limit);
     println!(
         "  {} resolved edge(s), {} ambiguous{}.",
         report.resolved_edges,
@@ -828,11 +882,8 @@ pub fn cmd_graph_edges(
             ""
         }
     );
-    if exclude_tests {
-        println!(
-            "  {} edge(s) from test files left out (--exclude-tests).",
-            excluded_test_edges
-        );
+    for note in &report.notes {
+        println!("  {}", note.yellow());
     }
     let multi = report.matched.len() > 1 || members;
     for item in &report.page.items {
@@ -904,6 +955,9 @@ struct ImpactReport {
     exclude_tests: bool,
     /// Distinct test-file dependents met and left out by `exclude_tests`.
     excluded_test_symbols: usize,
+    /// What the answer leaves out, in words.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
     levels: Vec<ImpactLevel>,
     total_symbols: usize,
     total_files: usize,
@@ -1082,6 +1136,13 @@ pub fn cmd_graph_impact(
             .then_with(|| a.symbol.line.cmp(&b.symbol.line))
     });
     let total = items.len();
+    let mut notes: Vec<String> = column_note(&matched).into_iter().collect();
+    if exclude_tests {
+        notes.push(format!(
+            "{} dependent(s) in test files left out and not followed (--exclude-tests).",
+            reach.excluded.len()
+        ));
+    }
     let report = ImpactReport {
         graph: GraphState::from(&state),
         matched: matched
@@ -1093,6 +1154,7 @@ pub fn cmd_graph_impact(
         members,
         exclude_tests,
         excluded_test_symbols: reach.excluded.len(),
+        notes,
         levels,
         total_symbols: reach.visited.len(),
         total_files: all_files.len(),
@@ -1117,9 +1179,7 @@ pub fn cmd_graph_impact(
         )
         .bold()
     );
-    for subject in &report.matched {
-        println!("  {}", subject.render());
-    }
+    print_matched(spec, &report.matched, limit);
     for level in &report.levels {
         println!(
             "  depth {}: {} symbol(s) in {} file(s)",
@@ -1130,11 +1190,8 @@ pub fn cmd_graph_impact(
         "  total: {} symbol(s) in {} file(s)",
         report.total_symbols, report.total_files
     );
-    if exclude_tests {
-        println!(
-            "  {} dependent(s) in test files left out and not followed (--exclude-tests).",
-            report.excluded_test_symbols
-        );
+    for note in &report.notes {
+        println!("  {}", note.yellow());
     }
     if let (Some(symbols), Some(files)) = (report.resolved_only_symbols, report.resolved_only_files)
     {
