@@ -29,6 +29,7 @@ static NON_CODE: super::NonCode = super::NonCode {
     strings: &["string", "interpolated_string", "character_literal"],
     code: &["interpolation"],
     keep: super::keep_no_string,
+    declared: super::declares_nothing,
 };
 
 impl LanguageParser for ScalaParser {

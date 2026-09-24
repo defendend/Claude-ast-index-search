@@ -62,6 +62,7 @@ static NON_CODE: super::NonCode = super::NonCode {
     strings: &["string_literal", "raw_string_literal", "char_literal"],
     code: &[],
     keep: captured_format_args,
+    declared: super::declares_nothing,
 };
 
 /// The identifiers a format string captures (`format!("{LIMIT} of {total:>4}")`):

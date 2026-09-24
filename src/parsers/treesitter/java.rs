@@ -69,6 +69,7 @@ static NON_CODE: super::NonCode = super::NonCode {
     strings: &["string_literal", "character_literal"],
     code: &["string_interpolation"],
     keep: super::keep_no_string,
+    declared: super::declares_nothing,
 };
 
 impl LanguageParser for JavaParser {

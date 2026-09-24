@@ -34,6 +34,7 @@ static NON_CODE: super::NonCode = super::NonCode {
     ],
     code: &["interpolated_expression", "raw_str_interpolation"],
     keep: super::keep_no_string,
+    declared: super::declares_nothing,
 };
 
 impl LanguageParser for SwiftParser {

@@ -35,6 +35,7 @@ static NON_CODE: super::NonCode = super::NonCode {
         "scoped_property_access_expression",
     ],
     keep: super::keep_no_string,
+    declared: super::declares_nothing,
 };
 
 impl LanguageParser for PhpParser {

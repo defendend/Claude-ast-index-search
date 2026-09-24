@@ -26,6 +26,7 @@ static NON_CODE: super::NonCode = super::NonCode {
     strings: &["string_literal", "character_literal"],
     code: &[],
     keep: gstring,
+    declared: super::declares_nothing,
 };
 
 /// A double-quoted string with `$` in it, kept whole: the grammar reads a

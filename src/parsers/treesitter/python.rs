@@ -30,6 +30,7 @@ static PY_NON_CODE: NonCode = NonCode {
     strings: &["string"],
     code: &["interpolation"],
     keep: names_class,
+    declared: super::declares_nothing,
 };
 
 /// A string that is exactly a dotted name ending in a class-like name

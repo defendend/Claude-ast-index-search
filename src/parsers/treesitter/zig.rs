@@ -35,6 +35,7 @@ static NON_CODE: super::NonCode = super::NonCode {
     strings: &["string", "multiline_string", "character"],
     code: &[],
     keep: super::keep_no_string,
+    declared: super::declares_nothing,
 };
 
 impl LanguageParser for ZigParser {

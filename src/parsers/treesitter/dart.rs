@@ -24,6 +24,7 @@ static NON_CODE: super::NonCode = super::NonCode {
     strings: &["string_literal"],
     code: &["template_substitution"],
     keep: super::keep_no_string,
+    declared: super::declares_nothing,
 };
 
 impl LanguageParser for DartParser {

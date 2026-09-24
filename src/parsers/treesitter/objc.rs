@@ -26,6 +26,7 @@ static NON_CODE: super::NonCode = super::NonCode {
     strings: &["string_literal", "char_literal", "system_lib_string"],
     code: &[],
     keep: super::keep_no_string,
+    declared: super::cpp::declared_function_name,
 };
 
 impl LanguageParser for ObjcParser {

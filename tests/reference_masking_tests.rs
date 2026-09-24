@@ -135,6 +135,70 @@ fn c_family_comments_and_literals_are_not_references() {
 }
 
 #[test]
+fn c_prototypes_declare_functions_instead_of_using_them() {
+    check(&Case {
+        file_type: FileType::Cpp,
+        source: "int send_alert(Conn *conn, int level);\n\
+                 extern const char *alert_name(void);\n\
+                 static int (*on_alert)(Conn *);\n\
+                 struct ops { int (*read_fn)(void *); };\n\
+                 class Widget { void draw(Canvas *canvas); virtual ~Widget(); };\n\
+                 typedef int (*handler_fn)(int);\n\
+                 IMPLEMENT_THING(Widget)\n",
+        present: &["Conn", "Canvas", "IMPLEMENT_THING"],
+        absent: &[
+            "send_alert",
+            "alert_name",
+            "on_alert",
+            "read_fn",
+            "draw",
+            "handler_fn",
+        ],
+    });
+    check(&Case {
+        file_type: FileType::Cpp,
+        source: "int send_alert(Conn *conn, int level) { return log_alert(level); }\n\
+                 void Widget::draw(Canvas *canvas) { paint(canvas); }\n",
+        present: &["log_alert", "paint"],
+        absent: &["send_alert", "draw"],
+    });
+    check(&Case {
+        file_type: FileType::Cpp,
+        source: "socklen_t addr_size(const Addr *addr)\n{\n    return 0;\n}\n",
+        present: &["Addr"],
+        absent: &["addr_size", "socklen_t"],
+    });
+    // Header prototypes behind attribute and deprecation macros, which the
+    // grammar only reads through error recovery.
+    check(&Case {
+        file_type: FileType::Cpp,
+        source: "__must_check int session_count(const Ctx *ctx);\n\
+                 DEPRECATED_SINCE_1_1(int old_accept(int sock, char **ip_port))\n\
+                 int later_call(void);\n",
+        present: &["Ctx", "DEPRECATED_SINCE_1_1"],
+        absent: &["session_count", "old_accept", "later_call"],
+    });
+    // Inside a body the grammar reads a macro type and code after a broken
+    // `#if` as declarations; those stay references.
+    check(&Case {
+        file_type: FileType::Cpp,
+        source: "int run(void)\n{\n    LHASH_OF(int) *h = lh_new();\n done:\n#ifndef NO_DEBUG\n    mem_debug_pop();\n#endif\n    return 0;\n}\n",
+        present: &["LHASH_OF", "lh_new", "mem_debug_pop"],
+        absent: &["run"],
+    });
+    check(&Case {
+        file_type: FileType::ObjC,
+        source: "#import <Foundation/Foundation.h>\n\
+                 @interface Widget : NSObject\n\
+                 @end\n\
+                 int send_alert(Conn *conn);\n\
+                 void run(void) { log_alert(1); }\n",
+        present: &["Conn", "log_alert"],
+        absent: &["send_alert"],
+    });
+}
+
+#[test]
 fn other_languages_skip_comments_and_strings() {
     let cases = [
         Case {

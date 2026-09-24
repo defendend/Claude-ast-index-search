@@ -47,7 +47,59 @@ static CPP_NON_CODE: NonCode = NonCode {
     ],
     code: &[],
     keep: macro_body_code,
+    declared: declared_function_name,
 };
+
+/// The function a declarator names: `int send_alert(SSL *s);` in a header
+/// declares `send_alert` and does not use it (the parameter types stay
+/// references). The same holds for a definition, a method declared in a
+/// class, a function-pointer field or parameter and a function typedef.
+/// Inside a function body the grammar also reads macro calls and code after
+/// a broken `#if` as declarations (`LHASH_OF(int) *h = ...;`), so only
+/// declarations outside bodies count; where the grammar recovers from an
+/// error (`DEPRECATEDIN_1_1_0(int f(void))`), an upper-case name is a macro
+/// call, not a declared function.
+pub(crate) fn declared_function_name(content: &str, node: Node) -> Option<std::ops::Range<usize>> {
+    if node.kind() != "function_declarator" {
+        return None;
+    }
+    let mut recovered = false;
+    let mut ancestor = node.parent();
+    while let Some(outer) = ancestor {
+        match outer.kind() {
+            "compound_statement" => return None,
+            "ERROR" => recovered = true,
+            _ => {}
+        }
+        ancestor = outer.parent();
+    }
+    let name = declarator_name(node)?;
+    let macro_like = content[name.clone()]
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    (!(recovered && macro_like)).then_some(name)
+}
+
+fn declarator_name(node: Node) -> Option<std::ops::Range<usize>> {
+    let mut name = node.child_by_field_name("declarator")?;
+    loop {
+        let inner = match name.kind() {
+            "pointer_declarator" => name.child_by_field_name("declarator"),
+            "parenthesized_declarator" | "reference_declarator" | "attributed_declarator" => {
+                name.named_child(0)
+            }
+            "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "qualified_identifier"
+            | "destructor_name"
+            | "operator_name"
+            | "template_function" => return Some(name.byte_range()),
+            _ => return None,
+        };
+        name = inner?;
+    }
+}
 
 /// The grammar leaves a macro body as raw text (`preproc_arg`); keep all of it
 /// but its literals and comments, which the scan finds lexically.

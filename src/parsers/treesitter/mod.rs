@@ -313,6 +313,15 @@ pub struct NonCode {
     /// names code (`class_name: 'Invoice'`, `import('./Page')`). The string's
     /// own range keeps it whole; an empty list blanks it.
     pub keep: fn(&str, tree_sitter::Node) -> Vec<std::ops::Range<usize>>,
+    /// The name a declaration node declares (a C prototype's function), which
+    /// is no reference to itself.
+    pub declared: fn(&str, tree_sitter::Node) -> Option<std::ops::Range<usize>>,
+}
+
+/// A [`NonCode::declared`] for grammars whose declarations the symbol lines
+/// already cover.
+pub(crate) fn declares_nothing(_: &str, _: tree_sitter::Node) -> Option<std::ops::Range<usize>> {
+    None
 }
 
 /// A [`NonCode::keep`] for grammars whose strings never name code.
@@ -335,6 +344,14 @@ pub(crate) fn mask_non_code(content: &str, root: tree_sitter::Node, kinds: &NonC
         }
     };
     walk_tree_preorder(&root, |node| {
+        if let Some(name) = (kinds.declared)(content, node) {
+            blank(&mut masked, name.clone());
+            // A `;` where the name ended keeps the return type from reading
+            // as a call once the name is gone: `size_t        (`.
+            if let Some(last) = name.end.checked_sub(1).filter(|&last| last >= name.start) {
+                masked[last] = b';';
+            }
+        }
         let kind = node.kind();
         if kinds.prose.contains(&kind) {
             blank(&mut masked, node.byte_range());

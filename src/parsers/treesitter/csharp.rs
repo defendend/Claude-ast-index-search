@@ -236,6 +236,7 @@ static NON_CODE: super::NonCode = super::NonCode {
     ],
     code: &["interpolation"],
     keep: super::keep_no_string,
+    declared: super::declares_nothing,
 };
 
 impl LanguageParser for CSharpParser {

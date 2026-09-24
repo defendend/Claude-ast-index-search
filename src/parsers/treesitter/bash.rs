@@ -38,6 +38,7 @@ static NON_CODE: super::NonCode = super::NonCode {
         "process_substitution",
     ],
     keep: super::keep_no_string,
+    declared: super::declares_nothing,
 };
 
 impl LanguageParser for BashParser {

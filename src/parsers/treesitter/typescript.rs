@@ -1066,6 +1066,7 @@ static TS_NON_CODE: NonCode = NonCode {
     strings: &["string", "template_string"],
     code: &["template_substitution"],
     keep: module_specifier,
+    declared: super::declares_nothing,
 };
 
 /// The module path of a dynamic `import('./Page')` or a `require('./Page')`,

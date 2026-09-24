@@ -127,6 +127,7 @@ static RUBY_NON_CODE: NonCode = NonCode {
     ],
     code: &["interpolation"],
     keep: constant_names_in,
+    declared: super::declares_nothing,
 };
 
 /// The parts of a string that name a class, kept when the string is blanked:

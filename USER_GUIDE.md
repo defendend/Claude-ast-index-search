@@ -552,6 +552,12 @@ in a class name (`"User"`, `"pkg.models.User"` in an annotation or
 Groovy GString with `${...}` in it. Perl, Vue/Svelte script blocks, SQL and
 the other grammars keep the line-based comment skipping only.
 
+In C, C++ and Objective-C a function declaration outside a function body —
+a header prototype (`int send_alert(SSL *s);`, also behind `__owur` or
+similar attribute macros), a `static` forward declaration, a method declared
+in a class, a function-pointer field or typedef — declares its name and is not
+a use of it; the parameter types on that line still are.
+
 BSL (1C:Enterprise, OneScript) references are calls in Cyrillic or Latin
 (`ПолучитьДанные()`), a module or object before `.` (`ОбщегоНазначения.`) and
 the type after `Новый` / `New`; a plain capitalized word is a variable, and
