@@ -43,7 +43,7 @@ use colored::Colorize;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use super::{Page, PathResolver};
+use super::{is_test_path, Page, PathResolver};
 use crate::db::{self, GraphSymbolInfo, SymbolEdgeRow, SymbolGraphMetrics};
 use crate::parsers::FileType;
 
@@ -1727,21 +1727,6 @@ struct MetricsReport {
     sort: Option<String>,
     #[serde(flatten)]
     page: Page<MetricsItem>,
-}
-
-pub fn is_test_path(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    lower.starts_with("spec/")
-        || lower.starts_with("test/")
-        || lower.starts_with("tests/")
-        || lower.contains("/spec/")
-        || lower.contains("/test/")
-        || lower.contains("/tests/")
-        || lower.contains("/__tests__/")
-        || lower.contains("_spec.")
-        || lower.contains("_test.")
-        || lower.contains(".spec.")
-        || lower.contains(".test.")
 }
 
 #[allow(clippy::too_many_arguments)]

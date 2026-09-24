@@ -649,6 +649,31 @@ fn production_code_never_resolves_into_test_trees() {
 }
 
 #[test]
+fn a_ruby_namespace_named_tests_is_production_code() {
+    let ws = workspace();
+    ws.write(
+        "app/models/tests/grader.rb",
+        "module Tests\n  class Grader\n    def self.grade(answers)\n      answers\n    end\n  end\nend\n",
+    );
+    ws.write(
+        "app/services/scoring_service.rb",
+        "class ScoringService\n  def run\n    Tests::Grader.grade([])\n  end\nend\n",
+    );
+    assert_success(&ws.ast_index(&["rebuild"]));
+    ws.run(&["graph", "build"]);
+    let report = ws.json(&["graph", "dependents", "self.grade"]);
+    assert_eq!(other_names(&report), vec!["run"], "{report:#}");
+
+    let top = ws.json(&["graph", "top", "--exclude-tests"]);
+    assert!(
+        items(&top)
+            .iter()
+            .any(|item| item["symbol"]["path"] == "app/models/tests/grader.rb"),
+        "{top:#}"
+    );
+}
+
+#[test]
 fn ruby_calls_without_parentheses_are_references() {
     let ws = workspace();
     ws.write(

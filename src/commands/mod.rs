@@ -25,7 +25,10 @@ pub mod modules;
 pub mod perl;
 pub mod project_info;
 pub mod rank;
+pub mod test_paths;
 pub mod watch;
+
+pub use test_paths::is_test_path;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

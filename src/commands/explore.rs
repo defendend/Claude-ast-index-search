@@ -18,7 +18,7 @@ use colored::Colorize;
 use rusqlite::Connection;
 use serde_json::json;
 
-use super::PathResolver;
+use super::{is_test_path, PathResolver};
 use crate::db::{self, SearchResult, SearchScope};
 
 /// Candidates pulled per query term from FTS before ranking.
@@ -697,28 +697,6 @@ fn path_stem(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string()
-}
-
-fn is_test_path(path: &str) -> bool {
-    let p = path.to_lowercase();
-    let dir_or_infix = p.contains("/spec/")
-        || p.contains("/test/")
-        || p.contains("/tests/")
-        || p.contains("/__tests__/")
-        || p.starts_with("spec/")
-        || p.starts_with("test/")
-        || p.starts_with("tests/")
-        || p.contains("_spec.")
-        || p.contains("_test.")
-        || p.contains(".spec.")
-        || p.contains(".test.");
-    if dir_or_infix {
-        return true;
-    }
-    // CamelCase filename suffix: FooTest.java, SessionTests.swift, BarSpec.kt.
-    // Use original case so plain words ("latest", "contest") are not flagged.
-    let stem = path_stem(path);
-    stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("Spec")
 }
 
 fn abs_path(root: &Path, rel: &str, root_path: Option<&str>) -> PathBuf {

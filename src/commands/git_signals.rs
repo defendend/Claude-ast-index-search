@@ -27,7 +27,7 @@ use serde::Serialize;
 use super::changed::{
     discover_vcs_root, os_args, parse_utf8, render_stderr, run_bounded, Deadline, Vcs, STDOUT_LIMIT,
 };
-use super::graph::is_test_path;
+use super::is_test_path;
 use super::Page;
 use crate::db::{self, GitFileSignalRow, GitFileStats};
 
