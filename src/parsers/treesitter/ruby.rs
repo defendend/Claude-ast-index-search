@@ -6,8 +6,8 @@ use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{
-    line_text, node_end_line, node_line, node_text, parse_tree, walk_tree_preorder, LanguageParser,
-    WalkControl,
+    line_text, node_end_line, node_line, node_text, parse_tree, signature_line, walk_tree_preorder,
+    LanguageParser, WalkControl,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -326,7 +326,7 @@ impl LanguageParser for RubyParser {
                     kind: SymbolKind::Class,
                     line,
                     end_line: end_line_of(m, idx_class_node),
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
                 });
                 continue;
@@ -342,7 +342,7 @@ impl LanguageParser for RubyParser {
                     kind: SymbolKind::Package,
                     line,
                     end_line: end_line_of(m, idx_module_node),
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                 });
                 continue;
@@ -359,7 +359,7 @@ impl LanguageParser for RubyParser {
                         kind: SymbolKind::Function,
                         line,
                         end_line: end_line_of(m, idx_singleton_method_node),
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                     });
                     // `def self.table_name_prefix; "billing_"; end` on a namespace
@@ -374,7 +374,7 @@ impl LanguageParser for RubyParser {
                             kind: SymbolKind::Annotation,
                             line,
                             end_line: Some(line),
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
                         });
                     }
@@ -391,7 +391,7 @@ impl LanguageParser for RubyParser {
                     kind: SymbolKind::Function,
                     line,
                     end_line: end_line_of(m, idx_method_node),
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                 });
                 continue;
@@ -413,7 +413,7 @@ impl LanguageParser for RubyParser {
                         kind: SymbolKind::Constant,
                         line,
                         end_line: end_line_of(m, idx_assign_const_node),
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                     });
                 }
@@ -440,7 +440,7 @@ impl LanguageParser for RubyParser {
                         kind: SymbolKind::Annotation,
                         line,
                         end_line: Some(line),
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                     });
                 }
@@ -471,7 +471,7 @@ impl LanguageParser for RubyParser {
                                 name: path.to_string(),
                                 kind: SymbolKind::Import,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -486,7 +486,7 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} {}", method, arg),
                                 kind: SymbolKind::Annotation,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -526,7 +526,7 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} :{}", method, sym_name),
                                 kind: SymbolKind::Property,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -542,7 +542,7 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} :{}", method, sym_name),
                                 kind: SymbolKind::Property,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -583,7 +583,7 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} :{}", method, sym_name),
                                 kind: SymbolKind::Property,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -598,7 +598,7 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} :{}", method, sym_name),
                                 kind: SymbolKind::Annotation,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -637,7 +637,7 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} :{}", method, sym_name),
                                 kind: SymbolKind::Annotation,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -652,7 +652,7 @@ impl LanguageParser for RubyParser {
                                 name: format!("scope :{}", sym_name),
                                 kind: SymbolKind::Function,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -680,7 +680,7 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} \"{}\"", method, desc),
                                 kind: SymbolKind::Class,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -695,7 +695,7 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} \"{}\"", method, desc),
                                 kind: SymbolKind::Function,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -710,7 +710,7 @@ impl LanguageParser for RubyParser {
                                 name: format!("{}(:{})", method, sym_name),
                                 kind: SymbolKind::Property,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: call_end_line,
                             });
@@ -879,7 +879,7 @@ fn push_schema_table(
         kind: SymbolKind::Table,
         line,
         end_line: Some(node_end_line(&call)),
-        signature: line_text(content, line).trim().to_string(),
+        signature: signature_line(content, line),
         parents: vec![],
     });
     let Some(block) = call.child_by_field_name("block") else {
@@ -919,7 +919,7 @@ fn push_schema_table(
                 kind: SymbolKind::Column,
                 line,
                 end_line: Some(node_end_line(&node)),
-                signature: line_text(content, line).trim().to_string(),
+                signature: signature_line(content, line),
                 parents: vec![],
             });
         }

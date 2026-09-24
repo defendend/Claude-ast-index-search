@@ -100,6 +100,7 @@ pub fn get_treesitter_parser(file_type: FileType) -> Option<&'static dyn Languag
 
 /// Helper: parse source code with a tree-sitter language
 fn parse_tree(content: &str, language: &Language) -> Result<Tree> {
+    forget_line_starts();
     PARSER.with(|p| {
         let mut parser = p.borrow_mut();
         parser
@@ -149,9 +150,83 @@ fn text_end_line(content: &str, node: &tree_sitter::Node) -> usize {
         .max(node_line(node))
 }
 
+/// Where each line of one text starts, keyed by the text's address and
+/// length.
+struct LineStarts {
+    text: (usize, usize),
+    starts: Vec<usize>,
+}
+
+thread_local! {
+    static LINE_STARTS: std::cell::RefCell<LineStarts> = const {
+        std::cell::RefCell::new(LineStarts { text: (0, 0), starts: Vec::new() })
+    };
+}
+
+/// Drop the line table [`line_text`] keeps. A freed text's address can come
+/// back with a new text of the same length, so the table must not outlive
+/// the parse it was built for; every parse starts in [`parse_tree`].
+fn forget_line_starts() {
+    LINE_STARTS.with(|cell| cell.borrow_mut().text = (0, 0));
+}
+
 /// Helper to get the full line text for a node (for signature)
+///
+/// The same as `content.lines().nth(line - 1).unwrap_or("")`. That scan from
+/// the top of the file on every call made signature extraction quadratic in
+/// file length, and it was the largest single cost of a rebuild; the lines
+/// are indexed once per text instead.
 fn line_text(content: &str, line: usize) -> &str {
-    content.lines().nth(line - 1).unwrap_or("")
+    let Some(index) = line.checked_sub(1) else {
+        return "";
+    };
+    let key = (content.as_ptr() as usize, content.len());
+    let (start, end) = LINE_STARTS.with(|cell| {
+        let mut table = cell.borrow_mut();
+        if table.text != key {
+            table.text = key;
+            table.starts.clear();
+            table.starts.push(0);
+            table
+                .starts
+                .extend(content.match_indices('\n').map(|(at, _)| at + 1));
+        }
+        let start = table.starts.get(index).copied();
+        let next = table.starts.get(index + 1).copied();
+        (start, next)
+    });
+    // `lines()` yields no line after a final newline, and strips a `\r` only
+    // together with the `\n` that follows it.
+    match (start, end) {
+        (Some(start), _) if start >= content.len() => "",
+        (Some(start), Some(next)) => {
+            let line = &content[start..next - 1];
+            line.strip_suffix('\r').unwrap_or(line)
+        }
+        (Some(start), None) => &content[start..],
+        (None, _) => "",
+    }
+}
+
+/// `line_text(content, line).trim()` as an owned signature, cut short where
+/// the insert-time [`crate::parsers::truncate_signature`] would cut it anyway.
+///
+/// A minified stylesheet is one line holding thousands of selectors; copying
+/// that whole line into every selector's signature took gigabytes of memory
+/// before the insert truncated each copy. The cut keeps the first char
+/// boundary at or past `MAX + 4` bytes, so the text is still over the limit
+/// and truncating it gives the same bytes as truncating the full line.
+fn signature_line(content: &str, line: usize) -> String {
+    let text = line_text(content, line).trim();
+    let keep = crate::parsers::MAX_SIGNATURE_LEN + 4;
+    if text.len() <= keep {
+        return text.to_string();
+    }
+    let mut end = keep;
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    text[..end].to_string()
 }
 
 /// Controls iterative pre-order tree walking.
@@ -210,5 +285,58 @@ mod tests {
 
         let declaration = tree.root_node().child(1).unwrap();
         assert_eq!(text_end_line(content, &declaration), 3);
+    }
+
+    #[test]
+    fn line_text_matches_lines_nth() {
+        let texts = [
+            "",
+            "one",
+            "one\n",
+            "one\ntwo",
+            "one\r\ntwo\r\n",
+            "one\r\ntwo\r",
+            "\n\n\nlast",
+            "a\rb\nc",
+            "\u{442}\u{435}\u{43a}\u{441}\u{442}\n\u{2014}\n",
+        ];
+        for text in texts {
+            for line in 0..6 {
+                let expected = if line == 0 {
+                    ""
+                } else {
+                    text.lines().nth(line - 1).unwrap_or("")
+                };
+                assert_eq!(line_text(text, line), expected, "{text:?} line {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn line_text_does_not_reuse_another_texts_lines() {
+        let first = "a\nb\nc".to_string();
+        assert_eq!(line_text(&first, 2), "b");
+        forget_line_starts();
+        let second = "xyz\nw".to_string();
+        assert_eq!(line_text(&second, 2), "w");
+        assert_eq!(line_text(&first, 3), "c");
+    }
+
+    #[test]
+    fn signature_line_truncates_to_the_same_bytes() {
+        let max = crate::parsers::MAX_SIGNATURE_LEN;
+        let long_ascii = format!("  {}  ", "x".repeat(max * 3));
+        let long_multibyte = format!("\t{}", "\u{44f}".repeat(max));
+        let near_limit = format!("{} tail", "y".repeat(max - 2));
+        for body in [long_ascii, long_multibyte, near_limit, "short".to_string()] {
+            let text = format!("first\n{body}\nlast");
+            let full = line_text(&text, 2).trim().to_string();
+            let capped = signature_line(&text, 2);
+            assert!(capped.len() <= full.len());
+            assert_eq!(
+                crate::parsers::truncate_signature(&capped),
+                crate::parsers::truncate_signature(&full)
+            );
+        }
     }
 }

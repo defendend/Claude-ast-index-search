@@ -5,8 +5,8 @@ use std::sync::LazyLock;
 use tree_sitter::{Language, Node};
 
 use super::{
-    line_text, node_line, node_text, parse_tree, text_end_line, walk_tree_preorder, LanguageParser,
-    WalkControl,
+    line_text, node_line, node_text, parse_tree, signature_line, text_end_line, walk_tree_preorder,
+    LanguageParser, WalkControl,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -167,7 +167,7 @@ fn extract_top_level_variable_decl(node: &Node, content: &str, symbols: &mut Vec
                         name,
                         kind: SymbolKind::Property,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: Some(text_end_line(content, &child)),
                     });
@@ -183,7 +183,7 @@ fn extract_top_level_variable_decl(node: &Node, content: &str, symbols: &mut Vec
                             name: node_text(content, &id).to_string(),
                             kind: SymbolKind::Property,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
                             end_line: Some(text_end_line(content, &id)),
                         });
@@ -860,7 +860,7 @@ fn extract_top_level_vars(node: &Node, content: &str, symbols: &mut Vec<ParsedSy
                     name: id,
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line: Some(text_end_line(content, &child)),
                 });
@@ -880,7 +880,7 @@ fn extract_top_level_consts(node: &Node, content: &str, symbols: &mut Vec<Parsed
                     name: id,
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line: Some(text_end_line(content, &child)),
                 });

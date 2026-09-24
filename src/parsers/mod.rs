@@ -53,7 +53,7 @@ const MAX_CONTEXT_LEN: usize = 500;
 /// megabytes), and there are thousands of symbols per file — multiplying out
 /// to easily 100+ GB of heap during a single rebuild. Truncating at the DB
 /// insert side caps that at `(MAX_SIGNATURE_LEN + 3) bytes per row`.
-const MAX_SIGNATURE_LEN: usize = 500;
+pub(crate) const MAX_SIGNATURE_LEN: usize = 500;
 
 /// Truncate context to avoid storing huge minified lines
 fn truncate_context(s: &str) -> String {

@@ -6,7 +6,9 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
+use super::{
+    line_text, node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser,
+};
 use crate::db::SymbolKind;
 use crate::parsers::{truncate_context, FileType, ParsedRef, ParsedSymbol};
 
@@ -298,7 +300,7 @@ impl LanguageParser for BslParser {
                         name: ann_text.clone(),
                         kind: SymbolKind::Annotation,
                         line: ann_line,
-                        signature: line_text(content, ann_line).trim().to_string(),
+                        signature: signature_line(content, ann_line),
                         parents: vec![],
                         end_line: Some(ann_line),
                     });
@@ -337,7 +339,7 @@ impl LanguageParser for BslParser {
                         name: ann_text.clone(),
                         kind: SymbolKind::Annotation,
                         line: ann_line,
-                        signature: line_text(content, ann_line).trim().to_string(),
+                        signature: signature_line(content, ann_line),
                         parents: vec![],
                         end_line: Some(ann_line),
                     });
@@ -362,7 +364,7 @@ impl LanguageParser for BslParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -379,7 +381,7 @@ impl LanguageParser for BslParser {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line: None,
                 });
@@ -399,7 +401,7 @@ impl LanguageParser for BslParser {
                         name: ann_text,
                         kind: SymbolKind::Annotation,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line,
                     });

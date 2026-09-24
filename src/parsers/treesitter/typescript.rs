@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_end_line, node_line, node_text, parse_tree, LanguageParser};
+use super::{
+    line_text, node_end_line, node_line, node_text, parse_tree, signature_line, LanguageParser,
+};
 use crate::db::SymbolKind;
 use crate::parsers::{truncate_context, FileType, ParsedRef, ParsedSymbol};
 
@@ -407,7 +409,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
                         end_line: end_line_of(m, idx_class_node),
                     });
@@ -427,7 +429,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
                         end_line: end_line_of(m, idx_abstract_class_node),
                     });
@@ -447,7 +449,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
                         end_line: end_line_of(m, idx_export_class_node),
                     });
@@ -467,7 +469,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
                         end_line: end_line_of(m, idx_export_abstract_class_node),
                     });
@@ -488,7 +490,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Interface,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
                         end_line: end_line_of(m, idx_interface_node),
                     });
@@ -507,7 +509,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Interface,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
                         end_line: end_line_of(m, idx_export_interface_node),
                     });
@@ -525,7 +527,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::TypeAlias,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_type_alias_node),
                     });
@@ -541,7 +543,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::TypeAlias,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_export_type_alias_node),
                     });
@@ -559,7 +561,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Enum,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_enum_node),
                     });
@@ -575,7 +577,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Enum,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_export_enum_node),
                     });
@@ -595,7 +597,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_func_node),
                     });
@@ -612,7 +614,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_export_func_node),
                     });
@@ -632,7 +634,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_arrow_func_node),
                     });
@@ -649,7 +651,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_export_arrow_func_node),
                     });
@@ -676,7 +678,7 @@ impl LanguageParser for TypeScriptParser {
                             name: name.to_string(),
                             kind,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
                             end_line: end_line_of(m, idx_const_node),
                         });
@@ -693,7 +695,7 @@ impl LanguageParser for TypeScriptParser {
                                 name: name.to_string(),
                                 kind: SymbolKind::Constant,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
                                 end_line: end_line_of(m, idx_const_node),
                             });
@@ -718,7 +720,7 @@ impl LanguageParser for TypeScriptParser {
                             name: name.to_string(),
                             kind,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
                             end_line: end_line_of(m, idx_export_const_node),
                         });
@@ -728,7 +730,7 @@ impl LanguageParser for TypeScriptParser {
                             name: name.to_string(),
                             kind: SymbolKind::Constant,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
                             end_line: end_line_of(m, idx_export_const_node),
                         });
@@ -747,7 +749,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Constant,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_export_ambient_const_node),
                     });
@@ -765,7 +767,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Package,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_namespace_node),
                     });
@@ -781,7 +783,7 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Package,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_export_namespace_node),
                     });
@@ -801,7 +803,7 @@ impl LanguageParser for TypeScriptParser {
                         name: source.to_string(),
                         kind: SymbolKind::Import,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_import_node),
                     });
@@ -819,7 +821,7 @@ impl LanguageParser for TypeScriptParser {
                         name: format!("@{}", name),
                         kind: SymbolKind::Annotation,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_decorator_node),
                     });
@@ -835,7 +837,7 @@ impl LanguageParser for TypeScriptParser {
                         name: format!("@{}", name),
                         kind: SymbolKind::Annotation,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: end_line_of(m, idx_decorator_call_node),
                     });
@@ -1054,7 +1056,7 @@ fn emit_class_member(
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line: Some(node_end_line(&node_cap.node)),
                     });

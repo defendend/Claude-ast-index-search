@@ -11,7 +11,9 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
+use super::{
+    line_text, node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser,
+};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -61,7 +63,7 @@ impl LanguageParser for ZigParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -96,7 +98,7 @@ impl LanguageParser for ZigParser {
                     name: format!("test {}", name),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -111,7 +113,7 @@ impl LanguageParser for ZigParser {
                     name: format!("test {}", name),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -126,7 +128,7 @@ impl LanguageParser for ZigParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });

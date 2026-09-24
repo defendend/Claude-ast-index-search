@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::{FileType, ParsedRef, ParsedSymbol};
 
@@ -179,7 +179,7 @@ fn push_named(
         name,
         kind,
         line,
-        signature: line_text(content, line).trim().to_string(),
+        signature: signature_line(content, line),
         parents: vec![],
         end_line: None,
     });
@@ -204,7 +204,7 @@ fn push_string_value(
         name: unquoted.to_string(),
         kind: SymbolKind::Import,
         line,
-        signature: line_text(content, line).trim().to_string(),
+        signature: signature_line(content, line),
         parents: vec![(unquoted.to_string(), inherit_kind.to_string())],
         end_line: None,
     });

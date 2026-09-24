@@ -5,7 +5,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -60,7 +60,7 @@ impl LanguageParser for SqlParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -75,7 +75,7 @@ impl LanguageParser for SqlParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -90,7 +90,7 @@ impl LanguageParser for SqlParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -105,7 +105,7 @@ impl LanguageParser for SqlParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -140,7 +140,7 @@ fn append_domain_symbols(content: &str, symbols: &mut Vec<ParsedSymbol>) {
                 name: name.as_str().to_string(),
                 kind: SymbolKind::Class,
                 line: line_no,
-                signature: line_text(content, line_no).trim().to_string(),
+                signature: signature_line(content, line_no),
                 parents: vec![],
                 end_line: None,
             });

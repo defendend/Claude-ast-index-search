@@ -4,7 +4,9 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
+use super::{
+    line_text, node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser,
+};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -100,7 +102,7 @@ impl LanguageParser for RustParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -115,7 +117,7 @@ impl LanguageParser for RustParser {
                     name: name.to_string(),
                     kind: SymbolKind::Enum,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -130,7 +132,7 @@ impl LanguageParser for RustParser {
                     name: name.to_string(),
                     kind: SymbolKind::Interface,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -153,7 +155,7 @@ impl LanguageParser for RustParser {
                         name: format!("impl {} for {}", trait_name, type_name),
                         kind: SymbolKind::Class,
                         line: impl_line,
-                        signature: line_text(content, impl_line).trim().to_string(),
+                        signature: signature_line(content, impl_line),
                         parents: vec![(trait_name.to_string(), "implements".to_string())],
                         end_line,
                     });
@@ -174,7 +176,7 @@ impl LanguageParser for RustParser {
                     name: format!("impl {}", type_name),
                     kind: SymbolKind::Class,
                     line: impl_line,
-                    signature: line_text(content, impl_line).trim().to_string(),
+                    signature: signature_line(content, impl_line),
                     parents: vec![],
                     end_line,
                 });
@@ -189,7 +191,7 @@ impl LanguageParser for RustParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -204,7 +206,7 @@ impl LanguageParser for RustParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -219,7 +221,7 @@ impl LanguageParser for RustParser {
                     name: format!("{}!", name),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -234,7 +236,7 @@ impl LanguageParser for RustParser {
                     name: name.to_string(),
                     kind: SymbolKind::TypeAlias,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -250,7 +252,7 @@ impl LanguageParser for RustParser {
                         name: name.to_string(),
                         kind: SymbolKind::Constant,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line,
                     });
@@ -267,7 +269,7 @@ impl LanguageParser for RustParser {
                         name: name.to_string(),
                         kind: SymbolKind::Constant,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
                         end_line,
                     });
@@ -283,7 +285,7 @@ impl LanguageParser for RustParser {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -298,7 +300,7 @@ impl LanguageParser for RustParser {
                     name: path.to_string(),
                     kind: SymbolKind::Import,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -313,7 +315,7 @@ impl LanguageParser for RustParser {
                     name: path.to_string(),
                     kind: SymbolKind::Import,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });

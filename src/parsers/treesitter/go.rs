@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, text_end_line, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -64,7 +64,7 @@ impl LanguageParser for GoParser {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -104,7 +104,7 @@ impl LanguageParser for GoParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -119,7 +119,7 @@ impl LanguageParser for GoParser {
                     name: name.to_string(),
                     kind: SymbolKind::Interface,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -137,7 +137,7 @@ impl LanguageParser for GoParser {
                         name: name.to_string(),
                         kind: SymbolKind::TypeAlias,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![(target.to_string(), "alias".to_string())],
                         end_line,
                     });
@@ -155,7 +155,7 @@ impl LanguageParser for GoParser {
                         name: name.to_string(),
                         kind: SymbolKind::Function,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![(receiver.to_string(), "receiver".to_string())],
                         end_line,
                     });
@@ -173,7 +173,7 @@ impl LanguageParser for GoParser {
                         name: name.to_string(),
                         kind: SymbolKind::Function,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![(receiver.to_string(), "receiver".to_string())],
                         end_line,
                     });
@@ -189,7 +189,7 @@ impl LanguageParser for GoParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -204,7 +204,7 @@ impl LanguageParser for GoParser {
                     name: name.to_string(),
                     kind: SymbolKind::Constant,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
@@ -219,7 +219,7 @@ impl LanguageParser for GoParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
                     end_line,
                 });
