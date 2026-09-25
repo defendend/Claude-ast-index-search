@@ -460,6 +460,7 @@ pub fn cmd_rebuild(
         db::open_staged_db(root, staged.db_path())?
     };
     init_rebuild_schema(&conn)?;
+    indexer::record_project_label(&conn, root)?;
     if verbose {
         eprintln!(
             "[verbose] staged DB opened + schema created in {:?}",
@@ -924,6 +925,7 @@ fn cmd_rebuild_sub_projects(
     let staged = IndexStaging::create(&live_db, "rebuild")?;
     let mut conn = db::open_staged_db(root, staged.db_path())?;
     init_rebuild_schema(&conn)?;
+    indexer::record_project_label(&conn, root)?;
     if verbose {
         eprintln!("[verbose] staged DB opened in {:?}", t.elapsed());
     }
@@ -1680,9 +1682,11 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
     let stats = db::get_stats(&conn)?;
     let db_path = db::get_db_path(root)?;
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let project = db::get_metadata_value(&conn, crate::indexer::PROJECT_LABEL_KEY)?;
 
     if format == "json" {
         let result = serde_json::json!({
+            "project": project,
             "stats": stats,
             "db_size_bytes": db_size,
             "db_path": db_path.display().to_string(),
@@ -1692,6 +1696,9 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
     }
 
     println!("{}", "Index Statistics:".bold());
+    if let Some(project) = &project {
+        println!("  Project:    {}", project);
+    }
     println!("  Files:      {}", stats.file_count);
     println!("  Symbols:    {}", stats.symbol_count);
     println!("  Refs:       {}", stats.refs_count);

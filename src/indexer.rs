@@ -929,6 +929,34 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
     detect_stacks_with_limits(root, StackScanLimits::default(), true)
 }
 
+/// Metadata key holding [`project_label`] as of the last full rebuild of the
+/// primary root; the stack scan takes seconds on a large tree, too long for
+/// `stats`.
+pub const PROJECT_LABEL_KEY: &str = "project_label";
+
+/// Record [`project_label`] of the primary `root` for `stats` and `map`.
+/// Called by `rebuild` for the primary root only, never for an extra root
+/// or subtree indexed into the same database.
+pub fn record_project_label(conn: &Connection, root: &Path) -> Result<()> {
+    db::set_metadata_value(conn, PROJECT_LABEL_KEY, &project_label(root))
+}
+
+/// What `stats` and `map` call the project: the stacks [`detect_stacks`]
+/// finds, joined (`Ruby + Web (TypeScript/JavaScript)`), or the
+/// [`detect_project_type`] label when no stack marker is present.
+pub fn project_label(root: &Path) -> String {
+    let detection = detect_stacks_with_limits(root, StackScanLimits::default(), false);
+    if detection.stacks.is_empty() {
+        return detect_project_type(root).as_str().to_string();
+    }
+    detection
+        .stacks
+        .iter()
+        .map(|stack| stack.label.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
 fn detect_stacks_with_limits(
     root: &Path,
     limits: StackScanLimits,
@@ -1474,6 +1502,7 @@ fn is_module_file(name: &str) -> bool {
         || name == "setup.py"
         || name == "setup.cfg"
         || name == "ya.make"
+        || name.ends_with(".gemspec")
 }
 
 fn sample_parseable_files_without_ignore(walk_dir: &Path, limit: usize) -> Vec<PathBuf> {
@@ -2986,6 +3015,30 @@ pub fn index_modules_from_files(
                         module_path.replace('/', ".")
                     };
 
+                    if !module_name.is_empty() {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
+                            rusqlite::params![module_name, module_path],
+                        )?;
+                        count += 1;
+                    }
+                }
+            }
+
+            // Ruby gems (`*.gemspec`): a Rails engine or a gem vendored in the
+            // repository, named by its directory like a Python module.
+            if name_str.ends_with(".gemspec") {
+                if let Some(parent) = path.parent() {
+                    let module_path = parent
+                        .strip_prefix(root)
+                        .unwrap_or(parent)
+                        .to_string_lossy()
+                        .to_string();
+                    let module_name = if module_path.is_empty() {
+                        name_str.trim_end_matches(".gemspec").to_string()
+                    } else {
+                        module_path.replace('/', ".")
+                    };
                     if !module_name.is_empty() {
                         conn.execute(
                             "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
@@ -5359,6 +5412,52 @@ no_ignore: true
         let dep_names: Vec<String> = deps.iter().map(|(n, _, _)| n.clone()).collect();
         assert!(dep_names.contains(&"lib/a".to_string()));
         assert!(dep_names.contains(&"lib/b".to_string()));
+    }
+
+    #[test]
+    fn gemspec_directories_are_ruby_modules() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("engines/billing")).unwrap();
+        fs::write(root.join("engines/billing/billing.gemspec"), "").unwrap();
+        fs::write(root.join("toolkit.gemspec"), "").unwrap();
+        assert!(is_module_file("billing.gemspec"));
+
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_db(&conn).unwrap();
+        let files = vec![
+            root.join("engines/billing/billing.gemspec"),
+            root.join("toolkit.gemspec"),
+        ];
+        assert_eq!(index_modules_from_files(&conn, root, &files).unwrap(), 2);
+        let modules: Vec<(String, String)> = conn
+            .prepare("SELECT name, path FROM modules ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            modules,
+            vec![
+                ("engines.billing".to_string(), "engines/billing".to_string()),
+                ("toolkit".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_label_names_every_stack_or_falls_back_to_the_project_type() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Gemfile"), "").unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let label = project_label(dir.path());
+        assert!(label.contains("Ruby"), "{label}");
+        assert!(label.contains("Web"), "{label}");
+        assert!(label.contains(" + "), "{label}");
+
+        let empty = TempDir::new().unwrap();
+        assert_eq!(project_label(empty.path()), ProjectType::Unknown.as_str());
     }
 
     #[test]

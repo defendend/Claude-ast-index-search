@@ -839,13 +839,32 @@ pub fn extract_references_for_lang(
     // line is skipped: a symbol used further down its own file (a constant fed
     // into the next constant, a local interface passed to defineProps) is a real
     // usage, and skipping the whole name hid it from `usages` entirely.
+    //
+    // A qualified name declares its last segment where the line spells the
+    // name out: `class Billing::Invoice` declares that `Invoice`, which the
+    // identifier scan below sees on its own. `Billing` stays a reference to
+    // the namespace, and so does the `Invoice` of `class Admin::Invoice <
+    // Invoice`, a different class.
     let mut declared_at: HashMap<&str, HashSet<usize>> = HashMap::new();
+    let mut qualified_at: HashMap<(usize, &str), Vec<&str>> = HashMap::new();
     for symbol in defined_symbols {
         declared_at
             .entry(symbol.name.as_str())
             .or_default()
             .insert(symbol.line);
+        let segment = crate::db::last_name_segment(&symbol.name);
+        if segment.len() < symbol.name.len() {
+            qualified_at
+                .entry((symbol.line, segment))
+                .or_default()
+                .push(symbol.name.as_str());
+        }
     }
+    let is_declared_segment = |line: &str, found: regex::Match<'_>, line_num: usize| {
+        qualified_at
+            .get(&(line_num, found.as_str()))
+            .is_some_and(|names| names.iter().any(|name| line[..found.end()].ends_with(name)))
+    };
     let is_declaration_line =
         |name: &str, line: usize| declared_at.get(name).is_some_and(|l| l.contains(&line));
 
@@ -1089,6 +1108,7 @@ pub fn extract_references_for_lang(
                 && !extra_keywords.contains(name)
                 && !is_reserved(found)
                 && !is_declaration_line(name, line_num)
+                && !is_declared_segment(line, found, line_num)
             {
                 refs.push(ParsedRef {
                     name: name.to_string(),
@@ -1107,6 +1127,7 @@ pub fn extract_references_for_lang(
                 && !extra_keywords.contains(name)
                 && !is_reserved(found)
                 && !is_declaration_line(name, line_num)
+                && !is_declared_segment(line, found, line_num)
             {
                 // Only add if name length > 2 to avoid noise
                 if name.len() > 2 {

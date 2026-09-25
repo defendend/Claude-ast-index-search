@@ -7096,60 +7096,57 @@ pub fn find_symbols_by_pattern(
     Ok(results)
 }
 
-/// Find implementations (subclasses/implementors)
+/// Kinds a parent type can be defined as: what `extends`, `implements`,
+/// `<` and `include` name.
+const TYPE_KINDS_SQL: &str =
+    "('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package', 'trait', 'typealias')";
+
+/// `i.parent_name` with a leading `::` (Ruby's top-level constant path) removed.
+const PARENT_NAME_SQL: &str =
+    "CASE WHEN substr(i.parent_name, 1, 2) = '::' THEN substr(i.parent_name, 3) ELSE i.parent_name END";
+
+/// Whether `i.parent_name` names the type `?1`: the name itself, the name
+/// under Ruby's top-level `::`, or a qualified name ending in it
+/// (`com.foo.Base`, `ns::Base`, `Billing::Base`), which is how Java, C++ and
+/// Ruby refer to a type through its package or namespace.
+///
+/// A qualified name is left out when it is itself the name of another type
+/// the index defines while `?1` is defined without a namespace:
+/// `Legacy::ApplicationService` is its own class, not `ApplicationService`,
+/// so its subclasses do not belong under `implementations ApplicationService`.
+/// Only names stored whole (Ruby's `class Legacy::ApplicationService`) take
+/// part; a C++ namespace lives in `qualified_name` and a Java package in no
+/// symbol name, so those keep every suffix match.
+fn implementation_parent_sql() -> String {
+    format!(
+        "({PARENT_NAME_SQL} = ?1 OR ((i.parent_name LIKE ?2 OR i.parent_name LIKE ?3) \
+         AND NOT (EXISTS (SELECT 1 FROM symbols d WHERE d.name = {PARENT_NAME_SQL} \
+                          AND d.kind IN {TYPE_KINDS_SQL}) \
+                  AND EXISTS (SELECT 1 FROM symbols q WHERE q.name = ?1 \
+                              AND q.qualified_name IS NULL AND q.kind IN {TYPE_KINDS_SQL}))))"
+    )
+}
+
+fn implementation_params(parent_name: &str) -> [String; 3] {
+    [
+        parent_name.to_string(),
+        format!("%.{parent_name}"),
+        format!("%::{parent_name}"),
+    ]
+}
+
+/// Find implementations (subclasses/implementors) of `parent_name`, see
+/// [`implementation_parent_sql`]. Direct children come first.
 pub fn find_implementations(
     conn: &Connection,
     parent_name: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    // Match exact name or qualified suffix in either dot- or C++-style form.
-    let suffix_pattern = format!("%.{}", parent_name);
-    let namespace_suffix_pattern = format!("%::{}", parent_name);
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
-        FROM inheritance i
-        JOIN symbols s ON i.child_id = s.id
-        JOIN files f ON s.file_id = f.id
-        WHERE i.parent_name = ?1 OR i.parent_name LIKE ?2 OR i.parent_name LIKE ?3
-        ORDER BY
-            CASE
-                WHEN i.parent_name = ?1 THEN 0
-                ELSE 1
-            END, s.name
-        LIMIT ?4
-        "#,
-    )?;
-
-    let results = stmt
-        .query_map(
-            params![
-                parent_name,
-                suffix_pattern,
-                namespace_suffix_pattern,
-                limit as i64
-            ],
-            row_to_search_result,
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(results)
+    query_implementations(conn, parent_name, limit, (String::new(), Vec::new()))
 }
 
 pub fn count_implementations(conn: &Connection, parent_name: &str) -> Result<usize> {
-    let suffix_pattern = format!("%.{}", parent_name);
-    let namespace_suffix_pattern = format!("%::{}", parent_name);
-    let count: i64 = conn.query_row(
-        r#"
-        SELECT COUNT(*)
-        FROM inheritance i
-        JOIN symbols s ON i.child_id = s.id
-        WHERE i.parent_name = ?1 OR i.parent_name LIKE ?2 OR i.parent_name LIKE ?3
-        "#,
-        params![parent_name, suffix_pattern, namespace_suffix_pattern],
-        |row| row.get(0),
-    )?;
-    Ok(count as usize)
+    query_implementation_count(conn, parent_name, (String::new(), Vec::new()))
 }
 
 pub fn count_implementations_scoped(
@@ -7157,32 +7154,34 @@ pub fn count_implementations_scoped(
     parent_name: &str,
     scope: &SearchScope,
 ) -> Result<usize> {
-    if scope.is_empty() {
-        return count_implementations(conn, parent_name);
-    }
-    let suffix_pattern = format!("%.{parent_name}");
-    let namespace_suffix_pattern = format!("%::{parent_name}");
-    let (scope_clause, scope_params) = scope.path_condition();
+    query_implementation_count(conn, parent_name, scope.path_condition())
+}
+
+/// `path_condition` is an SQL suffix over `f.path` and its parameters; the
+/// unscoped entry points pass none, so they ignore `--subtree` / `--local`
+/// as they always have.
+fn query_implementation_count(
+    conn: &Connection,
+    parent_name: &str,
+    (scope_clause, scope_params): (String, Vec<String>),
+) -> Result<usize> {
     let sql = format!(
         r#"
         SELECT COUNT(*)
         FROM inheritance i
         JOIN symbols s ON i.child_id = s.id
         JOIN files f ON s.file_id = f.id
-        WHERE (i.parent_name = ? OR i.parent_name LIKE ? OR i.parent_name LIKE ?){scope_clause}
-        "#
+        WHERE {}{scope_clause}
+        "#,
+        implementation_parent_sql()
     );
-    let mut values = vec![
-        parent_name.to_string(),
-        suffix_pattern,
-        namespace_suffix_pattern,
-    ];
+    let mut values = implementation_params(parent_name).to_vec();
     values.extend(scope_params);
-    let params: Vec<&dyn rusqlite::types::ToSql> = values
-        .iter()
-        .map(|value| value as &dyn rusqlite::types::ToSql)
-        .collect();
-    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    let count: i64 = conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(values.iter()),
+        |row| row.get(0),
+    )?;
     Ok(count as usize)
 }
 
@@ -7192,48 +7191,43 @@ pub fn find_implementations_scoped(
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<SearchResult>> {
-    if scope.is_empty() {
-        return find_implementations(conn, parent_name, limit);
-    }
+    query_implementations(conn, parent_name, limit, scope.path_condition())
+}
 
-    let suffix_pattern = format!("%.{}", parent_name);
-    let namespace_suffix_pattern = format!("%::{}", parent_name);
-    let (scope_clause, scope_params) = scope.path_condition();
-
+fn query_implementations(
+    conn: &Connection,
+    parent_name: &str,
+    limit: usize,
+    (scope_clause, scope_params): (String, Vec<String>),
+) -> Result<Vec<SearchResult>> {
+    use rusqlite::types::Value;
     let sql = format!(
         r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM inheritance i
         JOIN symbols s ON i.child_id = s.id
         JOIN files f ON s.file_id = f.id
-        WHERE (i.parent_name = ?1 OR i.parent_name LIKE ?2 OR i.parent_name LIKE ?3){}
+        WHERE {}{scope_clause}
         ORDER BY
             CASE
-                WHEN i.parent_name = ?1 THEN 0
+                WHEN {PARENT_NAME_SQL} = ?1 THEN 0
                 ELSE 1
             END, s.name
         LIMIT ?{}
         "#,
-        scope_clause,
+        implementation_parent_sql(),
         4 + scope_params.len()
     );
-
+    let mut values: Vec<Value> = implementation_params(parent_name)
+        .into_iter()
+        .map(Value::Text)
+        .collect();
+    values.extend(scope_params.into_iter().map(Value::Text));
+    values.push(Value::Integer(limit as i64));
     let mut stmt = conn.prepare(&sql)?;
-    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    all_params.push(Box::new(parent_name.to_string()));
-    all_params.push(Box::new(suffix_pattern));
-    all_params.push(Box::new(namespace_suffix_pattern));
-    for p in &scope_params {
-        all_params.push(Box::new(p.clone()));
-    }
-    all_params.push(Box::new(limit as i64));
-
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
     let results = stmt
-        .query_map(param_refs.as_slice(), row_to_search_result)?
+        .query_map(rusqlite::params_from_iter(values), row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
-
     Ok(results)
 }
 
@@ -7516,6 +7510,28 @@ pub fn get_file_symbols(
         .query_map(params![path, root_path.unwrap_or("")], row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
+}
+
+/// Id of the symbol named `name` declared at `line` of `path`, the way a
+/// [`SearchResult`] locates it. `root_path` is read as in [`get_file_symbols`].
+pub fn find_symbol_id(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+    line: i64,
+    name: &str,
+) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1 AND s.line = ?2 AND s.name = ?3 AND ",
+        file_under_root_sql!("?4"),
+        " LIMIT 1"
+    ))?;
+    Ok(stmt
+        .query_row(params![path, line, name, root_path.unwrap_or("")], |row| {
+            row.get(0)
+        })
+        .optional()?)
 }
 
 /// A definition's name, kind and line range.

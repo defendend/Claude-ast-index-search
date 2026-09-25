@@ -697,8 +697,8 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         "explore" => {
             argv.push("explore".into());
             // query is a single string; the CLI tokenizes it into terms.
-            argv.push(require_string(&arguments, "query")?);
-            push_if_num(&mut argv, &arguments, "max_files", "--max-files");
+            argv.push(require_string(arguments, "query")?);
+            push_if_num(&mut argv, arguments, "max_files", "--max-files");
             if arguments
                 .get("rwr")
                 .and_then(Value::as_bool)
@@ -709,11 +709,11 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         }
         "search" => {
             argv.push("search".into());
-            argv.push(require_string(&arguments, "query")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
-            push_if_str(&mut argv, &arguments, "kind", "--type");
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            argv.push(require_string(arguments, "query")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_str(&mut argv, arguments, "kind", "--type");
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
             if arguments
                 .get("fuzzy")
                 .and_then(Value::as_bool)
@@ -746,38 +746,38 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         }
         "outline" => {
             argv.push("outline".into());
-            argv.push(require_string(&arguments, "file")?);
+            argv.push(require_string(arguments, "file")?);
         }
         "usages" => {
             argv.push("usages".into());
-            argv.push(require_string(&arguments, "symbol")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            argv.push(require_string(arguments, "symbol")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
         }
         "callers" => {
             argv.push("callers".into());
-            argv.push(require_string(&arguments, "function")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            argv.push(require_string(arguments, "function")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "implementations" => {
             argv.push("implementations".into());
-            argv.push(require_string(&arguments, "parent")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            argv.push(require_string(arguments, "parent")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
         }
         "refs" => {
             argv.push("refs".into());
-            argv.push(require_string(&arguments, "symbol")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            argv.push(require_string(arguments, "symbol")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "rebuild" => {
             argv.push("rebuild".into());
         }
         "find_file" => {
             argv.push("file".into());
-            argv.push(require_string(&arguments, "pattern")?);
+            argv.push(require_string(arguments, "pattern")?);
             if arguments
                 .get("exact")
                 .and_then(Value::as_bool)
@@ -785,7 +785,7 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             {
                 argv.push("--exact".into());
             }
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "stats" => {
             argv.push("stats".into());
@@ -798,11 +798,11 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             if let Some(n) = arguments.get("name").and_then(Value::as_str) {
                 argv.push(n.into());
             }
-            push_if_str(&mut argv, &arguments, "pattern", "--pattern");
-            push_if_str(&mut argv, &arguments, "kind", "--type");
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            push_if_str(&mut argv, arguments, "pattern", "--pattern");
+            push_if_str(&mut argv, arguments, "kind", "--type");
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
             if arguments
                 .get("fuzzy")
                 .and_then(Value::as_bool)
@@ -816,10 +816,10 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             if let Some(n) = arguments.get("name").and_then(Value::as_str) {
                 argv.push(n.into());
             }
-            push_if_str(&mut argv, &arguments, "pattern", "--pattern");
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            push_if_str(&mut argv, arguments, "pattern", "--pattern");
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
             if arguments
                 .get("fuzzy")
                 .and_then(Value::as_bool)
@@ -830,18 +830,18 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         }
         "hierarchy" => {
             argv.push("hierarchy".into());
-            argv.push(require_string(&arguments, "name")?);
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            argv.push(require_string(arguments, "name")?);
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
         }
         "imports" => {
             argv.push("imports".into());
-            argv.push(require_string(&arguments, "file")?);
+            argv.push(require_string(arguments, "file")?);
         }
         "api" => {
             argv.push("api".into());
-            argv.push(require_string(&arguments, "module_path")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            argv.push(require_string(arguments, "module_path")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "changed" => {
             argv.push("changed".into());
@@ -850,22 +850,22 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         }
         "module" => {
             argv.push("module".into());
-            argv.push(require_string(&arguments, "pattern")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            argv.push(require_string(arguments, "pattern")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "deps" => {
             argv.push("deps".into());
-            argv.push(require_string(&arguments, "module")?);
+            argv.push(require_string(arguments, "module")?);
         }
         "dependents" => {
             argv.push("dependents".into());
-            argv.push(require_string(&arguments, "module")?);
+            argv.push(require_string(arguments, "module")?);
         }
         "call_tree" => {
             argv.push("call-tree".into());
-            argv.push(require_string(&arguments, "function")?);
-            push_if_num(&mut argv, &arguments, "depth", "--depth");
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            argv.push(require_string(arguments, "function")?);
+            push_if_num(&mut argv, arguments, "depth", "--depth");
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "graph_dependents" => {
             let symbol = require_string(arguments, "symbol")?;

@@ -554,7 +554,7 @@ ast-index conventions --format json          # JSON output
 
 Detects:
 - **Architecture**: Clean Architecture, Feature-sliced, BLoC, MVC, MVVM, MVP, Redux, Composition API, Hooks
-- **Frameworks**: DI (Hilt, Dagger, Koin), Async (Coroutines, RxJava, Combine), Network (Retrofit, OkHttp), DB (Room, Realm), UI (Compose, SwiftUI, React, Flutter), Testing (JUnit, Kotest, XCTest, pytest, Jest)
+- **Frameworks**: DI (Hilt, Dagger, Koin), Async (Coroutines, RxJava, Combine), Network (Retrofit, OkHttp), DB (Room, Realm, ActiveRecord, Sequel), UI (Compose, SwiftUI, React, Flutter), Testing (JUnit, Kotest, XCTest, pytest, Jest, RSpec), Web (Rails, Django, Flask, FastAPI, Express), Jobs (Sidekiq, Celery) — from import and `require` names, matched on whole name segments (`sequel-combine` is not Combine)
 - **Naming patterns**: ViewModel, Repository, UseCase, Service, Controller, Fragment, etc. (with counts)
 
 ## Common Flags
@@ -746,16 +746,22 @@ for name, path, parent in unused_impls:
 
 ## Performance Reference
 
-| Command | Time | Notes |
-|---------|------|-------|
-| search | ~10ms | Indexed FTS5 search |
-| class | ~1ms | Direct index lookup |
-| usages | ~8ms | Indexed reference search |
-| imports | ~0.3ms | File-based lookup |
-| callers | ~1s | Grep-based search |
-| map | ~1-3s | SQL aggregation (scales with project size) |
-| conventions | ~1-4s | SQL aggregation + import matching |
-| rebuild | ~25s–5m | Full project indexing (depends on size) |
+Wall time of one call, process start included: a small project, and a
+40k-file Rails + React monorepo (300k symbols) with a warm page cache.
+
+| Command | Small | 40k files | Notes |
+|---------|-------|-----------|-------|
+| class / symbol | ~10ms | ~20ms | Direct index lookup |
+| usages / implementations | ~10ms | ~20-40ms | Indexed reference search |
+| imports | ~10ms | ~20ms | File-based lookup |
+| outline | ~10ms | ~50ms | Parses the file |
+| search | ~10ms | ~250-550ms | FTS5 symbols plus a scan of file contents |
+| explore | ~15ms | ~100-150ms | `--rwr` ~200ms |
+| graph queries | ~10ms | ~100ms | Needs `graph build` (~1-2s) |
+| callers | ~20ms | ~200ms | Text match at query time |
+| call-tree | ~20ms | ~500ms | Callers of callers |
+| map / conventions | ~20ms | ~0.1-1s | SQL aggregation |
+| rebuild | seconds | minutes | Full project indexing |
 
 ## Platform-Specific Commands
 

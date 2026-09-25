@@ -1070,7 +1070,7 @@ fn main() -> Result<()> {
     // Conflict guard: --subtree and --local both narrow the workspace, but
     // they narrow it differently, so combining them is meaningless.
     if cli.subtree.is_some() && cli.local {
-        eprintln!("{}", "Error: --subtree and --local are mutually exclusive.");
+        eprintln!("Error: --subtree and --local are mutually exclusive.");
         std::process::exit(2);
     }
     if let Some(name) = &cli.subtree {

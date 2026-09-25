@@ -131,6 +131,29 @@ fn usages_of_a_full_name_read_the_lines_that_spell_it_out() {
 }
 
 #[test]
+fn a_qualified_class_declaration_is_no_usage_of_itself_but_uses_its_namespace() {
+    let (project, cache) = ruby_project();
+    let run = |args: &[&str]| run(project.path(), cache.path(), args);
+
+    for name in ["LedgerImporter", "Billing::LedgerImporter"] {
+        let usages = run(&["usages", name]);
+        assert!(
+            !usages.contains("app/services/billing/ledger_importer.rb:1"),
+            "{name}: {usages}"
+        );
+        assert!(
+            usages.contains("app/services/billing/csv_importer.rb:1"),
+            "{name}: {usages}"
+        );
+    }
+    let namespace = run(&["usages", "Billing"]);
+    assert!(
+        namespace.contains("app/services/billing/ledger_importer.rb:1"),
+        "{namespace}"
+    );
+}
+
+#[test]
 fn unused_symbols_look_up_references_by_the_last_segment() {
     let (project, cache) = ruby_project();
     let unused = run(project.path(), cache.path(), &["unused-symbols"]);
@@ -227,4 +250,24 @@ fn qualified_names_of_both_kinds_resolve_and_an_exact_name_still_wins() {
         names(&db::find_symbols_by_name(&conn, "Billing::Invoice", None, 10).unwrap()),
         ["Billing::Invoice"]
     );
+}
+
+#[test]
+fn a_parent_named_like_the_declared_segment_stays_a_reference() {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    for (path, content) in [
+        ("app/models/user.rb", "class User\nend\n"),
+        (
+            "app/models/admin/user.rb",
+            "class Admin::User < User\nend\n",
+        ),
+    ] {
+        let path = project.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    run(project.path(), cache.path(), &["rebuild"]);
+    let usages = run(project.path(), cache.path(), &["usages", "User"]);
+    assert!(usages.contains("app/models/admin/user.rb:1"), "{usages}");
 }

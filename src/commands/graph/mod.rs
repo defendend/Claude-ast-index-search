@@ -425,6 +425,69 @@ fn infos_for(conn: &Connection, ids: &HashSet<i64>) -> Result<HashMap<i64, Graph
     db::load_graph_symbol_infos(conn, &list)
 }
 
+/// Definitions that depend on each of `seeds` through a resolved edge —
+/// callers, subclasses, readers — at most `limit` per seed, from the symbol
+/// graph. `None` when the graph is not built or the index changed since, so
+/// the caller can fall back to matching references by name.
+pub fn resolved_dependents_of(
+    conn: &Connection,
+    seeds: &[db::SearchResult],
+    limit: usize,
+) -> Result<Option<Vec<Vec<db::SearchResult>>>> {
+    let state = db::symbol_graph_state(conn)?;
+    if !state.built || state.stale {
+        return Ok(None);
+    }
+    let ids: Vec<Option<i64>> = seeds
+        .iter()
+        .map(|seed| {
+            db::find_symbol_id(
+                conn,
+                seed.root_path.as_deref(),
+                &seed.path,
+                seed.line,
+                &seed.name,
+            )
+        })
+        .collect::<Result<_>>()?;
+    let known: Vec<i64> = ids.iter().flatten().copied().collect();
+    let edges = db::load_symbol_edges_to(conn, &known, Confidence::Unique.code())?;
+    let mut by_target: HashMap<i64, Vec<i64>> = HashMap::new();
+    for edge in &edges {
+        if edge.source_id != edge.target_id {
+            by_target
+                .entry(edge.target_id)
+                .or_default()
+                .push(edge.source_id);
+        }
+    }
+    let needed: HashSet<i64> = edges.iter().map(|edge| edge.source_id).collect();
+    let infos = infos_for(conn, &needed)?;
+    let result = ids
+        .iter()
+        .map(|id| {
+            let sources = id
+                .and_then(|id| by_target.get(&id))
+                .map_or(&[][..], Vec::as_slice);
+            sources
+                .iter()
+                .filter_map(|source| infos.get(source))
+                .take(limit)
+                .map(|info| db::SearchResult {
+                    name: info.name.clone(),
+                    qualified_name: None,
+                    kind: info.kind.clone(),
+                    line: info.line,
+                    signature: None,
+                    path: info.path.clone(),
+                    root_path: info.root_path.clone(),
+                })
+                .collect()
+        })
+        .collect();
+    Ok(Some(result))
+}
+
 /// Print the definitions `spec` matched, at most `limit` of them, after a
 /// warning when there are several: their edges are answered as one.
 fn print_matched(spec: &str, matched: &[SymbolRef], limit: usize) {
