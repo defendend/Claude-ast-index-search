@@ -579,9 +579,8 @@ fn max_paths_truncation_signals() {
 
     let paths = v["paths"].as_array().expect("paths must be array");
     assert_eq!(paths.len(), 3, "max-paths=3 must cap at 3 paths");
-    assert_eq!(
+    assert!(
         v["truncated"].as_bool().unwrap(),
-        true,
         "truncated must be true"
     );
     assert_eq!(
@@ -1258,9 +1257,8 @@ fn shortest_mode_timeout_signals_truncated_not_unreachable() {
     let v: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("must be JSON: {e}; stdout={stdout}"));
 
-    assert_eq!(
+    assert!(
         v["truncated"].as_bool().unwrap_or(false),
-        true,
         "timeout=0 must produce truncated=true; got: {}",
         stdout
     );
@@ -1378,9 +1376,8 @@ fn max_paths_zero_returns_no_paths() {
         "--max-paths 0 must report count=0; got: {}",
         stdout
     );
-    assert_eq!(
+    assert!(
         v["truncated"].as_bool().unwrap_or(false),
-        true,
         "--max-paths 0 must report truncated=true; got: {}",
         stdout
     );

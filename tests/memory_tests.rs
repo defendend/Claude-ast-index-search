@@ -909,7 +909,7 @@ fn create_10k_db() -> Connection {
 
 #[test]
 fn db_memory_create_10k() {
-    let (conn, stats) = measure(|| create_10k_db());
+    let (conn, stats) = measure(create_10k_db);
 
     eprintln!(
         "[db_create_10k] peak={}KB, retained={}KB",
