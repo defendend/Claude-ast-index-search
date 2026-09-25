@@ -131,6 +131,29 @@ fn usages_of_a_full_name_read_the_lines_that_spell_it_out() {
 }
 
 #[test]
+fn a_qualified_class_declaration_is_no_usage_of_itself_but_uses_its_namespace() {
+    let (project, cache) = ruby_project();
+    let run = |args: &[&str]| run(project.path(), cache.path(), args);
+
+    for name in ["LedgerImporter", "Billing::LedgerImporter"] {
+        let usages = run(&["usages", name]);
+        assert!(
+            !usages.contains("app/services/billing/ledger_importer.rb:1"),
+            "{name}: {usages}"
+        );
+        assert!(
+            usages.contains("app/services/billing/csv_importer.rb:1"),
+            "{name}: {usages}"
+        );
+    }
+    let namespace = run(&["usages", "Billing"]);
+    assert!(
+        namespace.contains("app/services/billing/ledger_importer.rb:1"),
+        "{namespace}"
+    );
+}
+
+#[test]
 fn unused_symbols_look_up_references_by_the_last_segment() {
     let (project, cache) = ruby_project();
     let unused = run(project.path(), cache.path(), &["unused-symbols"]);

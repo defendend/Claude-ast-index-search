@@ -178,6 +178,11 @@ end
         "app/services/offer/pdf_service.rb",
         "class Offer::PdfService < ApplicationService\n  def process\n    html\n  end\n\n  def html\n    true\n  end\nend\n",
     );
+    write(
+        root,
+        "app/controllers/merges_controller.rb",
+        "class MergesController\n  def update\n    Applicant::MergeService.call(to: 1, from: 2)\n  end\nend\n",
+    );
 
     let rebuild = run(root, cache.path(), &["rebuild"]);
     assert!(
@@ -309,4 +314,92 @@ fn declaration_is_outlined_within_the_module_holding_it() {
         names.contains(&"has_one :applicant_merge_target"),
         "{names:?}"
     );
+}
+
+fn neighbours(doc: &Value) -> Vec<(String, String)> {
+    doc["neighbours"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            (
+                n["link"].as_str().unwrap().to_string(),
+                format!(
+                    "{}:{}",
+                    n["path"].as_str().unwrap(),
+                    n["name"].as_str().unwrap()
+                ),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn rwr_takes_callers_from_the_symbol_graph_once_it_is_built() {
+    let (project, cache) = fixture();
+    let rwr = |project: &TempDir, cache: &TempDir| {
+        let out = run(
+            project.path(),
+            cache.path(),
+            &[
+                "--format",
+                "json",
+                "explore",
+                "applicant merge service",
+                "--rwr",
+            ],
+        );
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        neighbours(&doc)
+    };
+    let caller = (
+        "caller".to_string(),
+        "app/controllers/merges_controller.rb:update".to_string(),
+    );
+
+    // Without a graph neighbours come from references matched by name.
+    let without_graph = rwr(&project, &cache);
+    assert!(!without_graph.is_empty());
+
+    let build = run(project.path(), cache.path(), &["graph", "build"]);
+    assert!(build.status.success());
+    let with_graph = rwr(&project, &cache);
+    assert!(with_graph.contains(&caller), "{with_graph:?}");
+}
+
+#[test]
+fn graph_dependents_leave_out_references_to_a_namesake_in_another_namespace() {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let root = project.path();
+    write(root, "Gemfile", "source 'https://rubygems.org'\n");
+    write(root, "app/models/invoice.rb", "class Invoice\nend\n");
+    write(
+        root,
+        "app/services/charge.rb",
+        "class Charge\n  def call\n    Invoice.new\n  end\nend\n",
+    );
+    write(
+        root,
+        "lib/archive/reader.rb",
+        "module Archive\n  class Invoice\n  end\n\n  class Reader\n    def read\n      Invoice.new\n    end\n  end\nend\n",
+    );
+    assert!(run(root, cache.path(), &["rebuild"]).status.success());
+    assert!(run(root, cache.path(), &["graph", "build"])
+        .status
+        .success());
+
+    let db_path = run(root, cache.path(), &["db-path"]);
+    let conn =
+        rusqlite::Connection::open(String::from_utf8(db_path.stdout).unwrap().trim()).unwrap();
+    let seed = ast_index::db::search_symbols(&conn, "Invoice", 10)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.path == "app/models/invoice.rb")
+        .unwrap();
+    let dependents = ast_index::commands::graph::resolved_dependents_of(&conn, &[seed], 10)
+        .unwrap()
+        .expect("graph is built and fresh");
+    let paths: Vec<&str> = dependents[0].iter().map(|d| d.path.as_str()).collect();
+    assert_eq!(paths, vec!["app/services/charge.rb"], "{paths:?}");
 }

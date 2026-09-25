@@ -19,6 +19,8 @@ use crate::db;
 
 #[derive(Debug, Serialize)]
 struct MapSummaryOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
     file_count: i64,
     module_count: i64,
     showing: usize,
@@ -38,6 +40,8 @@ struct SummaryGroup {
 
 #[derive(Debug, Serialize)]
 struct MapDetailOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
     file_count: i64,
     module_count: i64,
     groups: Vec<DetailGroup>,
@@ -118,19 +122,37 @@ pub fn cmd_map(
 
     let depth = if stats.file_count > 5000 { 3 } else { 2 };
 
+    let project = db::get_metadata_value(&conn, crate::indexer::PROJECT_LABEL_KEY)?;
+
     if module.is_some() {
-        cmd_map_detailed(&conn, &stats, module, per_dir, limit, depth, format)?;
+        cmd_map_detailed(
+            &conn,
+            &stats,
+            project.as_deref(),
+            module,
+            per_dir,
+            limit,
+            depth,
+            format,
+        )?;
     } else {
-        cmd_map_summary(&conn, &stats, limit, depth, format)?;
+        cmd_map_summary(&conn, &stats, project.as_deref(), limit, depth, format)?;
     }
 
     Ok(())
+}
+
+/// `Project: <label> | ` for the header of `map`, empty for an index built
+/// before the label was recorded.
+fn project_prefix(project: Option<&str>) -> String {
+    project.map_or_else(String::new, |label| format!("Project: {label} | "))
 }
 
 /// Summary mode: directories + file counts + kind counts, sorted by file_count desc
 fn cmd_map_summary(
     conn: &rusqlite::Connection,
     stats: &db::DbStats,
+    project: Option<&str>,
     limit: usize,
     depth: usize,
     format: &str,
@@ -194,6 +216,7 @@ fn cmd_map_summary(
 
     if format == "json" {
         let output = MapSummaryOutput {
+            project: project.map(str::to_string),
             file_count: stats.file_count,
             module_count: stats.module_count,
             showing: groups.len(),
@@ -208,7 +231,8 @@ fn cmd_map_summary(
     println!(
         "{}",
         format!(
-            "{} files | {} modules | top {} of {} dirs",
+            "{}{} files | {} modules | top {} of {} dirs",
+            project_prefix(project),
             stats.file_count,
             stats.module_count,
             groups.len(),
@@ -257,9 +281,11 @@ fn cmd_map_summary(
 }
 
 /// Detailed mode: symbols with inheritance per directory (when --module is used)
+#[allow(clippy::too_many_arguments)]
 fn cmd_map_detailed(
     conn: &rusqlite::Connection,
     stats: &db::DbStats,
+    project: Option<&str>,
     module: Option<&str>,
     per_dir: usize,
     limit: usize,
@@ -444,6 +470,7 @@ fn cmd_map_detailed(
 
     if format == "json" {
         let output = MapDetailOutput {
+            project: project.map(str::to_string),
             file_count: stats.file_count,
             module_count: stats.module_count,
             groups,
@@ -456,8 +483,10 @@ fn cmd_map_detailed(
     println!(
         "{}",
         format!(
-            "{} files | {} modules",
-            stats.file_count, stats.module_count
+            "{}{} files | {} modules",
+            project_prefix(project),
+            stats.file_count,
+            stats.module_count
         )
         .bold()
     );
@@ -539,7 +568,9 @@ const NAMING_SUFFIXES: &[&str] = &[
     "Gateway",
 ];
 
-/// Known import prefixes → (category, display_name)
+/// Known import prefixes → (category, display_name). A leading `=` matches the
+/// whole import name only (Go's `testing` package, not every `…/testing/…`
+/// path); see [`import_matches_rule`] for the others.
 const FRAMEWORK_RULES: &[(&str, &str, &str)] = &[
     // DI
     ("dagger", "DI", "Dagger"),
@@ -566,6 +597,8 @@ const FRAMEWORK_RULES: &[(&str, &str, &str)] = &[
     ("io.realm", "DB", "Realm"),
     ("app.cash.sqldelight", "DB", "SQLDelight"),
     ("coredata", "DB", "CoreData"),
+    ("active_record", "DB", "ActiveRecord"),
+    ("sequel", "DB", "Sequel"),
     // UI
     ("androidx.compose", "UI", "Jetpack Compose"),
     ("swiftui", "UI", "SwiftUI"),
@@ -580,7 +613,7 @@ const FRAMEWORK_RULES: &[(&str, &str, &str)] = &[
     ("pytest", "Testing", "pytest"),
     ("jest", "Testing", "Jest"),
     ("rspec", "Testing", "RSpec"),
-    ("testing", "Testing", "testing"),
+    ("=testing", "Testing", "testing"),
     ("org.mockito", "Testing", "Mockito"),
     ("io.mockk", "Testing", "MockK"),
     // Serialization
@@ -592,6 +625,16 @@ const FRAMEWORK_RULES: &[(&str, &str, &str)] = &[
     ("com.google.gson", "Serialization", "Gson"),
     ("com.squareup.moshi", "Serialization", "Moshi"),
     ("com.fasterxml.jackson", "Serialization", "Jackson"),
+    // Web and jobs last: `rspec/rails` is RSpec, `rails_helper` is Rails.
+    // Web
+    ("rails", "Web", "Rails"),
+    ("django", "Web", "Django"),
+    ("flask", "Web", "Flask"),
+    ("fastapi", "Web", "FastAPI"),
+    ("express", "Web", "Express"),
+    // Jobs
+    ("sidekiq", "Jobs", "Sidekiq"),
+    ("celery", "Jobs", "Celery"),
 ];
 
 /// Architecture detection patterns (path-based)
@@ -610,6 +653,29 @@ const ARCH_PATTERNS: &[(&[&str], &str)] = &[
     (&["/composables/"], "Composition API"),
     (&["/hooks/"], "Hooks pattern"),
 ];
+
+/// Whether the lowercased import name `import` belongs to a [`FRAMEWORK_RULES`]
+/// prefix: the prefix starts the name or follows a `.` `/` `:` `@` separator,
+/// and is not continued by a letter. `androidx.hilt.navigation`, `retrofit2`,
+/// `@jest/globals` and `react-dom` match; `sequel-combine` is no Swift
+/// Combine and `preact` no React.
+fn import_matches_rule(import: &str, prefix: &str) -> bool {
+    if let Some(whole) = prefix.strip_prefix('=') {
+        return import == whole;
+    }
+    import.match_indices(prefix).any(|(at, _)| {
+        let starts_segment = import[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| matches!(c, '.' | '/' | ':' | '@'));
+        let ends_word = prefix.ends_with('.')
+            || import[at + prefix.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphabetic());
+        starts_segment && ends_word
+    })
+}
 
 pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
     if !db::db_exists(root) {
@@ -667,7 +733,7 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
             let (import_name, cnt) = row;
             let lower = import_name.to_lowercase();
             for &(prefix, category, display) in FRAMEWORK_RULES {
-                if lower.contains(prefix) {
+                if import_matches_rule(&lower, prefix) {
                     let cat_map = fw_map.entry(category.to_string()).or_default();
                     *cat_map.entry(display.to_string()).or_insert(0) += cnt;
                     break;
@@ -760,4 +826,45 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn framework(import: &str) -> Option<&'static str> {
+        let lower = import.to_lowercase();
+        FRAMEWORK_RULES
+            .iter()
+            .find(|(prefix, _, _)| import_matches_rule(&lower, prefix))
+            .map(|&(_, _, display)| display)
+    }
+
+    #[test]
+    fn framework_rules_match_whole_segments_across_ecosystems() {
+        assert_eq!(framework("androidx.hilt.navigation.compose"), Some("Hilt"));
+        assert_eq!(framework("kotlinx.coroutines.flow.Flow"), Some("Coroutines"));
+        assert_eq!(framework("retrofit2.Retrofit"), Some("Retrofit"));
+        assert_eq!(framework("okhttp3.OkHttpClient"), Some("OkHttp"));
+        assert_eq!(framework("rx.Observable"), Some("Rx"));
+        assert_eq!(framework("Combine"), Some("Combine"));
+        assert_eq!(framework("SwiftUI"), Some("SwiftUI"));
+        assert_eq!(framework("react-dom"), Some("React"));
+        assert_eq!(framework("@jest/globals"), Some("Jest"));
+        assert_eq!(framework("package:flutter/material.dart"), Some("Flutter"));
+        assert_eq!(framework("testing"), Some("testing"));
+        assert_eq!(framework("rails/all"), Some("Rails"));
+        assert_eq!(framework("sidekiq/testing"), Some("Sidekiq"));
+        assert_eq!(framework("rspec/rails"), Some("RSpec"));
+        assert_eq!(framework("django.db.models"), Some("Django"));
+    }
+
+    #[test]
+    fn framework_rules_skip_names_that_only_contain_the_prefix() {
+        assert_eq!(framework("sequel-combine"), Some("Sequel"));
+        assert_eq!(framework("preact"), None);
+        assert_eq!(framework("../testing/setup"), None);
+        assert_eq!(framework("./combineUtils"), None);
+        assert_eq!(framework("shared-testing/spec_helper"), None);
+    }
 }

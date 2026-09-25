@@ -535,7 +535,7 @@ fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>>
     }
     let mut found = Vec::new();
     for p in patterns {
-        for hit in db::find_files(conn, &p, 5)? {
+        for hit in db::find_files(conn, &p, TEST_CANDIDATES_PER_PATTERN)? {
             // find_files matches `%p%` (substring), so `JsonConverter.cs` would
             // falsely match `GenericJsonConverterTests.cs`. Keep only exact
             // basename matches.
@@ -548,7 +548,51 @@ fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>>
             }
         }
     }
-    Ok(found)
+    Ok(closest_tests(rel, found))
+}
+
+/// Candidate test files per name pattern read before [`closest_tests`]
+/// picks among them; a common file name has one per package.
+const TEST_CANDIDATES_PER_PATTERN: usize = 50;
+
+/// Directory names that hold tests rather than mirror the source tree.
+const TEST_ROOT_DIRS: &[&str] = &["spec", "specs", "test", "tests", "__tests__", "src"];
+
+/// The candidates whose directory ends like the source's: the most trailing
+/// directory names in common, test roots (`spec/`, `tests/`, `__tests__/`)
+/// left out. `app/services/billing/charge.rb` keeps
+/// `spec/services/billing/charge_spec.rb` over `engines/x/spec/charge_spec.rb`,
+/// and `src/main/java/a/b/X.java` keeps `src/test/java/a/b/XTest.java`. When
+/// no candidate shares a directory — a flat `tests/` — a single candidate is
+/// still the test; several are a guess and none is returned.
+fn closest_tests(source: &str, candidates: Vec<String>) -> Vec<String> {
+    let dirs = |path: &str| -> Vec<String> {
+        let mut dirs: Vec<String> = path.split('/').map(str::to_string).collect();
+        dirs.pop();
+        dirs.retain(|dir| !TEST_ROOT_DIRS.contains(&dir.as_str()));
+        dirs
+    };
+    let source_dirs = dirs(source);
+    let shared = |candidate: &str| {
+        dirs(candidate)
+            .iter()
+            .rev()
+            .zip(source_dirs.iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
+    let best = candidates.iter().map(|c| shared(c)).max().unwrap_or(0);
+    if best == 0 {
+        return if candidates.len() == 1 {
+            candidates
+        } else {
+            Vec::new()
+        };
+    }
+    candidates
+        .into_iter()
+        .filter(|c| shared(c) == best)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,28 +1081,51 @@ fn apply_rwr(
         g.restart[id] += c.score.max(0.0);
     }
 
-    // Build edges around each seed: callers (refs → owning symbol) + inheritance.
+    // Build edges around each seed: callers + inheritance. Callers come from
+    // the symbol graph when it is built and fresh — resolved edges point at
+    // this definition, not at every symbol sharing its name — and otherwise
+    // from references matched by name, each attributed to its owning symbol.
     let seeds: Vec<SearchResult> = cands.iter().take(seed_n).map(|c| c.sym.clone()).collect();
     // Role a node plays relative to the seed — for the "Graph neighbours" section.
     let mut link_role: HashMap<(String, i64), &'static str> = HashMap::new();
-    for sym in &seeds {
+    let graph_dependents = super::graph::resolved_dependents_of(conn, &seeds, REF_LIMIT)?;
+    for (i, sym) in seeds.iter().enumerate() {
         let sid = g.intern(sym);
-        for r in db::find_references(conn, &sym.name, REF_LIMIT)? {
-            if !resolver.matches_filter(r.root_path.as_deref()) {
+        let callers: Vec<SearchResult> = match &graph_dependents {
+            Some(dependents) => dependents[i].clone(),
+            None => {
+                let mut owners = Vec::new();
+                for r in db::find_references(conn, &sym.name, REF_LIMIT)? {
+                    if let Some(owner) =
+                        db::find_owning_symbol(conn, r.root_path.as_deref(), &r.path, r.line)
+                            .unwrap_or(None)
+                    {
+                        owners.push(owner);
+                    }
+                }
+                owners
+            }
+        };
+        let children = db::find_implementations(conn, &sym.name, REF_LIMIT)?;
+        // Inheritance is also a graph edge; name it `subclass` rather than
+        // `caller` when both sources list the same definition.
+        let subclass_keys: HashSet<(String, i64)> =
+            children.iter().map(|c| (c.path.clone(), c.line)).collect();
+        for caller in callers {
+            if !resolver.matches_filter(caller.root_path.as_deref()) {
                 continue;
             }
-            if let Some(owner) =
-                db::find_owning_symbol(conn, r.root_path.as_deref(), &r.path, r.line)
-                    .unwrap_or(None)
-            {
-                link_role
-                    .entry((owner.path.clone(), owner.line))
-                    .or_insert("caller");
-                let oid = g.intern(&owner);
-                g.edge(sid, oid);
-            }
+            let key = (caller.path.clone(), caller.line);
+            let role = if subclass_keys.contains(&key) {
+                "subclass"
+            } else {
+                "caller"
+            };
+            link_role.entry(key).or_insert(role);
+            let oid = g.intern(&caller);
+            g.edge(sid, oid);
         }
-        for child in db::find_implementations(conn, &sym.name, REF_LIMIT)? {
+        for child in children {
             if !resolver.matches_filter(child.root_path.as_deref()) {
                 continue;
             }
@@ -1389,6 +1456,47 @@ mod tests {
             "app/workers/w.rb",
             2
         )));
+    }
+
+    #[test]
+    fn closest_tests_prefer_the_mirrored_directory() {
+        let pick = |source: &str, candidates: &[&str]| {
+            closest_tests(source, candidates.iter().map(|c| c.to_string()).collect())
+        };
+        assert_eq!(
+            pick(
+                "app/services/billing/charge.rb",
+                &[
+                    "engines/x/spec/charge_spec.rb",
+                    "spec/services/billing/charge_spec.rb",
+                    "spec/services/charge_spec.rb",
+                ]
+            ),
+            vec!["spec/services/billing/charge_spec.rb"]
+        );
+        assert_eq!(
+            pick(
+                "src/main/java/a/b/X.java",
+                &["src/test/java/a/b/XTest.java", "src/test/java/c/XTest.java"]
+            ),
+            vec!["src/test/java/a/b/XTest.java"]
+        );
+        assert_eq!(
+            pick("src/ui/Button.tsx", &["src/ui/__tests__/Button.test.tsx"]),
+            vec!["src/ui/__tests__/Button.test.tsx"]
+        );
+        assert_eq!(
+            pick("pkg/core/parser.py", &["tests/test_parser.py"]),
+            vec!["tests/test_parser.py"]
+        );
+        assert!(pick(
+            "app/adapters/integrations/application/find_adapter.rb",
+            &[
+                "engines/integrations/spec/lib/integrations/adapters/applicants/applicant/find_adapter_spec.rb",
+                "engines/structs/spec/structs/adapters/applicants/applicant/find_adapter_spec.rb",
+            ]
+        )
+        .is_empty());
     }
 
     #[test]

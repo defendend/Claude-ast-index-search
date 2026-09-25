@@ -839,12 +839,20 @@ pub fn extract_references_for_lang(
     // line is skipped: a symbol used further down its own file (a constant fed
     // into the next constant, a local interface passed to defineProps) is a real
     // usage, and skipping the whole name hid it from `usages` entirely.
+    //
+    // A qualified name declares its last segment: `class Billing::Invoice`
+    // declares `Invoice`, which the identifier scan below sees on its own,
+    // while `Billing` is a real reference to the namespace.
     let mut declared_at: HashMap<&str, HashSet<usize>> = HashMap::new();
     for symbol in defined_symbols {
         declared_at
             .entry(symbol.name.as_str())
             .or_default()
             .insert(symbol.line);
+        let segment = crate::db::last_name_segment(&symbol.name);
+        if segment.len() < symbol.name.len() {
+            declared_at.entry(segment).or_default().insert(symbol.line);
+        }
     }
     let is_declaration_line =
         |name: &str, line: usize| declared_at.get(name).is_some_and(|l| l.contains(&line));
