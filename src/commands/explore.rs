@@ -1,7 +1,8 @@
 //! `explore` — Stage A prototype.
 //!
-//! One-shot context for a query: rank the most relevant symbols, show their
-//! source (read fresh from disk — never stored in the DB), their neighbours
+//! One-shot context for a query: rank the most relevant symbols, show the
+//! best files — the source of a function (read fresh from disk — never stored
+//! in the DB), an outline of a type or module — their neighbours
 //! (cross-references), and any tests located by path convention.
 //!
 //! Design goals (see RFC): language-agnostic, vendor-aware, honest about
@@ -18,11 +19,18 @@ use colored::Colorize;
 use rusqlite::Connection;
 use serde_json::json;
 
-use super::PathResolver;
-use crate::db::{self, SearchResult, SearchScope};
+use super::{is_test_path, PathResolver};
+use crate::db::{self, SearchResult, SearchScope, SymbolSpan};
 
-/// Candidates pulled per query term from FTS before ranking.
+/// Candidates pulled per query term (and per compound) from FTS before ranking.
 const SEED_PER_TERM: usize = 40;
+/// Candidates pulled by one bm25 ranking over all query terms.
+const RANKED_SEEDS: usize = 200;
+/// Candidates pulled from the files whose path spells out every query term.
+const PATH_SEEDS: usize = 60;
+const PATH_SEEDS_PER_FILE: usize = 3;
+/// Longest run of consecutive query words joined into one compound.
+const MAX_COMPOUND_WORDS: usize = 4;
 /// Max symbols listed in the ranked "Relevant symbols" section.
 const MAX_SYMBOLS_LISTED: usize = 15;
 /// Source files shown when `explore` runs as the `search` fallback; matches
@@ -30,6 +38,60 @@ const MAX_SYMBOLS_LISTED: usize = 15;
 const DEFAULT_MAX_FILES: usize = 6;
 /// Hard cap on lines per source snippet (god-file / minified protection).
 const SNIPPET_CAP_LINES: usize = 60;
+/// Hard cap on outline rows shown for one definition.
+const OUTLINE_CAP_ROWS: usize = 40;
+
+/// Words of a question that name no code: "how does the merge work" asks
+/// about `merge`, and `works` would otherwise match `workspace`.
+const QUESTION_WORDS: &[&str] = &[
+    "how", "does", "did", "what", "where", "which", "why", "when", "who", "the", "and", "for",
+    "with", "from", "into", "that", "this", "are", "was", "were", "work", "works", "working",
+];
+
+/// Kinds that hold other definitions: shown as an outline, and what a query
+/// naming a type or module is after.
+const CONTAINER_KINDS: &[&str] = &["class", "interface", "object", "enum", "package"];
+
+/// Kinds whose own text is the answer, shown as source rather than an outline.
+const BODY_KINDS: &[&str] = &["function", "procedure", "typealias", "constant", "table"];
+
+/// A query as `explore` reads it.
+struct Query {
+    /// Lowercased identifier words of 3+ characters, question words dropped.
+    terms: Vec<String>,
+    /// Runs of consecutive words joined together, longest first — how the
+    /// full-text index tokenizes a CamelCase name (`merge service` is
+    /// `mergeservice`). Short words stay in: `pdf to html` is `pdftohtml`.
+    compounds: Vec<String>,
+    /// Every word joined together: the name a symbol would carry if the query
+    /// spelled it out exactly.
+    whole: String,
+}
+
+impl Query {
+    fn parse(raw: &str) -> Self {
+        let words: Vec<String> = raw
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .filter(|word| !QUESTION_WORDS.contains(&word.as_str()))
+            .collect();
+        let mut compounds: Vec<String> = Vec::new();
+        for len in (2..=words.len().min(MAX_COMPOUND_WORDS)).rev() {
+            for window in words.windows(len) {
+                let compound = window.concat();
+                if !compounds.contains(&compound) {
+                    compounds.push(compound);
+                }
+            }
+        }
+        Query {
+            terms: tokenize(raw),
+            compounds,
+            whole: words.concat(),
+        }
+    }
+}
 
 struct Cand {
     sym: SearchResult,
@@ -72,38 +134,58 @@ fn run_explore(
     let resolver = PathResolver::try_from_conn(root, &conn)?;
 
     let raw = query.join(" ");
-    let terms = tokenize(&raw);
-    if terms.is_empty() {
+    let query = Query::parse(&raw);
+    if query.terms.is_empty() {
         println!("explore: query has no usable terms (need identifiers >= 3 chars)");
         return Ok(());
     }
 
-    // 1. Seed: FTS per term, fuzzy fallback when a term is thin. Dedup by (path,line).
-    let mut cands: Vec<Cand> = Vec::new();
-    let mut seen: HashSet<(String, i64)> = HashSet::new();
-    for term in &terms {
-        let mut hits = db::search_symbols(&conn, term, SEED_PER_TERM)?;
-        if hits.len() < 3 {
+    // 1. Seed, then dedup by (path, line): one bm25 ranking over all terms,
+    //    compound names, files whose path spells the query out, and a per-term
+    //    sample with a fuzzy fallback when a term is thin.
+    let mut hits = db::search_symbol_seeds_ranked(&conn, &query.terms, RANKED_SEEDS)?;
+    for compound in &query.compounds {
+        hits.extend(db::search_symbols(
+            &conn,
+            &format!("{compound}*"),
+            SEED_PER_TERM,
+        )?);
+    }
+    if query.terms.len() >= 2 {
+        hits.extend(db::search_symbols_in_matching_paths(
+            &conn,
+            &query.terms,
+            PATH_SEEDS_PER_FILE,
+            PATH_SEEDS,
+        )?);
+    }
+    for term in &query.terms {
+        let term_hits = db::search_symbol_seeds(&conn, term, SEED_PER_TERM)?;
+        let thin = term_hits.len() < 3;
+        hits.extend(term_hits);
+        if thin {
             hits.extend(db::search_symbols_fuzzy(&conn, term, SEED_PER_TERM)?);
         }
-        for s in hits {
-            if !resolver.matches_filter(s.root_path.as_deref()) {
-                continue;
-            }
-            if !scope.matches_path(&s.path) {
-                continue;
-            }
-            if !seen.insert((s.path.clone(), s.line)) {
-                continue;
-            }
-            let vendor = is_vendor(&s.path);
-            cands.push(Cand {
-                sym: s,
-                score: 0.0,
-                vendor,
-                link: None,
-            });
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    let mut seen: HashSet<(String, i64)> = HashSet::new();
+    for s in hits {
+        if !resolver.matches_filter(s.root_path.as_deref()) {
+            continue;
         }
+        if !scope.matches_path(&s.path) {
+            continue;
+        }
+        if !seen.insert((s.path.clone(), s.line)) {
+            continue;
+        }
+        let vendor = db::is_vendor_path(&s.path);
+        cands.push(Cand {
+            sym: s,
+            score: 0.0,
+            vendor,
+            link: None,
+        });
     }
     if cands.is_empty() {
         println!("explore: no symbols matched '{}'", raw);
@@ -116,7 +198,7 @@ fn run_explore(
 
     // 3. Score and sort.
     for c in &mut cands {
-        c.score = score(c, &terms, dom_lang.as_deref());
+        c.score = score(c, &query, dom_lang.as_deref());
     }
     cands.sort_by(|a, b| b.score.total_cmp(&a.score));
 
@@ -150,24 +232,29 @@ fn run_explore(
         tests.push((rel.clone(), found));
     }
 
+    let contexts: Vec<Option<FileContext>> = file_order
+        .iter()
+        .map(|&i| file_context(&conn, root, &cands[i].sym))
+        .collect();
+
     if format == "json" {
         return emit_json(
-            root,
             &raw,
             dom_lang.as_deref(),
             &cands,
             &file_order,
+            &contexts,
             &tests,
             fallback_reason,
         );
     }
 
     emit_text(
-        root,
         &raw,
         dom_lang.as_deref(),
         &cands,
         &file_order,
+        &contexts,
         &tests,
         &resolver,
     );
@@ -211,8 +298,10 @@ pub fn cmd_search_fallback(
 // Ranking
 // ---------------------------------------------------------------------------
 
-fn score(c: &Cand, terms: &[String], dom_lang: Option<&str>) -> f64 {
+fn score(c: &Cand, query: &Query, dom_lang: Option<&str>) -> f64 {
+    let terms = &query.terms;
     let name_lc = c.sym.name.to_lowercase();
+    let own_lc = db::last_name_segment(&c.sym.name).to_lowercase();
     let qual_lc = c.sym.qualified_name.as_deref().unwrap_or("").to_lowercase();
     let stem = path_stem(&c.sym.path).to_lowercase();
     let path_lc = c.sym.path.to_lowercase();
@@ -227,11 +316,17 @@ fn score(c: &Cand, terms: &[String], dom_lang: Option<&str>) -> f64 {
     let mut term_hits = 0u32;
     for t in terms {
         let mut hit = false;
+        // A word in the symbol's own name says more than one only in its
+        // namespace: `Applicant::MergeService` is the merge, while
+        // `Applicant::Merge::CallbacksService` is one of its helpers.
         if name_lc == *t {
             signal += 50.0;
             hit = true;
-        } else if name_lc.contains(t) {
+        } else if own_lc.contains(t) {
             signal += 25.0;
+            hit = true;
+        } else if name_lc.contains(t) {
+            signal += 15.0;
             hit = true;
         }
         if qual_lc.contains(t) {
@@ -267,7 +362,38 @@ fn score(c: &Cand, terms: &[String], dom_lang: Option<&str>) -> f64 {
     // Prefer concise names on ties (long auto-generated names rank lower).
     s -= c.sym.name.chars().count() as f64 * 0.05;
 
+    // The symbol the query spells out — `ApplicationService` for "application
+    // service" — outranks the ones that merely contain its words; so, less
+    // strongly, does one named by a run of them.
+    let segment = flatten(db::last_name_segment(&c.sym.name));
+    if !query.whole.is_empty() && (flatten(&c.sym.name) == query.whole || segment == query.whole) {
+        s *= 2.0;
+    } else if query.compounds.contains(&segment) {
+        s *= 1.5;
+    }
+
+    if is_primary_definition(&c.sym) {
+        s *= 1.3;
+    }
+
     s * penalty_mult(&c.sym, c.vendor, dom_lang)
+}
+
+/// Whether `sym` is the type or module its file is named after —
+/// `MergeService` in `merge_service.rb`, `PaymentGateway` in
+/// `PaymentGateway.kt` — rather than a helper or a namespace wrapper.
+fn is_primary_definition(sym: &SearchResult) -> bool {
+    CONTAINER_KINDS.contains(&sym.kind.as_str())
+        && flatten(db::last_name_segment(&sym.name)) == flatten(&path_stem(&sym.path))
+}
+
+/// `s` lowercased with everything but letters and digits removed, so that
+/// `MergeService`, `merge_service` and `merge-service` compare equal.
+fn flatten(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// Multiplicative down-ranking shared by the lexical pass (Stage A) and the
@@ -283,6 +409,12 @@ fn penalty_mult(sym: &SearchResult, vendor: bool, dom_lang: Option<&str>) -> f64
     if is_test_path(&sym.path) {
         m *= 0.3; // tests live in their own section, not as primary source.
     }
+    if is_declaration_statement(sym) {
+        m *= 0.4;
+    }
+    if is_namespace_wrapper(sym) {
+        m *= 0.3;
+    }
     if let (Some(dom), Some(ext)) = (dom_lang, ext_of(&sym.path)) {
         if ext != dom {
             m *= 0.4; // cross-stack down-rank (e.g. JMH .java in a Kotlin repo).
@@ -291,11 +423,27 @@ fn penalty_mult(sym: &SearchResult, vendor: bool, dom_lang: Option<&str>) -> f64
     m
 }
 
+/// Whether `sym` is a statement the index records as a symbol — Ruby
+/// `has_many :duplicates`, `scope :active`, `include Worker`, a DSL
+/// `enum` — rather than a definition. Its name holds whitespace; a type
+/// statement such as Rust's `impl Graph` still holds definitions and is not
+/// one.
+fn is_declaration_statement(sym: &SearchResult) -> bool {
+    sym.name.contains(char::is_whitespace) && !CONTAINER_KINDS.contains(&sym.kind.as_str())
+}
+
+/// Whether `sym` is a module or package opened only to nest the file's real
+/// definition — `module Applicant::Merge` around every class of
+/// `applicant/merge/` — which repeats once per file under the same name.
+fn is_namespace_wrapper(sym: &SearchResult) -> bool {
+    sym.kind == "package" && !is_primary_definition(sym)
+}
+
 fn kind_base(kind: &str) -> f64 {
     match kind {
-        "function" | "method" => 10.0,
-        "class" | "interface" | "struct" | "module" | "trait" => 8.0,
-        "enum" => 6.0,
+        "class" | "interface" | "object" => 12.0,
+        "function" | "procedure" => 10.0,
+        "enum" | "package" => 8.0,
         "constant" => 4.0,
         _ => 5.0,
     }
@@ -387,7 +535,7 @@ fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>>
     }
     let mut found = Vec::new();
     for p in patterns {
-        for hit in db::find_files(conn, &p, 5)? {
+        for hit in db::find_files(conn, &p, TEST_CANDIDATES_PER_PATTERN)? {
             // find_files matches `%p%` (substring), so `JsonConverter.cs` would
             // falsely match `GenericJsonConverterTests.cs`. Keep only exact
             // basename matches.
@@ -400,7 +548,53 @@ fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>>
             }
         }
     }
-    Ok(found)
+    Ok(closest_tests(rel, found))
+}
+
+/// Candidate test files per name pattern read before [`closest_tests`]
+/// picks among them; a common file name has one per package.
+const TEST_CANDIDATES_PER_PATTERN: usize = 50;
+
+/// Directory names that hold tests rather than mirror the source tree.
+const TEST_ROOT_DIRS: &[&str] = &["spec", "specs", "test", "tests", "__tests__", "src"];
+
+/// The candidates whose directory ends like the source's. A test in the
+/// source's own directory (`config_test.go`) ranks first; then the most
+/// trailing directory names in common, test roots (`spec/`, `tests/`,
+/// `__tests__/`, `src/`) left out: `app/services/billing/charge.rb` keeps
+/// `spec/services/billing/charge_spec.rb` over `engines/x/spec/charge_spec.rb`,
+/// and `src/main/java/a/b/X.java` keeps `src/test/java/a/b/XTest.java`. When
+/// no candidate shares a directory — a flat `tests/`, separate `*.Tests`
+/// projects — every candidate is kept.
+fn closest_tests(source: &str, candidates: Vec<String>) -> Vec<String> {
+    let parent = |path: &str| path.rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
+    let dirs = |path: &str| -> Vec<String> {
+        let mut dirs: Vec<String> = path.split('/').map(str::to_string).collect();
+        dirs.pop();
+        dirs.retain(|dir| !TEST_ROOT_DIRS.contains(&dir.as_str()));
+        dirs
+    };
+    let source_parent = parent(source);
+    let source_dirs = dirs(source);
+    let shared = |candidate: &str| {
+        if parent(candidate) == source_parent {
+            return usize::MAX;
+        }
+        dirs(candidate)
+            .iter()
+            .rev()
+            .zip(source_dirs.iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
+    let best = candidates.iter().map(|c| shared(c)).max().unwrap_or(0);
+    if best == 0 {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|c| shared(c) == best)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -409,11 +603,11 @@ fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>>
 
 #[allow(clippy::too_many_arguments)]
 fn emit_text(
-    root: &Path,
     raw: &str,
     dom_lang: Option<&str>,
     cands: &[Cand],
     file_order: &[usize],
+    contexts: &[Option<FileContext>],
     tests: &[(String, Vec<String>)],
     resolver: &PathResolver,
 ) {
@@ -469,12 +663,31 @@ fn emit_text(
     }
 
     println!("\n{} ({} files)", "Source (from disk):".cyan(), n_files);
-    for &i in file_order {
+    for (&i, context) in file_order.iter().zip(contexts) {
         let c = &cands[i];
         let disp = resolver.resolve_with_root(&c.sym.path, c.sym.root_path.as_deref());
         println!("\n{} {} — {}", "####".dimmed(), disp, c.sym.display_name());
-        match read_snippet(root, &c.sym) {
-            Some(snip) => print!("{}", snip),
+        match context {
+            Some(FileContext::Body(snip)) => print!("{}", snip),
+            Some(FileContext::Outline {
+                rows,
+                hidden,
+                focus,
+            }) => {
+                for row in rows {
+                    let marker = if row.line == *focus { "→" } else { " " };
+                    println!(
+                        "  {} {} {} [{}]",
+                        marker,
+                        position(row).dimmed(),
+                        row.name,
+                        row.kind
+                    );
+                }
+                if *hidden > 0 {
+                    println!("    … {hidden} more");
+                }
+            }
             None => println!("  (could not read source)"),
         }
     }
@@ -491,11 +704,11 @@ fn emit_text(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_json(
-    root: &Path,
     raw: &str,
     dom_lang: Option<&str>,
     cands: &[Cand],
     file_order: &[usize],
+    contexts: &[Option<FileContext>],
     tests: &[(String, Vec<String>)],
     fallback_reason: Option<&str>,
 ) -> Result<()> {
@@ -515,14 +728,34 @@ fn emit_json(
         .collect();
     let files: Vec<_> = file_order
         .iter()
-        .map(|&i| {
+        .zip(contexts)
+        .map(|(&i, context)| {
             let c = &cands[i];
-            json!({
+            let mut file = json!({
                 "path": c.sym.path,
                 "symbol": c.sym.display_name(),
                 "line": c.sym.line,
-                "source": read_snippet(root, &c.sym).unwrap_or_default(),
-            })
+            });
+            match context {
+                Some(FileContext::Outline { rows, hidden, .. }) => {
+                    let rows: Vec<_> = rows
+                        .iter()
+                        .map(|row| {
+                            json!({
+                                "name": row.name,
+                                "kind": row.kind,
+                                "line": row.line,
+                                "end_line": row.end_line,
+                            })
+                        })
+                        .collect();
+                    file["outline"] = json!(rows);
+                    file["outline_hidden"] = json!(hidden);
+                }
+                Some(FileContext::Body(source)) => file["source"] = json!(source),
+                None => file["source"] = json!(""),
+            }
+            file
         })
         .collect();
     let tests_json: Vec<_> = tests
@@ -564,6 +797,67 @@ fn emit_json(
 // ---------------------------------------------------------------------------
 // Source extraction (from disk, by coordinates + indentation heuristic)
 // ---------------------------------------------------------------------------
+
+/// What `explore` shows of a chosen file.
+enum FileContext {
+    /// Source of a function-like symbol: its body is the answer.
+    Body(String),
+    /// Definitions inside the type or module around the symbol, with line
+    /// ranges: a few lines of a class or of a `has_many` explain nothing,
+    /// while the member list says where to read next.
+    Outline {
+        rows: Vec<SymbolSpan>,
+        /// Rows past [`OUTLINE_CAP_ROWS`] left out.
+        hidden: usize,
+        /// Line of the chosen symbol.
+        focus: i64,
+    },
+}
+
+fn position(span: &SymbolSpan) -> String {
+    match span.end_line {
+        Some(end) if end > span.line => format!(":{}-{}", span.line, end),
+        _ => format!(":{}", span.line),
+    }
+}
+
+fn file_context(conn: &Connection, root: &Path, sym: &SearchResult) -> Option<FileContext> {
+    if !BODY_KINDS.contains(&sym.kind.as_str()) {
+        if let Some(outline) = read_outline(conn, sym) {
+            return Some(outline);
+        }
+    }
+    read_snippet(root, sym).map(FileContext::Body)
+}
+
+/// Outline of the innermost type or module holding `sym` (`sym` itself when
+/// it is one), or of the whole file when nothing holds it. Read from the
+/// index, which is where `sym` and its line come from; `None` when the file
+/// has no ranges to outline.
+fn read_outline(conn: &Connection, sym: &SearchResult) -> Option<FileContext> {
+    let spans = db::get_file_outline(conn, sym.root_path.as_deref(), &sym.path).ok()?;
+    if spans.iter().all(|span| span.end_line.is_none()) {
+        return None;
+    }
+    let focus = sym.line;
+    let holder = spans
+        .iter()
+        .filter(|span| CONTAINER_KINDS.contains(&span.kind.as_str()))
+        .filter_map(|span| Some((span.line, span.end_line?)))
+        .filter(|&(start, end)| start <= focus && focus <= end)
+        .min_by_key(|&(start, end)| end - start);
+    let mut rows: Vec<SymbolSpan> = spans
+        .into_iter()
+        .filter(|span| holder.is_none_or(|(start, end)| start <= span.line && span.line <= end))
+        .collect();
+    let hidden = rows.len().saturating_sub(OUTLINE_CAP_ROWS);
+    rows.truncate(OUTLINE_CAP_ROWS);
+    Some(FileContext::Outline {
+        rows,
+        hidden,
+        focus,
+    })
+}
 
 fn read_snippet(root: &Path, sym: &SearchResult) -> Option<String> {
     let abs = abs_path(root, &sym.path, sym.root_path.as_deref());
@@ -668,6 +962,8 @@ fn indent_block_end(lines: &[&str], start: usize, cap: usize) -> usize {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Query terms: lowercased identifiers of 3+ characters, deduplicated, without
+/// [`QUESTION_WORDS`] — unless those are all the query has.
 fn tokenize(raw: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -677,7 +973,16 @@ fn tokenize(raw: &str) -> Vec<String> {
             out.push(t);
         }
     }
-    out
+    let meaningful: Vec<String> = out
+        .iter()
+        .filter(|t| !QUESTION_WORDS.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    if meaningful.is_empty() {
+        out
+    } else {
+        meaningful
+    }
 }
 
 fn indent_width(line: &str) -> usize {
@@ -697,32 +1002,6 @@ fn path_stem(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string()
-}
-
-fn is_vendor(path: &str) -> bool {
-    path.contains("node_modules") || path.ends_with(".d.ts")
-}
-
-fn is_test_path(path: &str) -> bool {
-    let p = path.to_lowercase();
-    let dir_or_infix = p.contains("/spec/")
-        || p.contains("/test/")
-        || p.contains("/tests/")
-        || p.contains("/__tests__/")
-        || p.starts_with("spec/")
-        || p.starts_with("test/")
-        || p.starts_with("tests/")
-        || p.contains("_spec.")
-        || p.contains("_test.")
-        || p.contains(".spec.")
-        || p.contains(".test.");
-    if dir_or_infix {
-        return true;
-    }
-    // CamelCase filename suffix: FooTest.java, SessionTests.swift, BarSpec.kt.
-    // Use original case so plain words ("latest", "contest") are not flagged.
-    let stem = path_stem(path);
-    stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("Spec")
 }
 
 fn abs_path(root: &Path, rel: &str, root_path: Option<&str>) -> PathBuf {
@@ -804,29 +1083,57 @@ fn apply_rwr(
         g.restart[id] += c.score.max(0.0);
     }
 
-    // Build edges around each seed: callers (refs → owning symbol) + inheritance.
+    // Build edges around each seed: callers + inheritance. Callers come from
+    // the symbol graph when it is built and fresh — resolved edges point at
+    // this definition, not at every symbol sharing its name — and otherwise
+    // from references matched by name, each attributed to its owning symbol.
     let seeds: Vec<SearchResult> = cands.iter().take(seed_n).map(|c| c.sym.clone()).collect();
-    let mut file_cache: HashMap<String, Vec<SearchResult>> = HashMap::new();
     // Role a node plays relative to the seed — for the "Graph neighbours" section.
     let mut link_role: HashMap<(String, i64), &'static str> = HashMap::new();
-    for sym in &seeds {
+    let graph_dependents = super::graph::resolved_dependents_of(conn, &seeds, REF_LIMIT)?;
+    for (i, sym) in seeds.iter().enumerate() {
         let sid = g.intern(sym);
-        for r in db::find_references(conn, &sym.name, REF_LIMIT)? {
-            if !resolver.matches_filter(r.root_path.as_deref()) {
+        // A seed the graph resolves no edge to — calls through a receiver of
+        // unknown type in Java, Swift, Go — keeps the name-matched callers.
+        let resolved = graph_dependents
+            .as_ref()
+            .map(|dependents| dependents[i].clone())
+            .filter(|dependents| !dependents.is_empty());
+        let callers: Vec<SearchResult> = match resolved {
+            Some(dependents) => dependents,
+            None => {
+                let mut owners = Vec::new();
+                for r in db::find_references(conn, &sym.name, REF_LIMIT)? {
+                    if let Some(owner) =
+                        db::find_owning_symbol(conn, r.root_path.as_deref(), &r.path, r.line)
+                            .unwrap_or(None)
+                    {
+                        owners.push(owner);
+                    }
+                }
+                owners
+            }
+        };
+        let children = db::find_implementations(conn, &sym.name, REF_LIMIT)?;
+        // Inheritance is also a graph edge; name it `subclass` rather than
+        // `caller` when both sources list the same definition.
+        let subclass_keys: HashSet<(String, i64)> =
+            children.iter().map(|c| (c.path.clone(), c.line)).collect();
+        for caller in callers {
+            if !resolver.matches_filter(caller.root_path.as_deref()) {
                 continue;
             }
-            let fsyms = file_cache
-                .entry(r.path.clone())
-                .or_insert_with(|| db::get_file_symbols(conn, &r.path).unwrap_or_default());
-            if let Some(owner) = fsyms.iter().rev().find(|s| s.line <= r.line).cloned() {
-                link_role
-                    .entry((owner.path.clone(), owner.line))
-                    .or_insert("caller");
-                let oid = g.intern(&owner);
-                g.edge(sid, oid);
-            }
+            let key = (caller.path.clone(), caller.line);
+            let role = if subclass_keys.contains(&key) {
+                "subclass"
+            } else {
+                "caller"
+            };
+            link_role.entry(key).or_insert(role);
+            let oid = g.intern(&caller);
+            g.edge(sid, oid);
         }
-        for child in db::find_implementations(conn, &sym.name, REF_LIMIT)? {
+        for child in children {
             if !resolver.matches_filter(child.root_path.as_deref()) {
                 continue;
             }
@@ -902,7 +1209,7 @@ fn apply_rwr(
     for sym in &g.syms {
         let key = (sym.path.clone(), sym.line);
         if !existing.contains(&key) {
-            let vendor = is_vendor(&sym.path);
+            let vendor = db::is_vendor_path(&sym.path);
             let link = link_role.get(&key).copied();
             cands.push(Cand {
                 sym: sym.clone(),
@@ -945,7 +1252,7 @@ mod tests {
     }
 
     fn cand(name: &str, kind: &str, path: &str) -> Cand {
-        let vendor = is_vendor(path);
+        let vendor = db::is_vendor_path(path);
         Cand {
             sym: sym(name, kind, path, 1),
             score: 0.0,
@@ -960,13 +1267,6 @@ mod tests {
         assert_eq!(t, vec!["applicant", "merge", "mergeservice"]);
         // "a"/"of" dropped (<3 chars); dedup keeps first occurrence.
         assert_eq!(tokenize("Foo foo FOO"), vec!["foo"]);
-    }
-
-    #[test]
-    fn vendor_detection() {
-        assert!(is_vendor("node_modules/@types/react/index.d.ts"));
-        assert!(is_vendor("frontend/types/global.d.ts"));
-        assert!(!is_vendor("app/services/applicant/merge_service.rb"));
     }
 
     #[test]
@@ -1004,11 +1304,7 @@ mod tests {
 
     #[test]
     fn corroboration_beats_single_common_term() {
-        let terms = vec![
-            "applicant".to_string(),
-            "merge".to_string(),
-            "mergeservice".to_string(),
-        ];
+        let terms = Query::parse("applicant merge MergeService");
         let dom = Some("rb");
         // Matches all three terms (name + path).
         let strong = score(
@@ -1033,6 +1329,199 @@ mod tests {
         assert!(
             strong > weak,
             "multi-term symbol ({strong}) must outrank single-term getter ({weak})"
+        );
+    }
+
+    #[test]
+    fn question_words_are_dropped_unless_nothing_else_is_left() {
+        assert_eq!(
+            tokenize("how does applicant merge work"),
+            vec!["applicant", "merge"]
+        );
+        let query = Query::parse("how does the merge work");
+        assert_eq!(query.terms, vec!["merge"]);
+        assert_eq!(query.whole, "merge");
+        assert_eq!(tokenize("how does it work"), vec!["how", "does", "work"]);
+    }
+
+    #[test]
+    fn compounds_join_consecutive_words_longest_first() {
+        let query = Query::parse("pdf to html service");
+        assert_eq!(query.terms, vec!["pdf", "html", "service"]);
+        assert_eq!(query.whole, "pdftohtmlservice");
+        assert_eq!(query.compounds[0], "pdftohtmlservice");
+        assert!(query.compounds.contains(&"htmlservice".to_string()));
+        assert!(query.compounds.contains(&"pdfto".to_string()));
+        assert!(Query::parse("merge").compounds.is_empty());
+        assert_eq!(Query::parse("merge_service").whole, "mergeservice");
+    }
+
+    #[test]
+    fn symbol_the_query_spells_out_outranks_ones_sharing_a_word() {
+        let query = Query::parse("application service");
+        let dom = Some("rb");
+        let named = score(
+            &cand(
+                "ApplicationService",
+                "class",
+                "app/services/application_service.rb",
+            ),
+            &query,
+            dom,
+        );
+        let sharing = score(
+            &cand(
+                "Integrations::Application::FindAdapter",
+                "class",
+                "app/adapters/integrations/application/find_adapter.rb",
+            ),
+            &query,
+            dom,
+        );
+        let method = score(
+            &cand(
+                "application_service",
+                "function",
+                "app/services/offer/pdf_service.rb",
+            ),
+            &query,
+            dom,
+        );
+        assert!(named > sharing, "{named} vs {sharing}");
+        assert!(named > method, "{named} vs {method}");
+    }
+
+    #[test]
+    fn primary_definition_of_a_file_is_recognised_across_naming_styles() {
+        assert!(is_primary_definition(&sym(
+            "Applicant::MergeService",
+            "class",
+            "app/services/applicant/merge_service.rb",
+            3
+        )));
+        assert!(is_primary_definition(&sym(
+            "PaymentGateway",
+            "class",
+            "src/pay/PaymentGateway.kt",
+            1
+        )));
+        assert!(!is_primary_definition(&sym(
+            "Integrations::Application",
+            "package",
+            "app/adapters/integrations/application/find_adapter.rb",
+            4
+        )));
+        assert!(!is_primary_definition(&sym(
+            "merge_service",
+            "function",
+            "app/services/merge_service.rb",
+            9
+        )));
+    }
+
+    #[test]
+    fn declaration_statements_rank_below_definitions() {
+        let query = Query::parse("applicant merge");
+        let dom = Some("rb");
+        let path = "app/models/applicant/deduplication.rb";
+        let association = score(
+            &cand("has_many :applicant_merges", "property", path),
+            &query,
+            dom,
+        );
+        let method = score(&cand("applicant_merge", "function", path), &query, dom);
+        assert!(method > association, "{method} vs {association}");
+        assert!(!is_declaration_statement(&sym(
+            "impl Graph",
+            "class",
+            "src/g.rs",
+            1
+        )));
+
+        let merge = Query::parse("applicant merge");
+        let wrapper = score(
+            &cand(
+                "Applicant::Merge",
+                "package",
+                "app/services/applicant/merge/create_event_service.rb",
+            ),
+            &merge,
+            dom,
+        );
+        let service = score(
+            &cand(
+                "Applicant::MergeService",
+                "class",
+                "app/services/applicant/merge_service.rb",
+            ),
+            &merge,
+            dom,
+        );
+        assert!(service > wrapper, "{service} vs {wrapper}");
+        assert!(is_declaration_statement(&sym(
+            "include Sidekiq::Worker",
+            "annotation",
+            "app/workers/w.rb",
+            2
+        )));
+    }
+
+    #[test]
+    fn closest_tests_prefer_the_mirrored_directory() {
+        let pick = |source: &str, candidates: &[&str]| {
+            closest_tests(source, candidates.iter().map(|c| c.to_string()).collect())
+        };
+        assert_eq!(
+            pick(
+                "app/services/billing/charge.rb",
+                &[
+                    "engines/x/spec/charge_spec.rb",
+                    "spec/services/billing/charge_spec.rb",
+                    "spec/services/charge_spec.rb",
+                ]
+            ),
+            vec!["spec/services/billing/charge_spec.rb"]
+        );
+        assert_eq!(
+            pick(
+                "src/main/java/a/b/X.java",
+                &["src/test/java/a/b/XTest.java", "src/test/java/c/XTest.java"]
+            ),
+            vec!["src/test/java/a/b/XTest.java"]
+        );
+        assert_eq!(
+            pick("src/ui/Button.tsx", &["src/ui/__tests__/Button.test.tsx"]),
+            vec!["src/ui/__tests__/Button.test.tsx"]
+        );
+        assert_eq!(
+            pick("pkg/core/parser.py", &["tests/test_parser.py"]),
+            vec!["tests/test_parser.py"]
+        );
+        assert_eq!(
+            pick("config.go", &["cmd/tool/config_test.go", "config_test.go"]),
+            vec!["config_test.go"]
+        );
+        assert_eq!(
+            pick(
+                "pkg/lexer.py",
+                &[
+                    "tests/unit/test_lexer.py",
+                    "tests/integration/test_lexer.py"
+                ]
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            pick(
+                "src/App/InvoiceCalculator.cs",
+                &[
+                    "tests/App.UnitTests/InvoiceCalculatorTests.cs",
+                    "tests/App.IntegrationTests/InvoiceCalculatorTests.cs",
+                ]
+            )
+            .len(),
+            2
         );
     }
 

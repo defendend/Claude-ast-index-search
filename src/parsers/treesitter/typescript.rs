@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{
+    extract_refs_masked, line_text, mask_non_code, node_end_line, node_line, node_text, parse_tree,
+    signature_line, LanguageParser, NonCode,
+};
 use crate::db::SymbolKind;
 use crate::parsers::{truncate_context, FileType, ParsedRef, ParsedSymbol};
 
@@ -285,6 +288,23 @@ impl LanguageParser for TypeScriptParser {
 
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &TS_LANGUAGE)?;
+        self.symbols_in(content, &tree)
+    }
+
+    fn parse_symbols_and_refs(
+        &self,
+        content: &str,
+        file_type: FileType,
+    ) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
+        let tree = parse_tree(content, &TS_LANGUAGE)?;
+        let symbols = self.symbols_in(content, &tree)?;
+        let refs = self.typescript_extract_refs_in(content, &tree, &symbols, Some(file_type))?;
+        Ok((symbols, refs))
+    }
+}
+
+impl TypeScriptParser {
+    fn symbols_in(&self, content: &str, tree: &tree_sitter::Tree) -> Result<Vec<ParsedSymbol>> {
         let mut symbols = Vec::new();
         let query = &*TS_QUERY;
         let mut cursor = QueryCursor::new();
@@ -315,40 +335,56 @@ impl LanguageParser for TypeScriptParser {
 
         // Type alias captures
         let idx_type_alias_name = idx("type_alias_name");
+        let idx_type_alias_node = idx("type_alias_node");
         let idx_export_type_alias_name = idx("export_type_alias_name");
+        let idx_export_type_alias_node = idx("export_type_alias_node");
 
         // Enum captures
         let idx_enum_name = idx("enum_name");
+        let idx_enum_node = idx("enum_node");
         let idx_export_enum_name = idx("export_enum_name");
+        let idx_export_enum_node = idx("export_enum_node");
 
         // Function captures
         let idx_func_name = idx("func_name");
+        let idx_func_node = idx("func_node");
         let idx_export_func_name = idx("export_func_name");
+        let idx_export_func_node = idx("export_func_node");
 
         // Arrow function captures
         let idx_arrow_func_name = idx("arrow_func_name");
+        let idx_arrow_func_node = idx("arrow_func_node");
         let idx_export_arrow_func_name = idx("export_arrow_func_name");
+        let idx_export_arrow_func_node = idx("export_arrow_func_node");
 
         // Constant captures
         let idx_const_name = idx("const_name");
+        let idx_const_node = idx("const_node");
         let idx_export_const_name = idx("export_const_name");
+        let idx_export_const_node = idx("export_const_node");
 
         // Namespace captures
         let idx_namespace_name = idx("namespace_name");
+        let idx_namespace_node = idx("namespace_node");
         let idx_export_namespace_name = idx("export_namespace_name");
+        let idx_export_namespace_node = idx("export_namespace_node");
 
         // Ambient const captures (declare const without value)
         let idx_export_ambient_const_name = idx("export_ambient_const_name");
+        let idx_export_ambient_const_node = idx("export_ambient_const_node");
 
         // Export default captures
         let idx_export_default_value = idx("export_default_value");
 
         // Import captures
         let idx_import_source = idx("import_source");
+        let idx_import_node = idx("import_node");
 
         // Decorator captures
         let idx_decorator_id = idx("decorator_id");
+        let idx_decorator_node = idx("decorator_node");
         let idx_decorator_call_id = idx("decorator_call_id");
+        let idx_decorator_call_node = idx("decorator_call_node");
 
         // Method captures
         let idx_method_name = idx("method_name");
@@ -365,6 +401,10 @@ impl LanguageParser for TypeScriptParser {
         // Abstract method captures
         let idx_abstract_method_name = idx("abstract_method_name");
         let idx_abstract_method_node = idx("abstract_method_node");
+
+        let end_line_of = |m: &tree_sitter::QueryMatch, capture: Option<u32>| {
+            find_capture(m, capture).map(|c| node_end_line(&c.node))
+        };
 
         // Track emitted symbols to avoid duplicates
         let mut emitted_lines: std::collections::HashSet<(String, usize)> =
@@ -387,8 +427,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
+                        end_line: end_line_of(m, idx_class_node),
                     });
                 }
                 continue;
@@ -406,8 +447,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
+                        end_line: end_line_of(m, idx_abstract_class_node),
                     });
                 }
                 continue;
@@ -425,8 +467,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
+                        end_line: end_line_of(m, idx_export_class_node),
                     });
                 }
                 continue;
@@ -444,8 +487,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
+                        end_line: end_line_of(m, idx_export_abstract_class_node),
                     });
                 }
                 continue;
@@ -464,8 +508,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Interface,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
+                        end_line: end_line_of(m, idx_interface_node),
                     });
                 }
                 continue;
@@ -482,8 +527,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Interface,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
+                        end_line: end_line_of(m, idx_export_interface_node),
                     });
                 }
                 continue;
@@ -499,8 +545,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::TypeAlias,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_type_alias_node),
                     });
                 }
                 continue;
@@ -514,8 +561,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::TypeAlias,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_type_alias_node),
                     });
                 }
                 continue;
@@ -531,8 +579,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Enum,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_enum_node),
                     });
                 }
                 continue;
@@ -546,8 +595,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Enum,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_enum_node),
                     });
                 }
                 continue;
@@ -565,8 +615,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_func_node),
                     });
                 }
                 continue;
@@ -581,8 +632,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_func_node),
                     });
                 }
                 continue;
@@ -600,8 +652,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_arrow_func_node),
                     });
                 }
                 continue;
@@ -616,8 +669,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_arrow_func_node),
                     });
                 }
                 continue;
@@ -642,8 +696,9 @@ impl LanguageParser for TypeScriptParser {
                             name: name.to_string(),
                             kind,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
+                            end_line: end_line_of(m, idx_const_node),
                         });
                     } else if is_all_caps(name) {
                         // ALL_CAPS constants at module level
@@ -658,8 +713,9 @@ impl LanguageParser for TypeScriptParser {
                                 name: name.to_string(),
                                 kind: SymbolKind::Constant,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: end_line_of(m, idx_const_node),
                             });
                         }
                     }
@@ -682,8 +738,9 @@ impl LanguageParser for TypeScriptParser {
                             name: name.to_string(),
                             kind,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
+                            end_line: end_line_of(m, idx_export_const_node),
                         });
                     } else if is_all_caps(name) {
                         // Export statement is always module-level
@@ -691,8 +748,9 @@ impl LanguageParser for TypeScriptParser {
                             name: name.to_string(),
                             kind: SymbolKind::Constant,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
+                            end_line: end_line_of(m, idx_export_const_node),
                         });
                     }
                 }
@@ -709,8 +767,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Constant,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_ambient_const_node),
                     });
                 }
                 continue;
@@ -726,8 +785,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Package,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_namespace_node),
                     });
                 }
                 continue;
@@ -741,8 +801,9 @@ impl LanguageParser for TypeScriptParser {
                         name: name.to_string(),
                         kind: SymbolKind::Package,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_export_namespace_node),
                     });
                 }
                 continue;
@@ -760,8 +821,9 @@ impl LanguageParser for TypeScriptParser {
                         name: source.to_string(),
                         kind: SymbolKind::Import,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_import_node),
                     });
                 }
                 continue;
@@ -777,8 +839,9 @@ impl LanguageParser for TypeScriptParser {
                         name: format!("@{}", name),
                         kind: SymbolKind::Annotation,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_decorator_node),
                     });
                 }
                 continue;
@@ -792,8 +855,9 @@ impl LanguageParser for TypeScriptParser {
                         name: format!("@{}", name),
                         kind: SymbolKind::Annotation,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: end_line_of(m, idx_decorator_call_node),
                     });
                 }
                 continue;
@@ -867,6 +931,7 @@ impl LanguageParser for TypeScriptParser {
                                 line,
                                 signature: sig,
                                 parents: vec![],
+                                end_line: Some(node_end_line(node)),
                             });
                         }
                     }
@@ -879,13 +944,40 @@ impl LanguageParser for TypeScriptParser {
                                 line,
                                 signature: sig,
                                 parents: vec![],
+                                end_line: Some(node_end_line(node)),
                             });
                         }
                     }
-                    // export default someCall(...) or export default defineComponent(...)
-                    "call_expression" => {
-                        if let Some(func_node) = node.child_by_field_name("function") {
-                            let name = node_text(content, &func_node);
+                    // A higher-order call is named after what it wraps. Named after the
+                    // wrapper, every file applying `injectIntl` claimed a definition of
+                    // it, and the call on that line made `injectIntl` its own caller.
+                    "call_expression" => match wrapped_value(*node) {
+                        // export default memo(Button) / connect(mapState)(Button)
+                        Some(wrapped) if wrapped.kind() == "identifier" => {
+                            let name = format!("default({})", node_text(content, &wrapped));
+                            if emitted_lines.insert((name.clone(), line)) {
+                                symbols.push(ParsedSymbol {
+                                    name,
+                                    kind: SymbolKind::Object,
+                                    line,
+                                    signature: sig,
+                                    parents: vec![],
+                                    end_line: Some(node_end_line(node)),
+                                });
+                            }
+                        }
+                        // export default forwardRef((props, ref) => {})
+                        Some(wrapped) => push_anonymous_default(
+                            content,
+                            &wrapped,
+                            node,
+                            sig,
+                            &mut symbols,
+                            &mut emitted_lines,
+                        ),
+                        // export default createRouter({...}) / defineComponent({...})
+                        None => {
+                            let name = node_text(content, &root_callee(*node));
                             if emitted_lines.insert((name.to_string(), line)) {
                                 symbols.push(ParsedSymbol {
                                     name: name.to_string(),
@@ -893,12 +985,24 @@ impl LanguageParser for TypeScriptParser {
                                     line,
                                     signature: sig,
                                     parents: vec![],
+                                    end_line: Some(node_end_line(node)),
                                 });
                             }
                         }
+                    },
+                    // export default () => {} / function () {} / class {}
+                    "arrow_function" | "function_expression" | "generator_function" | "class" => {
+                        push_anonymous_default(
+                            content,
+                            node,
+                            node,
+                            sig,
+                            &mut symbols,
+                            &mut emitted_lines,
+                        )
                     }
-                    // export default function name() {} or export default class Name {}
-                    // These are already caught by other patterns
+                    // A named `export default function f() {}` or `class F {}` is a
+                    // declaration, not a value, and the declaration patterns emit it.
                     _ => {}
                 }
                 continue;
@@ -930,10 +1034,21 @@ impl TypeScriptParser {
         defined: &[ParsedSymbol],
         file_type: Option<FileType>,
     ) -> Result<Vec<ParsedRef>> {
+        let tree = parse_tree(content, &TS_LANGUAGE)?;
+        self.typescript_extract_refs_in(content, &tree, defined, file_type)
+    }
+
+    fn typescript_extract_refs_in(
+        &self,
+        content: &str,
+        tree: &tree_sitter::Tree,
+        defined: &[ParsedSymbol],
+        file_type: Option<FileType>,
+    ) -> Result<Vec<ParsedRef>> {
         // Keep the existing generic extraction as a baseline; add AST-aware refs
         // for TypeScript-specific constructs it cannot see, then deduplicate.
-        let mut refs = super::super::extract_references_for_lang(content, defined, file_type)?;
-        let tree = parse_tree(content, &TS_LANGUAGE)?;
+        let masked = mask_non_code(content, tree.root_node(), &TS_NON_CODE);
+        let mut refs = extract_refs_masked(content, &masked, defined, file_type)?;
 
         let mut bindings: HashMap<String, Vec<AliasBinding>> = HashMap::new();
         collect_alias_bindings(content, &tree.root_node(), &mut bindings);
@@ -941,6 +1056,45 @@ impl TypeScriptParser {
         dedup_refs(&mut refs);
         Ok(refs)
     }
+}
+
+/// Comments, JSX text, regexes and string literals; only the `${...}` of a
+/// template string is code.
+static TS_NON_CODE: NonCode = NonCode {
+    language: &TS_LANGUAGE,
+    prose: &["comment", "jsx_text", "regex"],
+    strings: &["string", "template_string"],
+    code: &["template_substitution"],
+    keep: module_specifier,
+    declared: super::declares_nothing,
+};
+
+/// The module path of a dynamic `import('./Page')` or a `require('./Page')`,
+/// kept whole: it names the file of a component loaded lazily.
+fn module_specifier(content: &str, string: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    if is_module_specifier(content, string) {
+        vec![string.byte_range()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn is_module_specifier(content: &str, string: tree_sitter::Node) -> bool {
+    let Some(call) = string
+        .parent()
+        .filter(|arguments| arguments.kind() == "arguments")
+        .and_then(|arguments| arguments.parent())
+    else {
+        return false;
+    };
+    call.kind() == "call_expression"
+        && call
+            .child_by_field_name("function")
+            .is_some_and(|function| {
+                function.kind() == "import"
+                    || (function.kind() == "identifier"
+                        && node_text(content, &function) == "require")
+            })
 }
 
 /// Check if a node is inside a class_body (class member, not object literal method)
@@ -970,8 +1124,9 @@ fn emit_class_member(
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: Some(node_end_line(&node_cap.node)),
                     });
                 }
             }
@@ -992,6 +1147,240 @@ fn classify_function_name(name: &str) -> SymbolKind {
         SymbolKind::Class // React component
     } else {
         SymbolKind::Function
+    }
+}
+
+/// Pushes the placeholder symbol for an anonymous default-exported function or
+/// class `value`, ranged over `export` — the value itself, or the call that
+/// wraps it.
+fn push_anonymous_default(
+    content: &str,
+    value: &tree_sitter::Node,
+    export: &tree_sitter::Node,
+    signature: String,
+    symbols: &mut Vec<ParsedSymbol>,
+    emitted_lines: &mut HashSet<(String, usize)>,
+) {
+    let line = node_line(export);
+    if !emitted_lines.insert((ANONYMOUS_DEFAULT_EXPORT.to_string(), line)) {
+        return;
+    }
+    let (kind, parents) = if value.kind() == "class" {
+        (SymbolKind::Class, extract_class_parents(content, value))
+    } else {
+        (SymbolKind::Function, vec![])
+    };
+    symbols.push(ParsedSymbol {
+        name: ANONYMOUS_DEFAULT_EXPORT.to_string(),
+        kind,
+        line,
+        signature,
+        parents,
+        end_line: Some(node_end_line(export)),
+    });
+}
+
+/// What a higher-order call wraps: `Button` in `memo(Button)`,
+/// `connect(mapState)(Button)`, `compose(a, b)(Button)` or
+/// `memo(injectIntl(Button))`, and the inline function or class in
+/// `forwardRef((props, ref) => …)`. It is the first argument, looked into
+/// through nested calls. Any other first argument — `createRouter({ … })`,
+/// `connect(null, actions)` — means the call builds a value rather than wraps
+/// one, and there is nothing to name the export after.
+fn wrapped_value(call: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let arguments = call
+        .child_by_field_name("arguments")
+        .filter(|arguments| arguments.kind() == "arguments")?;
+    let mut cursor = arguments.walk();
+    let first = arguments
+        .named_children(&mut cursor)
+        .find(|argument| argument.kind() != "comment")?;
+    let first = unwrap_ref_expr(first);
+    match first.kind() {
+        "identifier"
+        | "arrow_function"
+        | "function_expression"
+        | "generator_function"
+        | "class" => Some(first),
+        "call_expression" => wrapped_value(first),
+        _ => None,
+    }
+}
+
+/// The function a possibly curried call starts from: `connect` in
+/// `connect(a)(b)`, `styled` in ``styled(Button)`…` ``.
+fn root_callee(call: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    let mut callee = call;
+    while callee.kind() == "call_expression" {
+        match callee.child_by_field_name("function") {
+            Some(function) => callee = function,
+            None => break,
+        }
+    }
+    callee
+}
+
+/// Placeholder name [`TypeScriptParser`] gives an anonymous `export default`
+/// function or class. The parser never sees the file path the real name comes
+/// from, so callers that know it pass the symbols through
+/// [`name_default_export`].
+///
+/// The space keeps it apart from every real symbol: the query captures names
+/// only as identifiers, and a method or field may well be called `default`.
+pub const ANONYMOUS_DEFAULT_EXPORT: &str = "export default";
+
+/// Renames the anonymous `export default` function or class after its module.
+///
+/// Every importer picks its own local name for such a value, so the one name
+/// it reliably goes by is the module it is imported from. Without a name the
+/// symbol is unfindable, and a call inside its body — which has a range, so
+/// the owner lookup trusts it — is attributed to a symbol no one searches for.
+///
+/// A function is then classified the way a declaration with that name would
+/// be, so an anonymous component in `Button.jsx` indexes like `function
+/// Button()`. A path that yields no name falls back to `default`, the name
+/// `export default {}` already gets.
+pub fn name_default_export(symbols: &mut [ParsedSymbol], path: &str) {
+    let name = default_export_name(path).unwrap_or_else(|| "default".to_string());
+    for symbol in symbols
+        .iter_mut()
+        .filter(|s| s.name == ANONYMOUS_DEFAULT_EXPORT)
+    {
+        if symbol.kind == SymbolKind::Function {
+            symbol.kind = classify_function_name(&name);
+        }
+        symbol.name = name.clone();
+    }
+}
+
+/// The name a module is imported by: `hooks/useMap.js` → `useMap`. An
+/// `index` file stands for its directory (`./Button` resolves to
+/// `Button/index.jsx`), and everything from the first dot on is dropped
+/// (`Button.test.jsx`, `index.web.js`, `types.d.ts`) — no identifier has one.
+fn default_export_name(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let module = path.file_name()?.to_str()?.split('.').next()?;
+    let name = if module == "index" {
+        path.parent()
+            .and_then(index_directory_name)
+            .unwrap_or(module)
+    } else {
+        module
+    };
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The directory an `index` file in `dir` stands for. A build or source
+/// directory only says where a package keeps the file — `pkg/dist/index.d.ts`
+/// is what `import x from 'pkg'` loads — so the name comes from the nearest
+/// directory above it. A package root in `node_modules` keeps its own name
+/// even when it looks like one of them.
+fn index_directory_name(dir: &std::path::Path) -> Option<&str> {
+    let dirs: Vec<&str> = dir.iter().filter_map(|d| d.to_str()).collect();
+    for (at, name) in dirs.iter().enumerate().rev() {
+        let package_root = match at.checked_sub(1).map(|parent| dirs[parent]) {
+            Some("node_modules") => true,
+            Some(parent) if parent.starts_with('@') => at >= 2 && dirs[at - 2] == "node_modules",
+            _ => false,
+        };
+        if package_root || !is_build_directory(name) {
+            return Some(name);
+        }
+    }
+    dirs.last().copied()
+}
+
+/// Directories named after a build output, module format or source layout
+/// rather than after what they hold: `dist`, `lib`, `esm`, `src`, `types` and
+/// variants such as `dist-types`, `lib.esm`, `types-ts3.8`, `es2015`, and the
+/// `typesVersions` directories `ts3.4`, `ts4.0`.
+fn is_build_directory(name: &str) -> bool {
+    const DIRECTORIES: &[&str] = &[
+        "build",
+        "dist",
+        "out",
+        "lib",
+        "src",
+        "esm",
+        "cjs",
+        "es",
+        "umd",
+        "amd",
+        "commonjs",
+        "module",
+        "esnext",
+        "types",
+        "typings",
+        "declarations",
+    ];
+    const VARIANT_OF: &[&str] = &["build", "dist", "lib", "esm", "cjs", "types"];
+    const VERSIONED: &[&str] = &["es", "esm", "fesm", "ts"];
+    DIRECTORIES.contains(&name)
+        || VARIANT_OF.iter().any(|base| {
+            name.strip_prefix(base)
+                .is_some_and(|rest| rest.starts_with(['-', '.', '_']))
+        })
+        || VERSIONED.iter().any(|base| {
+            name.strip_prefix(base).is_some_and(|version| {
+                version.starts_with(|c: char| c.is_ascii_digit())
+                    && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+            })
+        })
+}
+
+/// A module's import declarations in source order, one line each: every
+/// top-level `import` statement without its keyword (`{ a, b } from 'pkg';`,
+/// `'./polyfill';`) and every re-export in full (`export * from './a';`). A
+/// statement written over several lines is joined onto one, without comments.
+///
+/// This lists what the file reads, packages included; the index keeps an
+/// import symbol only for a project-local specifier (`./a`, `@/a`, `~/a`).
+pub fn import_declarations(content: &str) -> Result<Vec<String>> {
+    let tree = parse_tree(content, &TS_LANGUAGE)?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let declarations = root
+        .named_children(&mut cursor)
+        .filter_map(|statement| match statement.kind() {
+            "import_statement" => one_line(content, &statement)
+                .strip_prefix("import")
+                .map(|rest| rest.trim_start().to_string()),
+            "export_statement" if statement.child_by_field_name("source").is_some() => {
+                Some(one_line(content, &statement))
+            }
+            _ => None,
+        })
+        .collect();
+    Ok(declarations)
+}
+
+/// `node`'s text with its comments dropped, every run of whitespace turned
+/// into one space, and the trailing comma of a multi-line `{ a, b, }` removed.
+fn one_line(content: &str, node: &tree_sitter::Node) -> String {
+    let mut comments = Vec::new();
+    collect_comments(node, &mut comments);
+    let mut text = String::new();
+    let mut at = node.start_byte();
+    for comment in comments {
+        text.push_str(&content[at..comment.start_byte()]);
+        text.push(' ');
+        at = comment.end_byte();
+    }
+    text.push_str(&content[at..node.end_byte()]);
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(", }", " }")
+}
+
+fn collect_comments<'a>(node: &tree_sitter::Node<'a>, comments: &mut Vec<tree_sitter::Node<'a>>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "comment" {
+            comments.push(child);
+        } else {
+            collect_comments(&child, comments);
+        }
     }
 }
 
@@ -1620,6 +2009,361 @@ declare function internalHelper(): void;
                 .iter()
                 .map(|s| (&s.name, &s.kind))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    fn anonymous_default(content: &str) -> Vec<(SymbolKind, usize, Option<usize>)> {
+        TYPESCRIPT_PARSER
+            .parse_symbols(content)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.name == ANONYMOUS_DEFAULT_EXPORT)
+            .map(|s| (s.kind, s.line, s.end_line))
+            .collect()
+    }
+
+    #[test]
+    fn anonymous_default_export_gets_a_ranged_symbol() {
+        let cases = [
+            (
+                "const a = 1;\nexport default ({ a }) => {\n  return a;\n};\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default async () => {\n  await x();\n}\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default function () {\n  x();\n}\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default async function () {\n  x();\n}\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default function* () {\n  yield 1;\n}\n",
+                SymbolKind::Function,
+            ),
+            ("export default class {\n  run() {}\n}\n", SymbolKind::Class),
+        ];
+        for (content, kind) in cases {
+            let start = content
+                .lines()
+                .position(|l| l.starts_with("export"))
+                .unwrap()
+                + 1;
+            let end = content.lines().count();
+            assert_eq!(
+                anonymous_default(content),
+                vec![(kind, start, Some(end))],
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_default_class_keeps_its_parents() {
+        let content = "export default class extends Component {\n  render() {}\n}\n";
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        let class = symbols
+            .iter()
+            .find(|s| s.name == ANONYMOUS_DEFAULT_EXPORT)
+            .unwrap();
+        assert_eq!(
+            class.parents,
+            vec![("Component".to_string(), "extends".to_string())]
+        );
+        assert!(symbols.iter().any(|s| s.name == "render"));
+    }
+
+    #[test]
+    fn named_default_export_is_not_duplicated() {
+        for content in [
+            "export default function useMap() {\n  x();\n}\n",
+            "export default class Widget {\n  run() {}\n}\n",
+            "export default function* gen() {\n  yield 1;\n}\n",
+        ] {
+            assert!(anonymous_default(content).is_empty(), "{content}");
+        }
+        let symbols = TYPESCRIPT_PARSER
+            .parse_symbols("export default function useMap() {\n  x();\n}\n")
+            .unwrap();
+        assert_eq!(
+            symbols.iter().filter(|s| s.name == "useMap").count(),
+            1,
+            "{symbols:?}"
+        );
+    }
+
+    #[test]
+    fn default_export_is_named_after_its_module() {
+        let rename = |content: &str, path: &str| {
+            let mut symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+            name_default_export(&mut symbols, path);
+            symbols
+                .into_iter()
+                .map(|s| (s.name, s.kind))
+                .collect::<Vec<_>>()
+        };
+        let arrow = "export default () => {\n  x();\n};\n";
+        assert_eq!(
+            rename(arrow, "src/hooks/useMap.js"),
+            vec![("useMap".to_string(), SymbolKind::Function)]
+        );
+        assert_eq!(
+            rename(arrow, "src/components/Button/index.jsx"),
+            vec![("Button".to_string(), SymbolKind::Class)]
+        );
+        assert_eq!(
+            rename(arrow, "src/Button.web.tsx"),
+            vec![("Button".to_string(), SymbolKind::Class)]
+        );
+        assert_eq!(
+            rename(arrow, "index.js"),
+            vec![("index".to_string(), SymbolKind::Function)]
+        );
+        assert_eq!(
+            rename("export default class {}\n", "src/api/client.ts"),
+            vec![("client".to_string(), SymbolKind::Class)]
+        );
+        assert_eq!(
+            rename(arrow, "src/.hidden.js"),
+            vec![("default".to_string(), SymbolKind::Function)]
+        );
+    }
+
+    #[test]
+    fn index_default_export_is_named_past_build_directories() {
+        for (path, expected) in [
+            ("node_modules/stylish/dist/index.d.ts", "stylish"),
+            ("node_modules/stylish/lib/index.d.ts", "stylish"),
+            ("node_modules/@scope/stylish/dist/esm/index.d.ts", "stylish"),
+            ("node_modules/stylish/dist-types/index.d.ts", "stylish"),
+            ("node_modules/stylish/types-ts3.8/index.d.ts", "stylish"),
+            ("node_modules/stylish/ts3.4/index.d.ts", "stylish"),
+            ("node_modules/stylish/dist.es2015/index.d.ts", "stylish"),
+            ("node_modules/stylish/lib/es5/index.d.ts", "stylish"),
+            ("packages/button/src/index.ts", "button"),
+            // An entry point is not a build directory.
+            ("node_modules/stylish/compat/index.d.ts", "compat"),
+            // A package keeps its name even when it reads like a build directory.
+            ("node_modules/@scope/types/index.d.ts", "types"),
+            ("node_modules/lib/dist/index.d.ts", "lib"),
+            // With nothing above it, the build directory is still better than `index`.
+            ("src/index.js", "src"),
+            ("src/components/Button/index.jsx", "Button"),
+        ] {
+            let mut symbols = TYPESCRIPT_PARSER
+                .parse_symbols("export default () => {};\n")
+                .unwrap();
+            name_default_export(&mut symbols, path);
+            assert_eq!(symbols[0].name, expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn import_declarations_list_every_import_on_one_line() {
+        let content = r#"import React from 'react';
+import 'shared/polyfills';
+import type {
+  Invoice,
+  // the draft is typed separately
+  Draft,
+} from '@/billing/types';
+import * as api from '../api';
+import {
+  Button,
+  Icon as Glyph,
+} from "shared/components";
+export * from './store';
+export { default as Table } from './Table';
+export const local = 1;
+export default api;
+
+function lazy() {
+  return import('./Lazy');
+}
+"#;
+        assert_eq!(
+            import_declarations(content).unwrap(),
+            vec![
+                "React from 'react';",
+                "'shared/polyfills';",
+                "type { Invoice, Draft } from '@/billing/types';",
+                "* as api from '../api';",
+                "{ Button, Icon as Glyph } from \"shared/components\";",
+                "export * from './store';",
+                "export { default as Table } from './Table';",
+            ]
+        );
+    }
+
+    #[test]
+    fn default_export_naming_leaves_other_default_symbols_alone() {
+        for (content, expected) in [
+            ("export default {\n  a: 1,\n};\n", "default"),
+            (
+                "const router = 1;\nexport default router;\n",
+                "default(router)",
+            ),
+            ("export default createRouter({});\n", "createRouter"),
+        ] {
+            let mut symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+            name_default_export(&mut symbols, "src/router.js");
+            assert!(
+                symbols.iter().any(|s| s.name == expected),
+                "{content}: {symbols:?}"
+            );
+            assert!(!symbols.iter().any(|s| s.name == "router"), "{symbols:?}");
+        }
+    }
+
+    fn ranged_symbols(content: &str) -> Vec<(String, SymbolKind, usize, Option<usize>)> {
+        TYPESCRIPT_PARSER
+            .parse_symbols(content)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.name, s.kind, s.line, s.end_line))
+            .collect()
+    }
+
+    #[test]
+    fn hoc_default_export_is_named_after_the_wrapped_identifier() {
+        for (content, wrapped, end) in [
+            ("export default injectIntl(Header);\n", "Header", 1),
+            ("export default memo(Button, areEqual);\n", "Button", 1),
+            ("export default React.memo(injectIntl(Card));\n", "Card", 1),
+            (
+                "export default connect(mapState, mapDispatch)(Page);\n",
+                "Page",
+                1,
+            ),
+            (
+                "export default connect((state) => ({ a: state.a }))(Page);\n",
+                "Page",
+                1,
+            ),
+            (
+                "export default compose(\n  withRouter,\n  connect\n)(Page);\n",
+                "Page",
+                4,
+            ),
+        ] {
+            assert_eq!(
+                ranged_symbols(content),
+                vec![(
+                    format!("default({wrapped})"),
+                    SymbolKind::Object,
+                    1,
+                    Some(end)
+                )],
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn hoc_default_export_leaves_the_wrapped_declaration_alone() {
+        let content = "const Header = () => null;\n\nexport default injectIntl(Header);\n";
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        let named = symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.line))
+            .collect::<Vec<_>>();
+        assert_eq!(named, vec![("Header", 1), ("default(Header)", 3)]);
+    }
+
+    #[test]
+    fn hoc_wrapping_an_inline_value_is_an_anonymous_default() {
+        let cases = [
+            (
+                "export default forwardRef((props, ref) => {\n  return render(ref);\n});\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default injectIntl(({ intl }) => (\n  <div>{intl.locale}</div>\n));\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default memo(function () {\n  return null;\n});\n",
+                SymbolKind::Function,
+            ),
+            (
+                "export default observer(class extends Component {\n  render() {}\n});\n",
+                SymbolKind::Class,
+            ),
+        ];
+        for (content, kind) in cases {
+            assert_eq!(
+                anonymous_default(content),
+                vec![(kind, 1, Some(3))],
+                "{content}"
+            );
+        }
+        let symbols = TYPESCRIPT_PARSER.parse_symbols(cases[3].0).unwrap();
+        let class = symbols
+            .iter()
+            .find(|s| s.name == ANONYMOUS_DEFAULT_EXPORT)
+            .unwrap();
+        assert_eq!(
+            class.parents,
+            vec![("Component".to_string(), "extends".to_string())]
+        );
+
+        let mut symbols = TYPESCRIPT_PARSER.parse_symbols(cases[1].0).unwrap();
+        name_default_export(&mut symbols, "src/components/Card.jsx");
+        assert_eq!(symbols[0].name, "Card");
+        assert_eq!(symbols[0].kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn default_export_of_a_built_value_keeps_the_callee_name() {
+        for (content, name) in [
+            ("export default createRouter({ routes });\n", "createRouter"),
+            ("export default connect(null, actions);\n", "connect"),
+            ("export default createStore();\n", "createStore"),
+            (
+                "export default defineStore('auth', () => ({}));\n",
+                "defineStore",
+            ),
+            (
+                "export default styled(Button)`\n  color: red;\n`;\n",
+                "styled",
+            ),
+        ] {
+            let symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+            assert_eq!(
+                symbols
+                    .iter()
+                    .map(|s| (s.name.as_str(), s.kind))
+                    .collect::<Vec<_>>(),
+                vec![(name, SymbolKind::Function)],
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_export_naming_keeps_members_called_default() {
+        let content = "class Config {\n  default = 1;\n  static default() {}\n}\n\nexport default () => new Config();\n";
+        let mut symbols = TYPESCRIPT_PARSER.parse_symbols(content).unwrap();
+        name_default_export(&mut symbols, "src/config.js");
+        let named = symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind, s.line))
+            .collect::<Vec<_>>();
+        assert!(
+            named.contains(&("default", SymbolKind::Property, 2)),
+            "{named:?}"
+        );
+        assert!(
+            named.contains(&("default", SymbolKind::Function, 3)),
+            "{named:?}"
+        );
+        assert!(
+            named.contains(&("config", SymbolKind::Function, 6)),
+            "{named:?}"
         );
     }
 

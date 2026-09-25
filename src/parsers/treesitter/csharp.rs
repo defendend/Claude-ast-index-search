@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -223,7 +223,27 @@ fn extract_using_name(content: &str, node: &tree_sitter::Node) -> Option<(String
     None
 }
 
+/// Comments and string and character literals; the holes of an interpolated string are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &CSHARP_LANGUAGE,
+    prose: &["comment"],
+    strings: &[
+        "string_literal",
+        "verbatim_string_literal",
+        "raw_string_literal",
+        "character_literal",
+        "interpolated_string_expression",
+    ],
+    code: &["interpolation"],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for CSharpParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &CSHARP_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -257,20 +277,33 @@ impl LanguageParser for CSharpParser {
         let idx_event_name = idx("event_name");
         let idx_delegate_name = idx("delegate_name");
         let idx_attr_name = idx("attr_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Namespace
             if let Some(cap) = find_capture(m, idx_namespace_name) {
                 let name = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
+                // `namespace A.B;` scopes the rest of the file, but the grammar
+                // ends the node at the semicolon.
+                let end_line = match cap.node.parent() {
+                    Some(decl) if decl.kind() == "file_scoped_namespace_declaration" => decl
+                        .parent()
+                        .map(|unit| text_end_line(content, &unit))
+                        .or(end_line),
+                    _ => end_line,
+                };
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -282,8 +315,9 @@ impl LanguageParser for CSharpParser {
                         name,
                         kind: SymbolKind::Import,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -301,8 +335,9 @@ impl LanguageParser for CSharpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -319,8 +354,9 @@ impl LanguageParser for CSharpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Interface,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -333,8 +369,9 @@ impl LanguageParser for CSharpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class, // Struct -> Class
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -351,8 +388,9 @@ impl LanguageParser for CSharpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class, // Record -> Class
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -365,8 +403,9 @@ impl LanguageParser for CSharpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Enum,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -379,8 +418,9 @@ impl LanguageParser for CSharpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -393,8 +433,9 @@ impl LanguageParser for CSharpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -407,8 +448,9 @@ impl LanguageParser for CSharpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -426,8 +468,9 @@ impl LanguageParser for CSharpParser {
                         name,
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -441,8 +484,9 @@ impl LanguageParser for CSharpParser {
                         name,
                         kind: SymbolKind::Property, // Event -> Property
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -456,8 +500,9 @@ impl LanguageParser for CSharpParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property, // Event -> Property
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -470,8 +515,9 @@ impl LanguageParser for CSharpParser {
                     name: name.to_string(),
                     kind: SymbolKind::TypeAlias, // Delegate -> TypeAlias
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -487,8 +533,9 @@ impl LanguageParser for CSharpParser {
                         name: format!("[{}]", simple_name),
                         kind: SymbolKind::Annotation,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;

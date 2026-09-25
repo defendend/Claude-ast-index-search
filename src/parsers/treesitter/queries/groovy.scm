@@ -1,36 +1,36 @@
 ; Package declaration
 (package_declaration
-  (identifier) @package_name)
+  (identifier) @package_name) @definition
 (package_declaration
-  (scoped_identifier) @package_name)
+  (scoped_identifier) @package_name) @definition
 
 ; Import declarations
 (import_declaration
-  (identifier) @import_path)
+  (identifier) @import_path) @definition
 (import_declaration
-  (scoped_identifier) @import_path)
+  (scoped_identifier) @import_path) @definition
 
 ; Class declarations
 (class_declaration
-  name: (identifier) @class_name)
+  name: (identifier) @class_name) @definition
 
 ; Interface declarations
 (interface_declaration
-  name: (identifier) @interface_name)
+  name: (identifier) @interface_name) @definition
 
 ; Enum declarations
 (enum_declaration
-  name: (identifier) @enum_name)
+  name: (identifier) @enum_name) @definition
 
 ; Method declarations
 (method_declaration
-  name: (identifier) @method_name)
+  name: (identifier) @method_name) @definition
 
 ; Constructor declarations
 (constructor_declaration
-  name: (identifier) @constructor_name)
+  name: (identifier) @constructor_name) @definition
 
 ; Field declarations
 (field_declaration
   declarator: (variable_declarator
-    name: (identifier) @field_name))
+    name: (identifier) @field_name)) @definition

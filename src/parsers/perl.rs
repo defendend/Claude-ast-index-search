@@ -76,6 +76,7 @@ pub fn parse_perl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line: line_num,
                     signature: line.trim().to_string(),
                     parents,
+                    end_line: None,
                 });
                 current_package = Some((name, symbols.len() as i64 - 1));
             }
@@ -92,6 +93,7 @@ pub fn parse_perl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line: line_num,
                     signature: line.trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
             continue;
@@ -107,6 +109,7 @@ pub fn parse_perl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line: line_num,
                     signature: line.trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
             continue;
@@ -123,6 +126,7 @@ pub fn parse_perl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line: line_num,
                     signature: line.trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }

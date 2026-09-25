@@ -50,16 +50,9 @@ fn indexed_repo() -> &'static IndexedRepo {
 
         let mut conn = db::open_db(tmp.path()).expect("reopen_db");
         let src_dir = project_root.join("src");
-        let _ = indexer::index_directory_scoped(
-            &mut conn,
-            tmp.path(),
-            &src_dir,
-            false,
-            false,
-            None,
-            None,
-        )
-        .expect("index_directory_scoped");
+        let _ =
+            indexer::index_directory_scoped(&mut conn, tmp.path(), &src_dir, false, false, None)
+                .expect("index_directory_scoped");
 
         let db_path = db::get_db_path(tmp.path()).expect("db_path");
         IndexedRepo { _tmp: tmp, db_path }

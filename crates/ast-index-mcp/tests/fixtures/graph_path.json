@@ -1,0 +1,73 @@
+{
+  "graph": {
+    "built": true,
+    "stale": false,
+    "built_at": 1790180724015
+  },
+  "from": [
+    {
+      "name": "OrdersController",
+      "kind": "class",
+      "path": "app/controllers/orders_controller.rb",
+      "line": 1
+    }
+  ],
+  "to": [
+    {
+      "name": "Invoice",
+      "kind": "class",
+      "path": "app/models/invoice.rb",
+      "line": 1
+    }
+  ],
+  "direction": "forward",
+  "length": 3,
+  "shortest_paths": 1,
+  "include_ambiguous": false,
+  "schema_version": 2,
+  "items": [
+    [
+      {
+        "symbol": {
+          "name": "create",
+          "kind": "function",
+          "path": "app/controllers/orders_controller.rb",
+          "line": 2
+        },
+        "edge": "scoped"
+      },
+      {
+        "symbol": {
+          "name": "Billing::ChargeService",
+          "kind": "class",
+          "path": "app/services/billing/charge_service.rb",
+          "line": 2
+        },
+        "edge": "contains"
+      },
+      {
+        "symbol": {
+          "name": "call",
+          "kind": "function",
+          "path": "app/services/billing/charge_service.rb",
+          "line": 3
+        },
+        "edge": "scoped"
+      },
+      {
+        "symbol": {
+          "name": "Invoice",
+          "kind": "class",
+          "path": "app/models/invoice.rb",
+          "line": 1
+        }
+      }
+    ]
+  ],
+  "pagination": {
+    "total": 1,
+    "returned": 1,
+    "truncated": false,
+    "limit": 3
+  }
+}

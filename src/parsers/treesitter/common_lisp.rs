@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -45,10 +45,21 @@ impl LanguageParser for CommonLispParser {
         let idx_const_name = idx("const_name");
         let idx_pkg_name_kwd = idx("pkg_name_kwd");
         let idx_pkg_name_sym = idx("pkg_name_sym");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            // A `defun_header` holds only the name and lambda list; the body
+            // forms are its siblings in the enclosing list.
+            let end_line = find_capture(m, idx_definition).map(|c| {
+                let definition = match c.node.kind() {
+                    "defun_header" => c.node.parent().unwrap_or(c.node),
+                    _ => c.node,
+                };
+                text_end_line(content, &definition)
+            });
+
             // defun/defmacro/defgeneric/defmethod with simple name
             if let Some(name_cap) = find_capture(m, idx_func_name) {
                 let name = node_text(content, &name_cap.node);
@@ -58,8 +69,9 @@ impl LanguageParser for CommonLispParser {
                     name: name.to_string(),
                     kind,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -74,8 +86,9 @@ impl LanguageParser for CommonLispParser {
                     name: name.to_string(),
                     kind,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -88,8 +101,9 @@ impl LanguageParser for CommonLispParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -102,8 +116,9 @@ impl LanguageParser for CommonLispParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -116,8 +131,9 @@ impl LanguageParser for CommonLispParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -130,8 +146,9 @@ impl LanguageParser for CommonLispParser {
                     name: name.to_string(),
                     kind: SymbolKind::Constant,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -146,8 +163,9 @@ impl LanguageParser for CommonLispParser {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -160,8 +178,9 @@ impl LanguageParser for CommonLispParser {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }

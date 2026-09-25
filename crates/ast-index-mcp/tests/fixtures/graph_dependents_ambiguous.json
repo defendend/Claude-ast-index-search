@@ -1,0 +1,191 @@
+{
+  "graph": {
+    "built": true,
+    "stale": false,
+    "built_at": 1790180553900
+  },
+  "direction": "dependents",
+  "matched": [
+    {
+      "name": "truncate",
+      "kind": "function",
+      "path": "crates/ast-index-mcp/src/format.rs",
+      "line": 416
+    }
+  ],
+  "resolved_edges": 7,
+  "ambiguous_edges": 6,
+  "include_ambiguous": true,
+  "members": false,
+  "schema_version": 2,
+  "items": [
+    {
+      "subject": {
+        "name": "truncate",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 416
+      },
+      "other": {
+        "name": "render_search",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 58
+      },
+      "confidence": "local",
+      "candidates": 1,
+      "references": 1,
+      "line": 115
+    },
+    {
+      "subject": {
+        "name": "truncate",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 416
+      },
+      "other": {
+        "name": "render_refs",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 125
+      },
+      "confidence": "local",
+      "candidates": 1,
+      "references": 1,
+      "line": 156
+    },
+    {
+      "subject": {
+        "name": "truncate",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 416
+      },
+      "other": {
+        "name": "write_symbol_line",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 382
+      },
+      "confidence": "local",
+      "candidates": 1,
+      "references": 1,
+      "line": 395
+    },
+    {
+      "subject": {
+        "name": "truncate",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 416
+      },
+      "other": {
+        "name": "write_ref_line",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 400
+      },
+      "confidence": "local",
+      "candidates": 1,
+      "references": 1,
+      "line": 411
+    },
+    {
+      "subject": {
+        "name": "truncate",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 416
+      },
+      "other": {
+        "name": "truncate_short_string_unchanged",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 734
+      },
+      "confidence": "local",
+      "candidates": 1,
+      "references": 1,
+      "line": 735
+    },
+    {
+      "subject": {
+        "name": "truncate",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 416
+      },
+      "other": {
+        "name": "truncate_long_string_appends_ellipsis",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 739
+      },
+      "confidence": "local",
+      "candidates": 1,
+      "references": 1,
+      "line": 740
+    },
+    {
+      "subject": {
+        "name": "truncate",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 416
+      },
+      "other": {
+        "name": "truncate_preserves_unicode_chars",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 744
+      },
+      "confidence": "local",
+      "candidates": 1,
+      "references": 1,
+      "line": 745
+    },
+    {
+      "subject": {
+        "name": "truncate",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 416
+      },
+      "other": {
+        "name": "cmd_composables",
+        "kind": "function",
+        "path": "src/commands/grep.rs",
+        "line": 769
+      },
+      "confidence": "ambiguous",
+      "candidates": 1,
+      "references": 1,
+      "line": 821
+    },
+    {
+      "subject": {
+        "name": "truncate",
+        "kind": "function",
+        "path": "crates/ast-index-mcp/src/format.rs",
+        "line": 416
+      },
+      "other": {
+        "name": "cmd_previews",
+        "kind": "function",
+        "path": "src/commands/grep.rs",
+        "line": 1197
+      },
+      "confidence": "ambiguous",
+      "candidates": 1,
+      "references": 1,
+      "line": 1249
+    }
+  ],
+  "pagination": {
+    "total": 13,
+    "returned": 9,
+    "truncated": true,
+    "limit": 9
+  }
+}

@@ -1,0 +1,137 @@
+{
+  "content_matches": [
+    {
+      "content": "class DraftService < ApplicationService",
+      "line": 2,
+      "path": "app/services/billing/draft_service.rb"
+    }
+  ],
+  "files": [
+    {
+      "path": "app/services/billing/draft_service.rb",
+      "rank": {
+        "blended": null,
+        "graph": {
+          "dependents": 0,
+          "dependents_depth": 3,
+          "dependents_pct": 0.0,
+          "fan_in": 0,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 0,
+          "fan_in_files_pct": 0.0,
+          "fan_out": 1,
+          "fan_out_ambiguous": 0,
+          "granularity": "file",
+          "in_graph": true,
+          "labels": [],
+          "pagerank": 0.415631,
+          "pagerank_pct": 0.0,
+          "strongest_symbol": {
+            "kind": "class",
+            "line": 2,
+            "name": "Billing::DraftService"
+          }
+        },
+        "history": null,
+        "score": null,
+        "tier": "file_name",
+        "unscored": "no_history"
+      }
+    }
+  ],
+  "pagination": {
+    "content_matches": {
+      "limit": 20,
+      "returned": 1,
+      "total": 1,
+      "truncated": false
+    },
+    "files": {
+      "limit": 20,
+      "returned": 1,
+      "total": 1,
+      "truncated": false
+    },
+    "references": {
+      "limit": 20,
+      "returned": 1,
+      "total": 1,
+      "truncated": false
+    },
+    "symbols": {
+      "limit": 20,
+      "returned": 1,
+      "total": 1,
+      "truncated": false
+    }
+  },
+  "rank": {
+    "applied": true,
+    "formula": "mean of calm (1 - file hotspot score), file age percentile, idle percentile (days since the file last changed) and used (1 when at least one caller resolves to the symbol, else 0)",
+    "graph": {
+      "built": true,
+      "built_at": 1790180724015,
+      "granularity": "symbol",
+      "stale": false
+    },
+    "history": {
+      "collected_at": 1790180696113,
+      "commits_analyzed": 11,
+      "files_with_history": 13,
+      "granularity": "file",
+      "head": "bcc236d01a46d048d162f5e9b0306cd44436e5ae"
+    },
+    "missing": [],
+    "pool": {
+      "files": 1,
+      "symbols": 1
+    },
+    "preset": "proven",
+    "preset_weight": 0.9,
+    "ranked_sections": [
+      "files",
+      "symbols"
+    ],
+    "warnings": []
+  },
+  "references": [
+    {
+      "name": "DraftService",
+      "usage_count": 1
+    }
+  ],
+  "schema_version": 2,
+  "symbols": [
+    {
+      "kind": "class",
+      "line": 2,
+      "name": "Billing::DraftService",
+      "path": "app/services/billing/draft_service.rb",
+      "rank": {
+        "blended": null,
+        "graph": {
+          "dependents": 0,
+          "dependents_depth": 3,
+          "dependents_pct": 0.0,
+          "fan_in": 0,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 0,
+          "fan_in_files_pct": 0.0,
+          "fan_out": 1,
+          "fan_out_ambiguous": 0,
+          "granularity": "symbol",
+          "in_graph": true,
+          "labels": [],
+          "pagerank": 0.415631,
+          "pagerank_pct": 0.0
+        },
+        "history": null,
+        "relevance_rank": 1,
+        "score": null,
+        "tier": "name",
+        "unscored": "no_history"
+      },
+      "signature": "class DraftService < ApplicationService"
+    }
+  ]
+}

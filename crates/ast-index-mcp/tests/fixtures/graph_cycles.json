@@ -1,0 +1,56 @@
+{
+  "graph": {
+    "built": true,
+    "stale": false,
+    "built_at": 1790180724015
+  },
+  "components": 1,
+  "schema_version": 2,
+  "items": [
+    {
+      "size": 2,
+      "files": 2,
+      "example": [
+        {
+          "name": "Invoice",
+          "kind": "class",
+          "path": "app/models/invoice.rb",
+          "line": 1
+        },
+        {
+          "name": "LineItem",
+          "kind": "class",
+          "path": "app/models/line_item.rb",
+          "line": 1
+        },
+        {
+          "name": "Invoice",
+          "kind": "class",
+          "path": "app/models/invoice.rb",
+          "line": 1
+        }
+      ],
+      "members": [
+        {
+          "name": "Invoice",
+          "kind": "class",
+          "path": "app/models/invoice.rb",
+          "line": 1
+        },
+        {
+          "name": "LineItem",
+          "kind": "class",
+          "path": "app/models/line_item.rb",
+          "line": 1
+        }
+      ],
+      "members_truncated": false
+    }
+  ],
+  "pagination": {
+    "total": 1,
+    "returned": 1,
+    "truncated": false,
+    "limit": 20
+  }
+}

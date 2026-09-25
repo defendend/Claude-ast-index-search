@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -19,7 +19,21 @@ pub static LUA_PARSER: LuaParser = LuaParser;
 
 pub struct LuaParser;
 
+/// Comments and string literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &LUA_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string"],
+    code: &[],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for LuaParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &LUA_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -45,10 +59,13 @@ impl LanguageParser for LuaParser {
         let idx_require_alias = idx("require_alias");
         let idx_require_path = idx("require_path");
         let idx_module_return = idx("module_return");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Require import (must check before local_var since it also matches variable_declaration)
             if let Some(alias_cap) = find_capture(m, idx_require_alias) {
                 if let Some(path_cap) = find_capture(m, idx_require_path) {
@@ -59,8 +76,9 @@ impl LanguageParser for LuaParser {
                         name: alias.to_string(),
                         kind: SymbolKind::Import,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![(path.to_string(), "from".to_string())],
+                        end_line,
                     });
                 }
                 continue;
@@ -76,8 +94,9 @@ impl LanguageParser for LuaParser {
                         name: name.to_string(),
                         kind: SymbolKind::Function,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![(class.to_string(), "receiver".to_string())],
+                        end_line,
                     });
                 }
                 continue;
@@ -93,8 +112,9 @@ impl LanguageParser for LuaParser {
                         name: name.to_string(),
                         kind: SymbolKind::Function,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![(class.to_string(), "receiver".to_string())],
+                        end_line,
                     });
                 }
                 continue;
@@ -108,8 +128,9 @@ impl LanguageParser for LuaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -122,8 +143,9 @@ impl LanguageParser for LuaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -143,8 +165,9 @@ impl LanguageParser for LuaParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -158,8 +181,9 @@ impl LanguageParser for LuaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }

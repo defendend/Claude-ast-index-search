@@ -2,13 +2,19 @@
 //! and must honour the AST_INDEX_NO_CANONICALIZE bypass.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ast_index::db;
 use tempfile::TempDir;
 
+// Tests in one binary share the process environment, so the bypass test must
+// not set AST_INDEX_NO_CANONICALIZE while another test expects canonical paths.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn returns_canonical_path_for_real_directory() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
     let path = tmp.path();
     let result = db::safe_canonicalize(path);
@@ -35,6 +41,7 @@ fn returns_raw_path_when_target_missing() {
 fn no_canonicalize_env_bypasses_completely() {
     // With the bypass env set we must skip the syscall altogether and return
     // the raw path even when the target is a perfectly valid directory.
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
     let path = tmp.path();
 

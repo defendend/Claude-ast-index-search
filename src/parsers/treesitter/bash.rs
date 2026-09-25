@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -19,7 +19,33 @@ pub static BASH_PARSER: BashParser = BashParser;
 
 pub struct BashParser;
 
+/// Comments, strings and heredocs; the expansions and command substitutions inside them are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &BASH_LANGUAGE,
+    prose: &["comment"],
+    strings: &[
+        "string",
+        "raw_string",
+        "ansi_c_string",
+        "translated_string",
+        "heredoc_body",
+    ],
+    code: &[
+        "expansion",
+        "simple_expansion",
+        "command_substitution",
+        "arithmetic_expansion",
+        "process_substitution",
+    ],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for BashParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &BASH_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -36,10 +62,13 @@ impl LanguageParser for BashParser {
 
         let idx_func_name = idx("func_name");
         let idx_var_name = idx("var_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Function definition
             if let Some(cap) = find_capture(m, idx_func_name) {
                 let name = node_text(content, &cap.node);
@@ -48,8 +77,9 @@ impl LanguageParser for BashParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -62,8 +92,9 @@ impl LanguageParser for BashParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }

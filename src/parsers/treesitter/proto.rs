@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -19,7 +19,21 @@ pub static PROTO_PARSER: ProtoParser = ProtoParser;
 
 pub struct ProtoParser;
 
+/// Comments and string literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &PROTO_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string"],
+    code: &[],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for ProtoParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &PROTO_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -41,10 +55,13 @@ impl LanguageParser for ProtoParser {
         let idx_rpc_name = idx("rpc_name");
         let idx_rpc_request_type = idx("rpc_request_type");
         let idx_rpc_response_type = idx("rpc_response_type");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Package
             if let Some(cap) = find_capture(m, idx_package_name) {
                 let name = node_text(content, &cap.node);
@@ -53,8 +70,9 @@ impl LanguageParser for ProtoParser {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -71,8 +89,9 @@ impl LanguageParser for ProtoParser {
                         name: format!("{}:{}", opt_name, clean_value),
                         kind: SymbolKind::Property,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -86,8 +105,9 @@ impl LanguageParser for ProtoParser {
                     name: name.to_string(),
                     kind: SymbolKind::Interface,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -113,6 +133,7 @@ impl LanguageParser for ProtoParser {
                     line,
                     signature,
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -160,8 +181,9 @@ fn collect_messages_and_enums(
                         name: full_name.clone(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
+                        end_line: Some(text_end_line(content, &child)),
                     });
 
                     // Recurse into message_body for nested messages/enums
@@ -188,8 +210,9 @@ fn collect_messages_and_enums(
                         name: full_name,
                         kind: SymbolKind::Enum,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line: Some(text_end_line(content, &child)),
                     });
                 }
             }

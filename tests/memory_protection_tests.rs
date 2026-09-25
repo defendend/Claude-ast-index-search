@@ -91,7 +91,10 @@ fn signature_truncated_at_db_insert() {
         let filler = "x".repeat(2_000);
         source.push_str(&format!("pub fn f{i}() {{ let _ = \"{filler}\"; }}\n"));
     }
-    write(&root.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0\"\n",
+    );
     write(&root.join("src/lib.rs"), &source);
 
     let mut conn = open_fresh_db(root);
@@ -105,11 +108,7 @@ fn signature_truncated_at_db_insert() {
         .collect();
     assert!(!sigs.is_empty(), "expected indexed symbols");
     for s in &sigs {
-        assert!(
-            s.len() <= 503,
-            "signature exceeded cap: {} bytes",
-            s.len()
-        );
+        assert!(s.len() <= 503, "signature exceeded cap: {} bytes", s.len());
     }
 }
 
@@ -120,7 +119,10 @@ fn file_size_cap_skips_parsing_but_keeps_file_row() {
 
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(&root.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0\"\n",
+    );
     // Source file > 1 KB cap — must be recorded but not parsed.
     let big = "fn huge() {}\n".repeat(200); // ~2.6 KB
     write(&root.join("src/big.rs"), &big);
@@ -169,7 +171,10 @@ fn walker_cap_aborts_with_actionable_error() {
 
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(&root.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0\"\n",
+    );
     // 15 source files — well above the cap of 5.
     for i in 0..15 {
         write(
@@ -188,7 +193,10 @@ fn walker_cap_aborts_with_actionable_error() {
         "missing abort message: {msg}"
     );
     assert!(msg.contains("--force"), "must mention --force: {msg}");
-    assert!(msg.contains("--max-files"), "must mention --max-files: {msg}");
+    assert!(
+        msg.contains("--max-files"),
+        "must mention --max-files: {msg}"
+    );
     assert!(
         msg.contains("AST_INDEX_MAX_FILES"),
         "must mention env override: {msg}"
@@ -202,7 +210,10 @@ fn walker_cap_bypassed_via_metadata_flag() {
 
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(&root.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0\"\n",
+    );
     for i in 0..15 {
         write(
             &root.join(format!("src/file_{i}.rs")),
@@ -233,7 +244,10 @@ fn walker_cap_disabled_when_env_is_zero() {
 
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(&root.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0\"\n",
+    );
     for i in 0..50 {
         write(
             &root.join(format!("src/file_{i}.rs")),
@@ -259,7 +273,10 @@ fn soft_warn_threshold_does_not_abort_rebuild() {
 
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    write(&root.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0\"\n");
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0\"\n",
+    );
     for i in 0..30 {
         write(
             &root.join(format!("src/file_{i}.rs")),

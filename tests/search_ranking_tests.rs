@@ -1,0 +1,891 @@
+//! Relevance ranking and result ordering for the FTS5 symbol searches.
+//!
+//! The FTS branches order by `bm25()` with `name` weighted far above
+//! `signature`, in front of an exact-name tier and behind a path/line
+//! tie-break. These tests pin the three properties that combination has to
+//! hold: the exact hit leads, a signature-only hit never outranks a name hit,
+//! and the same query returns the same page every time.
+
+use ast_index::db::{self, SearchScope, SymbolKind};
+use tempfile::TempDir;
+
+fn open_fresh_db(project_root: &std::path::Path) -> rusqlite::Connection {
+    if db::db_exists(project_root) {
+        db::delete_db(project_root).unwrap();
+    }
+    let conn = db::open_db(project_root).unwrap();
+    db::init_db(&conn).unwrap();
+    conn
+}
+
+fn names(results: &[db::SearchResult]) -> Vec<&str> {
+    results.iter().map(|r| r.name.as_str()).collect()
+}
+
+fn located(results: &[db::SearchResult]) -> Vec<String> {
+    results
+        .iter()
+        .map(|r| format!("{}:{}:{}", r.name, r.path, r.line))
+        .collect()
+}
+
+fn module_scope(prefix: &str) -> SearchScope<'_> {
+    SearchScope {
+        in_file: None,
+        module: Some(prefix),
+        dir_prefix: None,
+    }
+}
+
+// ----------------------------------------------------------------------
+// Exact name wins
+// ----------------------------------------------------------------------
+
+#[test]
+fn exact_name_leads_every_fts_entry_point() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+
+    // A base class plus 30 subclasses that name it only in their signature.
+    // Every subclass name is shorter than the base class name, which is what
+    // made the pre-bm25 length ordering bury the base class.
+    let base = db::upsert_file(&conn, "app/services/application_service.rb", 0, 100).unwrap();
+    db::insert_symbol(
+        &conn,
+        base,
+        "ApplicationService",
+        SymbolKind::Class,
+        5,
+        Some("class ApplicationService"),
+    )
+    .unwrap();
+    for i in 0..30 {
+        let path = format!("app/services/svc_{i:02}_service.rb");
+        let file = db::upsert_file(&conn, &path, 0, 100).unwrap();
+        let name = format!("Svc{i:02}Service");
+        db::insert_symbol(
+            &conn,
+            file,
+            &name,
+            SymbolKind::Class,
+            3,
+            Some(&format!("class {name} < ApplicationService")),
+        )
+        .unwrap();
+    }
+
+    let none = SearchScope::none();
+    let scoped = module_scope("app/services");
+    let pages = [
+        db::search_symbols(&conn, "ApplicationService", 10).unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["ApplicationService"], None, 10, &none, false)
+            .unwrap(),
+        db::search_symbols_scoped(&conn, "ApplicationService", 10, &scoped).unwrap(),
+        db::search_symbols_for_command(&conn, "ApplicationService", None, 10, &none, false, false)
+            .unwrap(),
+        // A `kind` filter binds a parameter between the match and the
+        // ordering, so the ranked page has to survive it too.
+        db::search_symbol_terms_scoped(
+            &conn,
+            &["ApplicationService"],
+            Some("class"),
+            10,
+            &scoped,
+            false,
+        )
+        .unwrap(),
+        db::search_symbols_for_command(
+            &conn,
+            "ApplicationService",
+            Some("class"),
+            10,
+            &scoped,
+            false,
+            true,
+        )
+        .unwrap(),
+    ];
+
+    for page in &pages {
+        assert_eq!(
+            names(page).first(),
+            Some(&"ApplicationService"),
+            "{:?}",
+            names(page)
+        );
+        assert_eq!(page.len(), 10, "{:?}", names(page));
+    }
+}
+
+#[test]
+fn a_capitalised_query_prefers_the_type_over_the_accessor() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // FTS folds case, so both rows match `User`; only the ordering separates
+    // the class the user asked for from the accessor that shares its name.
+    let model = db::upsert_file(&conn, "app/models/user.rb", 0, 100).unwrap();
+    db::insert_symbol(
+        &conn,
+        model,
+        "User",
+        SymbolKind::Class,
+        3,
+        Some("class User < ApplicationRecord # a long trailing comment"),
+    )
+    .unwrap();
+    for i in 0..10 {
+        let path = format!("app/services/accessor_{i:02}.rb");
+        let file = db::upsert_file(&conn, &path, 0, 100).unwrap();
+        db::insert_symbol(
+            &conn,
+            file,
+            "user",
+            SymbolKind::Function,
+            7,
+            Some("def user"),
+        )
+        .unwrap();
+    }
+
+    let results = db::search_symbols(&conn, "User", 5).unwrap();
+    assert_eq!(
+        results[0].path,
+        "app/models/user.rb",
+        "{:?}",
+        located(&results)
+    );
+}
+
+// ----------------------------------------------------------------------
+// Namespaced names
+// ----------------------------------------------------------------------
+
+fn insert_with_signature(
+    conn: &rusqlite::Connection,
+    path: &str,
+    name: &str,
+    kind: SymbolKind,
+    signature: &str,
+) {
+    let file = db::upsert_file(conn, path, 0, 100).unwrap();
+    db::insert_symbol(conn, file, name, kind, 3, Some(signature)).unwrap();
+}
+
+/// Ruby records `class Billing::Importers::LedgerImporter` under its full
+/// name, so `LedgerImporter` has no exact row. The specs describing the class
+/// are shorter documents and led on bm25 alone.
+fn seed_namespaced_class(conn: &rusqlite::Connection) {
+    insert_with_signature(
+        conn,
+        "spec/billing/importers/ledger_importer_spec.rb",
+        "describe \"Billing::Importers::LedgerImporter\"",
+        SymbolKind::Class,
+        "describe \"Billing::Importers::LedgerImporter\"",
+    );
+    insert_with_signature(
+        conn,
+        "spec/billing/importers/ledger_importer_queries_spec.rb",
+        "describe \"Billing::Importers::LedgerImporter queries\"",
+        SymbolKind::Class,
+        "describe \"Billing::Importers::LedgerImporter queries\"",
+    );
+    insert_with_signature(
+        conn,
+        "app/models/ledger.rb",
+        "include Billing::Importers::LedgerImporter",
+        SymbolKind::Annotation,
+        "include Billing::Importers::LedgerImporter",
+    );
+    insert_with_signature(
+        conn,
+        "app/services/billing/importers/ledger_importer_job.rb",
+        "Billing::Importers::LedgerImporterJob",
+        SymbolKind::Class,
+        "class Billing::Importers::LedgerImporterJob < ApplicationJob",
+    );
+    insert_with_signature(
+        conn,
+        "app/services/billing/importers/ledger_importer.rb",
+        "Billing::Importers::LedgerImporter",
+        SymbolKind::Class,
+        "class Billing::Importers::LedgerImporter < Billing::Importers::BaseImporter",
+    );
+}
+
+#[test]
+fn a_namespaced_definition_leads_every_fts_entry_point() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_namespaced_class(&conn);
+
+    let none = SearchScope::none();
+    let scoped = module_scope("");
+    let pages = [
+        db::search_symbols(&conn, "LedgerImporter", 10).unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["LedgerImporter"], None, 10, &none, false).unwrap(),
+        db::search_symbol_terms_scoped(
+            &conn,
+            &["Unrelated", "LedgerImporter"],
+            None,
+            10,
+            &none,
+            false,
+        )
+        .unwrap(),
+        db::search_symbols_scoped(&conn, "LedgerImporter", 10, &scoped).unwrap(),
+        db::search_symbols_for_command(&conn, "LedgerImporter", None, 10, &none, false, false)
+            .unwrap(),
+        db::search_symbol_terms_scoped(
+            &conn,
+            &["LedgerImporter"],
+            Some("class"),
+            10,
+            &scoped,
+            false,
+        )
+        .unwrap(),
+        db::search_symbols_for_command(
+            &conn,
+            "LedgerImporter",
+            Some("class"),
+            10,
+            &scoped,
+            false,
+            true,
+        )
+        .unwrap(),
+    ];
+    for page in &pages {
+        assert_eq!(
+            names(page).first(),
+            Some(&"Billing::Importers::LedgerImporter"),
+            "{:?}",
+            names(page)
+        );
+    }
+}
+
+#[test]
+fn an_exact_name_still_leads_a_namespaced_one() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_namespaced_class(&conn);
+    insert_with_signature(
+        &conn,
+        "lib/ledger_importer.rb",
+        "LedgerImporter",
+        SymbolKind::Class,
+        "class LedgerImporter",
+    );
+    insert_with_signature(
+        &conn,
+        "lib/archive/ledger_importer.rb",
+        "Archive::LedgerImporter",
+        SymbolKind::Class,
+        "class Archive::LedgerImporter",
+    );
+
+    let results = db::search_symbol_terms_scoped(
+        &conn,
+        &["LedgerImporter"],
+        None,
+        10,
+        &SearchScope::none(),
+        false,
+    )
+    .unwrap();
+    // The namespaced tier is ordered by name length, like the exact tier.
+    assert_eq!(
+        names(&results)[..3],
+        [
+            "LedgerImporter",
+            "Archive::LedgerImporter",
+            "Billing::Importers::LedgerImporter",
+        ]
+    );
+}
+
+#[test]
+fn a_column_named_after_the_query_leads_longer_columns() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // Rails schema columns are indexed as `table.column`. The longer columns
+    // are shorter FTS documents per match and sort before `users/` by path.
+    let schema = db::upsert_file(&conn, "db/schema.rb", 0, 100).unwrap();
+    for (line, (name, signature)) in [
+        (
+            "events.email_communicator_email_id",
+            "t.bigint \"email_communicator_email_id\"",
+        ),
+        ("accounts.email_confirmed", "t.boolean \"email_confirmed\""),
+        (
+            "users.email",
+            "t.string \"email\", null: false, default: \"\"",
+        ),
+        ("customers.email", "t.string \"email\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        db::insert_symbol(
+            &conn,
+            schema,
+            name,
+            SymbolKind::Column,
+            line + 1,
+            Some(signature),
+        )
+        .unwrap();
+    }
+    // A Ruby singleton method is indexed as `self.email`.
+    insert_with_signature(
+        &conn,
+        "app/models/user.rb",
+        "self.email",
+        SymbolKind::Function,
+        "def self.email(value)",
+    );
+
+    let none = SearchScope::none();
+    let columns =
+        db::search_symbol_terms_scoped(&conn, &["email"], Some("column"), 10, &none, false)
+            .unwrap();
+    assert_eq!(names(&columns)[..2], ["users.email", "customers.email"]);
+    assert_eq!(columns.len(), 4);
+    let all = db::search_symbol_terms_scoped(&conn, &["email"], None, 3, &none, false).unwrap();
+    assert_eq!(
+        names(&all),
+        ["self.email", "users.email", "customers.email"]
+    );
+}
+
+// ----------------------------------------------------------------------
+// Definitions before imports
+// ----------------------------------------------------------------------
+
+/// A Python class imported by eleven modules whose paths all sort before
+/// the one that defines it.
+fn seed_imported_class(conn: &rusqlite::Connection) {
+    for i in 0..11 {
+        insert_with_signature(
+            conn,
+            &format!("pkg/a{i:02}.py"),
+            "InstallRequirement",
+            SymbolKind::Import,
+            "from pkg.req.req_install import InstallRequirement",
+        );
+    }
+    insert_with_signature(
+        conn,
+        "pkg/req/req_install.py",
+        "InstallRequirement",
+        SymbolKind::Class,
+        "class InstallRequirement:",
+    );
+}
+
+#[test]
+fn a_definition_leads_the_imports_of_its_tier() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_imported_class(&conn);
+
+    let none = SearchScope::none();
+    let pages = [
+        db::search_symbols(&conn, "InstallRequirement", 5).unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["InstallRequirement"], None, 5, &none, false)
+            .unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["InstallRequirement"], None, 5, &none, true)
+            .unwrap(),
+        db::search_symbols_scoped(&conn, "InstallRequirement", 5, &module_scope("pkg")).unwrap(),
+        db::search_symbols_for_command(&conn, "InstallRequirement", None, 5, &none, false, false)
+            .unwrap(),
+        db::search_symbols_for_command(&conn, "InstallRequirement", None, 5, &none, true, false)
+            .unwrap(),
+    ];
+    for page in &pages {
+        assert_eq!(
+            located(page).first().map(String::as_str),
+            Some("InstallRequirement:pkg/req/req_install.py:3"),
+            "{:?}",
+            located(page)
+        );
+        assert_eq!(page.len(), 5);
+    }
+}
+
+#[test]
+fn an_import_path_is_not_a_namespaced_definition() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // `use std::path::Path` is indexed as `std::path::Path`, whose last
+    // segment is the query; the project's own types only start with it.
+    for i in 0..12 {
+        insert_with_signature(
+            &conn,
+            &format!("src/commands/c{i:02}.rs"),
+            "std::path::Path",
+            SymbolKind::Import,
+            "use std::path::Path;",
+        );
+    }
+    insert_with_signature(
+        &conn,
+        "src/resolve.rs",
+        "PathResolver",
+        SymbolKind::Class,
+        "pub struct PathResolver {",
+    );
+    insert_with_signature(
+        &conn,
+        "src/walk.rs",
+        "PathWalker",
+        SymbolKind::Class,
+        "pub struct PathWalker {",
+    );
+
+    let none = SearchScope::none();
+    for fuzzy in [false, true] {
+        let page = db::search_symbol_terms_scoped(&conn, &["Path"], None, 4, &none, fuzzy).unwrap();
+        let mut definitions = names(&page)[..2].to_vec();
+        definitions.sort_unstable();
+        assert_eq!(
+            definitions,
+            ["PathResolver", "PathWalker"],
+            "fuzzy: {fuzzy}"
+        );
+        assert_eq!(
+            names(&page)[2..],
+            ["std::path::Path", "std::path::Path"],
+            "fuzzy: {fuzzy}"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// Tests after production code in the partial tiers
+// ----------------------------------------------------------------------
+
+/// Rust keeps unit tests next to the code (`#[cfg(test)] fn test_parse_*`),
+/// and their one-line signatures are short bm25 documents that led every
+/// partial match of `parse`.
+fn seed_parsers_and_their_tests(conn: &rusqlite::Connection) {
+    let parser = db::upsert_file(conn, "src/parsers/go.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        parser,
+        "parse",
+        SymbolKind::Function,
+        5,
+        Some("fn parse("),
+    )
+    .unwrap();
+    for (line, name) in ["test_parse_var", "test_parse_enum", "test_parse_rpc"]
+        .iter()
+        .enumerate()
+    {
+        db::insert_symbol(
+            conn,
+            parser,
+            name,
+            SymbolKind::Function,
+            100 + line,
+            Some(&format!("fn {name}()")),
+        )
+        .unwrap();
+    }
+    let spec = db::upsert_file(conn, "tests/parse_tests.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        spec,
+        "parse_all_files",
+        SymbolKind::Function,
+        3,
+        Some("fn parse_all_files()"),
+    )
+    .unwrap();
+    let go_test = db::upsert_file(conn, "pkg/parse.go", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        go_test,
+        "TestParseHeader",
+        SymbolKind::Function,
+        9,
+        Some("func TestParseHeader(t *testing.T)"),
+    )
+    .unwrap();
+    let indexer = db::upsert_file(conn, "src/indexer.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        conn,
+        indexer,
+        "parse_file_symbols_for_every_supported_language",
+        SymbolKind::Function,
+        40,
+        Some("pub fn parse_file_symbols_for_every_supported_language(path: &Path, content: &str, kind: FileKind) -> Result<Vec<Symbol>>"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_symbols_follow_production_code_in_partial_tiers() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_parsers_and_their_tests(&conn);
+    // An exact test hit keeps its tier: the name is what was typed.
+    let helper = db::upsert_file(&conn, "tests/common/mod.rs", 0, 100).unwrap();
+    db::insert_symbol(
+        &conn,
+        helper,
+        "parse",
+        SymbolKind::Function,
+        2,
+        Some("fn parse("),
+    )
+    .unwrap();
+
+    let none = SearchScope::none();
+    let expected_head = [
+        "parse:src/parsers/go.rs:5",
+        "parse:tests/common/mod.rs:2",
+        "parse_file_symbols_for_every_supported_language:src/indexer.rs:40",
+    ];
+    let pages = [
+        db::search_symbol_terms_scoped(&conn, &["parse"], None, 10, &none, false).unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["parse"], Some("function"), 10, &none, false)
+            .unwrap(),
+        db::search_symbols(&conn, "parse", 10).unwrap(),
+        db::search_symbols_scoped(&conn, "parse", 10, &module_scope("")).unwrap(),
+        db::search_symbols_for_command(&conn, "parse", None, 10, &none, false, false).unwrap(),
+    ];
+    for page in &pages {
+        let found = located(page);
+        // `TestParseHeader` is one FTS token and does not match `parse*`.
+        assert_eq!(found.len(), 7, "{found:?}");
+        assert_eq!(found[..3], expected_head, "{found:?}");
+    }
+    // Fuzzy search tiers by length, but tests still follow in the partial tier.
+    for fuzzy in [
+        db::search_symbol_terms_scoped(&conn, &["parse"], None, 10, &none, true).unwrap(),
+        db::search_symbols_for_command(&conn, "parse", None, 10, &none, true, false).unwrap(),
+    ] {
+        let found = names(&fuzzy);
+        assert_eq!(
+            found[..3],
+            [
+                "parse",
+                "parse",
+                "parse_file_symbols_for_every_supported_language"
+            ],
+            "{found:?}"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// Project code before third-party code
+// ----------------------------------------------------------------------
+
+fn insert_at(conn: &rusqlite::Connection, path: &str, name: &str, kind: SymbolKind) {
+    let file = db::upsert_file(conn, path, 0, 100).unwrap();
+    db::insert_symbol(conn, file, name, kind, 3, Some(&format!("class {name}"))).unwrap();
+}
+
+#[test]
+fn project_hits_lead_vendor_hits_of_the_same_tier() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // `node_modules/` sorts before `system/` and `vendor/`, so the path
+    // tie-break alone put the library copy first.
+    insert_at(
+        &conn,
+        "node_modules/react-hot-loader/index.d.ts",
+        "AppContainer",
+        SymbolKind::Class,
+    );
+    insert_at(
+        &conn,
+        "node_modules/react-hot-loader/props.d.ts",
+        "AppContainerProps",
+        SymbolKind::Interface,
+    );
+    insert_at(
+        &conn,
+        "system/container.rb",
+        "AppContainer",
+        SymbolKind::Class,
+    );
+    insert_at(
+        &conn,
+        "system/container_factory.rb",
+        "AppContainerFactory",
+        SymbolKind::Class,
+    );
+    // A project-owned `vendor/` directory is project code, not a dependency.
+    insert_at(
+        &conn,
+        "vendor/container.rb",
+        "AppContainer",
+        SymbolKind::Class,
+    );
+
+    let exact = [
+        "AppContainer:system/container.rb:3",
+        "AppContainer:vendor/container.rb:3",
+        "AppContainer:node_modules/react-hot-loader/index.d.ts:3",
+    ];
+    // The CLI searches by prefix, so it also reaches the partial hits, where the
+    // exact vendor hit stays above the project's partial one.
+    let none = SearchScope::none();
+    assert_eq!(
+        located(
+            &db::search_symbol_terms_scoped(&conn, &["AppContainer"], None, 10, &none, false)
+                .unwrap()
+        ),
+        [
+            &exact[..],
+            &[
+                "AppContainerFactory:system/container_factory.rb:3",
+                "AppContainerProps:node_modules/react-hot-loader/props.d.ts:3",
+            ],
+        ]
+        .concat()
+    );
+    let token_pages = [
+        db::search_symbols(&conn, "AppContainer", 10).unwrap(),
+        db::search_symbols_scoped(&conn, "AppContainer", 10, &module_scope("")).unwrap(),
+        db::search_symbols_for_command(&conn, "AppContainer", None, 10, &none, false, false)
+            .unwrap(),
+        db::search_symbol_terms_scoped(&conn, &["AppContainer"], None, 3, &none, true).unwrap(),
+    ];
+    for page in &token_pages {
+        assert_eq!(located(page), exact);
+    }
+}
+
+#[test]
+fn a_library_only_name_keeps_its_exact_hit_first() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // The project never defines `useState`; its own hits only contain it.
+    for i in 0..5 {
+        insert_at(
+            &conn,
+            &format!("frontend/hooks/use_state_{i}.js"),
+            &format!("useStateModal{i}"),
+            SymbolKind::Function,
+        );
+    }
+    insert_at(
+        &conn,
+        "node_modules/react-use/lib/useStateList.d.ts",
+        "useStateList",
+        SymbolKind::Function,
+    );
+    insert_at(
+        &conn,
+        "node_modules/@types/react/index.d.ts",
+        "useState",
+        SymbolKind::Function,
+    );
+
+    let results =
+        db::search_symbol_terms_scoped(&conn, &["useState"], None, 10, &SearchScope::none(), false)
+            .unwrap();
+    assert_eq!(
+        names(&results),
+        vec![
+            "useState",
+            "useStateModal0",
+            "useStateModal1",
+            "useStateModal2",
+            "useStateModal3",
+            "useStateModal4",
+            "useStateList",
+        ]
+    );
+}
+
+// ----------------------------------------------------------------------
+// bm25 column weights
+// ----------------------------------------------------------------------
+
+#[test]
+fn a_name_hit_outranks_a_signature_only_hit() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // The `w00`…`w19` rows carry `retry` in their signature only, and their
+    // names are far shorter, so without the `name` column weight they lead.
+    for i in 0..20 {
+        let path = format!("app/workers/w{i:02}.rb");
+        let file = db::upsert_file(&conn, &path, 0, 100).unwrap();
+        let name = format!("w{i:02}");
+        db::insert_symbol(
+            &conn,
+            file,
+            &name,
+            SymbolKind::Function,
+            3,
+            Some(&format!("def {name} retry")),
+        )
+        .unwrap();
+    }
+    let file = db::upsert_file(&conn, "lib/retry_policy.rb", 0, 100).unwrap();
+    db::insert_symbol(
+        &conn,
+        file,
+        "retry_policy",
+        SymbolKind::Function,
+        1,
+        Some("def retry_policy"),
+    )
+    .unwrap();
+
+    let results = db::search_symbols(&conn, "retry", 5).unwrap();
+    assert_eq!(
+        names(&results).first(),
+        Some(&"retry_policy"),
+        "{:?}",
+        names(&results)
+    );
+}
+
+// ----------------------------------------------------------------------
+// Determinism
+// ----------------------------------------------------------------------
+
+/// Rows sharing a name, a signature and a rank — only the final path/line
+/// tie-break can order them.
+fn seed_identical_rows(conn: &rusqlite::Connection) {
+    for i in 0..25 {
+        let path = format!("app/handlers/h{i:02}.rb");
+        let file = db::upsert_file(conn, &path, 0, 100).unwrap();
+        for line in [4, 9] {
+            db::insert_symbol(
+                conn,
+                file,
+                "handle",
+                SymbolKind::Function,
+                line,
+                Some("def handle"),
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn ranked_searches_are_reproducible_across_calls() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_identical_rows(&conn);
+    let none = SearchScope::none();
+    let scoped = module_scope("app/handlers");
+
+    let page = |()| {
+        (
+            located(&db::search_symbols(&conn, "handle", 12).unwrap()),
+            located(
+                &db::search_symbol_terms_scoped(&conn, &["handle"], None, 12, &none, false)
+                    .unwrap(),
+            ),
+            located(&db::search_symbols_scoped(&conn, "handle", 12, &scoped).unwrap()),
+            located(
+                &db::search_symbols_for_command(&conn, "handle", None, 12, &none, false, false)
+                    .unwrap(),
+            ),
+            located(&db::search_symbol_seeds(&conn, "handle", 12).unwrap()),
+        )
+    };
+
+    let first = page(());
+    assert_eq!(first.0.len(), 12);
+    for _ in 0..5 {
+        assert_eq!(page(()), first);
+    }
+}
+
+#[test]
+fn tied_rows_are_ordered_by_path_then_line() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    seed_identical_rows(&conn);
+
+    assert_eq!(
+        located(&db::search_symbols(&conn, "handle", 6).unwrap()),
+        vec![
+            "handle:app/handlers/h00.rb:4",
+            "handle:app/handlers/h00.rb:9",
+            "handle:app/handlers/h01.rb:4",
+            "handle:app/handlers/h01.rb:9",
+            "handle:app/handlers/h02.rb:4",
+            "handle:app/handlers/h02.rb:9",
+        ]
+    );
+}
+
+// ----------------------------------------------------------------------
+// Fallbacks that must keep working
+// ----------------------------------------------------------------------
+
+#[test]
+fn fuzzy_cascade_still_orders_exact_then_prefix_then_contains() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    let file = db::upsert_file(&conn, "app/models/order.rb", 0, 100).unwrap();
+    // Inserted worst-match first so a passing test cannot be insertion order.
+    db::insert_symbol(&conn, file, "reorder_items", SymbolKind::Function, 30, None).unwrap();
+    db::insert_symbol(&conn, file, "order_total", SymbolKind::Function, 20, None).unwrap();
+    db::insert_symbol(&conn, file, "order", SymbolKind::Function, 10, None).unwrap();
+
+    let results = db::search_symbols_fuzzy(&conn, "order", 10).unwrap();
+    assert_eq!(
+        names(&results),
+        vec!["order", "order_total", "reorder_items"]
+    );
+}
+
+#[test]
+fn seeds_keep_the_spread_of_matched_names() {
+    let dir = TempDir::new().unwrap();
+    let conn = open_fresh_db(dir.path());
+    // 30 rows literally named `service` would fill a ranked page on their own;
+    // `explore` re-ranks candidates itself and needs the other names too.
+    for i in 0..30 {
+        let path = format!("app/services/plain_{i:02}.rb");
+        let file = db::upsert_file(&conn, &path, 0, 100).unwrap();
+        db::insert_symbol(
+            &conn,
+            file,
+            "service",
+            SymbolKind::Function,
+            3,
+            Some("def service"),
+        )
+        .unwrap();
+    }
+    let file = db::upsert_file(&conn, "app/services/merge_service.rb", 0, 100).unwrap();
+    db::insert_symbol(
+        &conn,
+        file,
+        "Applicant::Merge::Service",
+        SymbolKind::Class,
+        4,
+        Some("class Applicant::Merge::Service"),
+    )
+    .unwrap();
+
+    let seeds = db::search_symbol_seeds(&conn, "service", 40).unwrap();
+    assert!(
+        names(&seeds).contains(&"Applicant::Merge::Service"),
+        "{:?}",
+        names(&seeds)
+    );
+
+    // The ranked search is the one that deliberately leads with the exact hit.
+    let ranked = db::search_symbols(&conn, "service", 5).unwrap();
+    assert!(
+        ranked.iter().all(|r| r.name == "service"),
+        "{:?}",
+        names(&ranked)
+    );
+}

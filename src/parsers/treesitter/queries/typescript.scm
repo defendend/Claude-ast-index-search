@@ -31,31 +31,31 @@
 
 ; type Name = ...
 (type_alias_declaration
-  name: (type_identifier) @type_alias_name)
+  name: (type_identifier) @type_alias_name) @type_alias_node
 
 (export_statement
   (type_alias_declaration
-    name: (type_identifier) @export_type_alias_name))
+    name: (type_identifier) @export_type_alias_name) @export_type_alias_node)
 
 ; === Enums ===
 
 ; enum Name { }
 (enum_declaration
-  name: (identifier) @enum_name)
+  name: (identifier) @enum_name) @enum_node
 
 (export_statement
   (enum_declaration
-    name: (identifier) @export_enum_name))
+    name: (identifier) @export_enum_name) @export_enum_node)
 
 ; === Functions ===
 
 ; function name(...) { }
 (function_declaration
-  name: (identifier) @func_name)
+  name: (identifier) @func_name) @func_node
 
 (export_statement
   (function_declaration
-    name: (identifier) @export_func_name))
+    name: (identifier) @export_func_name) @export_func_node)
 
 ; === Arrow functions as const/let ===
 
@@ -63,13 +63,13 @@
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow_func_name
-    value: (arrow_function)))
+    value: (arrow_function)) @arrow_func_node)
 
 (export_statement
   (lexical_declaration
     (variable_declarator
       name: (identifier) @export_arrow_func_name
-      value: (arrow_function))))
+      value: (arrow_function)) @export_arrow_func_node))
 
 ; const name: Type = (...) => { }
 ; (type annotated arrow functions are still captured by the above patterns)
@@ -80,39 +80,39 @@
 (lexical_declaration
   (variable_declarator
     name: (identifier) @const_name
-    value: (_) @const_value))
+    value: (_) @const_value) @const_node)
 
 (export_statement
   (lexical_declaration
     (variable_declarator
       name: (identifier) @export_const_name
-      value: (_) @export_const_value)))
+      value: (_) @export_const_value) @export_const_node))
 
 ; === Namespaces ===
 
 ; namespace Name { }
 (internal_module
-  name: (identifier) @namespace_name)
+  name: (identifier) @namespace_name) @namespace_node
 
 (export_statement
   (internal_module
-    name: (identifier) @export_namespace_name))
+    name: (identifier) @export_namespace_name) @export_namespace_node)
 
 ; === Imports ===
 
 ; import ... from 'module'
 (import_statement
-  source: (string) @import_source)
+  source: (string) @import_source) @import_node
 
 ; === Decorators ===
 
 ; @DecoratorName  or  @DecoratorName(...)
 (decorator
-  (identifier) @decorator_id)
+  (identifier) @decorator_id) @decorator_node
 
 (decorator
   (call_expression
-    function: (identifier) @decorator_call_id))
+    function: (identifier) @decorator_call_id)) @decorator_call_node
 
 ; === Class methods ===
 
@@ -145,13 +145,13 @@
 ; declare function name(...)
 (ambient_declaration
   (function_signature
-    name: (identifier) @func_name))
+    name: (identifier) @func_name) @func_node)
 
 ; export declare function name(...)
 (export_statement
   (ambient_declaration
     (function_signature
-      name: (identifier) @export_func_name)))
+      name: (identifier) @export_func_name) @export_func_node))
 
 ; export declare class Name {}
 (export_statement
@@ -175,26 +175,26 @@
 (export_statement
   (ambient_declaration
     (type_alias_declaration
-      name: (type_identifier) @export_type_alias_name)))
+      name: (type_identifier) @export_type_alias_name) @export_type_alias_node))
 
 ; export declare enum Name {}
 (export_statement
   (ambient_declaration
     (enum_declaration
-      name: (identifier) @export_enum_name)))
+      name: (identifier) @export_enum_name) @export_enum_node))
 
 ; export declare namespace Name {}
 (export_statement
   (ambient_declaration
     (internal_module
-      name: (identifier) @export_namespace_name)))
+      name: (identifier) @export_namespace_name) @export_namespace_node))
 
 ; export declare const NAME: Type (ambient, may have no value)
 (export_statement
   (ambient_declaration
     (lexical_declaration
       (variable_declarator
-        name: (identifier) @export_ambient_const_name))))
+        name: (identifier) @export_ambient_const_name) @export_ambient_const_node)))
 
 ; === Export default ===
 

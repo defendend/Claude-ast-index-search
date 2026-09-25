@@ -29,6 +29,9 @@ pub struct ParsedSymbol {
     pub name: String,
     pub kind: SymbolKind,
     pub line: usize,
+    /// Last line of the whole definition, 1-based and inclusive. `None` when
+    /// the language parser does not report ranges yet.
+    pub end_line: Option<usize>,
     pub signature: String,
     pub parents: Vec<(String, String)>, // (parent_name, inherit_kind)
 }
@@ -50,7 +53,7 @@ const MAX_CONTEXT_LEN: usize = 500;
 /// megabytes), and there are thousands of symbols per file — multiplying out
 /// to easily 100+ GB of heap during a single rebuild. Truncating at the DB
 /// insert side caps that at `(MAX_SIGNATURE_LEN + 3) bytes per row`.
-const MAX_SIGNATURE_LEN: usize = 500;
+pub(crate) const MAX_SIGNATURE_LEN: usize = 500;
 
 /// Truncate context to avoid storing huge minified lines
 fn truncate_context(s: &str) -> String {
@@ -77,7 +80,7 @@ fn truncate_to_len(s: &str, max: usize) -> String {
 
 use anyhow::Result;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// Strip // line comments only (no block comments). Used for BSL.
@@ -671,9 +674,7 @@ pub fn parse_file_symbols(
 
     // Try tree-sitter parser first
     if let Some(ts_parser) = treesitter::get_treesitter_parser(effective_type) {
-        let symbols = ts_parser.parse_symbols(content)?;
-        let refs = ts_parser.extract_refs_for_lang(content, &symbols, effective_type)?;
-        return Ok((symbols, refs));
+        return ts_parser.parse_symbols_and_refs(content, effective_type);
     }
 
     // Fallback: regex-based parsing for unsupported languages
@@ -696,8 +697,126 @@ pub fn parse_file_symbols(
         // All other types are handled by tree-sitter above
         _ => return Err(anyhow::anyhow!("No parser for {:?}", file_type)),
     };
-    let refs = extract_references(content, &symbols)?;
+    let refs = extract_references_for_lang(content, &symbols, Some(file_type))?;
     Ok((symbols, refs))
+}
+
+/// Parse only the symbols of a file, skipping reference extraction.
+///
+/// Used for inputs indexed purely for their definitions — `node_modules` type
+/// declarations — where references would describe a library's own internals.
+pub fn parse_file_symbols_only(content: &str, file_type: FileType) -> Result<Vec<ParsedSymbol>> {
+    let effective_type = if file_type == FileType::Cpp && detect_h_file_objc(content) {
+        FileType::ObjC
+    } else {
+        file_type
+    };
+
+    if let Some(ts_parser) = treesitter::get_treesitter_parser(effective_type) {
+        return ts_parser.parse_symbols(content);
+    }
+
+    let stripped = strip_comments(content, file_type);
+    let content = &stripped;
+
+    match file_type {
+        FileType::Perl => parse_perl_symbols(content),
+        FileType::Wsdl => parse_wsdl_symbols(content),
+        FileType::Vue => {
+            let script = extract_vue_script(content);
+            let script_stripped = strip_c_comments(&script, false);
+            parse_typescript_symbols(&script_stripped)
+        }
+        FileType::Svelte => {
+            let script = extract_svelte_script(content);
+            let script_stripped = strip_c_comments(&script, false);
+            parse_typescript_symbols(&script_stripped)
+        }
+        _ => Err(anyhow::anyhow!("No parser for {:?}", file_type)),
+    }
+}
+
+/// Reserved words of the languages whose reference extraction runs through
+/// the generic line scan. A reserved word can never name a symbol, so a match
+/// on one — `sizeof (x)`, `#if defined(X)`, Go's `func (r *T)`, Rust's
+/// `pub(crate)`, Python's `except (A, B):` or `None` — is never a reference.
+///
+/// Contextual keywords that are ordinary identifiers elsewhere (Python's
+/// `match` and `type`, Rust's `union`, JavaScript's `async`) are left out: a
+/// function may well carry those names.
+fn reserved_words(file_type: Option<FileType>) -> &'static HashSet<&'static str> {
+    fn words(list: &'static str) -> HashSet<&'static str> {
+        list.split_whitespace().collect()
+    }
+    static NONE: LazyLock<HashSet<&str>> = LazyLock::new(HashSet::new);
+    // C and C++ share `FileType::Cpp` (and `.h`), so the set covers both,
+    // plus preprocessor operators and the GNU / MSVC spellings of keywords.
+    // `new` and `delete` stay out: they are valid C function names.
+    static C_FAMILY: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+        words(
+            "auto break case char const continue default do double else enum extern float for
+             goto if inline int long register restrict return short signed sizeof static struct
+             switch typedef union unsigned void volatile while _Alignas _Alignof _Atomic _Bool
+             _Complex _Generic _Imaginary _Noreturn _Static_assert _Thread_local alignas alignof
+             bool false nullptr static_assert thread_local true typeof asm decltype noexcept
+             operator requires typeid co_await co_return co_yield defined _Pragma __has_include
+             __has_include_next __has_attribute __has_cpp_attribute __has_builtin __has_feature
+             __has_extension __attribute__ __attribute __declspec __asm__ __asm __typeof__
+             __typeof __alignof__ __volatile__ __extension__ __restrict __restrict__ __inline
+             __inline__ __forceinline",
+        )
+    });
+    static GO: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+        words(
+            "break case chan const continue default defer else fallthrough for func go goto if
+             import interface map package range return select struct switch type var",
+        )
+    });
+    static PYTHON: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+        words(
+            "False None True and as assert async await break class continue def del elif else
+             except finally for from global if import in is lambda nonlocal not or pass raise
+             return try while with yield",
+        )
+    });
+    static RUST: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+        words(
+            "as async await break const continue crate dyn else enum extern false fn for if impl
+             in let loop match mod move mut pub ref return self Self static struct super trait
+             true type unsafe use where while abstract become box do final macro override priv
+             try typeof unsized virtual yield",
+        )
+    });
+    static PERL: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+        words(
+            "if elsif else unless until while for foreach do my our local state return sub and
+             or not xor eq ne lt gt le ge cmp",
+        )
+    });
+    static JAVASCRIPT: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+        words(
+            "await break case catch class const continue debugger default delete do else enum
+             export extends false finally for function if implements import in instanceof
+             interface let new null package private protected public return static super switch
+             this throw true try typeof var void while with yield",
+        )
+    });
+    match file_type {
+        Some(FileType::Cpp) | Some(FileType::ObjC) => &C_FAMILY,
+        Some(FileType::Go) => &GO,
+        Some(FileType::Python) => &PYTHON,
+        Some(FileType::Rust) => &RUST,
+        Some(FileType::Perl) => &PERL,
+        Some(FileType::TypeScript) | Some(FileType::Vue) | Some(FileType::Svelte) => &JAVASCRIPT,
+        _ => &NONE,
+    }
+}
+
+/// Whether the text before a match makes it a member or a path segment
+/// (`map.delete(k)`, `$obj->xor(...)`, `Pkg::local(...)`). JavaScript and
+/// Perl allow reserved words there, so the reserved-word filter must not apply.
+fn follows_member_access(before: &str) -> bool {
+    before.ends_with('.') || before.ends_with("->") || before.ends_with("::")
 }
 
 /// Extract references/usages from file content
@@ -716,20 +835,57 @@ pub fn extract_references_for_lang(
 ) -> Result<Vec<ParsedRef>> {
     let mut refs = Vec::new();
 
-    // Build set of locally defined symbol names (to skip them)
-    let defined_names: HashSet<&str> = defined_symbols.iter().map(|s| s.name.as_str()).collect();
+    // Map every locally defined symbol to the line it is declared on. Only that
+    // line is skipped: a symbol used further down its own file (a constant fed
+    // into the next constant, a local interface passed to defineProps) is a real
+    // usage, and skipping the whole name hid it from `usages` entirely.
+    //
+    // A qualified name declares its last segment where the line spells the
+    // name out: `class Billing::Invoice` declares that `Invoice`, which the
+    // identifier scan below sees on its own. `Billing` stays a reference to
+    // the namespace, and so does the `Invoice` of `class Admin::Invoice <
+    // Invoice`, a different class.
+    let mut declared_at: HashMap<&str, HashSet<usize>> = HashMap::new();
+    let mut qualified_at: HashMap<(usize, &str), Vec<&str>> = HashMap::new();
+    for symbol in defined_symbols {
+        declared_at
+            .entry(symbol.name.as_str())
+            .or_default()
+            .insert(symbol.line);
+        let segment = crate::db::last_name_segment(&symbol.name);
+        if segment.len() < symbol.name.len() {
+            qualified_at
+                .entry((symbol.line, segment))
+                .or_default()
+                .push(symbol.name.as_str());
+        }
+    }
+    let is_declared_segment = |line: &str, found: regex::Match<'_>, line_num: usize| {
+        qualified_at
+            .get(&(line_num, found.as_str()))
+            .is_some_and(|names| names.iter().any(|name| line[..found.end()].ends_with(name)))
+    };
+    let is_declaration_line =
+        |name: &str, line: usize| declared_at.get(name).is_some_and(|l| l.contains(&line));
 
     // Regex for identifiers that might be references:
     // - CamelCase identifiers (types, classes) like PaymentRepository, String
-    // - Function calls like getCards(, process(
+    // - SCREAMING_SNAKE_CASE constants like DEAL_KIND_ICONS, MAX_RETRIES
+    // - Function calls like getCards(, process(, update_profile(, _helper(
+    //
+    // `_` is a word character, so `\b` never fires inside DEAL_KIND_ICONS or
+    // update_profile: without `_` in the class the name matches neither whole
+    // nor in parts, and every reference to an upper-snake constant or a
+    // snake_case function is silently dropped.
     static IDENTIFIER_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b([A-Z][a-zA-Z0-9]*)\b").unwrap());
+        LazyLock::new(|| Regex::new(r"\b([A-Z][A-Za-z0-9_]*)\b").unwrap());
 
     let identifier_re = &*IDENTIFIER_RE; // CamelCase types
     static FUNC_CALL_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b([a-z][a-zA-Z0-9]*)\s*\(").unwrap());
+        LazyLock::new(|| Regex::new(r"\b([a-z_][a-zA-Z0-9_]*)\s*\(").unwrap());
 
     let func_call_re = &*FUNC_CALL_RE; // function calls
+    let reserved = reserved_words(file_type);
 
     // Common keywords to skip across all languages
     static BASE_KEYWORDS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
@@ -909,6 +1065,9 @@ pub fn extract_references_for_lang(
     };
 
     let is_swift = matches!(file_type, Some(FileType::Swift));
+    // `&name(...)` always calls a sub in Perl, whatever it is named:
+    // perlasm scripts call `&xor`, `&and` and `&sub` this way.
+    let is_perl = matches!(file_type, Some(FileType::Perl));
 
     for (line_num, line) in content.lines().enumerate() {
         let line_num = line_num + 1;
@@ -933,13 +1092,23 @@ pub fn extract_references_for_lang(
             continue;
         }
 
+        let is_reserved = |found: regex::Match| {
+            let before = &line[..found.start()];
+            reserved.contains(found.as_str())
+                && !follows_member_access(before)
+                && !(is_perl && before.ends_with('&'))
+        };
+
         // Extract CamelCase types (classes, interfaces, etc.)
         for caps in identifier_re.captures_iter(line) {
-            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let Some(found) = caps.get(1) else { continue };
+            let name = found.as_str();
             if !name.is_empty()
                 && !base_keywords.contains(name)
                 && !extra_keywords.contains(name)
-                && !defined_names.contains(name)
+                && !is_reserved(found)
+                && !is_declaration_line(name, line_num)
+                && !is_declared_segment(line, found, line_num)
             {
                 refs.push(ParsedRef {
                     name: name.to_string(),
@@ -951,11 +1120,14 @@ pub fn extract_references_for_lang(
 
         // Extract function calls
         for caps in func_call_re.captures_iter(line) {
-            let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let Some(found) = caps.get(1) else { continue };
+            let name = found.as_str();
             if !name.is_empty()
                 && !base_keywords.contains(name)
                 && !extra_keywords.contains(name)
-                && !defined_names.contains(name)
+                && !is_reserved(found)
+                && !is_declaration_line(name, line_num)
+                && !is_declared_segment(line, found, line_num)
             {
                 // Only add if name length > 2 to avoid noise
                 if name.len() > 2 {
@@ -1048,6 +1220,63 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_references_finds_usage_in_declaring_file() {
+        // A symbol used further down its own file is a real usage; skipping the
+        // whole name (instead of just the declaration line) hid it from `usages`.
+        let content = "export const ICONS = {}\nexport const ORDER = Object.keys(ICONS)\n";
+        let symbols = vec![ParsedSymbol {
+            name: "ICONS".to_string(),
+            kind: SymbolKind::Constant,
+            line: 1,
+            signature: "export const ICONS".to_string(),
+            parents: vec![],
+            end_line: None,
+        }];
+        let refs = extract_references(content, &symbols).unwrap();
+        assert!(
+            refs.iter().any(|r| r.name == "ICONS" && r.line == 2),
+            "expected ICONS usage on line 2; got {:?}",
+            refs.iter().map(|r| (&r.name, r.line)).collect::<Vec<_>>()
+        );
+        // The declaration itself is still not a reference.
+        assert!(!refs.iter().any(|r| r.name == "ICONS" && r.line == 1));
+    }
+
+    #[test]
+    fn test_parse_file_symbols_only_skips_refs() {
+        let content = "export declare const RESULT_TONE: Record<string, string>;\nexport declare function helper(): void;\n";
+        let symbols = parse_file_symbols_only(content, FileType::TypeScript).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "RESULT_TONE"));
+        // Same input through the full entry point still yields references, so the
+        // difference is the skipped extraction, not a parser change.
+        let (full_symbols, refs) = parse_file_symbols(content, FileType::TypeScript).unwrap();
+        assert_eq!(symbols.len(), full_symbols.len());
+        assert!(!refs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_references_finds_upper_snake_case_constants() {
+        // `_` is a word character, so a `[A-Z][a-zA-Z0-9]*` class matches an
+        // upper-snake name neither whole nor in parts (issue: `usages` returned
+        // zero for every SCREAMING_SNAKE constant).
+        let content = "const icon = DEAL_KIND_ICONS[kind]\nuseMediaQuery(COARSE_POINTER_MQ)\n";
+        let symbols = vec![];
+        let refs = extract_references(content, &symbols).unwrap();
+        assert!(
+            refs.iter().any(|r| r.name == "DEAL_KIND_ICONS"),
+            "expected DEAL_KIND_ICONS; got {:?}",
+            refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            refs.iter().any(|r| r.name == "COARSE_POINTER_MQ"),
+            "expected COARSE_POINTER_MQ; got {:?}",
+            refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        // The name must not be split into fragments.
+        assert!(!refs.iter().any(|r| r.name == "DEAL" || r.name == "ICONS"));
+    }
+
+    #[test]
     fn test_extract_references_skips_defined_symbols() {
         let content = "class MyClass {\n    val other: OtherClass\n}\n";
         let symbols = vec![ParsedSymbol {
@@ -1056,6 +1285,7 @@ mod tests {
             line: 1,
             signature: "class MyClass".to_string(),
             parents: vec![],
+            end_line: None,
         }];
         let refs = extract_references(content, &symbols).unwrap();
         assert!(

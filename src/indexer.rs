@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::db;
+use crate::minified;
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
 
 /// File-size cap for parsing. Larger files are recorded in the `files`
@@ -928,6 +929,34 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
     detect_stacks_with_limits(root, StackScanLimits::default(), true)
 }
 
+/// Metadata key holding [`project_label`] as of the last full rebuild of the
+/// primary root; the stack scan takes seconds on a large tree, too long for
+/// `stats`.
+pub const PROJECT_LABEL_KEY: &str = "project_label";
+
+/// Record [`project_label`] of the primary `root` for `stats` and `map`.
+/// Called by `rebuild` for the primary root only, never for an extra root
+/// or subtree indexed into the same database.
+pub fn record_project_label(conn: &Connection, root: &Path) -> Result<()> {
+    db::set_metadata_value(conn, PROJECT_LABEL_KEY, &project_label(root))
+}
+
+/// What `stats` and `map` call the project: the stacks [`detect_stacks`]
+/// finds, joined (`Ruby + Web (TypeScript/JavaScript)`), or the
+/// [`detect_project_type`] label when no stack marker is present.
+pub fn project_label(root: &Path) -> String {
+    let detection = detect_stacks_with_limits(root, StackScanLimits::default(), false);
+    if detection.stacks.is_empty() {
+        return detect_project_type(root).as_str().to_string();
+    }
+    detection
+        .stacks
+        .iter()
+        .map(|stack| stack.label.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
 fn detect_stacks_with_limits(
     root: &Path,
     limits: StackScanLimits,
@@ -1149,12 +1178,49 @@ struct ParsedFile {
     symbols: Vec<ParsedSymbol>,
     qualified_names: HashMap<(String, usize, String), String>,
     refs: Vec<ParsedRef>,
+    /// [`content_words`] of the text, when it was read.
+    words: Option<String>,
+}
+
+/// Whether `c` belongs to a word for [`content_words`] and
+/// [`literal_word_runs`]. Both sides must split text the same way.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The distinct maximal runs of word characters in `content`, sorted and
+/// joined by `\n`.
+///
+/// Every occurrence of a literal lies in the text, so each of the literal's
+/// own word runs lies inside one of these words. A file whose words hold no
+/// word containing some run of the literal cannot contain the literal, and a
+/// grep for it can skip the file without opening it.
+pub fn content_words(content: &str) -> String {
+    let mut words: Vec<&str> = content
+        .split(|c: char| !is_word_char(c))
+        .filter(|word| !word.is_empty())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    words.sort_unstable();
+    words.join("\n")
+}
+
+/// The maximal runs of word characters in `literal`, the pieces
+/// [`content_words`] can vouch for.
+pub fn literal_word_runs(literal: &str) -> Vec<String> {
+    literal
+        .split(|c: char| !is_word_char(c))
+        .filter(|run| !run.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// File scheduled by incremental update.
 enum PendingUpdateFile {
     Regular {
         root: PathBuf,
+        root_key: String,
         path: PathBuf,
     },
     NodeModulesDts {
@@ -1164,15 +1230,31 @@ enum PendingUpdateFile {
     },
 }
 
-/// Parse a single file without DB access (thread-safe)
-fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
+/// Parse a single file without DB access (thread-safe). `None` for a
+/// minified file, which stays out of the index altogether.
+#[cfg(test)]
+fn parse_file(root: &Path, file_path: &Path) -> Result<Option<ParsedFile>> {
+    parse_file_keyed(root, &db::normalize_root_for_storage(root), file_path)
+}
+
+/// [`parse_file`] with the storage key of `root` computed by the caller.
+/// The key costs a thread and a `realpath` per call, which a walk over tens
+/// of thousands of files must not pay per file.
+fn parse_file_keyed(
+    root: &Path,
+    root_key: &str,
+    file_path: &Path,
+) -> Result<Option<ParsedFile>> {
+    if minified::skip_by_name(file_path) {
+        return Ok(None);
+    }
     let metadata = fs::metadata(file_path)?;
     let mtime = metadata
         .modified()?
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_secs() as i64;
     let size = metadata.len() as i64;
-    let root_path = db::normalize_root_for_storage(root);
+    let root_path = root_key.to_string();
 
     let rel_path = file_path
         .strip_prefix(root)
@@ -1185,7 +1267,10 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     // never read into memory or parsed — that's how a single 200 MB vendor
     // bundle used to push rebuild to 20+ GB RSS.
     if (size as u64) > max_file_size_bytes() {
-        return Ok(ParsedFile {
+        if minified::skip(file_path, None) {
+            return Ok(None);
+        }
+        return Ok(Some(ParsedFile {
             rel_path,
             root_path,
             mtime,
@@ -1193,10 +1278,15 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
             symbols: vec![],
             qualified_names: HashMap::new(),
             refs: vec![],
-        });
+            words: None,
+        }));
     }
 
     let content = fs::read_to_string(file_path)?;
+    if minified::skip(file_path, Some(content.as_bytes())) {
+        return Ok(None);
+    }
+    let words = Some(content_words(&content));
 
     // Detect file type by extension, with content-based sniffing for .m files
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -1207,7 +1297,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
     } {
         Some(ft) => ft,
         None => {
-            return Ok(ParsedFile {
+            return Ok(Some(ParsedFile {
                 rel_path,
                 root_path,
                 mtime,
@@ -1215,7 +1305,8 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                 symbols: vec![],
                 qualified_names: HashMap::new(),
                 refs: vec![],
-            });
+                words,
+            }));
         }
     };
 
@@ -1224,6 +1315,10 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
 
     if file_type == parsers::FileType::Cpp {
         qualified_names = parsers::treesitter::cpp::collect_qualified_names(&content)?;
+    }
+
+    if file_type == parsers::FileType::TypeScript {
+        parsers::treesitter::typescript::name_default_export(&mut symbols, &rel_path);
     }
 
     // BSL (1C:Enterprise) — module names are encoded in directory structure,
@@ -1236,6 +1331,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                 line: 1,
                 signature: format!("module {}", rel_path),
                 parents: vec![],
+                end_line: Some(content.lines().count().max(1)),
             });
         }
     }
@@ -1257,12 +1353,13 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
                     line: 1,
                     signature: format!("component {}", stem),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
     }
 
-    Ok(ParsedFile {
+    Ok(Some(ParsedFile {
         rel_path,
         root_path,
         mtime,
@@ -1270,7 +1367,8 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<ParsedFile> {
         symbols,
         qualified_names,
         refs,
-    })
+        words,
+    }))
 }
 
 /// Directories to always exclude from indexing (regardless of .gitignore).
@@ -1404,6 +1502,7 @@ fn is_module_file(name: &str) -> bool {
         || name == "setup.py"
         || name == "setup.cfg"
         || name == "ya.make"
+        || name.ends_with(".gemspec")
 }
 
 fn sample_parseable_files_without_ignore(walk_dir: &Path, limit: usize) -> Vec<PathBuf> {
@@ -1836,6 +1935,7 @@ fn index_directory_scoped_with_max_depth(
             gb.build().ok()
         }
     };
+    let schema_exclude = exclude_matcher.clone();
 
     let mut builder = WalkBuilder::new(walk_dir);
     builder
@@ -1968,7 +2068,14 @@ fn index_directory_scoped_with_max_depth(
         ));
     }
 
-    let files = collected.files;
+    let mut files = collected.files;
+    if use_git || arc_root.is_some() {
+        for schema in rails_schema_files(root, walk_dir, schema_exclude.as_ref()) {
+            if !files.contains(&schema) {
+                files.push(schema);
+            }
+        }
+    }
     let module_files = collected.module_files;
     let storyboard_files = collected.storyboard_files;
     let xcassets_dirs = collected.xcassets_dirs;
@@ -2017,79 +2124,57 @@ fn index_directory_scoped_with_max_depth(
 
     let mut total_count = 0;
     let parsed_global = Arc::new(AtomicUsize::new(0));
+    let minified_skipped = AtomicUsize::new(0);
     if verbose {
         eprintln!("[verbose] using {} threads for parsing", num_threads);
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .stack_size(RAYON_WORKER_STACK_SIZE)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
-
-    let root_buf = root.to_path_buf();
-    let total_chunks = (files.len() + chunk_size - 1) / chunk_size;
-    for (chunk_idx, chunk) in files.chunks(chunk_size).enumerate() {
-        let root_clone = root_buf.clone();
-        let counter = parsed_global.clone();
-        let total = total_files;
-
-        if verbose {
-            eprintln!(
-                "[verbose] chunk {}/{}: parsing {} files...",
-                chunk_idx + 1,
-                total_chunks,
-                chunk.len()
-            );
-        }
-        let chunk_start = Instant::now();
-
-        // Parse chunk in parallel — at most `chunk_size` ParsedFiles in memory
-        let parsed_files: Vec<ParsedFile> = pool.install(|| {
-            chunk
-                .par_iter()
-                .filter_map(|path| {
-                    let result = parse_file(&root_clone, path).ok();
-                    let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if progress && c % 2000 == 0 {
-                        eprintln!("Parsed {} / {} files...", c, total);
-                    }
-                    result
-                })
-                .collect()
-        });
-
-        if verbose {
-            eprintln!(
-                "[verbose] chunk {}/{}: parsed in {:?}, writing {} to DB...",
-                chunk_idx + 1,
-                total_chunks,
-                chunk_start.elapsed(),
-                parsed_files.len()
-            );
-        }
-        let write_start = Instant::now();
-
-        // Write to DB and free parsed_files
-        write_batch_to_db(
-            conn,
-            parsed_files,
-            &mut total_count,
-            WriteMode::FreshRebuild,
-        )?;
-
-        if verbose {
-            eprintln!(
-                "[verbose] chunk {}/{}: written in {:?}",
-                chunk_idx + 1,
-                total_chunks,
-                write_start.elapsed()
-            );
-        }
-
-        if progress {
-            eprintln!("Written {} / {} files to DB", total_count, total_files);
-        }
+    let root_key = db::normalize_root_for_storage(root);
+    let parse_start = Instant::now();
+    parse_and_write_in_order(
+        conn,
+        &files,
+        num_threads,
+        chunk_size,
+        &|path: &PathBuf| {
+            let result = match parse_file_keyed(root, &root_key, path) {
+                Ok(Some(parsed)) => Some(parsed),
+                Ok(None) => {
+                    minified_skipped.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+                Err(_) => None,
+            };
+            let c = parsed_global.fetch_add(1, Ordering::Relaxed) + 1;
+            if progress && c % 2000 == 0 {
+                eprintln!("Parsed {} / {} files...", c, total_files);
+            }
+            result
+        },
+        &mut total_count,
+        |written| {
+            if progress {
+                eprintln!("Written {} / {} files to DB", written, total_files);
+            }
+        },
+    )?;
+    if verbose {
+        eprintln!(
+            "[verbose] parsed and wrote {} files in {:?}",
+            total_count,
+            parse_start.elapsed()
+        );
     }
+
+    let minified_skipped = minified_skipped.into_inner();
+    if progress && minified_skipped > 0 {
+        eprintln!(
+            "Skipped {} minified file{} (set {}=0 to index them)",
+            minified_skipped,
+            if minified_skipped == 1 { "" } else { "s" },
+            minified::SKIP_ENV
+        );
+    }
+    record_minified_filter(conn)?;
 
     Ok(WalkResult {
         file_count: total_count,
@@ -2102,6 +2187,108 @@ fn index_directory_scoped_with_max_depth(
     })
 }
 
+/// Metadata key present while no minified file is left in the index. An index
+/// written by an older version or with the filter off lacks it, and the next
+/// `update` then checks unchanged files too, dropping the minified ones.
+const MINIFIED_FILTER_KEY: &str = "minified_filter";
+
+fn record_minified_filter(conn: &Connection) -> Result<()> {
+    if minified::enabled() {
+        db::set_metadata_value(conn, MINIFIED_FILTER_KEY, "1")
+    } else {
+        db::delete_metadata_value(conn, MINIFIED_FILTER_KEY)
+    }
+}
+
+/// Parse `items` on `threads` workers and write the results to `conn` in
+/// input order, one transaction per `batch` items, while later items are
+/// still being parsed.
+///
+/// Parsing a chunk and then writing it left every parse thread idle during
+/// the write, and one large file held up its whole chunk. Workers now run at
+/// most two batches ahead of the writer, which bounds memory like the chunks
+/// did. Items are written in the order they are given, with the same
+/// transaction boundaries, so every file gets the id it got before.
+fn parse_and_write_in_order<T: Sync>(
+    conn: &mut Connection,
+    items: &[T],
+    threads: usize,
+    batch: usize,
+    parse: &(dyn Fn(&T) -> Option<ParsedFile> + Sync),
+    total_count: &mut usize,
+    mut after_batch: impl FnMut(usize),
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let batch = batch.max(1);
+    let window = batch * 2;
+    let next = AtomicUsize::new(0);
+    let written = AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (tx, rx) = crossbeam_channel::bounded::<(usize, Option<ParsedFile>)>(window);
+
+    std::thread::scope(|scope| -> Result<()> {
+        for _ in 0..threads.max(1).min(items.len()) {
+            let tx = tx.clone();
+            let (next, written, stop) = (&next, &written, &stop);
+            std::thread::Builder::new()
+                .stack_size(RAYON_WORKER_STACK_SIZE)
+                .spawn_scoped(scope, move || loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= items.len() {
+                        break;
+                    }
+                    while index >= written.load(Ordering::Acquire) + window
+                        && !stop.load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    if tx.send((index, parse(&items[index]))).is_err() {
+                        break;
+                    }
+                })
+                .map_err(|e| anyhow::anyhow!("Failed to start a parse thread: {}", e))?;
+        }
+        drop(tx);
+
+        let mut pending: HashMap<usize, Option<ParsedFile>> = HashMap::new();
+        let mut frontier = 0usize;
+        let mut consumed = 0usize;
+        let mut current: Vec<ParsedFile> = Vec::with_capacity(batch);
+        let result = (|| -> Result<()> {
+            for (index, parsed) in &rx {
+                pending.insert(index, parsed);
+                while let Some(parsed) = pending.remove(&frontier) {
+                    frontier += 1;
+                    consumed += 1;
+                    current.extend(parsed);
+                    if consumed == batch || frontier == items.len() {
+                        write_batch_to_db(
+                            conn,
+                            std::mem::take(&mut current),
+                            total_count,
+                            WriteMode::FreshRebuild,
+                        )?;
+                        consumed = 0;
+                        written.store(frontier, Ordering::Release);
+                        after_batch(*total_count);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        drop(rx);
+        result
+    })
+}
+
 /// Write a batch of parsed files to DB in a single transaction
 fn write_batch_to_db(
     conn: &mut Connection,
@@ -2110,6 +2297,9 @@ fn write_batch_to_db(
     mode: WriteMode,
 ) -> Result<()> {
     let tx = conn.transaction()?;
+    if !batch.is_empty() {
+        db::bump_index_generation(&tx)?;
+    }
 
     {
         let file_sql = match mode {
@@ -2122,13 +2312,18 @@ fn write_batch_to_db(
         };
         let mut file_stmt = tx.prepare_cached(file_sql)?;
         let mut sym_stmt = tx.prepare_cached(
-            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, end_line, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         )?;
         let mut inh_stmt = tx.prepare_cached(
             "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)",
         )?;
         let mut ref_stmt = tx.prepare_cached(
             "INSERT INTO refs (file_id, name, line, context) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        // An index created before the table existed gains it on its next write.
+        tx.execute_batch(db::CREATE_FILE_WORDS_SQL)?;
+        let mut words_stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO file_words (file_id, mtime, size, words) VALUES (?1, ?2, ?3, ?4)",
         )?;
 
         for pf in batch {
@@ -2140,10 +2335,14 @@ fn write_batch_to_db(
                 symbols,
                 qualified_names,
                 refs,
+                words,
             } = pf;
 
             file_stmt.execute(rusqlite::params![rel_path, root_path, mtime, size])?;
             let file_id = tx.last_insert_rowid();
+            if let Some(words) = words {
+                words_stmt.execute(rusqlite::params![file_id, mtime, size, words])?;
+            }
             // `INSERT OR REPLACE` on `files.path` drops the previous file row first, and
             // `ON DELETE CASCADE` clears old symbols/refs automatically. Explicit deletes
             // here only add extra work, especially during full rebuilds on a fresh DB.
@@ -2160,6 +2359,7 @@ fn write_batch_to_db(
                     qualified_name,
                     sym.kind.as_str(),
                     sym.line as i64,
+                    sym.end_line.map(|l| l as i64),
                     parsers::truncate_signature(&sym.signature)
                 ])?;
                 let symbol_id = tx.last_insert_rowid();
@@ -2179,6 +2379,29 @@ fn write_batch_to_db(
 
     tx.commit()?;
     Ok(())
+}
+
+/// `(mtime seconds, size)` of every path, in order; `(0, 0)` for a path that
+/// cannot be read. Stats run on the rayon pool: one by one they made the
+/// change scan of `update` wait on tens of thousands of serial syscalls.
+fn stat_mtime_size_parallel(paths: &[PathBuf]) -> Vec<(i64, i64)> {
+    paths
+        .par_iter()
+        .map(|path| {
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| {
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    (mtime, metadata.len() as i64)
+                })
+                .unwrap_or((0, 0))
+        })
+        .collect()
 }
 
 /// Incremental update: only re-index changed/new files, delete removed files.
@@ -2231,6 +2454,13 @@ pub fn update_directory_incremental(
         eprintln!("Loaded {} files from index", existing_files.len());
     }
 
+    // Files already in the index are only re-read when they change, so a
+    // minified file an older index kept would never be noticed; until the
+    // filter has run over every file once, unchanged files are checked too.
+    let minified_filter_recorded =
+        db::get_metadata_value(conn, MINIFIED_FILTER_KEY)?.as_deref() == Some("1");
+    let check_unchanged_for_minified = minified::enabled() && !minified_filter_recorded;
+
     // 2. Build the list of (walk_dir, path_anchor) pairs. `path_anchor` is the
     //    base used for `strip_prefix` when computing rel_path — keeping it equal
     //    to the outer root for include sub-paths means the DB stays consistent
@@ -2268,6 +2498,7 @@ pub fn update_directory_incremental(
         std::collections::HashSet::new();
 
     for (walk_dir, anchor) in &walk_specs {
+        let anchor_key = db::normalize_root_for_storage(anchor);
         let is_git = has_git_repo(walk_dir) || has_git_repo(anchor);
         let arc_root = find_arc_root(walk_dir).or_else(|| find_arc_root(anchor));
         let mut builder = WalkBuilder::new(walk_dir);
@@ -2295,70 +2526,83 @@ pub fn update_directory_incremental(
                 builder.add_ignore(root_gitignore);
             }
         }
-        let walker = builder.build();
+        // A parallel walk, sorted afterwards so the outcome does not depend
+        // on thread timing. Only the order changed files are written in (and
+        // so the ids they get) differs from the former serial walk order.
+        let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+        builder
+            .threads(effective_num_threads())
+            .build_parallel()
+            .run(|| {
+                let tx = tx.clone();
+                Box::new(move |entry| {
+                    if let Ok(entry) = entry {
+                        let is_supported = entry
+                            .path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(parsers::is_supported_extension)
+                            .unwrap_or(false);
+                        if is_supported {
+                            let _ = tx.send(entry.into_path());
+                        }
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+        drop(tx);
+        let mut walked: Vec<PathBuf> = rx.into_iter().collect();
+        walked.sort_unstable();
+        let schema_files = if is_git || arc_root.is_some() {
+            rails_schema_files(anchor, walk_dir, exclude_matcher)
+        } else {
+            Vec::new()
+        };
 
-        for entry in walker.filter_map(|e| e.ok()) {
-            let is_supported = entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(parsers::is_supported_extension)
-                .unwrap_or(false);
-            if !is_supported {
-                continue;
-            }
-
-            let file_path = entry.path().to_path_buf();
+        // Stat in parallel but decide in walk order: which pending file comes
+        // first sets the order changed files are written, and so their ids.
+        let paths: Vec<PathBuf> = walked.into_iter().chain(schema_files).collect();
+        let stats = stat_mtime_size_parallel(&paths);
+        for (file_path, (file_mtime, file_size)) in paths.into_iter().zip(stats) {
             let rel_path = file_path
                 .strip_prefix(anchor)
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .to_string();
-            let root_key = db::normalize_root_for_storage(anchor);
+            let key = (anchor_key.clone(), rel_path);
+            if current_paths.contains(&key) {
+                continue;
+            }
+            // Left out of `current_paths`, a minified file already in the
+            // index is removed below like a deleted one.
+            if minified::skip_by_name(&file_path) {
+                continue;
+            }
 
-            let (file_mtime, file_size) = fs::metadata(&file_path)
-                .ok()
-                .map(|metadata| {
-                    let mtime = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    (mtime, metadata.len() as i64)
-                })
-                .unwrap_or((0, 0));
-
-            let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
+            let need_parse = match existing_files.get(&key) {
                 Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
                 None => true,
             };
+            if (need_parse || check_unchanged_for_minified) && minified::skip(&file_path, None) {
+                continue;
+            }
 
             if need_parse {
                 files_to_parse.push(PendingUpdateFile::Regular {
                     root: anchor.clone(),
+                    root_key: anchor_key.clone(),
                     path: file_path,
                 });
             }
-            current_paths.insert((root_key, rel_path));
+            current_paths.insert(key);
         }
     }
 
     let root_key = db::normalize_root_for_storage(root);
-    for (file_path, rel_path) in collect_node_modules_dts_files(root) {
-        let (file_mtime, file_size) = fs::metadata(&file_path)
-            .ok()
-            .map(|metadata| {
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                (mtime, metadata.len() as i64)
-            })
-            .unwrap_or((0, 0));
-
+    let dts_files = collect_node_modules_dts_files(root);
+    let dts_paths: Vec<PathBuf> = dts_files.iter().map(|(path, _)| path.clone()).collect();
+    let dts_stats = stat_mtime_size_parallel(&dts_paths);
+    for ((file_path, rel_path), (file_mtime, file_size)) in dts_files.into_iter().zip(dts_stats) {
         let need_parse = match existing_files.get(&(root_key.clone(), rel_path.clone())) {
             Some((_, db_mtime, db_size)) => file_mtime != *db_mtime || file_size != *db_size,
             None => true,
@@ -2405,6 +2649,7 @@ pub fn update_directory_incremental(
                 del_file_stmt.execute(rusqlite::params![root_path, path])?;
             }
         }
+        db::bump_index_generation(&tx)?;
         tx.commit()?;
     }
 
@@ -2434,14 +2679,17 @@ pub fn update_directory_incremental(
                 .par_iter()
                 .filter_map(|pending| {
                     let result = match pending {
-                        PendingUpdateFile::Regular { root, path } => parse_file(root, path),
+                        PendingUpdateFile::Regular {
+                            root,
+                            root_key,
+                            path,
+                        } => parse_file_keyed(root, root_key, path).ok().flatten(),
                         PendingUpdateFile::NodeModulesDts {
                             path,
                             rel_path,
                             root_path,
-                        } => parse_dts_file(path, rel_path, root_path),
-                    }
-                    .ok();
+                        } => parse_dts_file(path, rel_path, root_path).ok(),
+                    };
                     let c = parsed_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
                     if progress && c % 500 == 0 {
                         eprintln!("Parsed {} / {} changed files...", c, total_files);
@@ -2468,6 +2716,9 @@ pub fn update_directory_incremental(
     if all_planned_files_written && (has_planned_mutations || was_dirty) {
         db::complete_index_update(conn)?;
     }
+    if minified::enabled() != minified_filter_recorded {
+        record_minified_filter(conn)?;
+    }
 
     Ok((updated_count, files_to_parse.len(), deleted_paths.len()))
 }
@@ -2492,11 +2743,18 @@ fn swift_target_name(module_name: &str) -> &str {
 /// named after its target — the Swift `import` name — unless that name is
 /// declared more than once or already taken, in which case every such target
 /// gets a manifest-qualified `dir.path.Target` name so none silently wins.
-fn index_swift_manifest_modules(conn: &Connection, root: &Path, manifests: &[&Path]) -> Result<usize> {
+fn index_swift_manifest_modules(
+    conn: &Connection,
+    root: &Path,
+    manifests: &[&Path],
+) -> Result<usize> {
     let mut declared = Vec::new();
     for manifest in manifests {
         let (Some(kind), Some(dir)) = (
-            manifest.file_name().and_then(|n| n.to_str()).and_then(swift_manifest_kind),
+            manifest
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(swift_manifest_kind),
             manifest.parent(),
         ) else {
             continue;
@@ -2757,6 +3015,30 @@ pub fn index_modules_from_files(
                         module_path.replace('/', ".")
                     };
 
+                    if !module_name.is_empty() {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
+                            rusqlite::params![module_name, module_path],
+                        )?;
+                        count += 1;
+                    }
+                }
+            }
+
+            // Ruby gems (`*.gemspec`): a Rails engine or a gem vendored in the
+            // repository, named by its directory like a Python module.
+            if name_str.ends_with(".gemspec") {
+                if let Some(parent) = path.parent() {
+                    let module_path = parent
+                        .strip_prefix(root)
+                        .unwrap_or(parent)
+                        .to_string_lossy()
+                        .to_string();
+                    let module_name = if module_path.is_empty() {
+                        name_str.trim_end_matches(".gemspec").to_string()
+                    } else {
+                        module_path.replace('/', ".")
+                    };
                     if !module_name.is_empty() {
                         conn.execute(
                             "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
@@ -3463,11 +3745,17 @@ fn swift_manifest_edges(
             continue;
         };
         for dep in &target.dependencies {
-            let local = targets.iter().find(|t| t.name == dep.name).and_then(local_id);
-            let dep_id = local.or_else(|| match modules.by_target.get(&dep.name).map(Vec::as_slice) {
-                Some([only]) => Some(*only),
-                _ => None,
-            });
+            let local = targets
+                .iter()
+                .find(|t| t.name == dep.name)
+                .and_then(local_id);
+            let dep_id =
+                local.or_else(
+                    || match modules.by_target.get(&dep.name).map(Vec::as_slice) {
+                        Some([only]) => Some(*only),
+                        _ => None,
+                    },
+                );
             if let Some(dep_id) = dep_id.filter(|id| *id != module_id) {
                 edges.push((module_id, dep_id, dep.kind.clone()));
             }
@@ -4512,9 +4800,43 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     Ok(count)
 }
 
-fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {
-    use ignore::WalkBuilder;
+/// Rails schema dumps under `root` (`db/schema.rb`, `db/<database>_schema.rb`)
+/// that lie inside `walk_dir` and outside the configured excludes.
+///
+/// They are indexed even when ignore rules hide them: teams often gitignore
+/// the dump because every migration regenerates it, yet it is the only place
+/// that declares a model's columns. Like `node_modules` type declarations, it
+/// is generated but describes code the project uses.
+fn rails_schema_files(
+    root: &Path,
+    walk_dir: &Path,
+    exclude: Option<&ignore::gitignore::Gitignore>,
+) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root.join("db")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "schema.rb" || name.ends_with("_schema.rb"))
+        })
+        .filter(|path| path.starts_with(walk_dir))
+        .filter(|path| {
+            exclude.is_none_or(|matcher| {
+                !path.starts_with(matcher.path())
+                    || !matcher.matched_path_or_any_parents(path, false).is_ignore()
+            })
+        })
+        .collect();
+    found.sort();
+    found
+}
 
+fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {
     let node_modules = root.join("node_modules");
     if !node_modules.exists() || !node_modules.is_dir() {
         return Vec::new();
@@ -4570,44 +4892,52 @@ fn collect_node_modules_dts_files(root: &Path) -> Vec<(PathBuf, String)> {
     // Walk each resolved package dir for .d.ts files.
     // follow_links=false — already resolved top-level symlinks.
     // Store (abs_path, rel_path) pairs for correct DB storage.
-    let mut dts_files: Vec<(PathBuf, String)> = Vec::new();
+    // Thousands of small package walks run in parallel and are concatenated
+    // in package order, so the list comes out exactly as a serial walk's.
+    let per_package: Vec<Vec<(PathBuf, String)>> = pkg_map
+        .par_iter()
+        .map(|(pkg_dir, nm_prefix)| walk_package_dts(pkg_dir, nm_prefix))
+        .collect();
+    per_package.concat()
+}
 
-    for (pkg_dir, nm_prefix) in &pkg_map {
-        let mut builder = WalkBuilder::new(pkg_dir);
-        builder
-            .hidden(false)
-            .git_ignore(false)
-            .git_exclude(false)
-            .follow_links(false)
-            .max_depth(Some(8))
-            .filter_entry(|entry| {
-                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name == "node_modules" || name.starts_with('.') {
-                            return false;
-                        }
+fn walk_package_dts(pkg_dir: &Path, nm_prefix: &str) -> Vec<(PathBuf, String)> {
+    use ignore::WalkBuilder;
+
+    let mut dts_files: Vec<(PathBuf, String)> = Vec::new();
+    let mut builder = WalkBuilder::new(pkg_dir);
+    builder
+        .hidden(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .follow_links(false)
+        .max_depth(Some(8))
+        .filter_entry(|entry| {
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name == "node_modules" || name.starts_with('.') {
+                        return false;
                     }
                 }
-                true
-            });
+            }
+            true
+        });
 
-        for entry in builder.build().filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".d.ts") {
-                    // Map resolved path back to node_modules/... relative path
-                    let sub_path = path.strip_prefix(pkg_dir).unwrap_or(path).to_string_lossy();
-                    let rel_path = if sub_path.is_empty() || sub_path == "." {
-                        nm_prefix.clone()
-                    } else {
-                        format!("{}/{}", nm_prefix, sub_path)
-                    };
-                    dts_files.push((path.to_path_buf(), rel_path));
-                }
+    for entry in builder.build().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.ends_with(".d.ts") {
+                // Map resolved path back to node_modules/... relative path
+                let sub_path = path.strip_prefix(pkg_dir).unwrap_or(path).to_string_lossy();
+                let rel_path = if sub_path.is_empty() || sub_path == "." {
+                    nm_prefix.to_string()
+                } else {
+                    format!("{}/{}", nm_prefix, sub_path)
+                };
+                dts_files.push((path.to_path_buf(), rel_path));
             }
         }
     }
-
     dts_files
 }
 
@@ -4661,41 +4991,24 @@ pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool
 
     let num_threads = effective_num_threads();
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .stack_size(RAYON_WORKER_STACK_SIZE)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
-
     let mut total_count = 0;
     let root_path = db::normalize_root_for_storage(root);
-
-    for chunk in dts_files.chunks(chunk_size) {
-        let counter = parsed_global.clone();
-        let total = total_files;
-        let root_path = root_path.clone();
-
-        let parsed_files: Vec<ParsedFile> = pool.install(|| {
-            chunk
-                .par_iter()
-                .filter_map(|(abs_path, rel_path)| {
-                    let result = parse_dts_file(abs_path, rel_path, &root_path).ok();
-                    let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if progress && c % 1000 == 0 {
-                        eprintln!("Parsed {} / {} .d.ts files...", c, total);
-                    }
-                    result
-                })
-                .collect()
-        });
-
-        write_batch_to_db(
-            conn,
-            parsed_files,
-            &mut total_count,
-            WriteMode::FreshRebuild,
-        )?;
-    }
+    parse_and_write_in_order(
+        conn,
+        &dts_files,
+        num_threads,
+        chunk_size,
+        &|(abs_path, rel_path): &(PathBuf, String)| {
+            let result = parse_dts_file(abs_path, rel_path, &root_path).ok();
+            let c = parsed_global.fetch_add(1, Ordering::Relaxed) + 1;
+            if progress && c % 1000 == 0 {
+                eprintln!("Parsed {} / {} .d.ts files...", c, total_files);
+            }
+            result
+        },
+        &mut total_count,
+        |_| {},
+    )?;
 
     if progress {
         eprintln!("Indexed {} .d.ts files from node_modules", total_count);
@@ -4722,11 +5035,16 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
             symbols: vec![],
             qualified_names: HashMap::new(),
             refs: vec![],
+            words: None,
         });
     }
 
     let content = fs::read_to_string(file_path)?;
-    let (symbols, refs) = parsers::parse_file_symbols(&content, parsers::FileType::TypeScript)?;
+    // Symbols only: a .d.ts is indexed so that a library's exported types resolve,
+    // and its internal references would otherwise dominate `usages`/`refs` output
+    // for common names, pushing the project's own code past the result limit.
+    let mut symbols = parsers::parse_file_symbols_only(&content, parsers::FileType::TypeScript)?;
+    parsers::treesitter::typescript::name_default_export(&mut symbols, rel_path);
 
     Ok(ParsedFile {
         rel_path: rel_path.to_string(),
@@ -4735,7 +5053,8 @@ fn parse_dts_file(file_path: &Path, rel_path: &str, root_path: &str) -> Result<P
         size,
         symbols,
         qualified_names: HashMap::new(),
-        refs,
+        refs: Vec::new(),
+        words: None,
     })
 }
 
@@ -4923,7 +5242,7 @@ no_ignore: true
         let content = "a".repeat(1_100_000);
         fs::write(&large_file, &content).unwrap();
 
-        let result = parse_file(dir.path(), &large_file).unwrap();
+        let result = parse_file(dir.path(), &large_file).unwrap().unwrap();
         assert!(result.symbols.is_empty(), "should skip large files");
         assert!(result.refs.is_empty());
     }
@@ -4934,7 +5253,7 @@ no_ignore: true
         let kt_file = dir.path().join("Test.kt");
         fs::write(&kt_file, "class TestClass {\n    fun doSomething() {}\n}\n").unwrap();
 
-        let result = parse_file(dir.path(), &kt_file).unwrap();
+        let result = parse_file(dir.path(), &kt_file).unwrap().unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "TestClass"));
         assert!(result.symbols.iter().any(|s| s.name == "doSomething"));
     }
@@ -4949,7 +5268,7 @@ no_ignore: true
         )
         .unwrap();
 
-        let result = parse_file(dir.path(), &swift_file).unwrap();
+        let result = parse_file(dir.path(), &swift_file).unwrap().unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "MyView"));
         assert!(result.symbols.iter().any(|s| s.name == "setup"));
     }
@@ -4964,7 +5283,7 @@ no_ignore: true
         )
         .unwrap();
 
-        let result = parse_file(dir.path(), &py_file).unwrap();
+        let result = parse_file(dir.path(), &py_file).unwrap().unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "Service"));
         assert!(result.symbols.iter().any(|s| s.name == "process"));
     }
@@ -5093,6 +5412,52 @@ no_ignore: true
         let dep_names: Vec<String> = deps.iter().map(|(n, _, _)| n.clone()).collect();
         assert!(dep_names.contains(&"lib/a".to_string()));
         assert!(dep_names.contains(&"lib/b".to_string()));
+    }
+
+    #[test]
+    fn gemspec_directories_are_ruby_modules() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("engines/billing")).unwrap();
+        fs::write(root.join("engines/billing/billing.gemspec"), "").unwrap();
+        fs::write(root.join("toolkit.gemspec"), "").unwrap();
+        assert!(is_module_file("billing.gemspec"));
+
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_db(&conn).unwrap();
+        let files = vec![
+            root.join("engines/billing/billing.gemspec"),
+            root.join("toolkit.gemspec"),
+        ];
+        assert_eq!(index_modules_from_files(&conn, root, &files).unwrap(), 2);
+        let modules: Vec<(String, String)> = conn
+            .prepare("SELECT name, path FROM modules ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            modules,
+            vec![
+                ("engines.billing".to_string(), "engines/billing".to_string()),
+                ("toolkit".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_label_names_every_stack_or_falls_back_to_the_project_type() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("Gemfile"), "").unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let label = project_label(dir.path());
+        assert!(label.contains("Ruby"), "{label}");
+        assert!(label.contains("Web"), "{label}");
+        assert!(label.contains(" + "), "{label}");
+
+        let empty = TempDir::new().unwrap();
+        assert_eq!(project_label(empty.path()), ProjectType::Unknown.as_str());
     }
 
     #[test]

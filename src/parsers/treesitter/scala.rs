@@ -5,7 +5,8 @@ use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{
-    line_text, node_line, node_text, parse_tree, walk_tree_preorder, LanguageParser, WalkControl,
+    node_line, node_text, parse_tree, signature_line, text_end_line, walk_tree_preorder,
+    LanguageParser, WalkControl,
 };
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
@@ -21,7 +22,21 @@ pub static SCALA_PARSER: ScalaParser = ScalaParser;
 
 pub struct ScalaParser;
 
+/// Comments and string and character literals; the interpolations of a string are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &SCALA_LANGUAGE,
+    prose: &["comment", "block_comment"],
+    strings: &["string", "interpolated_string", "character_literal"],
+    code: &["interpolation"],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for ScalaParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &SCALA_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -51,10 +66,13 @@ impl LanguageParser for ScalaParser {
         let idx_var_decl_name = idx("var_decl_name");
         let idx_type_name = idx("type_name");
         let idx_given_name = idx("given_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Class definition
             if let Some(name_cap) = find_capture(m, idx_class_name) {
                 let name = node_text(content, &name_cap.node);
@@ -70,8 +88,9 @@ impl LanguageParser for ScalaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -91,8 +110,9 @@ impl LanguageParser for ScalaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Object,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -112,8 +132,9 @@ impl LanguageParser for ScalaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Interface,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line,
                 });
                 continue;
             }
@@ -126,8 +147,9 @@ impl LanguageParser for ScalaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Enum,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -140,8 +162,9 @@ impl LanguageParser for ScalaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -154,8 +177,9 @@ impl LanguageParser for ScalaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -170,8 +194,9 @@ impl LanguageParser for ScalaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -186,8 +211,9 @@ impl LanguageParser for ScalaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -200,8 +226,9 @@ impl LanguageParser for ScalaParser {
                     name: name.to_string(),
                     kind: SymbolKind::TypeAlias,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -214,8 +241,9 @@ impl LanguageParser for ScalaParser {
                     name: name.to_string(),
                     kind: SymbolKind::Object,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }

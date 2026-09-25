@@ -11,7 +11,9 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{
+    line_text, node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser,
+};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -26,7 +28,21 @@ pub static ZIG_PARSER: ZigParser = ZigParser;
 
 pub struct ZigParser;
 
+/// Comments and string and character literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &ZIG_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string", "multiline_string", "character"],
+    code: &[],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for ZigParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &ZIG_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -46,10 +62,13 @@ impl LanguageParser for ZigParser {
         let idx_test_name = idx("test_name");
         let idx_test_ident = idx("test_ident");
         let idx_field_name = idx("field_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Function declaration
             if let Some(cap) = find_capture(m, idx_func_name) {
                 let name = node_text(content, &cap.node);
@@ -58,8 +77,9 @@ impl LanguageParser for ZigParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -78,6 +98,7 @@ impl LanguageParser for ZigParser {
                     line,
                     signature: sig_line.to_string(),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -91,8 +112,9 @@ impl LanguageParser for ZigParser {
                     name: format!("test {}", name),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -105,8 +127,9 @@ impl LanguageParser for ZigParser {
                     name: format!("test {}", name),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -119,8 +142,9 @@ impl LanguageParser for ZigParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }

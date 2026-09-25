@@ -1,0 +1,65 @@
+{
+  "graph": {
+    "built": true,
+    "stale": true,
+    "built_at": 1790180724015
+  },
+  "direction": "dependents",
+  "matched": [
+    {
+      "name": "ApplicationService",
+      "kind": "class",
+      "path": "app/services/application_service.rb",
+      "line": 1
+    }
+  ],
+  "resolved_edges": 3,
+  "ambiguous_edges": 0,
+  "include_ambiguous": false,
+  "members": false,
+  "schema_version": 2,
+  "items": [
+    {
+      "subject": {
+        "name": "ApplicationService",
+        "kind": "class",
+        "path": "app/services/application_service.rb",
+        "line": 1
+      },
+      "other": {
+        "name": "Billing::ChargeService",
+        "kind": "class",
+        "path": "app/services/billing/charge_service.rb",
+        "line": 2
+      },
+      "confidence": "scoped",
+      "candidates": 1,
+      "references": 1,
+      "line": 2
+    },
+    {
+      "subject": {
+        "name": "ApplicationService",
+        "kind": "class",
+        "path": "app/services/application_service.rb",
+        "line": 1
+      },
+      "other": {
+        "name": "Billing::DraftService",
+        "kind": "class",
+        "path": "app/services/billing/draft_service.rb",
+        "line": 2
+      },
+      "confidence": "scoped",
+      "candidates": 1,
+      "references": 1,
+      "line": 2
+    }
+  ],
+  "pagination": {
+    "total": 3,
+    "returned": 2,
+    "truncated": true,
+    "limit": 2
+  }
+}

@@ -13,7 +13,7 @@ use std::os::windows::process::CommandExt;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 
-const STDOUT_LIMIT: usize = 16 * 1024 * 1024;
+pub(crate) const STDOUT_LIMIT: usize = 16 * 1024 * 1024;
 const STDERR_LIMIT: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -25,7 +25,7 @@ pub enum Vcs {
 }
 
 impl Vcs {
-    fn command_name(self) -> &'static str {
+    pub(crate) fn command_name(self) -> &'static str {
         match self {
             Self::Arc => "arc",
             Self::Git => "git",
@@ -67,32 +67,32 @@ pub struct ChangedResult {
 }
 
 #[derive(Debug)]
-struct VcsRoot {
-    vcs: Vcs,
-    path: PathBuf,
+pub(crate) struct VcsRoot {
+    pub(crate) vcs: Vcs,
+    pub(crate) path: PathBuf,
 }
 
 #[derive(Debug)]
-struct Captured {
-    bytes: Vec<u8>,
-    truncated: bool,
+pub(crate) struct Captured {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
 }
 
 #[derive(Debug)]
-struct ProcessOutput {
-    status: ExitStatus,
-    stdout: Captured,
-    stderr: Captured,
+pub(crate) struct ProcessOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Captured,
+    pub(crate) stderr: Captured,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Deadline {
+pub(crate) struct Deadline {
     started: Instant,
     timeout: Duration,
 }
 
 impl Deadline {
-    fn new(timeout: Duration) -> Self {
+    pub(crate) fn new(timeout: Duration) -> Self {
         Self {
             started: Instant::now(),
             timeout,
@@ -256,7 +256,7 @@ pub(crate) fn detect_git_default_branch_compat(root: &Path) -> &'static str {
     "origin/main"
 }
 
-fn discover_vcs_root(invocation_cwd: &Path) -> Result<VcsRoot> {
+pub(crate) fn discover_vcs_root(invocation_cwd: &Path) -> Result<VcsRoot> {
     let home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -327,7 +327,7 @@ fn invocation_scope(invocation_cwd: &Path, vcs_root: &Path) -> Result<Option<Str
     Ok(Some(components.join("/")))
 }
 
-fn vcs_executable(vcs: Vcs) -> OsString {
+pub(crate) fn vcs_executable(vcs: Vcs) -> OsString {
     std::env::var_os("AST_INDEX_VCS_BIN")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| OsString::from(vcs.command_name()))
@@ -402,7 +402,7 @@ fn resolve_git_default_base(
     )
 }
 
-fn os_args(values: &[&str]) -> Vec<OsString> {
+pub(crate) fn os_args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
 
@@ -443,19 +443,38 @@ fn diff_args(vcs: Vcs, base: &str, scope: Option<&str>) -> Vec<OsString> {
     }
 }
 
-fn run_bounded(
+pub(crate) fn run_bounded(
     executable: &OsStr,
     args: &[OsString],
     current_dir: &Path,
     deadline: Deadline,
     verbose: bool,
 ) -> Result<ProcessOutput> {
+    run_bounded_capped(
+        executable,
+        args,
+        current_dir,
+        deadline,
+        verbose,
+        STDOUT_LIMIT,
+    )
+}
+
+/// [`run_bounded`] keeping at most `stdout_limit` bytes of stdout.
+pub(crate) fn run_bounded_capped(
+    executable: &OsStr,
+    args: &[OsString],
+    current_dir: &Path,
+    deadline: Deadline,
+    verbose: bool,
+    stdout_limit: usize,
+) -> Result<ProcessOutput> {
     if deadline.expired() {
         return Err(deadline.timeout_error());
     }
     if verbose {
         eprintln!(
-            "changed: cwd={:?} executable={:?} argv={:?}",
+            "vcs: cwd={:?} executable={:?} argv={:?}",
             current_dir, executable, args
         );
     }
@@ -477,7 +496,7 @@ fn run_bounded(
         .stderr
         .take()
         .ok_or_else(|| anyhow!("failed to capture VCS stderr"))?;
-    let stdout_reader = thread::spawn(move || read_capped(stdout, STDOUT_LIMIT));
+    let stdout_reader = thread::spawn(move || read_capped(stdout, stdout_limit));
     let stderr_reader = thread::spawn(move || read_capped(stderr, STDERR_LIMIT));
 
     let mut status = None;
@@ -810,7 +829,7 @@ fn join_reader(
         .with_context(|| format!("failed to read VCS {stream}"))
 }
 
-fn render_stderr(stderr: &Captured) -> String {
+pub(crate) fn render_stderr(stderr: &Captured) -> String {
     let mut rendered = String::from_utf8_lossy(&stderr.bytes).trim().to_string();
     if stderr.truncated {
         rendered.push_str(" [stderr truncated]");
@@ -978,7 +997,7 @@ fn validate_repo_path(path: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
-fn parse_utf8<'a>(bytes: &'a [u8], label: &str) -> Result<&'a str> {
+pub(crate) fn parse_utf8<'a>(bytes: &'a [u8], label: &str) -> Result<&'a str> {
     std::str::from_utf8(bytes).with_context(|| format!("{label} is not UTF-8"))
 }
 

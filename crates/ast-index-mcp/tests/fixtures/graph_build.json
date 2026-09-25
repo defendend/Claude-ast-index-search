@@ -1,0 +1,51 @@
+{
+  "nodes": 17,
+  "edges": 17,
+  "resolved_edges": 17,
+  "references_seen": 35,
+  "references_linked": 17,
+  "by_confidence": [
+    {
+      "confidence": "local",
+      "edges": 0,
+      "references": 0
+    },
+    {
+      "confidence": "scoped",
+      "edges": 17,
+      "references": 17
+    },
+    {
+      "confidence": "import",
+      "edges": 0,
+      "references": 0
+    },
+    {
+      "confidence": "unique",
+      "edges": 0,
+      "references": 0
+    },
+    {
+      "confidence": "ambiguous",
+      "edges": 0,
+      "references": 0
+    }
+  ],
+  "dropped": [
+    {
+      "reason": "external",
+      "references": 5
+    },
+    {
+      "reason": "declaration",
+      "references": 9
+    },
+    {
+      "reason": "namespace",
+      "references": 4
+    }
+  ],
+  "ambiguity_cap": 8,
+  "dependents_depth": 3,
+  "elapsed_ms": 0
+}

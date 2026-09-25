@@ -46,17 +46,13 @@ npx @ast-index/cli search MyClass
 winget install --id defendend.ast-index
 ```
 
-### Cargo (pending first crates.io release)
+### Cargo (crates.io)
 
-This channel becomes available with the first ast-index release on crates.io.
-After that rollout, install with a Rust toolchain:
+Builds from source; requires a Rust toolchain:
 
 ```bash
 cargo install ast-index --locked
 ```
-
-Before the first crates.io release, use one of the binary channels above or
-build from source.
 
 ### GitHub Releases
 
@@ -93,7 +89,9 @@ After a successful `rebuild` or `update`, `ast-index` removes caches for other
 projects only when they have not been touched for more than 14 days. Open
 commands and a running `watch` hold an external lease, so an active index is
 never selected by this cleanup. A removed cache is recreated by the next
-`ast-index rebuild` in that project.
+`ast-index rebuild` in that project. The same pass also deletes the lock files
+in the cache's `.leases` directory that belong to caches which no longer exist,
+whatever their age; a lock that another process holds is kept.
 
 ## Connect It To A Project
 
@@ -126,6 +124,20 @@ ast-index rebuild
 Use `include` when you only want selected directories from a larger tree. Use
 `exclude` for generated or vendored folders that should never enter the index.
 
+Minified JavaScript and CSS is left out without any configuration: it never
+enters the index, the grep-based commands (`search` file contents, `callers`,
+`call-tree`, `todo`, …) never read it, and `outline` / `imports` on such a file
+answer `Skipped: minified file` instead of parsing it. A `.js`, `.mjs`, `.cjs`
+or `.css` file counts as minified when its name ends in `.min` or `-min` before
+the extension (`app.min.js`, `vendor-min.css`), or when its first 64 KiB has
+lines of 1000 bytes or more on average, at least 100 of them outside string
+literals. Source with a few long lines — an inline SVG path, a data URI, an
+HTML or legal-text template in a string — stays below that. TypeScript, JSX,
+SCSS and `.d.ts` files are never judged. Set `AST_INDEX_SKIP_MINIFIED=0` to index
+and search minified files like any other source; the variable applies to
+whichever command runs with it, so keep it set for `update` and the grep-based
+commands too.
+
 ## Keeping The Index Fresh
 
 Use three commands for the index lifecycle:
@@ -141,17 +153,24 @@ indexes new or changed supported source files, and removes deleted files from
 the index. It honors `.gitignore`, built-in ignored directories, and
 `.ast-index.yaml` `include` / `exclude` settings.
 
-Change detection is timestamp-based. During `rebuild` and `update`,
+Change detection is metadata-based. During `rebuild` and `update`,
 `ast-index` stores each indexed file's relative path, filesystem modified time
 (`mtime`), and size in SQLite. On the next `update`, it walks the current source
-tree and compares each file's current `mtime` with the stored one:
+tree and compares each file's current `mtime` and size with the stored ones:
 
 - path is missing from the database: index it as a new file;
-- current `mtime` is newer than stored `mtime`: re-parse and replace that file's
-  symbols and references;
+- `mtime` or size differs from the stored value (newer or older): re-parse and
+  replace that file's symbols and references;
 - path exists in the database but is no longer found on disk: delete it from the
   index;
-- current `mtime` is the same or older: leave the existing index rows as-is.
+- `mtime` and size are both unchanged: leave the existing index rows as-is.
+
+A new or changed file that is minified is not indexed, and one that is already
+in the index is removed like a deleted file. An index written by an older
+version (or with `AST_INDEX_SKIP_MINIFIED=0`) may still hold minified files
+whose `mtime` has not moved; the first `update` after that also checks the
+unchanged `.js` / `.mjs` / `.cjs` / `.css` files once, so no `rebuild` is
+needed to clear them.
 
 `update` does not use `git diff` and does not hash file contents, so it also
 works after ordinary file edits, generated file changes, branch checkouts, and
@@ -187,6 +206,20 @@ If `ast-index watch` is already running, file-system events usually keep the
 index fresh automatically. A manual `update` is still a good habit after a large
 checkout, rebase, or branch switch because it reconciles the full file list with
 the database.
+
+Collected Git history (`hotspots --collect`) is not refreshed by `update`. Run
+`ast-index hotspots --collect` again after switching: it subtracts the commits
+the new `HEAD` no longer reaches and adds the new ones, reusing diffs it has
+read before, so a branch switch or a rebase costs about a second instead of a
+full rescan, and the numbers match a fresh `hotspots --collect --full`. Line
+counts come from the working tree, so an uncommitted edit to a file counts
+once a later `--collect` recomputes that file or on `--full`.
+
+`rebuild` keeps the collected history: it depends on the repository, not on
+the index, so the next `hotspots --collect` stays incremental. Only history
+collected by an older version, from another working tree or for another
+directory of the repository is left behind; the rebuild says so and the next
+`--collect` reads the history again.
 
 Use `rebuild` instead of `update` when:
 
@@ -354,22 +387,26 @@ slice via offset/limit. Never bulk-read large files.
 
 - **Search:** `search`, `file`, `symbol`, `class` — find files and symbols by name
 - **Usages:** `usages`, `callers`, `call-tree`, `refs` — find where symbols are used
+- **Graph:** `graph dependents|dependencies|impact|path|cycles|top|metrics` — symbol dependency graph (`graph build` first)
 - **Hierarchy:** `implementations`, `hierarchy`, `extensions` — class hierarchy
 - **Modules:** `module`, `deps`, `dependents`, `api` — module dependencies
 - **Files:** `outline`, `imports`, `changed` — file analysis
-- **iOS:** `storyboard-usages`, `asset-usages`, `asset-unused` — storyboard/asset search
-- **Quality:** `todo`, `deprecated` — find TODOs and deprecated items
+- **iOS:** `storyboard-usages`, `asset-usages` (`--unused` for unused assets) — storyboard/asset search
+- **Quality:** `todo`, `deprecated`, `hotspots` — TODOs, deprecated items, Git-history risk
 - **Index:** `rebuild`, `update`, `watch`, `stats` — index management
 
 ## Common Use Cases
 
 - `ast-index usages "PaymentViewController"` — where is this class used?
 - `ast-index implementations "PaymentProcessing"` — what implements this protocol?
-- `ast-index callers "processPayment"` — what calls this function?
+- `ast-index callers "processPayment"` — where is this function called?
 - `ast-index call-tree "processPayment" -d 3` — call hierarchy
 - `ast-index deps "PaymentFeature"` — module dependencies
 - `ast-index dependents "NetworkKit"` — what depends on this module?
 - `ast-index changed` — what changed in my branch?
+- `ast-index hotspots --collect` — which files churn most and attract the most bugfixes?
+- `ast-index search Service --rank proven` — which of these is safe to copy? (also `risky`, `hotspots`, `central`)
+- `ast-index graph impact "PaymentGateway" --depth 3` — what breaks if I change this, transitively?
 - `ast-index todo` — find all TODOs
 ````
 
@@ -417,6 +454,7 @@ permissions to your own policy.
 
 ```bash
 ast-index search "Payment"              # broad search across files and symbols
+ast-index search "Payment" --rank risky # re-rank by history + graph (proven|hotspots|risky|central)
 ast-index file "PaymentView"            # find files by name
 ast-index symbol "PaymentRepository"    # find a symbol
 ast-index class "BaseController"        # find class-like definitions
@@ -428,9 +466,30 @@ ast-index hierarchy "BaseController"    # inheritance tree
 ast-index outline src/main.rs           # file structure
 ast-index imports src/main.rs           # imports/includes
 ast-index changed                       # files changed on the current branch
+ast-index hotspots --collect            # rank files by Git history (churn, fixes, authors)
+ast-index graph build                   # precompute the symbol dependency graph
+ast-index graph dependents "Invoice"    # who depends on it, with resolution confidence
+ast-index graph impact "Invoice" -d 3   # transitive dependents per depth
+ast-index graph path "OrdersController" "Invoice"  # how one reaches the other
+ast-index graph top --kind class        # most central symbols (PageRank)
 ast-index map                           # compact project map
 ast-index conventions                   # detected frameworks and patterns
 ```
+
+`symbol`, `class`, `refs`, `hierarchy` and `implementations` find a class
+under a namespace by its short name or its full name: `LedgerImporter` and
+`Billing::LedgerImporter` both find `class Billing::LedgerImporter`. A short
+name looks for that exact name first and only then for names whose last `::`
+or `.` segment it is, so a top-level `LedgerImporter` wins over namespaced
+ones. References are recorded under the last segment, so `usages
+Billing::LedgerImporter` lists the references to `LedgerImporter` on lines that
+spell out `Billing::LedgerImporter` (and says so); `usages LedgerImporter`
+lists all of them. `unused-symbols` looks references up the same way.
+
+`usages` and the usages section of `refs` list references in production files
+first and in test files (**Test files** under ranking below) after them, each
+group by path and line, so a page shows the code that uses a name before its
+specs. In JSON a reference in a test file carries `"test": true`.
 
 Use JSON for scripts or agents:
 
@@ -443,7 +502,13 @@ Paginated search commands use JSON schema v2. Single-result-set commands return
 `refs` keep named arrays with per-array pagination metadata. Clients written
 for bare arrays must unwrap `items`, and every client should check `truncated`
 before treating results as complete. Increase `--limit` to request more rows.
-The `changed` command remains on its independent schema v1.
+The `changed` command remains on its independent schema v1. `outline --format
+json` reads one file and has no limit, so it uses its own schema v1 as well:
+`{ schema_version, file, symbols: [{ name, kind, line, end_line }] }`, plus
+`skipped` (`not_found`, `minified` or `unsupported`) when it parsed nothing.
+A schema table carries `columns` (the folded count) unless `--full` is given.
+`end_line` is `null` where the parser reports no range; the text form prints
+a multi-line definition as `:line-end_line`.
 
 ## Advanced
 
@@ -458,6 +523,335 @@ ast-index query "
   ORDER BY f.path, s.line
 "
 ```
+
+`call-tree` finds callers by text search at query time and prints every
+caller with its file, same-named definitions of other files included (two
+`it "works"` blocks are two callers). Callers are looked up by name, so each
+name is expanded once: a later caller of that name is marked
+`(expanded above)`, and `(recursive)` marks only a definition already on its
+own path — a real cycle. A call belongs to the definition around it, never to
+an import or annotation line (`use`, `import`, `include Mod`, a Rails
+callback, a multi-line RSpec `include(...)` matcher), and a line that
+declares the function itself (a Go method `func (s *Server) Handle(`, a
+JavaScript method `handle(event) {`, `let(:handle)`) is not a call of it.
+`callers` and `call-tree` count a Ruby symbol naming the method as a call
+(`before_save :handle`, `delegate :handle`, `map(&:handle)`), but not
+`:handle?` / `:handle!` / `:handle=` (other methods) and not a `::handle`
+path (`use super::handle;`, `Billing::Handle`) that nothing calls.
+
+Build the symbol dependency graph when you need to know who really depends on
+a definition, how central it is, or what a change would reach transitively:
+
+```bash
+ast-index graph build                         # explicit; rebuild/update never run it
+ast-index graph dependents "Invoice"          # incoming edges with confidence
+ast-index graph dependencies "OrdersController" --members
+ast-index graph impact "Invoice" --depth 3    # blast radius per depth (symbols, files)
+ast-index graph path "OrdersController" "Invoice"
+ast-index graph cycles
+ast-index graph top --sort pagerank --kind class
+```
+
+Each edge records how its target was resolved: `local`, `scoped` (namespace,
+receiver type or inheritance), `import`, `unique`, or `ambiguous` with the
+number of candidates. Installed packages (files under `node_modules`) are
+never part of the graph; everything else in the index is project code,
+including a `vendor/` directory and the project's own `.d.ts` files — keep
+vendored third-party code out with `exclude` in `.ast-index.yaml`. Code
+outside tests never resolves to a definition inside them (a spec helper that
+reopens a class to stub a method is not what production code calls; see
+**Test files** below for what counts as a test). Metrics count resolved edges only;
+`--include-ambiguous` lists the rest. After `update` changes the index the graph reports itself as
+stale until `graph build` (or a query with `--refresh`) runs again.
+
+Rust paths resolve the way the compiler reads them: a file is a module
+(`src/db.rs` is `db`, `src/commands/mod.rs` is `commands`, `src/lib.rs` and
+`src/main.rs` the crate root), `crate::`, `super::` and `self::` walk that
+tree, and `use` declarations — grouped, aliased, globbed, re-exported with
+`pub use` — bind the names a file uses. Another crate of the workspace is
+reached by its library name from `Cargo.toml` (`my_crate::db::open_db` in
+`tests/`). A path that leaves the project (`std::`, a dependency, or a name a
+`use` binds to one) never resolves to a project definition of the same name.
+
+References are capitalized names and calls written `name(` — snake_case and
+`_private` names included (`update_profile(user)`, `self._compute()`). Reserved
+words of C/C++, Go, Python, Rust, Perl and JavaScript never count: `sizeof (x)`,
+`#if defined(X)`, Go's `func (r *T)`, Rust's `pub(crate)`, Python's
+`except (A, B):` and `None`. A reserved word used as a member
+(`map.delete(key)`) or called as a Perl `&name(...)` is still a reference.
+
+A name inside a comment, a docstring or a string literal is not a reference:
+the syntax tree tells prose from code for Ruby, Python, JavaScript/TypeScript,
+C/C++ (macro bodies included), Objective-C, Go, Rust, Java, Kotlin, C#, PHP,
+Swift, Scala, Dart, Lua, Groovy, Elixir, Bash, R, Zig and Protocol Buffers.
+Code nested in a string still counts — `#{...}`, `${...}`, f-string `{...}`,
+Swift `\(...)`, the identifiers a Rust format string captures
+(`format!("{LIMIT}")`) — and so do strings that name code: a Ruby string or
+`%w[]` word that is exactly a constant path (`class_name: 'Invoice'`,
+`'Event::Stage'`), a quoted constant path inside a Ruby string or heredoc
+(`WHERE type = 'Event::Stage'`), a Python string that is a dotted name ending
+in a class name (`"User"`, `"pkg.models.User"` in an annotation or
+`mock.patch`), the path of a JavaScript `import('./Page')` / `require()`, and a
+Groovy GString with `${...}` in it. Perl, Vue/Svelte script blocks, SQL and
+the other grammars keep the line-based comment skipping only.
+
+In C, C++ and Objective-C a function declaration outside a function body —
+a header prototype (`int send_alert(SSL *s);`, also behind `__owur` or
+similar attribute macros), a `static` forward declaration, a method declared
+in a class, a function-pointer field or typedef — declares its name and is not
+a use of it; the parameter types on that line still are.
+
+BSL (1C:Enterprise, OneScript) references are calls in Cyrillic or Latin
+(`ПолучитьДанные()`), a module or object before `.` (`ОбщегоНазначения.`) and
+the type after `Новый` / `New`; a plain capitalized word is a variable, and
+keywords are skipped in any letter case (`НЕ`, `Не`). Stylesheets (CSS, SCSS,
+Less) record no references.
+
+Ruby references include calls without parentheses (`recv.name`, `name arg`,
+a bare `name` that is not a local variable), so the graph also links a method
+to the instance methods and attribute readers it calls on `self`, and an RSpec
+example to the `let` helpers it uses. Calls on a receiver of unknown type stay
+`ambiguous`, and core Ruby collection/string methods called without
+parentheses are not recorded at all. A lowercase `name(` counts only where the
+syntax tree has a call: in a comment, a string or a heredoc it does not.
+
+A symbol that names a method is a reference to it: a callback or custom
+validator (`before_save :normalize`, `before_action :authorize`, `validate
+:check_total`, and the other Active Record, Action Controller and Active Job
+callbacks), an attribute a validation reads (`validates :email`,
+`validates_presence_of :email` — inside a model that resolves to the column),
+a condition (`if: :paid?`, `unless: [:draft?, :locked?]`), `rescue_from ...
+with: :handler`, `helper_method :current_user`, the original of `alias_method`,
+and what `delegate :name, to: :owner` forwards and where. The class links to
+those methods, so `graph dependents normalize` shows the model that registers
+the callback. `map(&:total)` and the forwarded `name` are calls on another
+object and resolve like `value.total`; other symbols (`on: :create`, `status:
+:active`) are data.
+
+In a Rails application `db/schema.rb` is indexed even when it is gitignored:
+each `create_table` becomes a `table` symbol and each column a `column` symbol
+named `table.column` (`ast-index search email -t column` lists the columns
+named `email` before `email_confirmed` and the like). The lines of the
+`ActiveRecord::Schema.define` block are not references: `t.string` and
+`t.integer` name column types, not the project's `string` or `integer`
+methods. `outline db/schema.rb` prints each table with its line range and
+column count (`:96-149 orders [table] 33 columns`) instead of thousands of
+column rows; `outline --full` lists every column, and `ast-index symbol --type
+column --pattern 'orders.*'` lists one table's. `graph build`
+matches tables to models by Active Record's rules — `self.table_name`,
+single-table inheritance, a model nested in another model, a namespace's
+`table_name_prefix` or engine `isolate_namespace`, then the pluralized class
+name — and prints what it could not match (`--format json` lists the tables
+without a model, the models without a table, and models for which both a
+plain and a namespaced table exist). Inside a model, a column reader or
+attribute method (`email`, `self.email`, `email?`, `email_changed?`,
+`saved_change_to_email?`) that no method in the class chain defines resolves
+as a `scoped` edge to the column; a call on any other receiver
+(`user.email`) is never guessed:
+
+```bash
+ast-index graph dependents users.email       # or users#email
+```
+
+Most reads of a column therefore are no edges of it, and a query about a
+column says so (`notes` in JSON); `ast-index usages email` lists every read.
+A bare name that matches several definitions — `call`, or `Applicant` as a
+model, TypeScript types and spec stubs — merges their edges; `dependents`,
+`dependencies` and `impact` say how many definitions matched, list at most
+`--limit` of them and suggest `Outer::Name`, `Class#member`, `--in-file` or
+`--kind` to narrow the query.
+
+### Ranking search results by history and structure
+
+`search --rank <preset>` re-orders the **Files** and **Symbols** sections of a
+search by what the index knows beyond the name: the Git history of the file
+(`hotspots --collect`) and the symbol's place in the dependency graph
+(`graph build`). References and content matches keep their plain order.
+
+```bash
+ast-index hotspots --collect && ast-index graph build     # once; both are explicit
+ast-index search Service --fuzzy --module app/services/ --rank proven   # what to copy
+ast-index search Merge --rank risky                       # what is dangerous to touch
+ast-index search Import --module app/services/ --rank hotspots          # where it keeps breaking
+ast-index search Event --module app/models/ --rank central
+ast-index search Import --rank hotspots --exclude-tests   # without spec/test files
+ast-index --format json search Merge --rank risky         # dossier per result
+```
+
+| Preset | Question | Needs |
+|--------|----------|-------|
+| `proven` | Which of these is a settled, used example worth copying? | history + graph |
+| `hotspots` | Which of these keeps being changed and fixed? | history |
+| `risky` | Which of these is dangerous to touch? | history + graph |
+| `central` | Which of these does the rest of the code lean on? | graph |
+
+**Formulas.** Every input is a 0..1 value; history percentiles are against all
+live files of the repository, graph percentiles against all symbols with at
+least one resolved caller.
+
+- `hotspots` = the file's hotspot score: mean percentile of commits, churn and
+  bugfix ratio — the number `ast-index hotspots` prints rounded (`score`) and
+  in full (`score_exact` in JSON). Presets use the unrounded percentiles, so
+  files that share a rounded score near the top still order meaningfully.
+- `proven` = mean(*calm*, *mature*, *used*) × *substance* × *lineage*:
+  - *calm* = 1 − hotspot score;
+  - *mature* = file age / 180 days, at most 1 — half a year of history counts
+    in full, and seven years count no more than that;
+  - *used* = 1 when at least one resolved reference points at the symbol,
+    else 0;
+  - *substance* = 0.5 for a stub — a file under 10 lines or a class with an
+    empty body (`class Billing::UpdateService < Billing::CreateService; end`) —
+    else 1;
+  - *lineage* = 0.5 + 0.5 × the vitality of the weakest base the class is or
+    descends from (superclasses as the graph resolved them, up to 4 hops).
+    A base's vitality is the share of its subclasses added in the last two
+    years, relative to the share of all files added in those two years, at
+    most 1; only bases with 5+ resolved subclasses count, and without one the
+    factor is 1. A base nobody has extended for years (a `Legacy::` service
+    base, a framework class the code moved away from) halves the score of
+    everything built on it.
+  How long a file has been left alone is shown but not scored: an abandoned
+  file is not a proven one.
+- `risky` = *blast radius* × hotspot score, where blast radius is the
+  percentile of the symbol's transitive dependents (≤ 3 hops, resolved edges),
+  0 when nothing depends on it. Both have to be high.
+- `central` = PageRank percentile, 0 when nothing resolves to the symbol.
+
+**Why these formulas.** They were chosen by backtesting on a 40k-file
+Ruby/TypeScript monorepo with 25k commits: file signals were computed from the
+history up to a cut-off T, and the outcome was bugfix commits to the same file
+in the 12 months after T, for T = 12, 24 and 36 months before HEAD.
+
+- The hotspot score's top 10% of files received a bugfix 4.2×, 2.2× and 5.1× as
+  often as the average file. Bugfix ratio on its own managed only 1.5×, 0.9×
+  and 1.6×: it is part of the score, but activity is what predicts.
+- `proven` answers "what to copy", and a formula tuned to next-year bugfixes
+  alone rewards what nobody touches: the first version (mean of calm, age
+  percentile, idle percentile and used) put stubs and code on abandoned bases
+  on top, because untouched files are not fixed. Re-run on the same protocol
+  with today's graph, among files something depends on, its top decile was
+  fixed 0.17×, 0.05× and 0.24× as often as the average such file — and 22–26%
+  of that decile were files under 10 lines, 35–43% sat on a dying lineage,
+  median age 3.5–5.3 years. The current formula's top decile is fixed 0.13×,
+  0.40× and 0.16× as often as average, with no stubs, no dying lineage and a
+  median age of 1–3 years. On 11 "which one do I copy" queries (update, create
+  and destroy services, show and list serializers, workers, consumers,
+  contracts, policies), judged by hand for a substantial class on a base the
+  team still uses, the top five held 24 of 55 such results before and 39 of 55
+  after; the rest are queries whose relevance tiers fill the pool with
+  methods, constants or spec blocks, which a preset cannot reorder away. The
+  first backtest found that the author count makes a top decile more
+  fix-prone (authors track activity), and weighting usage by caller count
+  instead of 1/0 picked no better examples here (38 of 55), so neither is
+  scored.
+- `risky` was measured as impact-weighted damage — P(bugfix next year) ×
+  log2(1 + dependents) — collected by the top decile: 7.4×, 6.9× and 8.0×
+  random, against 6.3×/5.8×/6.7× for centrality alone, 5.1×/4.0×/6.4× for the
+  hotspot score alone, and 7.0×/6.3×/7.5× for the same product with dependents
+  ranked against all graph nodes.
+- `central`: PageRank, fan-in and dependents rank-correlate at 0.98+ among
+  graph nodes, so the choice matters only at the top; PageRank is what
+  `graph top` sorts by. 69% of graph nodes have no resolved caller, so against
+  all nodes any caller at all lands above the 69th percentile; ranking against
+  referenced symbols spreads the scale over the range that varies.
+
+**Relevance is kept, not replaced.**
+
+1. The pool is the top 100 project symbols of the plain relevance order (or
+   `--limit` + 1 if larger) and up to 2000 project files matching the path.
+2. Symbol tiers are hard: exact name (case-sensitive), exact name ignoring
+   case, last `::` or `.` segment of the name equal to the query
+   (case-sensitive, not with `--fuzzy`; `Billing::LedgerImporter` for
+   `LedgerImporter`, the schema column `users.email` or the singleton method
+   `self.email` for `email`), a word of
+   the name starting with the query (a substring with `--fuzzy`, where case is
+   not told apart), signature-only match. The plain order uses the same tiers.
+   A preset only re-orders inside a tier, so an exact match is never pushed
+   below a partial one. Imports never take the last-segment tier (`use
+   anyhow::Result` is indexed as `anyhow::Result`), and inside every tier
+   definitions come before imports, whatever their scores: a class imported
+   in eleven files is listed before those eleven imports. In the partial
+   tiers (a word of the name, the signature) test symbols come after the
+   other definitions: a symbol in a test file (**Test files** below) or one
+   named `test_*` or `Test` + an uppercase letter (Rust unit tests live in
+   `src/`). An exact name keeps its place even in a test.
+3. Inside a tier the sort key is `0.9 × score + 0.1 × relevance`, where
+   relevance is `1 / (1 + position / 20)` and position is the candidate's place
+   in the tier's plain order. The weight was swept over 11 queries: 0.9
+   realizes 93% of the score the tiers allow in the top five while reaching
+   about 21 positions deep on average; 0.8 kept 73%, 1.0 reached 33 deep.
+4. Files all contain the query in their path and come back alphabetically, so
+   where the match sits — file stem, file name, directory — is their relevance
+   term (`1 / (1 + tier)`), with the same 0.9 weight.
+
+**Granularity.** History is per *file*: every symbol in a file shares its
+file's history, and the output says "file history". Graph metrics are per
+*symbol*; a file result borrows them from its strongest symbol (highest
+PageRank), named in the output.
+
+**Missing evidence.** A preset whose data is missing is not applied: results
+stay in plain relevance order, the text output says what is missing and which
+command collects it, and JSON reports `rank.applied: false` with
+`rank.missing: [{signal, reason, command}]`. A stale graph (the index changed
+since `graph build`) still ranks, with a warning and `rank.graph.stale: true`.
+
+**Unscored results.** Third-party code (`node_modules`, `.d.ts`) has no
+history in the repository and no graph edges (`graph build` never targets
+installed packages), so presets never score it and list it after every project
+result. Project files without collected history (untracked, or newer than the
+last `hotspots --collect`) and files of attached subtrees (history covers the
+primary root only) keep their relevance order after the scored results of
+their tier, marked `unscored`.
+
+**Test files.** Specs churn and get fixed by nature, so they crowd the top of
+`hotspots` and `risky`. `--exclude-tests` leaves them out of the ranked files
+and symbols sections and their totals. Percentiles are still computed against
+every file, so a file's score does not change with the flag; `hotspots
+--exclude-tests` works the same way.
+
+One test-path rule serves `search --rank`, `hotspots`, `graph top`, `graph
+dependents` and `graph impact` with `--exclude-tests` (`impact` does not follow
+test dependents either), the graph (code outside tests never resolves into
+them), `explore` (test files rank below source), the plain `search` order (test
+symbols follow the other partial matches) and `usages` (test files after
+production code). A file is a test when its name
+follows a test convention — `*_test.*`, `*_spec.*`, `*.test.*`, `*.spec.*`,
+`test_*.py`, `conftest.py`, and `FooTest` / `FooTests` / `FooSpec` in Java,
+Kotlin, Scala, Groovy, Swift, Objective-C, C#, PHP and C++ — or when it sits in
+a `spec/`, `test/`, `tests/` or `__tests__/` directory. Two exceptions keep
+production code in: in JavaScript / TypeScript those directory names count in
+lowercase only (`components/Test/` is a component), and a Ruby file under
+`app/` or `lib/` is namespaced code (`app/jobs/tests/` is
+`module Tests`), as is a Ruby file in a `tests/` directory, which no Ruby test
+framework uses. `latest.rb`, `contest.py` and `Testimonial.kt` are not tests.
+
+**Output.** Each file and symbol carries its dossier: the preset score and its
+terms, the relevance position and tier, the raw history numbers with their
+percentiles and labels (`churn:high`, `fixes:elevated`, `authors:many`,
+`veteran`, …) and the graph numbers with theirs (`fan-in:high`,
+`dependents:high`, `pagerank:high`, `callers:unresolved` when only ambiguous
+references point at it). `proven` adds why a result counts as a stub and its
+weakest lineage (`rank.proven.stub`, `rank.proven.lineage {base, subclasses,
+recent, vitality}` in JSON); its factors carry `"factor": true` among the
+components. In JSON, `files` become objects `{path, rank}` and
+symbols gain a `rank` object; the top-level `rank` object carries the preset,
+formula, evidence summary, pool sizes and weight.
+
+`rewritten-often` (churn relative to the file's current size, top 10%) is only
+computed for files of 10 lines or more. Below that a line count stops measuring
+content: a one-line minified bundle or fixture, or a view gutted to a mount
+point, would read as "3000x file", and a routine one-line edit already moves a
+three-line file by a third. Such files keep their absolute churn labels.
+
+**Known limits.** When a query's exact-name tier fills the page (`search
+Policy` in a code base full of `POLICY` constants), a preset can only re-order
+that tier; the files section usually answers better. Safe by the numbers is not
+the same as a good example: `proven` knows that code is settled, used, more
+than a stub and built on a base the code base keeps extending, but not which of
+two living styles a team prefers today (two serializer bases can both still
+gain subclasses), and a base whose subclasses the graph cannot resolve
+(generic parameters, ambiguous names) is not judged at all. History is per
+file, so for a small method it describes the class around it.
 
 Use structural search through ast-grep when `sg` is installed:
 

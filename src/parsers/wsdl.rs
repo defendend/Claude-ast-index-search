@@ -162,6 +162,7 @@ pub fn parse_wsdl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line: line_num,
                     signature: line.trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
@@ -181,6 +182,7 @@ pub fn parse_wsdl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line: line_num,
                     signature: line.trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
@@ -195,6 +197,7 @@ pub fn parse_wsdl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line: line_num,
                     signature: line.trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
@@ -209,6 +212,7 @@ pub fn parse_wsdl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line: line_num,
                     signature: line.trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
@@ -223,6 +227,7 @@ pub fn parse_wsdl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line: line_num,
                     signature: line.trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
@@ -237,6 +242,7 @@ pub fn parse_wsdl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
                     line: line_num,
                     signature: line.trim().to_string(),
                     parents: vec![],
+                    end_line: None,
                 });
             }
         }
@@ -257,6 +263,7 @@ pub fn parse_wsdl_symbols(content: &str) -> Result<Vec<ParsedSymbol>> {
             line: 1,
             signature: format!("targetNamespace=\"{}\"", namespace),
             parents: vec![],
+            end_line: None,
         });
     }
 

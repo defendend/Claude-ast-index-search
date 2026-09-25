@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -19,7 +19,32 @@ pub static GROOVY_PARSER: GroovyParser = GroovyParser;
 
 pub struct GroovyParser;
 
+/// Comments and string and character literals.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &GROOVY_LANGUAGE,
+    prose: &["line_comment", "block_comment"],
+    strings: &["string_literal", "character_literal"],
+    code: &[],
+    keep: gstring,
+    declared: super::declares_nothing,
+};
+
+/// A double-quoted string with `$` in it, kept whole: the grammar reads a
+/// GString's `${expr}` as plain text, and the expression is code.
+fn gstring(content: &str, string: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    let text = node_text(content, &string);
+    if text.starts_with('"') && text.contains('$') {
+        vec![string.byte_range()]
+    } else {
+        Vec::new()
+    }
+}
+
 impl LanguageParser for GroovyParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &GROOVY_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -42,10 +67,13 @@ impl LanguageParser for GroovyParser {
         let idx_method_name = idx("method_name");
         let idx_constructor_name = idx("constructor_name");
         let idx_field_name = idx("field_name");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Package
             if let Some(cap) = find_capture(m, idx_package_name) {
                 let name = node_text(content, &cap.node);
@@ -54,8 +82,9 @@ impl LanguageParser for GroovyParser {
                     name: name.to_string(),
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -70,8 +99,9 @@ impl LanguageParser for GroovyParser {
                     name: name.to_string(),
                     kind: SymbolKind::Import,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![(full_path.to_string(), "from".to_string())],
+                    end_line,
                 });
                 continue;
             }
@@ -84,8 +114,9 @@ impl LanguageParser for GroovyParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -98,8 +129,9 @@ impl LanguageParser for GroovyParser {
                     name: name.to_string(),
                     kind: SymbolKind::Interface,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -112,8 +144,9 @@ impl LanguageParser for GroovyParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -126,8 +159,9 @@ impl LanguageParser for GroovyParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -140,8 +174,9 @@ impl LanguageParser for GroovyParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -154,8 +189,9 @@ impl LanguageParser for GroovyParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }

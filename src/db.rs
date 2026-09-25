@@ -961,14 +961,14 @@ fn is_cache_owner_intent_name(name: &str, cache_key: &str) -> bool {
     cache_owner_intent_key(name) == Some(cache_key)
 }
 
-fn read_cache_owner_intents(
-    cache_base: &Path,
-    cache_dir: &Path,
-    only_cache_key: Option<&str>,
-) -> Result<Vec<(PathBuf, String, CacheOwnerManifest)>> {
-    let Some(generation) = read_cache_generation(cache_dir)? else {
-        return Ok(Vec::new());
-    };
+fn cache_owner_intent_path_key(path: &Path) -> Option<&str> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(cache_owner_intent_key)
+}
+
+/// Every owner-intent file under `.leases`, in path order.
+fn list_cache_owner_intent_paths(cache_base: &Path) -> Result<Vec<PathBuf>> {
     let intent_dir = leases_dir(cache_base);
     ensure_real_cache_directory(&intent_dir)?;
     let entries = std::fs::read_dir(&intent_dir)?.collect::<std::io::Result<Vec<_>>>()?;
@@ -979,21 +979,25 @@ fn read_cache_owner_intents(
                 .file_name()
                 .to_str()
                 .and_then(cache_owner_intent_key)
-                .map(|cache_key| only_cache_key.map_or(true, |only| only == cache_key))
-                .unwrap_or(false)
+                .is_some()
         })
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
     paths.sort();
+    Ok(paths)
+}
 
-    let mut intents = Vec::with_capacity(paths.len());
+/// Read and validate the listed intents, keeping those recorded against
+/// `generation`. Any unreadable or inconsistent listed intent is an error.
+fn read_generation_owner_intents<'a>(
+    generation: &str,
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+) -> Result<Vec<(PathBuf, String, CacheOwnerManifest)>> {
+    let mut intents = Vec::new();
     for path in paths {
-        let intent: CacheOwnerIntent = read_bounded_json_file(&path)?
+        let intent: CacheOwnerIntent = read_bounded_json_file(path)?
             .with_context(|| format!("cache owner intent disappeared: {}", path.display()))?;
-        let filename_key = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(cache_owner_intent_key)
+        let filename_key = cache_owner_intent_path_key(path)
             .context("cache owner intent filename changed while reading")?;
         anyhow::ensure!(
             intent.version == CACHE_OWNER_INTENT_VERSION
@@ -1003,10 +1007,27 @@ fn read_cache_owner_intents(
             path.display()
         );
         if intent.generation == generation {
-            intents.push((path, intent.cache_key, intent.owner));
+            intents.push((path.clone(), intent.cache_key, intent.owner));
         }
     }
     Ok(intents)
+}
+
+fn read_cache_owner_intents(
+    cache_base: &Path,
+    cache_dir: &Path,
+    only_cache_key: Option<&str>,
+) -> Result<Vec<(PathBuf, String, CacheOwnerManifest)>> {
+    let Some(generation) = read_cache_generation(cache_dir)? else {
+        return Ok(Vec::new());
+    };
+    let paths = list_cache_owner_intent_paths(cache_base)?;
+    read_generation_owner_intents(
+        &generation,
+        paths.iter().filter(|path| {
+            only_cache_key.map_or(true, |only| cache_owner_intent_path_key(path) == Some(only))
+        }),
+    )
 }
 
 fn cache_owner_intents(
@@ -1014,12 +1035,76 @@ fn cache_owner_intents(
     cache_dir: &Path,
     cache_key: &str,
 ) -> Result<Vec<(PathBuf, CacheOwnerManifest)>> {
-    read_cache_owner_intents(cache_base, cache_dir, Some(cache_key)).map(|intents| {
-        intents
-            .into_iter()
-            .map(|(path, _cache_key, owner)| (path, owner))
-            .collect()
-    })
+    read_cache_owner_intents(cache_base, cache_dir, Some(cache_key)).map(without_intent_keys)
+}
+
+fn without_intent_keys(
+    intents: Vec<(PathBuf, String, CacheOwnerManifest)>,
+) -> Vec<(PathBuf, CacheOwnerManifest)> {
+    intents
+        .into_iter()
+        .map(|(path, _cache_key, owner)| (path, owner))
+        .collect()
+}
+
+/// Owner intents of many caches under one base, with `.leases` listed at most
+/// once instead of once per cache.
+///
+/// Reusing the listing is sound only while the caller holds the base's
+/// cache-layout lock and creates or removes no intents itself. Intents are
+/// only created under that lock, so none can appear unseen. The one removal
+/// that bypasses it (the legacy migration sweeping its source base) makes a
+/// listed read fail closed, as it already could between a per-cache listing
+/// and its reads. Generation markers, manifests, and intent contents are
+/// still read on every lookup. A failed listing is not cached, so each lookup
+/// retries it exactly as a per-cache read would.
+struct CacheOwnerIntentListing<'a> {
+    cache_base: &'a Path,
+    by_key: Option<HashMap<String, Vec<PathBuf>>>,
+}
+
+impl<'a> CacheOwnerIntentListing<'a> {
+    fn new(cache_base: &'a Path) -> Self {
+        Self {
+            cache_base,
+            by_key: None,
+        }
+    }
+
+    /// Same result as `cache_owner_intents` for this base.
+    fn intents(
+        &mut self,
+        cache_dir: &Path,
+        cache_key: &str,
+    ) -> Result<Vec<(PathBuf, CacheOwnerManifest)>> {
+        let Some(generation) = read_cache_generation(cache_dir)? else {
+            return Ok(Vec::new());
+        };
+        if self.by_key.is_none() {
+            let mut by_key: HashMap<String, Vec<PathBuf>> = HashMap::new();
+            for path in list_cache_owner_intent_paths(self.cache_base)? {
+                if let Some(key) = cache_owner_intent_path_key(&path) {
+                    by_key.entry(key.to_owned()).or_default().push(path);
+                }
+            }
+            self.by_key = Some(by_key);
+        }
+        let paths = self
+            .by_key
+            .as_ref()
+            .and_then(|by_key| by_key.get(cache_key));
+        read_generation_owner_intents(&generation, paths.into_iter().flatten())
+            .map(without_intent_keys)
+    }
+
+    /// Same result as `effective_cache_owner` for this base.
+    fn effective_owner(
+        &mut self,
+        cache_dir: &Path,
+        cache_key: &str,
+    ) -> Result<Option<CacheOwnerManifest>> {
+        effective_cache_owner_from(cache_dir, cache_key, || self.intents(cache_dir, cache_key))
+    }
 }
 
 fn effective_cache_owner(
@@ -1027,8 +1112,18 @@ fn effective_cache_owner(
     cache_dir: &Path,
     cache_key: &str,
 ) -> Result<Option<CacheOwnerManifest>> {
+    effective_cache_owner_from(cache_dir, cache_key, || {
+        cache_owner_intents(cache_base, cache_dir, cache_key)
+    })
+}
+
+fn effective_cache_owner_from(
+    cache_dir: &Path,
+    cache_key: &str,
+    intents: impl FnOnce() -> Result<Vec<(PathBuf, CacheOwnerManifest)>>,
+) -> Result<Option<CacheOwnerManifest>> {
     let final_owner = read_cache_owner_manifest(cache_dir)?;
-    let intents = cache_owner_intents(cache_base, cache_dir, cache_key)?;
+    let intents = intents()?;
     let mut effective = match final_owner {
         Some(owner) if owner.is_self_consistent(cache_key) => Some(owner),
         Some(owner) => {
@@ -1694,6 +1789,11 @@ fn resolve_db_path_and_lease(project_root: &Path) -> Result<(PathBuf, ProjectLea
     // metadata. Foreign DBs are opened read-only and never schema-migrated.
     if !db_path.exists() && !interrupted_publication {
         if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            // Inspecting candidates writes no owner intents, and no other
+            // process can create any while the layout lock is held, so one
+            // `.leases` listing serves every candidate. The locked migration
+            // below re-reads intents fresh and ends the scan once it writes.
+            let mut candidate_intents = CacheOwnerIntentListing::new(&cache_dir);
             for entry in entries.flatten() {
                 let is_real_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
                 let old_dir = entry.path();
@@ -1719,7 +1819,7 @@ fn resolve_db_path_and_lease(project_root: &Path) -> Result<(PathBuf, ProjectLea
                     continue;
                 }
                 ensure_safe_live_db_artifacts(&old_db)?;
-                let cache_owner = match effective_cache_owner(&cache_dir, &old_dir, old_key) {
+                let cache_owner = match candidate_intents.effective_owner(&old_dir, old_key) {
                     Ok(owner) => owner,
                     Err(owner_error) => match read_cached_project_root(&old_db) {
                         Ok(root) if root != normalized && root != raw_identity => continue,
@@ -2726,10 +2826,135 @@ fn cache_has_unresolved_publication(cache_dir: &Path) -> bool {
     )
 }
 
+/// The cache key a `.leases` project or publication lock file belongs to.
+fn lease_lock_key(name: &str) -> Option<&str> {
+    name.strip_suffix(".publish.lock")
+        .or_else(|| name.strip_suffix(".lock"))
+        .filter(|key| is_cache_key(key))
+}
+
+fn cache_entry_is_absent(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn open_lease_lock_for_removal(path: &Path, create: bool) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if file.metadata()?.file_type().is_file() {
+        Ok(file)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "lease lock is not a regular file",
+        ))
+    }
+}
+
+/// Unlink `path` only while it still names the inode locked through `file`.
+fn remove_locked_lease_file(path: &Path, file: &File) -> bool {
+    let (Ok(listed), Ok(opened)) = (std::fs::symlink_metadata(path), file.metadata()) else {
+        return false;
+    };
+    listed.file_type().is_file()
+        && same_file_identity(&listed, &opened)
+        && std::fs::remove_file(path).is_ok()
+}
+
+fn remove_orphaned_key_locks(base: &Path, leases: &Path, key: &str) {
+    use fs2::FileExt;
+
+    let cache_dir = base.join(key);
+    if !cache_entry_is_absent(&cache_dir) {
+        return;
+    }
+    let project_path = leases.join(format!("{key}.lock"));
+    let publication_path = leases.join(format!("{key}.publish.lock"));
+    let Ok(project) = open_lease_lock_for_removal(&project_path, true) else {
+        return;
+    };
+    if project.try_lock_exclusive().is_err() || !cache_entry_is_absent(&cache_dir) {
+        return;
+    }
+    let publication = match open_lease_lock_for_removal(&publication_path, false) {
+        Ok(file) => {
+            if file.try_lock_exclusive().is_err() {
+                return;
+            }
+            Some(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return,
+    };
+    // Publication lockers hold the project lease, so the project lock file
+    // must outlive the publication lock file.
+    if let Some(file) = &publication {
+        if !remove_locked_lease_file(&publication_path, file) {
+            return;
+        }
+    }
+    remove_locked_lease_file(&project_path, &project);
+}
+
+/// Remove the `{key}.lock` and `{key}.publish.lock` files of every cache key
+/// other than `keep` whose directory is gone, whether GC just quarantined it
+/// or it disappeared some other way.
+///
+/// The caller must hold the exclusive cache-layout lock. Every opener of a
+/// `{key}.lock` holds that lock from opening the file until its flock is
+/// taken, and every opener of a `{key}.publish.lock` holds a shared
+/// `{key}.lock` lease meanwhile. So once both files are locked exclusively
+/// here, nobody holds either inode or is about to lock it, and unlinking them
+/// cannot leave two processes locking different inodes for one key. Anything
+/// busy, not a regular file, or with a cache entry present is left alone.
+fn remove_orphaned_lease_locks(base: &Path, keep: Option<&str>) {
+    let leases = leases_dir(base);
+    if !std::fs::symlink_metadata(&leases)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&leases) else {
+        return;
+    };
+    let mut keys = std::collections::BTreeSet::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(key) = name.to_str().and_then(lease_lock_key) else {
+            continue;
+        };
+        if Some(key) != keep && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            keys.insert(key.to_owned());
+        }
+    }
+    for key in keys {
+        remove_orphaned_key_locks(base, &leases, &key);
+    }
+}
+
 /// Remove cached indexes for *other* projects that have not been touched
 /// within `max_age`. Best-effort: unreadable or undeletable entries are
 /// skipped. `keep` is the hash-dir name of the project currently in use, so
 /// it is never removed. Returns the number of project caches deleted.
+///
+/// The same sweep drops the `.leases` lock files of every other key whose
+/// cache directory no longer exists, regardless of `max_age`.
 ///
 /// Split out from `gc_stale_caches` so tests can drive it against a
 /// throwaway base dir with an injected `now`.
@@ -2819,6 +3044,8 @@ pub fn gc_stale_caches_in(
             removed += 1;
         }
     }
+
+    remove_orphaned_lease_locks(base, keep);
 
     // Renaming is the atomic logical deletion. Physical cleanup happens
     // after releasing all locks; crash leftovers are retried on the next GC.
@@ -4085,6 +4312,7 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
             qualified_name TEXT,
             kind TEXT NOT NULL,
             line INTEGER NOT NULL,
+            end_line INTEGER,
             parent_id INTEGER,
             signature TEXT,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
@@ -4223,6 +4451,9 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    conn.execute_batch(CREATE_GIT_SIGNALS_SQL)?;
+    conn.execute_batch(CREATE_SYMBOL_GRAPH_SQL)?;
+    conn.execute_batch(CREATE_FILE_WORDS_SQL)?;
     Ok(())
 }
 
@@ -4234,7 +4465,13 @@ fn create_secondary_indexes(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
             ON symbols(qualified_name) WHERE qualified_name IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
-        CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+        -- Covering index for find_owning_symbol: seeks straight to one file's
+        -- symbols ordered by start line and reads end_line without touching
+        -- the table, so "which symbol contains this line" stays a range scan
+        -- over a handful of index rows. Its file_id prefix also serves every
+        -- per-file lookup and the ON DELETE CASCADE from files.
+        CREATE INDEX IF NOT EXISTS idx_symbols_file_line_end
+            ON symbols(file_id, line, end_line);
         CREATE INDEX IF NOT EXISTS idx_module_deps_module ON module_deps(module_id);
         CREATE INDEX IF NOT EXISTS idx_module_deps_dep ON module_deps(dep_module_id);
         CREATE INDEX IF NOT EXISTS idx_inheritance_child ON inheritance(child_id);
@@ -4336,12 +4573,140 @@ const CREATE_SUBTREES_SQL: &str = r#"
         original_path TEXT NOT NULL
     )
 "#;
+/// Per-file VCS history signals, collected on demand by `hotspots --collect`.
+///
+/// Kept out of `files` and `symbols` on purpose: the rows cover paths the
+/// indexer never parses (fixtures, configs, migrations), follow the commit
+/// history rather than a file walk, and a rebuild carries them over
+/// ([`carry_git_history`]) instead of starting them over.
+///
+/// `git_commits`, `git_paths` and `git_commit_changes` are the per-commit
+/// store: what each commit did to each project path. `git_commits.live` marks
+/// the commits reachable from the collected HEAD; the rest are kept so that
+/// switching back to a branch does not re-read its diffs. `order_key` is the
+/// commit's corrected commit date (never below a parent's plus one), the
+/// order in which renames hand history from one path to the next.
+/// `git_commit_changes.kind` is 0 for a plain change of `path_id`, 1 for a
+/// rename from `from_path_id` to `path_id`, 2 for `path_id` moved out of the
+/// project.
+///
+/// `git_file_stats` / `git_file_authors` are derived from the live commits:
+/// one row per path that exists in the working tree, keyed by the
+/// project-relative path (same key space as `files.path`).
+pub(crate) const CREATE_GIT_SIGNALS_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS git_file_stats (
+        path TEXT PRIMARY KEY,
+        commits INTEGER NOT NULL DEFAULT 0,
+        fix_commits INTEGER NOT NULL DEFAULT 0,
+        lines_added INTEGER NOT NULL DEFAULT 0,
+        lines_deleted INTEGER NOT NULL DEFAULT 0,
+        first_commit_at INTEGER,
+        last_commit_at INTEGER,
+        current_lines INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS git_file_authors (
+        path TEXT NOT NULL,
+        author TEXT NOT NULL,
+        PRIMARY KEY (path, author)
+    );
+    CREATE TABLE IF NOT EXISTS git_commits (
+        id INTEGER PRIMARY KEY,
+        sha TEXT NOT NULL UNIQUE,
+        order_key INTEGER NOT NULL,
+        live INTEGER NOT NULL,
+        authored_at INTEGER,
+        author TEXT,
+        is_fix INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS git_paths (
+        id INTEGER PRIMARY KEY,
+        hash INTEGER NOT NULL,
+        path TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_git_paths_hash ON git_paths(hash);
+    CREATE TABLE IF NOT EXISTS git_commit_changes (
+        commit_id INTEGER NOT NULL,
+        path_id INTEGER NOT NULL,
+        kind INTEGER NOT NULL,
+        from_path_id INTEGER,
+        added INTEGER NOT NULL,
+        deleted INTEGER NOT NULL,
+        PRIMARY KEY (commit_id, path_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS idx_git_commit_changes_path
+        ON git_commit_changes(path_id);
+    CREATE INDEX IF NOT EXISTS idx_git_commit_changes_renames
+        ON git_commit_changes(commit_id, from_path_id, path_id) WHERE kind = 1;
+"#;
+/// Tables [`CREATE_GIT_SIGNALS_SQL`] creates; all must exist for the schema
+/// to count as current.
+const GIT_SIGNAL_TABLES: [&str; 5] = [
+    "git_file_stats",
+    "git_file_authors",
+    "git_commits",
+    "git_paths",
+    "git_commit_changes",
+];
+/// Symbol-to-symbol dependency graph, built on demand by `graph build`.
+///
+/// Both tables key on `symbols.id` without a foreign key on purpose: a
+/// cascading delete would tax every incremental `update`, and a graph that
+/// silently lost rows would look fresh when it is not. Staleness is detected
+/// instead through the `symbol_graph_fingerprint` metadata key.
+///
+/// `symbol_edges.confidence` is the resolution level of the edge target
+/// (0 local, 1 scoped, 2 import, 3 unique, 4 ambiguous); `candidates` is how
+/// many definitions shared the referenced name when the edge is ambiguous.
+/// `symbol_metrics` only holds symbols that touch at least one edge.
+pub(crate) const CREATE_SYMBOL_GRAPH_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS symbol_edges (
+        source_id INTEGER NOT NULL,
+        target_id INTEGER NOT NULL,
+        confidence INTEGER NOT NULL,
+        candidates INTEGER NOT NULL,
+        ref_count INTEGER NOT NULL,
+        line INTEGER NOT NULL,
+        PRIMARY KEY (source_id, target_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS idx_symbol_edges_target
+        ON symbol_edges(target_id, confidence);
+    CREATE TABLE IF NOT EXISTS symbol_metrics (
+        symbol_id INTEGER PRIMARY KEY,
+        fan_in INTEGER NOT NULL,
+        fan_in_files INTEGER NOT NULL,
+        fan_in_ambiguous INTEGER NOT NULL,
+        fan_out INTEGER NOT NULL,
+        fan_out_ambiguous INTEGER NOT NULL,
+        dependents INTEGER NOT NULL,
+        pagerank REAL NOT NULL,
+        pagerank_pct REAL NOT NULL
+    );
+"#;
+/// The distinct words of each indexed file's text, comments and strings
+/// included, sorted and joined by newlines; see
+/// [`crate::indexer::content_words`]. Grep-based commands use it to skip
+/// files that cannot contain the literal they search for.
+///
+/// `mtime` and `size` repeat the `files` row the words were read with, so
+/// words that outlived their file row, or were written by a build that knew
+/// another version of the file, are never trusted. An index without this
+/// table, or a file without a row in it, is simply searched in full.
+pub(crate) const CREATE_FILE_WORDS_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS file_words (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        mtime INTEGER NOT NULL,
+        size INTEGER NOT NULL,
+        words TEXT NOT NULL
+    )
+"#;
 const CREATE_QUALIFIED_NAME_INDEX_SQL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
         ON symbols(qualified_name) WHERE qualified_name IS NOT NULL
 "#;
 const CREATE_REFS_NAME_FILE_LINE_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_refs_name_file_line ON refs(name, file_id, line)";
+const CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_symbols_file_line_end ON symbols(file_id, line, end_line)";
 const DEFAULT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
@@ -4478,6 +4843,8 @@ struct OptionalIndexMigrations {
     drop_modules_name: bool,
     drop_refs_name: bool,
     rewrite_qualified_name: bool,
+    create_symbols_file_line_end: bool,
+    drop_symbols_file: bool,
 }
 
 impl OptionalIndexMigrations {
@@ -4486,8 +4853,15 @@ impl OptionalIndexMigrations {
             || self.drop_modules_name
             || self.drop_refs_name
             || self.rewrite_qualified_name
+            || self.create_symbols_file_line_end
+            || self.drop_symbols_file
     }
 }
+
+/// `idx_symbols_file (file_id)` is the leftmost prefix of
+/// `idx_symbols_file_line_end`, so it only costs space. Dropped once its
+/// replacement exists, never before.
+const DROP_SYMBOLS_FILE_INDEX_SQL: &str = "DROP INDEX IF EXISTS idx_symbols_file";
 
 struct OpenMigrationPreflight {
     functional_migration_required: bool,
@@ -4503,11 +4877,19 @@ fn inspect_open_migrations(
 ) -> Result<OpenMigrationPreflight> {
     let metadata_exists = table_exists(conn, "metadata")?;
     let subtrees_exists = table_exists(conn, "subtrees")?;
+    let mut git_signals_exist = true;
+    for table in GIT_SIGNAL_TABLES {
+        git_signals_exist &= table_exists(conn, table)?;
+    }
+    let symbol_graph_exists =
+        table_exists(conn, "symbol_edges")? && table_exists(conn, "symbol_metrics")?;
     let files_exists = table_exists(conn, "files")?;
     let symbols_exists = table_exists(conn, "symbols")?;
     let files_current = !files_exists || column_exists(conn, "files", "root_path")?;
     let files_uniqueness_current = !files_exists || !files_has_legacy_path_unique(conn)?;
-    let symbols_current = !symbols_exists || column_exists(conn, "symbols", "qualified_name")?;
+    let symbols_current = !symbols_exists
+        || (column_exists(conn, "symbols", "qualified_name")?
+            && column_exists(conn, "symbols", "end_line")?);
 
     let (stored_root, has_legacy_extra_roots) = if metadata_exists {
         let stored_root = conn
@@ -4543,11 +4925,17 @@ fn inspect_open_migrations(
         drop_modules_name: index_exists(conn, "idx_modules_name")?,
         drop_refs_name: index_exists(conn, "idx_refs_name")?,
         rewrite_qualified_name: !qualified_index_current,
+        create_symbols_file_line_end: symbols_exists
+            && symbols_current
+            && !index_exists(conn, "idx_symbols_file_line_end")?,
+        drop_symbols_file: symbols_current && index_exists(conn, "idx_symbols_file")?,
     };
 
     Ok(OpenMigrationPreflight {
         functional_migration_required: !metadata_exists
             || !subtrees_exists
+            || !git_signals_exist
+            || !symbol_graph_exists
             || !files_current
             || !files_uniqueness_current
             || !symbols_current
@@ -4577,6 +4965,13 @@ fn apply_optional_index_migrations(
     if migrations.rewrite_qualified_name {
         conn.execute("DROP INDEX IF EXISTS idx_symbols_qualified_name", [])?;
         conn.execute(CREATE_QUALIFIED_NAME_INDEX_SQL, [])?;
+    }
+    if migrations.create_symbols_file_line_end {
+        conn.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])?;
+    }
+    if migrations.drop_symbols_file {
+        conn.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])?;
+        conn.execute(DROP_SYMBOLS_FILE_INDEX_SQL, [])?;
     }
     Ok(())
 }
@@ -4620,6 +5015,10 @@ fn apply_open_migrations_transaction(
         .context("failed to create metadata table")?;
     tx.execute(CREATE_SUBTREES_SQL, [])
         .context("failed to create subtrees table")?;
+    tx.execute_batch(CREATE_GIT_SIGNALS_SQL)
+        .context("failed to create git signal tables")?;
+    tx.execute_batch(CREATE_SYMBOL_GRAPH_SQL)
+        .context("failed to create symbol graph tables")?;
 
     if table_exists(&tx, "files")? && !column_exists(&tx, "files", "root_path")? {
         tx.execute(
@@ -4637,10 +5036,18 @@ fn apply_open_migrations_transaction(
             tx.execute("ALTER TABLE symbols ADD COLUMN qualified_name TEXT", [])
                 .context("failed to add symbols.qualified_name")?;
         }
+        if !column_exists(&tx, "symbols", "end_line")? {
+            tx.execute("ALTER TABLE symbols ADD COLUMN end_line INTEGER", [])
+                .context("failed to add symbols.end_line")?;
+        }
         tx.execute("DROP INDEX IF EXISTS idx_symbols_qualified_name", [])
             .context("failed to replace idx_symbols_qualified_name")?;
         tx.execute(CREATE_QUALIFIED_NAME_INDEX_SQL, [])
             .context("failed to create idx_symbols_qualified_name")?;
+        tx.execute(CREATE_SYMBOLS_FILE_LINE_END_INDEX_SQL, [])
+            .context("failed to create idx_symbols_file_line_end")?;
+        tx.execute(DROP_SYMBOLS_FILE_INDEX_SQL, [])
+            .context("failed to drop idx_symbols_file")?;
     }
 
     tx.execute("DROP INDEX IF EXISTS idx_files_root_path_path", [])
@@ -4950,12 +5357,16 @@ fn cleanup_restore_staging(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Checked after the snapshot has been migrated, so an index a migration
+/// installs (`idx_symbols_file_line_end`) is required even of a backup taken
+/// before it existed, and one a migration drops (`idx_symbols_file`) must not
+/// be listed.
 const REQUIRED_RESTORE_INDEXES: &[&str] = &[
     "idx_files_path",
     "idx_symbols_name",
     "idx_symbols_qualified_name",
     "idx_symbols_kind",
-    "idx_symbols_file",
+    "idx_symbols_file_line_end",
     "idx_module_deps_module",
     "idx_module_deps_dep",
     "idx_inheritance_child",
@@ -5372,6 +5783,9 @@ pub enum SymbolKind {
     Import,
     // For annotations/decorators
     Annotation,
+    // Database schema dumps (Rails `db/schema.rb`)
+    Table,
+    Column,
 }
 
 impl SymbolKind {
@@ -5389,6 +5803,8 @@ impl SymbolKind {
             SymbolKind::Constant => "constant",
             SymbolKind::Import => "import",
             SymbolKind::Annotation => "annotation",
+            SymbolKind::Table => "table",
+            SymbolKind::Column => "column",
         }
     }
 }
@@ -5399,7 +5815,9 @@ pub fn upsert_file(conn: &Connection, path: &str, mtime: i64, size: i64) -> Resu
         "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?1, ?2, ?3)",
         params![path, mtime, size],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    bump_index_generation(conn)?;
+    Ok(id)
 }
 
 /// Insert a symbol
@@ -5415,7 +5833,9 @@ pub fn insert_symbol(
         "INSERT INTO symbols (file_id, name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![file_id, name, kind.as_str(), line as i64, signature],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    bump_index_generation(conn)?;
+    Ok(id)
 }
 
 /// Insert inheritance relationship
@@ -5429,7 +5849,7 @@ pub fn insert_inheritance(
         "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)",
         params![child_id, parent_name, kind],
     )?;
-    Ok(())
+    bump_index_generation(conn)
 }
 
 /// Escape FTS5 special characters
@@ -5450,6 +5870,240 @@ fn escape_fts5_query(query: &str) -> String {
     format!("\"{}\"{}", escaped, suffix)
 }
 
+/// FTS5 relevance score. `bm25()` is negative and smaller means more relevant;
+/// the column weights rank a hit in `name` an order of magnitude above one in
+/// `signature`, so `ApplicationService` outranks the hundreds of subclasses
+/// that only name it in their `class X < ApplicationService` signature.
+const FTS_RANK: &str = "bm25(symbols_fts, 10.0, 1.0)";
+
+/// Kind filter for a query driven by `symbols_fts MATCH`. The unary `+` keeps
+/// the planner off `idx_symbols_kind`: with it, the bundled SQLite scans every
+/// symbol of that kind and re-runs the full-text query per row (tens of seconds
+/// on a large index) instead of filtering the handful of full-text hits.
+const FTS_KIND_FILTER: &str = " AND +s.kind = ?";
+const FTS_CLASS_ONLY_FILTER: &str =
+    " AND +s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')";
+
+/// Whether an indexed path belongs to an installed package: a `node_modules`
+/// path segment. The indexer adds such files on its own (type declarations
+/// for the imports of a JavaScript project); every other indexed file passed
+/// the project's ignore and exclude rules and is the project's code — a
+/// project's own `vendor/` directory included.
+///
+/// The symbol graph leaves these files out entirely; search ranking demotes
+/// them together with type declarations ([`is_vendor_path`]).
+pub fn is_third_party_path(path: &str) -> bool {
+    path.starts_with("node_modules/") || path.contains("/node_modules/")
+}
+
+/// Whether search rankers demote an indexed path below the project's own
+/// code: installed packages ([`is_third_party_path`]) and `.d.ts` type
+/// declarations, which describe code rather than implement it.
+///
+/// A project's own `vendor/` directory is deliberately not vendor here: it is
+/// indexed and ranked like the rest of the project's source.
+pub fn is_vendor_path(path: &str) -> bool {
+    is_third_party_path(path) || path.ends_with(".d.ts")
+}
+
+/// [`is_vendor_path`] over `f.path`, for ordering inside SQL. `instr` and
+/// `substr` rather than `LIKE`, which folds case and reads `_` as a wildcard.
+const VENDOR_PATH_SQL: &str = "(substr(f.path, 1, 13) = 'node_modules/' \
+     OR instr(f.path, '/node_modules/') > 0 OR substr(f.path, -5) = '.d.ts')";
+
+const NAME_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
+
+/// Whether `name` is a qualified name whose last segment is `term`, as
+/// `Billing::Importers::LedgerImporter` is for `LedgerImporter`.
+///
+/// Segments are separated by `::` or `.`: the index records a Rails schema
+/// column as `users.email`, a Ruby singleton method as `self.build`, a
+/// nested protobuf message as `Outer.Inner` and a C# namespace as
+/// `MyApp.Services`.
+///
+/// Statements the index records as symbols — `include Foo::Bar`,
+/// `extend ActiveSupport::Concern`, `describe ".call"` — contain whitespace
+/// and are not a name under a namespace, so they never qualify.
+pub fn is_last_name_segment(name: &str, term: &str) -> bool {
+    !name.contains(NAME_WHITESPACE)
+        && name
+            .strip_suffix(term)
+            .is_some_and(|namespace| namespace.ends_with("::") || namespace.ends_with('.'))
+}
+
+/// The last `::` or `.` segment of a qualified name — what a reference to it
+/// is recorded under (`Billing::Invoice.new` records `Invoice`, a call of a
+/// Ruby `def self.build` records `build`). A name containing whitespace is a
+/// statement rather than a qualified name and comes back whole.
+pub fn last_name_segment(name: &str) -> &str {
+    if name.contains(NAME_WHITESPACE) {
+        return name;
+    }
+    let after_colons = name.rfind("::").map_or(0, |at| at + 2);
+    let after_dot = name.rfind('.').map_or(0, |at| at + 1);
+    match &name[after_colons.max(after_dot)..] {
+        "" => name,
+        segment => segment,
+    }
+}
+
+/// [`is_last_name_segment`] over `s.name` for any of `placeholders`. `substr`
+/// and `instr` rather than `LIKE`, which folds case and reads `_` as a
+/// wildcard (`pg_search_scope` is an ordinary name).
+fn last_name_segment_sql(placeholders: &[&str]) -> String {
+    let suffixes = placeholders
+        .iter()
+        .map(|placeholder| {
+            format!(
+                "substr(s.name, -length({placeholder}) - 2) = '::' || {placeholder} \
+                 OR substr(s.name, -length({placeholder}) - 1) = '.' || {placeholder}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let no_whitespace = NAME_WHITESPACE
+        .iter()
+        .map(|c| format!("instr(s.name, char({})) = 0", u32::from(*c)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!("({no_whitespace} AND ({suffixes}))")
+}
+
+/// Whether a symbol of `kind` named `name` belongs to the last-segment tier
+/// for `term`: [`is_last_name_segment`], and not an import.
+///
+/// Imports are indexed under the path they bring in (`use anyhow::Result`
+/// as `anyhow::Result`, `import a.b.C` as `a.b.C`). They name a definition
+/// that lives elsewhere, so a query for `Result` must not rank every file
+/// that imports one above the project's own `SearchResult`.
+pub fn is_last_segment_match(name: &str, kind: &str, term: &str) -> bool {
+    kind != "import" && is_last_name_segment(name, term)
+}
+
+/// [`is_last_segment_match`] over `s.kind` and `s.name`.
+fn last_segment_match_sql(placeholders: &[&str]) -> String {
+    format!(
+        "(s.kind <> 'import' AND {})",
+        last_name_segment_sql(placeholders)
+    )
+}
+
+/// Sort key that puts definitions before imports inside a relevance tier.
+/// An import matches by name exactly like the definition it brings in, and
+/// a class imported in eleven files would otherwise bury the class itself.
+const IMPORT_LAST_SQL: &str = "s.kind = 'import'";
+
+/// SQL function [`crate::commands::is_test_symbol`]`(name, path)`, defined by
+/// [`ensure_test_functions`].
+const IS_TEST_SYMBOL_FN: &str = "ast_index_is_test_symbol";
+/// SQL function [`crate::commands::is_test_path`]`(path)`, defined by
+/// [`ensure_test_functions`].
+const IS_TEST_PATH_FN: &str = "ast_index_is_test_path";
+
+/// Define the SQL functions that tell test code apart on `conn`, unless they
+/// already are. They call the one Rust definition of a test path, which SQL
+/// could only copy. Connection-local, so every query that uses them calls
+/// this first; a lookup of an existing definition is a cached statement.
+fn ensure_test_functions(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    if conn
+        .prepare_cached(&format!(
+            "SELECT {IS_TEST_SYMBOL_FN}('', ''), {IS_TEST_PATH_FN}('')"
+        ))
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    let text = |ctx: &rusqlite::functions::Context<'_>, index: usize| -> rusqlite::Result<String> {
+        Ok(ctx.get::<Option<String>>(index)?.unwrap_or_default())
+    };
+    conn.create_scalar_function(IS_TEST_SYMBOL_FN, 2, flags, move |ctx| {
+        Ok(crate::commands::is_test_symbol(
+            &text(ctx, 0)?,
+            &text(ctx, 1)?,
+        ))
+    })?;
+    conn.create_scalar_function(IS_TEST_PATH_FN, 1, flags, move |ctx| {
+        Ok(crate::commands::is_test_path(&text(ctx, 0)?))
+    })?;
+    Ok(())
+}
+
+/// Sort key that lists test symbols ([`crate::commands::is_test_symbol`])
+/// after the others of a partial-match tier. `exact` is the condition of the
+/// tiers where the name itself is what was typed; those keep their order, so
+/// an exact `parse` in a test still leads a partial `parse_config`.
+fn test_last_sql(exact: &str) -> String {
+    format!("CASE WHEN {exact} THEN 0 WHEN {IS_TEST_SYMBOL_FN}(s.name, f.path) THEN 1 ELSE 0 END")
+}
+
+/// Deterministic ordering for a query that matches `symbols_fts`.
+///
+/// `exact_name_placeholders` bind the raw query terms, and each one is read
+/// several times, so every caller must pass numbered placeholders.
+///
+/// A symbol whose own name equals a term is pinned to the front: bm25 alone
+/// can rank a long symbol with several term occurrences above the short exact
+/// hit the user typed. FTS5 folds case, so that tier splits in two, and
+/// `Applicant` the class lands above `applicant` the accessor for a
+/// capitalised query.
+///
+/// Right below come names whose last `::` or `.` segment equals a term
+/// ([`is_last_segment_match`]): Ruby indexes `class A::B::MergeService` under
+/// its full name, so `MergeService` has no exact row, and bm25 alone put a
+/// spec's `describe "A::B::MergeService"` — a shorter document — above the
+/// class itself; `users.email` had the same problem against every longer
+/// column that merely starts with `email`. Imports never enter that tier.
+///
+/// bm25 is then suppressed for the rows of those tiers. They all carry the
+/// same name or last segment, so what is left for the score to measure is
+/// document length — ranking `User` in `app/models/user.rb` below `User`
+/// in a spec fixture because the model has a longer `class … <
+/// ApplicationRecord` line is noise, not relevance. Name length and `f.path,
+/// s.line` decide instead, which also makes repeated runs return the same
+/// page.
+///
+/// Inside each tier definitions lead imports ([`IMPORT_LAST_SQL`]), and the
+/// project's own code leads third-party code ([`is_vendor_path`]). Without
+/// that, the path tie-break decided, and `node_modules/…` sorts ahead of
+/// `spec/` or `system/`. The tier still comes first: a library's exact
+/// `useState` stays above a project's partial `useStateModal`, because the
+/// library name is what was typed. In the partial tiers test symbols follow
+/// the rest of the project's code ([`test_last_sql`]): bm25 favours their
+/// short signatures, and `parse` in Rust sources was answered with a page of
+/// `#[cfg(test)] fn test_parse_*`.
+///
+/// The query must define the test functions first ([`ensure_test_functions`]).
+fn fts_order_by(exact_name_placeholders: &[&str]) -> String {
+    let tail = "length(COALESCE(s.qualified_name, s.name)), f.path, s.line";
+    if exact_name_placeholders.is_empty() {
+        return format!(
+            " ORDER BY {IMPORT_LAST_SQL}, {VENDOR_PATH_SQL}, {}, {FTS_RANK}, {tail}",
+            test_last_sql("0")
+        );
+    }
+    let cased = exact_name_placeholders.join(", ");
+    let folded = exact_name_placeholders
+        .iter()
+        .map(|placeholder| format!("lower({placeholder})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let last_segment = last_segment_match_sql(exact_name_placeholders);
+    format!(
+        " ORDER BY \
+         CASE WHEN s.name IN ({cased}) THEN 0 \
+         WHEN lower(s.name) IN ({folded}) THEN 1 \
+         WHEN {last_segment} THEN 2 ELSE 3 END, \
+         {IMPORT_LAST_SQL}, \
+         {VENDOR_PATH_SQL}, \
+         {test_last}, \
+         CASE WHEN lower(s.name) IN ({folded}) OR {last_segment} THEN 0.0 ELSE {FTS_RANK} END, \
+         {tail}",
+        test_last = test_last_sql(&format!("lower(s.name) IN ({folded}) OR {last_segment}"))
+    )
+}
+
 /// Search symbols by name (FTS5)
 pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
     // Handle empty query
@@ -5465,8 +6119,8 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
                 SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
-                WHERE s.qualified_name LIKE ?1
-                ORDER BY length(s.qualified_name), s.qualified_name
+                WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
+                ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
                 LIMIT ?2
                 "#,
                 format!("%{}", raw),
@@ -5477,8 +6131,8 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
                 SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
-                WHERE s.qualified_name LIKE ?1
-                ORDER BY length(s.qualified_name), s.qualified_name
+                WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
+                ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
                 LIMIT ?2
                 "#,
                 format!("{raw}%"),
@@ -5489,7 +6143,7 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
                 SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
                 FROM symbols s
                 JOIN files f ON s.file_id = f.id
-                WHERE s.qualified_name = ?1
+                WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))
                 LIMIT ?2
                 "#,
                 raw.to_string(),
@@ -5502,7 +6156,51 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
             .collect::<Result<Vec<_>, _>>()?);
     }
 
+    ensure_test_functions(conn)?;
     let escaped_query = escape_fts5_query(query);
+    let exact_name = query.trim_end_matches('*');
+
+    let sql = format!(
+        r#"
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM symbols_fts fts
+        JOIN symbols s ON fts.rowid = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE symbols_fts MATCH ?1{order}
+        LIMIT ?3
+        "#,
+        order = fts_order_by(&["?2"])
+    );
+    let mut stmt = conn.prepare(&sql)?;
+
+    let results = stmt
+        .query_map(
+            params![escaped_query, exact_name, limit as i64],
+            row_to_search_result,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Candidate sample for callers that rank symbols themselves, such as
+/// `explore`.
+///
+/// Matches exactly what [`search_symbols`] matches, but orders by insertion id
+/// instead of relevance. A relevance-ordered head is the wrong input for a
+/// re-ranker: for a term like `service` the best-scoring rows are the symbols
+/// literally named `service`, and a caller that scores candidates lexically
+/// needs the spread of names FTS actually matched, not the head of another
+/// ranking. Insertion order keeps that spread and makes the sample
+/// reproducible for a given index.
+pub fn search_symbol_seeds(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    if query.trim().is_empty() || query.contains("::") {
+        return search_symbols(conn, query, limit);
+    }
 
     let mut stmt = conn.prepare(
         r#"
@@ -5511,14 +6209,125 @@ pub fn search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Ve
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
         WHERE symbols_fts MATCH ?1
+        ORDER BY s.id
         LIMIT ?2
         "#,
     )?;
 
     let results = stmt
-        .query_map(params![escaped_query, limit as i64], row_to_search_result)?
+        .query_map(
+            params![escape_fts5_query(query), limit as i64],
+            row_to_search_result,
+        )?
         .collect::<Result<Vec<_>, _>>()?;
 
+    Ok(results)
+}
+
+/// Candidates for `explore` ranked by relevance to the whole query: symbols
+/// with a token starting with any of `terms`, ordered by bm25 over all terms
+/// at once.
+///
+/// The per-term [`search_symbol_seeds`] sample is the first rows by insertion
+/// order, so for a term that matches thousands of symbols it holds whatever
+/// the indexer happened to reach first. A single bm25 over every term favours
+/// the documents that carry several of them, and the rarer ones — the
+/// corroborated rows a re-ranker is looking for. Project code leads
+/// third-party code and definitions lead imports.
+pub fn search_symbol_seeds_ranked(
+    conn: &Connection,
+    terms: &[String],
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let query = terms
+        .iter()
+        .filter(|term| !term.trim().is_empty())
+        .map(|term| escape_fts5_query(&format!("{term}*")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    if query.is_empty() {
+        return Ok(vec![]);
+    }
+    let sql = format!(
+        r#"
+        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM symbols_fts fts
+        JOIN symbols s ON fts.rowid = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE symbols_fts MATCH ?1
+        ORDER BY {VENDOR_PATH_SQL}, {IMPORT_LAST_SQL}, {FTS_RANK}, s.id
+        LIMIT ?2
+        "#
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params![query, limit as i64], row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
+/// Symbols of the project files whose path contains every one of `terms`,
+/// case-insensitively: `app/services/applicant/merge_service.rb` for
+/// `applicant merge service`. At most `per_file` symbols of a file are
+/// returned — the types and modules it defines first — and shorter paths
+/// come first. Third-party files, imports and schema columns are left out.
+///
+/// Where the project names files after what they define, the path is the
+/// one place a CamelCase class name is spelled out word by word, which the
+/// full-text index cannot split.
+///
+/// `CROSS JOIN` pins `files` as the outer loop: otherwise the planner walks
+/// every symbol through its file index and tests each one's path (80 ms
+/// instead of 11 ms on a 300k-symbol index).
+pub fn search_symbols_in_matching_paths(
+    conn: &Connection,
+    terms: &[String],
+    per_file: usize,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    use rusqlite::types::Value;
+    let terms: Vec<String> = terms
+        .iter()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return Ok(vec![]);
+    }
+    let path_filter = (1..=terms.len())
+        .map(|n| format!("instr(lower(f.path), ?{n}) > 0"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let per_file_at = terms.len() + 1;
+    let limit_at = terms.len() + 2;
+    let sql = format!(
+        r#"
+        SELECT name, qualified_name, kind, line, signature, path, root_path FROM (
+            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY s.file_id
+                       ORDER BY CASE WHEN s.kind IN ('class', 'interface', 'object', 'enum', 'package')
+                                     THEN 0 ELSE 1 END,
+                                s.line
+                   ) AS rank_in_file
+            FROM files f
+            CROSS JOIN symbols s ON s.file_id = f.id
+            WHERE {path_filter}
+              AND NOT {VENDOR_PATH_SQL}
+              AND s.kind NOT IN ('import', 'column')
+        )
+        WHERE rank_in_file <= ?{per_file_at}
+        ORDER BY length(path), path, line
+        LIMIT ?{limit_at}
+        "#
+    );
+    let mut values: Vec<Value> = terms.into_iter().map(Value::Text).collect();
+    values.push(Value::Integer(per_file as i64));
+    values.push(Value::Integer(limit as i64));
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(rusqlite::params_from_iter(values), row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }
 
@@ -5557,6 +6366,91 @@ fn row_to_search_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchResul
         path: row.get(5)?,
         root_path,
     })
+}
+
+/// The name a symbol is shown under ([`SearchResult::display_name`]):
+/// `qualified_name` where the parser records one (C++ keeps the bare name in
+/// `name`), otherwise `name`. Ruby records `class Billing::Invoice` under its
+/// full name and leaves `qualified_name` empty, so a lookup by a `::` name
+/// has to read `name` as well.
+const DISPLAY_NAME_SQL: &str = "COALESCE(s.qualified_name, s.name)";
+
+/// `DISPLAY_NAME_SQL = ?1`, spelled out so that the index on each column can
+/// serve its half.
+const DISPLAY_NAME_IS_FIRST_PARAM_SQL: &str =
+    "(s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))";
+
+/// WHERE condition, with its values bound from `?1`, for the symbols whose
+/// last `::` or `.` segment is `name` ([`is_last_segment_match`]).
+///
+/// Testing every symbol's name costs a full table scan per lookup, so the
+/// full-text index first narrows the candidates to names containing
+/// `name`'s words (`Billing::Invoice` holds the word `invoice`).
+fn last_segment_condition(name: &str) -> (String, Vec<String>) {
+    if !name.chars().any(char::is_alphanumeric) {
+        return (last_segment_match_sql(&["?1"]), vec![name.to_string()]);
+    }
+    (
+        format!(
+            "s.id IN (SELECT rowid FROM symbols_fts WHERE symbols_fts MATCH ?1) AND {}",
+            last_segment_match_sql(&["?2"])
+        ),
+        vec![
+            format!("name : {}", escape_fts5_query(name.trim_end_matches('*'))),
+            name.to_string(),
+        ],
+    )
+}
+
+/// Symbols whose last `::` or `.` segment is `name` ([`is_last_segment_match`]):
+/// the stage a bare-name lookup falls back to when no symbol has that exact
+/// name, because Ruby indexes `class Billing::Invoice` under its full name
+/// and `Invoice` alone finds nothing. Shortest name first.
+fn find_by_last_segment(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    class_only: bool,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let (condition, mut values) = last_segment_condition(name);
+    let mut sql = format!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path \
+         FROM symbols s JOIN files f ON s.file_id = f.id WHERE {condition}{scope_clause}"
+    );
+    values.extend(scope_params);
+    if let Some(kind) = kind {
+        sql.push_str(" AND s.kind = ?");
+        values.push(kind.to_string());
+    }
+    if class_only {
+        sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
+    }
+    sql.push_str(" ORDER BY length(s.name), s.name, f.path, s.line LIMIT ?");
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let results = stmt
+        .query_map(params.as_slice(), row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
+/// How many symbols [`find_by_last_segment`] would list without a limit.
+fn count_by_last_segment(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    class_only: bool,
+    scope: &SearchScope,
+) -> Result<usize> {
+    let (condition, values) = last_segment_condition(name);
+    count_symbol_matches(conn, &condition, values, kind, scope, class_only, false)
 }
 
 #[derive(Debug, Serialize)]
@@ -5645,6 +6539,19 @@ pub fn find_files_with_roots_terms_scoped(
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<FileResult>> {
+    find_files_with_roots_terms_filtered(conn, terms, limit, scope, None)
+}
+
+/// [`find_files_with_roots_terms_scoped`] restricted to third-party paths
+/// (`vendor = Some(true)`, see [`is_vendor_path`]) or to the project's own
+/// (`Some(false)`), so a ranker can fill its pool with project files only.
+pub fn find_files_with_roots_terms_filtered(
+    conn: &Connection,
+    terms: &[&str],
+    limit: usize,
+    scope: &SearchScope,
+    vendor: Option<bool>,
+) -> Result<Vec<FileResult>> {
     if terms.is_empty() {
         return Ok(Vec::new());
     }
@@ -5653,8 +6560,9 @@ pub fn find_files_with_roots_terms_scoped(
         .collect::<Vec<_>>()
         .join(" OR ");
     let (scope_clause, scope_params) = scope.path_condition();
+    let vendor_clause = vendor_condition(vendor);
     let sql = format!(
-        "SELECT f.path, f.root_path FROM files f WHERE ({predicates}){scope_clause} ORDER BY f.path LIMIT ?"
+        "SELECT f.path, f.root_path FROM files f WHERE ({predicates}){scope_clause}{vendor_clause} ORDER BY f.path LIMIT ?"
     );
     let mut values: Vec<String> = terms.iter().map(|term| format!("%{term}%")).collect();
     values.extend(scope_params);
@@ -5704,7 +6612,10 @@ pub fn find_files_with_roots_scoped(
     Ok(results)
 }
 
-/// Find symbols by name (exact match first, then prefix/contains if no results)
+/// Find symbols by name: the exact name first; failing that, names whose last
+/// `::` or `.` segment it is ([`find_by_last_segment`]), then the prefix. A
+/// `::` name is matched against [`DISPLAY_NAME_SQL`]: exactly, as the tail of
+/// a longer namespace, then as a prefix.
 pub fn find_symbols_by_name(
     conn: &Connection,
     name: &str,
@@ -5717,8 +6628,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1 AND s.kind = ?2
-            ORDER BY length(s.qualified_name), s.qualified_name
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind = ?2
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?3
             "#
         } else {
@@ -5726,8 +6637,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
-            ORDER BY length(s.qualified_name), s.qualified_name
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?2
             "#
         };
@@ -5750,7 +6661,7 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name = ?1 AND s.kind = ?2
+            WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1)) AND s.kind = ?2
             LIMIT ?3
             "#
         } else {
@@ -5758,7 +6669,7 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name = ?1
+            WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))
             LIMIT ?2
             "#
         };
@@ -5781,8 +6692,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1 AND s.kind = ?2
-            ORDER BY length(s.qualified_name)
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind = ?2
+            ORDER BY length(COALESCE(s.qualified_name, s.name))
             LIMIT ?3
             "#
         } else {
@@ -5790,8 +6701,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
-            ORDER BY length(s.qualified_name)
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
+            ORDER BY length(COALESCE(s.qualified_name, s.name))
             LIMIT ?2
             "#
         };
@@ -5818,8 +6729,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1 AND s.kind = ?2
-            ORDER BY length(s.qualified_name)
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind = ?2
+            ORDER BY length(COALESCE(s.qualified_name, s.name))
             LIMIT ?3
             "#
         } else {
@@ -5827,8 +6738,8 @@ pub fn find_symbols_by_name(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
-            ORDER BY length(s.qualified_name)
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
+            ORDER BY length(COALESCE(s.qualified_name, s.name))
             LIMIT ?2
             "#
         };
@@ -5874,6 +6785,14 @@ pub fn find_symbols_by_name(
             .collect::<Result<Vec<_>, _>>()?
     };
 
+    if results.is_empty() {
+        let namespaced =
+            find_by_last_segment(conn, name, kind, false, limit, &SearchScope::none())?;
+        if !namespaced.is_empty() {
+            return Ok(namespaced);
+        }
+    }
+
     // If no exact match, try prefix match
     if results.is_empty() {
         let pattern = format!("{}%", name);
@@ -5911,7 +6830,8 @@ pub fn find_symbols_by_name(
     Ok(results)
 }
 
-/// Find class-like symbols (class, interface, object, enum) by name - single query
+/// Find class-like symbols (class, interface, object, enum) by name, in the
+/// stages of [`find_symbols_by_name`] minus its prefix fallback for a bare name.
 pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Vec<SearchResult>> {
     if name.starts_with("::") {
         let mut stmt = conn.prepare(
@@ -5919,9 +6839,9 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
               AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
-            ORDER BY length(s.qualified_name), s.qualified_name
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?2
             "#,
         )?;
@@ -5937,7 +6857,7 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name = ?1
+            WHERE (s.qualified_name = ?1 OR (s.qualified_name IS NULL AND s.name = ?1))
               AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
             LIMIT ?2
             "#,
@@ -5955,9 +6875,9 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
               AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
-            ORDER BY length(s.qualified_name), s.qualified_name
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?2
             "#,
         )?;
@@ -5974,9 +6894,9 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
               AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')
-            ORDER BY length(s.qualified_name), s.qualified_name
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?2
             "#,
         )?;
@@ -5999,6 +6919,9 @@ pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Ve
     let results = stmt
         .query_map(params![name, limit as i64], row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
+    if results.is_empty() {
+        return find_by_last_segment(conn, name, None, true, limit, &SearchScope::none());
+    }
 
     Ok(results)
 }
@@ -6173,60 +7096,57 @@ pub fn find_symbols_by_pattern(
     Ok(results)
 }
 
-/// Find implementations (subclasses/implementors)
+/// Kinds a parent type can be defined as: what `extends`, `implements`,
+/// `<` and `include` name.
+const TYPE_KINDS_SQL: &str =
+    "('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package', 'trait', 'typealias')";
+
+/// `i.parent_name` with a leading `::` (Ruby's top-level constant path) removed.
+const PARENT_NAME_SQL: &str =
+    "CASE WHEN substr(i.parent_name, 1, 2) = '::' THEN substr(i.parent_name, 3) ELSE i.parent_name END";
+
+/// Whether `i.parent_name` names the type `?1`: the name itself, the name
+/// under Ruby's top-level `::`, or a qualified name ending in it
+/// (`com.foo.Base`, `ns::Base`, `Billing::Base`), which is how Java, C++ and
+/// Ruby refer to a type through its package or namespace.
+///
+/// A qualified name is left out when it is itself the name of another type
+/// the index defines while `?1` is defined without a namespace:
+/// `Legacy::ApplicationService` is its own class, not `ApplicationService`,
+/// so its subclasses do not belong under `implementations ApplicationService`.
+/// Only names stored whole (Ruby's `class Legacy::ApplicationService`) take
+/// part; a C++ namespace lives in `qualified_name` and a Java package in no
+/// symbol name, so those keep every suffix match.
+fn implementation_parent_sql() -> String {
+    format!(
+        "({PARENT_NAME_SQL} = ?1 OR ((i.parent_name LIKE ?2 OR i.parent_name LIKE ?3) \
+         AND NOT (EXISTS (SELECT 1 FROM symbols d WHERE d.name = {PARENT_NAME_SQL} \
+                          AND d.kind IN {TYPE_KINDS_SQL}) \
+                  AND EXISTS (SELECT 1 FROM symbols q WHERE q.name = ?1 \
+                              AND q.qualified_name IS NULL AND q.kind IN {TYPE_KINDS_SQL}))))"
+    )
+}
+
+fn implementation_params(parent_name: &str) -> [String; 3] {
+    [
+        parent_name.to_string(),
+        format!("%.{parent_name}"),
+        format!("%::{parent_name}"),
+    ]
+}
+
+/// Find implementations (subclasses/implementors) of `parent_name`, see
+/// [`implementation_parent_sql`]. Direct children come first.
 pub fn find_implementations(
     conn: &Connection,
     parent_name: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    // Match exact name or qualified suffix in either dot- or C++-style form.
-    let suffix_pattern = format!("%.{}", parent_name);
-    let namespace_suffix_pattern = format!("%::{}", parent_name);
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
-        FROM inheritance i
-        JOIN symbols s ON i.child_id = s.id
-        JOIN files f ON s.file_id = f.id
-        WHERE i.parent_name = ?1 OR i.parent_name LIKE ?2 OR i.parent_name LIKE ?3
-        ORDER BY
-            CASE
-                WHEN i.parent_name = ?1 THEN 0
-                ELSE 1
-            END, s.name
-        LIMIT ?4
-        "#,
-    )?;
-
-    let results = stmt
-        .query_map(
-            params![
-                parent_name,
-                suffix_pattern,
-                namespace_suffix_pattern,
-                limit as i64
-            ],
-            row_to_search_result,
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(results)
+    query_implementations(conn, parent_name, limit, (String::new(), Vec::new()))
 }
 
 pub fn count_implementations(conn: &Connection, parent_name: &str) -> Result<usize> {
-    let suffix_pattern = format!("%.{}", parent_name);
-    let namespace_suffix_pattern = format!("%::{}", parent_name);
-    let count: i64 = conn.query_row(
-        r#"
-        SELECT COUNT(*)
-        FROM inheritance i
-        JOIN symbols s ON i.child_id = s.id
-        WHERE i.parent_name = ?1 OR i.parent_name LIKE ?2 OR i.parent_name LIKE ?3
-        "#,
-        params![parent_name, suffix_pattern, namespace_suffix_pattern],
-        |row| row.get(0),
-    )?;
-    Ok(count as usize)
+    query_implementation_count(conn, parent_name, (String::new(), Vec::new()))
 }
 
 pub fn count_implementations_scoped(
@@ -6234,32 +7154,34 @@ pub fn count_implementations_scoped(
     parent_name: &str,
     scope: &SearchScope,
 ) -> Result<usize> {
-    if scope.is_empty() {
-        return count_implementations(conn, parent_name);
-    }
-    let suffix_pattern = format!("%.{parent_name}");
-    let namespace_suffix_pattern = format!("%::{parent_name}");
-    let (scope_clause, scope_params) = scope.path_condition();
+    query_implementation_count(conn, parent_name, scope.path_condition())
+}
+
+/// `path_condition` is an SQL suffix over `f.path` and its parameters; the
+/// unscoped entry points pass none, so they ignore `--subtree` / `--local`
+/// as they always have.
+fn query_implementation_count(
+    conn: &Connection,
+    parent_name: &str,
+    (scope_clause, scope_params): (String, Vec<String>),
+) -> Result<usize> {
     let sql = format!(
         r#"
         SELECT COUNT(*)
         FROM inheritance i
         JOIN symbols s ON i.child_id = s.id
         JOIN files f ON s.file_id = f.id
-        WHERE (i.parent_name = ? OR i.parent_name LIKE ? OR i.parent_name LIKE ?){scope_clause}
-        "#
+        WHERE {}{scope_clause}
+        "#,
+        implementation_parent_sql()
     );
-    let mut values = vec![
-        parent_name.to_string(),
-        suffix_pattern,
-        namespace_suffix_pattern,
-    ];
+    let mut values = implementation_params(parent_name).to_vec();
     values.extend(scope_params);
-    let params: Vec<&dyn rusqlite::types::ToSql> = values
-        .iter()
-        .map(|value| value as &dyn rusqlite::types::ToSql)
-        .collect();
-    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    let count: i64 = conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(values.iter()),
+        |row| row.get(0),
+    )?;
     Ok(count as usize)
 }
 
@@ -6269,48 +7191,73 @@ pub fn find_implementations_scoped(
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<SearchResult>> {
-    if scope.is_empty() {
-        return find_implementations(conn, parent_name, limit);
-    }
+    query_implementations(conn, parent_name, limit, scope.path_condition())
+}
 
-    let suffix_pattern = format!("%.{}", parent_name);
-    let namespace_suffix_pattern = format!("%::{}", parent_name);
-    let (scope_clause, scope_params) = scope.path_condition();
-
+fn query_implementations(
+    conn: &Connection,
+    parent_name: &str,
+    limit: usize,
+    (scope_clause, scope_params): (String, Vec<String>),
+) -> Result<Vec<SearchResult>> {
+    use rusqlite::types::Value;
     let sql = format!(
         r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM inheritance i
         JOIN symbols s ON i.child_id = s.id
         JOIN files f ON s.file_id = f.id
-        WHERE (i.parent_name = ?1 OR i.parent_name LIKE ?2 OR i.parent_name LIKE ?3){}
+        WHERE {}{scope_clause}
         ORDER BY
             CASE
-                WHEN i.parent_name = ?1 THEN 0
+                WHEN {PARENT_NAME_SQL} = ?1 THEN 0
                 ELSE 1
             END, s.name
         LIMIT ?{}
         "#,
-        scope_clause,
+        implementation_parent_sql(),
         4 + scope_params.len()
     );
-
+    let mut values: Vec<Value> = implementation_params(parent_name)
+        .into_iter()
+        .map(Value::Text)
+        .collect();
+    values.extend(scope_params.into_iter().map(Value::Text));
+    values.push(Value::Integer(limit as i64));
     let mut stmt = conn.prepare(&sql)?;
-    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    all_params.push(Box::new(parent_name.to_string()));
-    all_params.push(Box::new(suffix_pattern));
-    all_params.push(Box::new(namespace_suffix_pattern));
+    let results = stmt
+        .query_map(rusqlite::params_from_iter(values), row_to_search_result)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(results)
+}
+
+/// Find parents (inherited types) of a symbol, scoped to the file that defines it.
+/// When scope is empty, returns parents for all symbols with that name.
+pub fn find_parents_scoped(
+    conn: &Connection,
+    child_name: &str,
+    scope: &SearchScope,
+) -> Result<Vec<(String, String)>> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        "SELECT i.parent_name, i.kind \
+         FROM inheritance i \
+         JOIN symbols s ON i.child_id = s.id \
+         JOIN files f ON s.file_id = f.id \
+         WHERE s.name = ?1{}",
+        scope_clause
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(child_name.to_string())];
     for p in &scope_params {
         all_params.push(Box::new(p.clone()));
     }
-    all_params.push(Box::new(limit as i64));
-
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         all_params.iter().map(|p| p.as_ref()).collect();
     let results = stmt
-        .query_map(param_refs.as_slice(), row_to_search_result)?
-        .collect::<Result<Vec<_>, _>>()?;
-
+        .query_map(param_refs.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
     Ok(results)
 }
 
@@ -6363,8 +7310,10 @@ pub struct DbStats {
 
 /// Clear all data from the database
 pub fn clear_db(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CREATE_FILE_WORDS_SQL)?;
     conn.execute_batch(
         r#"
+        DELETE FROM file_words;
         DELETE FROM ios_asset_usages;
         DELETE FROM ios_assets;
         DELETE FROM storyboard_usages;
@@ -6380,7 +7329,30 @@ pub fn clear_db(conn: &Connection) -> Result<()> {
         DELETE FROM files;
         "#,
     )?;
-    Ok(())
+    bump_index_generation(conn)
+}
+
+/// `(path, mtime, size, words)` of every file indexed under `root_key`
+/// whose words were read from the version its `files` row describes. `None`
+/// when the index keeps no words at all.
+pub fn load_file_words(
+    conn: &Connection,
+    root_key: &str,
+) -> Result<Option<Vec<(String, i64, i64, String)>>> {
+    if !table_exists(conn, "file_words")? {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT f.path, f.mtime, f.size, w.words
+         FROM files f JOIN file_words w ON w.file_id = f.id
+         WHERE f.root_path = ?1 AND w.mtime = f.mtime AND w.size = f.size",
+    )?;
+    let rows = stmt
+        .query_map(params![root_key], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(rows))
 }
 
 /// Reference result
@@ -6392,6 +7364,10 @@ pub struct RefResult {
     pub path: String,
     #[serde(skip_serializing)]
     pub root_path: Option<String>,
+    /// The reference sits in a test file ([`crate::commands::is_test_path`]);
+    /// only serialized when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub test: bool,
 }
 
 fn row_to_ref_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<RefResult> {
@@ -6400,44 +7376,79 @@ fn row_to_ref_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<RefResult> {
     } else {
         None
     };
+    let path: String = row.get(3)?;
     Ok(RefResult {
         name: row.get(0)?,
         line: row.get(1)?,
         context: row.get(2)?,
-        path: row.get(3)?,
+        test: crate::commands::is_test_path(&path),
+        path,
         root_path,
     })
 }
 
-/// Find references (usages) of a symbol
-pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Vec<RefResult>> {
-    // Early materialization: filter and sort refs using covering index BEFORE
-    // joining with files. Avoids SQLite planner choosing full scan on large
-    // tables (~12M rows) when ORDER BY references the joined table. See #19.
-    //
-    // Inner ORDER BY (file_id, line) is free because idx_refs_name_file_line
-    // has exactly this sort order. Outer ORDER BY f.path reshuffles the tiny
-    // result set (bounded by LIMIT) so output is stable for users.
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT r.name, r.line, r.context, f.path, f.root_path
-        FROM (
-            SELECT name, file_id, line, context
-            FROM refs
-            WHERE name = ?1
-            ORDER BY file_id, line
-            LIMIT ?2
-        ) r
-        JOIN files f ON f.id = r.file_id
-        ORDER BY f.path, r.line
-        "#,
-    )?;
-
+/// The first `limit` references matching `condition` (over `refs r0`, with
+/// `values` bound in order): production files first, test files
+/// ([`crate::commands::is_test_path`]) after them, each group by path and
+/// line, so the references of one file stay together.
+///
+/// The page is picked from `(name, file_id, line)` of
+/// `idx_refs_name_file_line` plus the file path — refs drive the join
+/// (`CROSS JOIN`), so the planner never scans every file or ref (see #19) —
+/// and only the rows on the page read their context.
+fn find_references_where(
+    conn: &Connection,
+    condition: &str,
+    mut values: Vec<String>,
+    limit: usize,
+) -> Result<Vec<RefResult>> {
+    ensure_test_functions(conn)?;
+    let order =
+        |r: &str, f: &str| format!("{IS_TEST_PATH_FN}({f}.path), {f}.path, {r}.file_id, {r}.line");
+    let sql = format!(
+        "SELECT r.name, r.line, r.context, f.path, f.root_path
+         FROM (
+             SELECT r0.id AS id
+             FROM refs r0 CROSS JOIN files f0
+             WHERE {condition} AND f0.id = r0.file_id
+             ORDER BY {inner}
+             LIMIT ?
+         ) page
+         CROSS JOIN refs r CROSS JOIN files f
+         WHERE r.id = page.id AND f.id = r.file_id
+         ORDER BY {outer}",
+        inner = order("r0", "f0"),
+        outer = order("r", "f"),
+    );
+    values.push(limit.to_string());
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
     let results = stmt
-        .query_map(params![name, limit as i64], row_to_ref_result)?
+        .query_map(params.as_slice(), row_to_ref_result)?
         .collect::<Result<Vec<_>, _>>()?;
-
     Ok(results)
+}
+
+/// `AND` condition on `r0.file_id` for `scope`, and its values.
+fn ref_scope_condition(scope: &SearchScope) -> (String, Vec<String>) {
+    let (scope_clause, scope_params) = scope.path_condition();
+    if scope_clause.is_empty() {
+        return (String::new(), scope_params);
+    }
+    let bare_conditions = scope_clause.trim_start_matches(" AND ");
+    (
+        format!(" AND r0.file_id IN (SELECT id FROM files f WHERE {bare_conditions})"),
+        scope_params,
+    )
+}
+
+/// Find references (usages) of a symbol, production code first
+/// ([`find_references_where`]).
+pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Vec<RefResult>> {
+    find_references_where(conn, "r0.name = ?", vec![name.to_string()], limit)
 }
 
 pub fn count_references_scoped(
@@ -6459,24 +7470,239 @@ pub fn count_references_scoped(
     Ok(count as usize)
 }
 
-/// All symbols defined in a file, ordered by line. Used by `explore --rwr`
-/// to attribute a reference (file + line) to its owning symbol — the last
-/// symbol whose start line is <= the reference line. Approximate without
-/// `end_line`, but good enough to build a caller→callee graph in memory.
-pub fn get_file_symbols(conn: &Connection, path: &str) -> Result<Vec<SearchResult>> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE f.path = ?1
-        ORDER BY s.line
-        "#,
-    )?;
+/// SQL condition: file `f` is stored under the root whose `files.root_path`
+/// is bound to the placeholder (`''` for none), so that a relative path shared
+/// by two roots resolves to the file of the root that was asked for.
+///
+/// The primary root has two spellings: current indexers store its normalized
+/// path, and indexes created before `root_path` existed keep `''`. Either one
+/// finds a file stored under the other, going by the primary root recorded in
+/// `metadata`.
+macro_rules! file_under_root_sql {
+    ($root:literal) => {
+        concat!(
+            "(f.root_path = ",
+            $root,
+            " OR (f.root_path IN ('', (SELECT value FROM metadata WHERE key = 'project_root'))",
+            " AND ",
+            $root,
+            " IN ('', (SELECT value FROM metadata WHERE key = 'project_root'))))"
+        )
+    };
+}
+
+/// All symbols defined in a file, ordered by line. `root_path` is the owning
+/// root as stored in `files.root_path`, `None` for `''`.
+pub fn get_file_symbols(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+) -> Result<Vec<SearchResult>> {
+    let mut stmt = conn.prepare(concat!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1 AND ",
+        file_under_root_sql!("?2"),
+        " ORDER BY s.line"
+    ))?;
     let results = stmt
-        .query_map(params![path], row_to_search_result)?
+        .query_map(params![path, root_path.unwrap_or("")], row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
+}
+
+/// Id of the symbol named `name` declared at `line` of `path`, the way a
+/// [`SearchResult`] locates it. `root_path` is read as in [`get_file_symbols`].
+pub fn find_symbol_id(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+    line: i64,
+    name: &str,
+) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1 AND s.line = ?2 AND s.name = ?3 AND ",
+        file_under_root_sql!("?4"),
+        " LIMIT 1"
+    ))?;
+    Ok(stmt
+        .query_row(params![path, line, name, root_path.unwrap_or("")], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+/// A definition's name, kind and line range.
+#[derive(Debug, Clone)]
+pub struct SymbolSpan {
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+    /// `None` where the language parser reports no ranges.
+    pub end_line: Option<i64>,
+}
+
+/// Definitions of a file with their line ranges, in the order an outline
+/// reads: by line, a definition before the ones nested in it. Imports and
+/// schema columns are left out. `root_path` is read as in [`get_file_symbols`].
+pub fn get_file_outline(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+) -> Result<Vec<SymbolSpan>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.name, s.kind, s.line, s.end_line
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1 AND s.kind NOT IN ('import', 'column') AND ",
+        file_under_root_sql!("?2"),
+        " ORDER BY s.line, COALESCE(s.end_line, s.line) DESC"
+    ))?;
+    let spans = stmt
+        .query_map(params![path, root_path.unwrap_or("")], |row| {
+            Ok(SymbolSpan {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                line: row.get(2)?,
+                end_line: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(spans)
+}
+
+/// Whether the index knows line ranges for at least one symbol in this file.
+///
+/// `symbols.end_line` is only filled by parsers that report a range, so a
+/// `false` here means "this file's language has no range support" rather than
+/// "this file has no symbols". Callers use it to tell a genuine
+/// "the line belongs to no symbol" answer from [`find_owning_symbol`] apart
+/// from "the index cannot answer" — only the latter deserves a fallback.
+/// `root_path` is read as in [`get_file_symbols`].
+pub fn file_has_symbol_ranges(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE f.path = ?1 AND s.end_line IS NOT NULL AND ",
+        file_under_root_sql!("?2"),
+        ")"
+    ))?;
+    let has_ranges: bool =
+        stmt.query_row(params![path, root_path.unwrap_or("")], |row| row.get(0))?;
+    Ok(has_ranges)
+}
+
+/// Whether a symbol of `kind` is a definition that owns the references in
+/// its range. Imports (`use`, `from … import`, `require`) and annotations
+/// (`include Mod`, a decorator, a Rails callback or validation) are lines
+/// inside a definition: a reference on one belongs to the definition around
+/// it, or to none at module level. The SQL of [`find_owning_symbol`] and
+/// [`find_definitions_on_line`] spells out the same two kinds.
+pub fn is_owner_kind(kind: &str) -> bool {
+    !matches!(kind, "import" | "annotation")
+}
+
+/// The symbol whose body contains `line` in `path`, narrowest range first.
+///
+/// Nested definitions all contain the line, so the ordering picks the method
+/// over the class that encloses it. A symbol without `end_line` is treated as
+/// spanning its own declaration line only, which keeps one-line declarations
+/// (constants, `scope`, `attr_reader`) eligible for a reference sitting on
+/// them without letting them claim the rest of the file. Imports and
+/// annotations own nothing ([`is_owner_kind`]): `use super::helper;` is no
+/// caller of `helper`, and a multi-line `include(...)` matcher in a spec
+/// does not stand in for the example around it.
+///
+/// Languages whose parsers report no range at all would then never match, so
+/// files with no `end_line` data fall back to the historical heuristic — the
+/// last symbol declared at or before `line`. That fallback is scoped to those
+/// files on purpose: applying it everywhere is what made module-level
+/// references get attributed to the preceding method.
+///
+/// `root_path` is read as in [`get_file_symbols`].
+pub fn find_owning_symbol(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+    line: i64,
+) -> Result<Option<SearchResult>> {
+    let root_path = root_path.unwrap_or("");
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1
+           AND s.line <= ?2
+           AND COALESCE(s.end_line, s.line) >= ?2
+           AND s.kind NOT IN ('import', 'annotation')
+           AND ",
+        file_under_root_sql!("?3"),
+        " ORDER BY COALESCE(s.end_line, s.line) - s.line ASC, s.line DESC
+         LIMIT 1"
+    ))?;
+    let owner = stmt
+        .query_row(params![path, line, root_path], row_to_search_result)
+        .optional()?;
+    drop(stmt);
+    if owner.is_some() {
+        return Ok(owner);
+    }
+
+    let mut fallback = conn.prepare_cached(concat!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1
+           AND s.line <= ?2
+           AND s.kind NOT IN ('import', 'annotation')
+           AND NOT EXISTS (
+               SELECT 1 FROM symbols r
+               WHERE r.file_id = s.file_id AND r.end_line IS NOT NULL
+           )
+           AND ",
+        file_under_root_sql!("?3"),
+        " ORDER BY s.line DESC
+         LIMIT 1"
+    ))?;
+    Ok(fallback
+        .query_row(params![path, line, root_path], row_to_search_result)
+        .optional()?)
+}
+
+/// Names of the definitions declared on `line` of `path`, imports and
+/// annotations left out ([`is_owner_kind`]): a text match of one of these
+/// names on that line is the definition itself, not a use of it.
+/// `root_path` is read as in [`get_file_symbols`].
+pub fn find_definitions_on_line(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+    line: i64,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.name
+         FROM symbols s
+         JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1
+           AND s.line = ?2
+           AND s.kind NOT IN ('import', 'annotation')
+           AND ",
+        file_under_root_sql!("?3"),
+    ))?;
+    let names = stmt
+        .query_map(params![path, line, root_path.unwrap_or("")], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names)
 }
 
 /// Search references by name (prefix match, grouped by unique name)
@@ -6721,25 +7947,28 @@ pub fn find_definitions(conn: &Connection, name: &str, limit: usize) -> Result<V
     };
 
     if name.starts_with("::") {
-        return find("s.qualified_name LIKE ?", format!("%{name}"));
+        return find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%{name}"));
     }
     if name.contains("::") {
-        let exact = find("s.qualified_name = ?", name.to_string())?;
+        let exact = find(DISPLAY_NAME_IS_FIRST_PARAM_SQL, name.to_string())?;
         if !exact.is_empty() {
             return Ok(exact);
         }
-        let suffix = find("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        let suffix = find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%::{name}"))?;
         if !suffix.is_empty() {
             return Ok(suffix);
         }
-        return find("s.qualified_name LIKE ?", format!("{name}%"));
+        return find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("{name}%"));
     }
     let exact = find("s.name = ?", name.to_string())?;
     if !exact.is_empty() {
-        Ok(exact)
-    } else {
-        find("s.name LIKE ?", format!("{name}%"))
+        return Ok(exact);
     }
+    let namespaced = find_by_last_segment(conn, name, None, false, limit, &SearchScope::none())?;
+    if !namespaced.is_empty() {
+        return Ok(namespaced);
+    }
+    find("s.name LIKE ?", format!("{name}%"))
 }
 
 pub fn find_definitions_scoped(
@@ -6768,25 +7997,28 @@ pub fn find_definitions_scoped(
     };
 
     if name.starts_with("::") {
-        return find("s.qualified_name LIKE ?", format!("%{name}"));
+        return find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%{name}"));
     }
     if name.contains("::") {
-        let exact = find("s.qualified_name = ?", name.to_string())?;
+        let exact = find(DISPLAY_NAME_IS_FIRST_PARAM_SQL, name.to_string())?;
         if !exact.is_empty() {
             return Ok(exact);
         }
-        let suffix = find("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        let suffix = find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%::{name}"))?;
         if !suffix.is_empty() {
             return Ok(suffix);
         }
-        return find("s.qualified_name LIKE ?", format!("{name}%"));
+        return find(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("{name}%"));
     }
     let exact = find("s.name = ?", name.to_string())?;
     if !exact.is_empty() {
-        Ok(exact)
-    } else {
-        find("s.name LIKE ?", format!("{name}%"))
+        return Ok(exact);
     }
+    let namespaced = find_by_last_segment(conn, name, None, false, limit, scope)?;
+    if !namespaced.is_empty() {
+        return Ok(namespaced);
+    }
+    find("s.name LIKE ?", format!("{name}%"))
 }
 
 /// Find all cross-references for a symbol: definitions, imports, and usages
@@ -6822,12 +8054,12 @@ pub fn search_symbols_fuzzy(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
             ORDER BY
-                CASE WHEN s.qualified_name = ?2 THEN 0
-                     WHEN s.qualified_name LIKE ?3 THEN 1
+                CASE WHEN COALESCE(s.qualified_name, s.name) = ?2 THEN 0
+                     WHEN COALESCE(s.qualified_name, s.name) LIKE ?3 THEN 1
                      ELSE 2 END,
-                length(s.qualified_name)
+                length(COALESCE(s.qualified_name, s.name))
             LIMIT ?4
             "#,
         )?;
@@ -7009,26 +8241,29 @@ pub fn count_symbols_by_name_scoped(
         )
     };
     if name.starts_with("::") {
-        return count("s.qualified_name LIKE ?", format!("%{name}"));
+        return count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%{name}"));
     }
     if name.contains("::") {
-        let exact = count("s.qualified_name = ?", name.to_string())?;
+        let exact = count(DISPLAY_NAME_IS_FIRST_PARAM_SQL, name.to_string())?;
         if exact > 0 {
             return Ok(exact);
         }
-        let suffix = count("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        let suffix = count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%::{name}"))?;
         if suffix > 0 {
             return Ok(suffix);
         }
-        return count("s.qualified_name LIKE ?", format!("{name}%"));
+        return count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("{name}%"));
     }
 
     let exact = count("s.name = ?", name.to_string())?;
     if exact > 0 {
-        Ok(exact)
-    } else {
-        count("s.name LIKE ?", format!("{name}%"))
+        return Ok(exact);
     }
+    let namespaced = count_by_last_segment(conn, name, kind, false, scope)?;
+    if namespaced > 0 {
+        return Ok(namespaced);
+    }
+    count("s.name LIKE ?", format!("{name}%"))
 }
 
 pub fn count_symbols_by_pattern_scoped(
@@ -7081,20 +8316,24 @@ pub fn count_class_like_scoped(
         count_symbol_matches(conn, predicate, vec![value], None, scope, true, false)
     };
     if name.starts_with("::") {
-        return count("s.qualified_name LIKE ?", format!("%{name}"));
+        return count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%{name}"));
     }
     if name.contains("::") {
-        let exact = count("s.qualified_name = ?", name.to_string())?;
+        let exact = count(DISPLAY_NAME_IS_FIRST_PARAM_SQL, name.to_string())?;
         if exact > 0 {
             return Ok(exact);
         }
-        let suffix = count("s.qualified_name LIKE ?", format!("%::{name}"))?;
+        let suffix = count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("%::{name}"))?;
         if suffix > 0 {
             return Ok(suffix);
         }
-        return count("s.qualified_name LIKE ?", format!("{name}%"));
+        return count(&format!("{DISPLAY_NAME_SQL} LIKE ?"), format!("{name}%"));
     }
-    count("s.name = ?", name.to_string())
+    let exact = count("s.name = ?", name.to_string())?;
+    if exact > 0 {
+        return Ok(exact);
+    }
+    count_by_last_segment(conn, name, None, true, scope)
 }
 
 pub fn count_symbols_fuzzy_scoped(
@@ -7105,7 +8344,10 @@ pub fn count_symbols_fuzzy_scoped(
     class_only: bool,
 ) -> Result<usize> {
     let (predicate, value) = if query.contains("::") {
-        ("s.qualified_name LIKE ?", format!("%{query}%"))
+        (
+            "COALESCE(s.qualified_name, s.name) LIKE ?",
+            format!("%{query}%"),
+        )
     } else {
         ("s.name LIKE ?", format!("%{query}%"))
     };
@@ -7124,11 +8366,17 @@ pub fn count_search_symbols_scoped(
     if query.contains("::") {
         let raw = query.trim_end_matches('*');
         let (predicate, value) = if query.starts_with("::") {
-            ("s.qualified_name LIKE ?", format!("%{raw}"))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?",
+                format!("%{raw}"),
+            )
         } else if query.ends_with('*') {
-            ("s.qualified_name LIKE ?", format!("{raw}%"))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?",
+                format!("{raw}%"),
+            )
         } else {
-            ("s.qualified_name = ?", raw.to_string())
+            (DISPLAY_NAME_IS_FIRST_PARAM_SQL, raw.to_string())
         };
         return count_symbol_matches(conn, predicate, vec![value], kind, scope, false, false);
     }
@@ -7145,7 +8393,7 @@ pub fn count_search_symbols_scoped(
         "#
     );
     if kind.is_some() {
-        sql.push_str(" AND s.kind = ?");
+        sql.push_str(FTS_KIND_FILTER);
     }
     let mut values = vec![escaped_query];
     values.extend(scope_params);
@@ -7178,7 +8426,7 @@ pub fn count_search_symbol_terms_scoped(
             .map(|term| {
                 values.push(format!("%{term}%"));
                 if term.contains("::") {
-                    "s.qualified_name LIKE ?"
+                    "COALESCE(s.qualified_name, s.name) LIKE ?"
                 } else {
                     "s.name LIKE ?"
                 }
@@ -7201,7 +8449,11 @@ pub fn count_search_symbol_terms_scoped(
     };
     values.extend(scope_params);
     if let Some(kind) = kind {
-        sql.push_str(" AND s.kind = ?");
+        sql.push_str(if fuzzy {
+            " AND s.kind = ?"
+        } else {
+            FTS_KIND_FILTER
+        });
         values.push(kind.to_string());
     }
     let params: Vec<&dyn rusqlite::types::ToSql> = values
@@ -7220,10 +8472,43 @@ pub fn search_symbol_terms_scoped(
     scope: &SearchScope,
     fuzzy: bool,
 ) -> Result<Vec<SearchResult>> {
+    Ok(
+        search_symbol_terms_scoped_with_ids(conn, terms, kind, limit, scope, fuzzy, None)?
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect(),
+    )
+}
+
+/// `AND` clause keeping only third-party paths, only project paths, or
+/// (for `None`) everything.
+fn vendor_condition(vendor: Option<bool>) -> String {
+    match vendor {
+        None => String::new(),
+        Some(true) => format!(" AND {VENDOR_PATH_SQL}"),
+        Some(false) => format!(" AND NOT {VENDOR_PATH_SQL}"),
+    }
+}
+
+/// [`search_symbol_terms_scoped`] with each row's symbol id, in the same
+/// order, optionally restricted to third-party (`vendor = Some(true)`) or
+/// project (`Some(false)`) paths. Rankers need the id to look up per-symbol
+/// graph metrics.
+pub fn search_symbol_terms_scoped_with_ids(
+    conn: &Connection,
+    terms: &[&str],
+    kind: Option<&str>,
+    limit: usize,
+    scope: &SearchScope,
+    fuzzy: bool,
+    vendor: Option<bool>,
+) -> Result<Vec<(i64, SearchResult)>> {
     if terms.is_empty() {
         return Ok(Vec::new());
     }
+    ensure_test_functions(conn)?;
     let (scope_clause, scope_params) = scope.path_condition();
+    let vendor_clause = vendor_condition(vendor);
     let mut values = Vec::new();
     let mut sql = if fuzzy {
         let predicates = terms
@@ -7231,7 +8516,7 @@ pub fn search_symbol_terms_scoped(
             .map(|term| {
                 values.push(format!("%{term}%"));
                 if term.contains("::") {
-                    "s.qualified_name LIKE ?"
+                    "COALESCE(s.qualified_name, s.name) LIKE ?"
                 } else {
                     "s.name LIKE ?"
                 }
@@ -7239,7 +8524,7 @@ pub fn search_symbol_terms_scoped(
             .collect::<Vec<_>>()
             .join(" OR ");
         format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicates}){scope_clause}"
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.id FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicates}){scope_clause}{vendor_clause}"
         )
     } else {
         values.push(
@@ -7250,15 +8535,50 @@ pub fn search_symbol_terms_scoped(
                 .join(" OR "),
         );
         format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols_fts fts JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id WHERE symbols_fts MATCH ?{scope_clause}"
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.id FROM symbols_fts fts JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id WHERE symbols_fts MATCH ?{scope_clause}{vendor_clause}"
         )
     };
     values.extend(scope_params);
     if let Some(kind) = kind {
-        sql.push_str(" AND s.kind = ?");
+        sql.push_str(if fuzzy {
+            " AND s.kind = ?"
+        } else {
+            FTS_KIND_FILTER
+        });
         values.push(kind.to_string());
     }
-    sql.push_str(" ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), f.path, s.line LIMIT ?");
+    if fuzzy {
+        // Fuzzy matching does not tell case apart, so its tiers are a name
+        // equal to a term ignoring case, then any other match.
+        let first = values.len() + 1;
+        let folded = (0..terms.len())
+            .map(|offset| format!("lower(?{})", first + offset))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let exact = format!("lower(s.name) IN ({folded})");
+        sql.push_str(&format!(
+            " ORDER BY CASE WHEN {exact} THEN 0 ELSE 1 END, {IMPORT_LAST_SQL}, {}, length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name), {VENDOR_PATH_SQL}, f.path, s.line",
+            test_last_sql(&exact)
+        ));
+        values.extend(
+            terms
+                .iter()
+                .map(|term| term.trim_end_matches('*').to_string()),
+        );
+    } else {
+        let first = values.len() + 1;
+        let placeholders = (0..terms.len())
+            .map(|offset| format!("?{}", first + offset))
+            .collect::<Vec<_>>();
+        let placeholder_refs = placeholders.iter().map(String::as_str).collect::<Vec<_>>();
+        sql.push_str(&fts_order_by(&placeholder_refs));
+        values.extend(
+            terms
+                .iter()
+                .map(|term| term.trim_end_matches('*').to_string()),
+        );
+    }
+    sql.push_str(&format!(" LIMIT ?{}", values.len() + 1));
     values.push(limit.to_string());
     let params: Vec<&dyn rusqlite::types::ToSql> = values
         .iter()
@@ -7266,7 +8586,9 @@ pub fn search_symbol_terms_scoped(
         .collect();
     let mut stmt = conn.prepare(&sql)?;
     let results = stmt
-        .query_map(params.as_slice(), row_to_search_result)?
+        .query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(7)?, row_to_search_result(row)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }
@@ -7283,6 +8605,7 @@ pub fn search_symbols_for_command(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
+    ensure_test_functions(conn)?;
     let (scope_clause, scope_params) = scope.path_condition();
     let mut values = Vec::new();
     let mut sql;
@@ -7290,7 +8613,7 @@ pub fn search_symbols_for_command(
     if fuzzy {
         let (column, contains, exact, prefix) = if query.contains("::") {
             (
-                "s.qualified_name",
+                DISPLAY_NAME_SQL,
                 format!("%{query}%"),
                 if query.starts_with("::") {
                     format!("%{query}")
@@ -7328,22 +8651,30 @@ pub fn search_symbols_for_command(
             sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
         }
         sql.push_str(&format!(
-            " ORDER BY CASE WHEN {column} = ? THEN 0 WHEN {column} LIKE ? THEN 1 ELSE 2 END, length({column}) LIMIT ?"
+            " ORDER BY CASE WHEN {column} = ? THEN 0 WHEN {column} LIKE ? THEN 1 ELSE 2 END, {IMPORT_LAST_SQL}, {}, length({column}) LIMIT ?",
+            test_last_sql(&format!("{column} = ?"))
         ));
         if let Some(kind) = kind {
             values.push(kind.to_string());
         }
-        values.push(exact);
+        values.push(exact.clone());
         values.push(prefix);
+        values.push(exact);
         values.push(limit.to_string());
     } else if query.contains("::") {
         let raw = query.trim_end_matches('*');
         let (predicate, value) = if query.starts_with("::") {
-            ("s.qualified_name LIKE ?", format!("%{raw}"))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?",
+                format!("%{raw}"),
+            )
         } else if query.ends_with('*') {
-            ("s.qualified_name LIKE ?", format!("{raw}%"))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?",
+                format!("{raw}%"),
+            )
         } else {
-            ("s.qualified_name = ?", raw.to_string())
+            (DISPLAY_NAME_IS_FIRST_PARAM_SQL, raw.to_string())
         };
         sql = format!(
             r#"
@@ -7361,7 +8692,7 @@ pub fn search_symbols_for_command(
         if class_only {
             sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
         }
-        sql.push_str(" ORDER BY length(s.qualified_name), s.qualified_name LIMIT ?");
+        sql.push_str(" ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name) LIMIT ?");
         if let Some(kind) = kind {
             values.push(kind.to_string());
         }
@@ -7378,16 +8709,17 @@ pub fn search_symbols_for_command(
         );
         values.push(escape_fts5_query(query));
         values.extend(scope_params);
-        if kind.is_some() {
-            sql.push_str(" AND s.kind = ?");
-        }
-        if class_only {
-            sql.push_str(" AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')");
-        }
-        sql.push_str(" LIMIT ?");
         if let Some(kind) = kind {
+            sql.push_str(FTS_KIND_FILTER);
             values.push(kind.to_string());
         }
+        if class_only {
+            sql.push_str(FTS_CLASS_ONLY_FILTER);
+        }
+        let exact_placeholder = format!("?{}", values.len() + 1);
+        sql.push_str(&fts_order_by(&[exact_placeholder.as_str()]));
+        values.push(query.trim_end_matches('*').to_string());
+        sql.push_str(&format!(" LIMIT ?{}", values.len() + 1));
         values.push(limit.to_string());
     }
 
@@ -7421,11 +8753,17 @@ pub fn search_symbols_scoped(
         let raw = query.trim_end_matches('*');
         let (scope_clause, scope_params) = scope.path_condition();
         let (predicate, value) = if query.starts_with("::") {
-            ("s.qualified_name LIKE ?1", format!("%{}", raw))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?1",
+                format!("%{}", raw),
+            )
         } else if query.ends_with('*') {
-            ("s.qualified_name LIKE ?1", format!("{raw}%"))
+            (
+                "COALESCE(s.qualified_name, s.name) LIKE ?1",
+                format!("{raw}%"),
+            )
         } else {
-            ("s.qualified_name = ?1", raw.to_string())
+            (DISPLAY_NAME_IS_FIRST_PARAM_SQL, raw.to_string())
         };
 
         let sql = format!(
@@ -7434,7 +8772,7 @@ pub fn search_symbols_scoped(
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             WHERE {}{}
-            ORDER BY length(s.qualified_name), s.qualified_name
+            ORDER BY length(COALESCE(s.qualified_name, s.name)), COALESCE(s.qualified_name, s.name)
             LIMIT ?{}
             "#,
             predicate,
@@ -7457,20 +8795,23 @@ pub fn search_symbols_scoped(
             .collect::<Result<Vec<_>, _>>()?);
     }
 
+    ensure_test_functions(conn)?;
     let escaped_query = escape_fts5_query(query);
     let (scope_clause, scope_params) = scope.path_condition();
 
+    let exact_placeholder = format!("?{}", 2 + scope_params.len());
     let sql = format!(
         r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
-        WHERE symbols_fts MATCH ?1{}
+        WHERE symbols_fts MATCH ?1{}{}
         LIMIT ?{}
         "#,
         scope_clause,
-        2 + scope_params.len()
+        fts_order_by(&[exact_placeholder.as_str()]),
+        3 + scope_params.len()
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -7479,6 +8820,7 @@ pub fn search_symbols_scoped(
     for p in &scope_params {
         all_params.push(Box::new(p.clone()));
     }
+    all_params.push(Box::new(query.trim_end_matches('*').to_string()));
     all_params.push(Box::new(limit as i64));
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -7506,9 +8848,9 @@ pub fn find_symbols_by_name_scoped(
 
     if name.starts_with("::") || name.contains("::") {
         let predicate = if name.starts_with("::") {
-            "s.qualified_name LIKE ?1"
+            "COALESCE(s.qualified_name, s.name) LIKE ?1"
         } else {
-            "s.qualified_name = ?1"
+            DISPLAY_NAME_IS_FIRST_PARAM_SQL
         };
         let value = if name.starts_with("::") {
             format!("%{}", name)
@@ -7548,7 +8890,7 @@ pub fn find_symbols_by_name_scoped(
         }
 
         let mut sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.qualified_name LIKE ?1{}",
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE COALESCE(s.qualified_name, s.name) LIKE ?1{}",
             scope_clause
         );
         if kind.is_some() {
@@ -7579,7 +8921,7 @@ pub fn find_symbols_by_name_scoped(
         }
 
         let mut sql = format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.qualified_name LIKE ?1{}",
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE COALESCE(s.qualified_name, s.name) LIKE ?1{}",
             scope_clause
         );
         if kind.is_some() {
@@ -7634,6 +8976,9 @@ pub fn find_symbols_by_name_scoped(
     let results = stmt
         .query_map(param_refs.as_slice(), row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
+    if results.is_empty() {
+        return find_by_last_segment(conn, name, kind, false, limit, scope);
+    }
 
     Ok(results)
 }
@@ -7651,9 +8996,9 @@ pub fn find_class_like_scoped(
 
     let (scope_clause, scope_params) = scope.path_condition();
     let predicate = if name.starts_with("::") {
-        "s.qualified_name LIKE ?1"
+        "COALESCE(s.qualified_name, s.name) LIKE ?1"
     } else if name.contains("::") {
-        "s.qualified_name = ?1"
+        DISPLAY_NAME_IS_FIRST_PARAM_SQL
     } else {
         "s.name = ?1"
     };
@@ -7696,7 +9041,7 @@ pub fn find_class_like_scoped(
             SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
-            WHERE s.qualified_name LIKE ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
+            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1 AND s.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package'){}
             LIMIT ?{}
             "#,
             scope_clause,
@@ -7715,72 +9060,77 @@ pub fn find_class_like_scoped(
             .query_map(param_refs.as_slice(), row_to_search_result)?
             .collect::<Result<Vec<_>, _>>()?);
     }
+    if results.is_empty() && !name.contains("::") {
+        return find_by_last_segment(conn, name, None, true, limit, scope);
+    }
 
     Ok(results)
 }
 
-/// Find references with scope filtering
+/// Find references with scope filtering, production code first
+/// ([`find_references_where`]).
 pub fn find_references_scoped(
     conn: &Connection,
     name: &str,
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<RefResult>> {
-    if scope.is_empty() {
-        return find_references(conn, name, limit);
-    }
+    let (scope_condition, scope_params) = ref_scope_condition(scope);
+    let mut values = vec![name.to_string()];
+    values.extend(scope_params);
+    find_references_where(
+        conn,
+        &format!("r0.name = ?{scope_condition}"),
+        values,
+        limit,
+    )
+}
 
+/// References recorded under `name` on a line that contains `mention`.
+///
+/// This is how a qualified name that no reference is recorded under is
+/// looked up: `Billing::Invoice.new` records `Invoice`, so `usages
+/// Billing::Invoice` reads the references to `Invoice` whose line spells
+/// `Billing::Invoice` out, leaving another namespace's `Invoice` alone.
+pub fn find_references_mentioning_scoped(
+    conn: &Connection,
+    name: &str,
+    mention: &str,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<RefResult>> {
+    let (scope_condition, scope_params) = ref_scope_condition(scope);
+    let mut values = vec![name.to_string(), mention.to_string()];
+    values.extend(scope_params);
+    find_references_where(
+        conn,
+        &format!("r0.name = ? AND instr(r0.context, ?) > 0{scope_condition}"),
+        values,
+        limit,
+    )
+}
+
+/// How many references [`find_references_mentioning_scoped`] would list
+/// without a limit.
+pub fn count_references_mentioning_scoped(
+    conn: &Connection,
+    name: &str,
+    mention: &str,
+    scope: &SearchScope,
+) -> Result<usize> {
     let (scope_clause, scope_params) = scope.path_condition();
-
-    // Early materialization with scope pushed into the subquery via IN clause.
-    // Avoids materializing millions of refs when scope narrows by path. See #19.
-    //
-    // Scope filter is applied at files table (small, ~tens of thousands),
-    // producing a small file_id set, then refs are filtered by both name
-    // AND file_id — both covered by idx_refs_name_file_line.
-    let scope_subquery = if scope_clause.is_empty() {
-        String::new()
-    } else {
-        // Strip leading " AND " and wrap in file_id IN subselect
-        let bare_conditions = scope_clause.trim_start_matches(" AND ");
-        format!(
-            " AND file_id IN (SELECT id FROM files f WHERE {})",
-            bare_conditions
-        )
-    };
-
     let sql = format!(
-        r#"
-        SELECT r.name, r.line, r.context, f.path, f.root_path
-        FROM (
-            SELECT name, file_id, line, context
-            FROM refs
-            WHERE name = ?1{}
-            ORDER BY file_id, line
-            LIMIT ?{}
-        ) r
-        JOIN files f ON f.id = r.file_id
-        ORDER BY f.path, r.line
-        "#,
-        scope_subquery,
-        2 + scope_params.len()
+        "SELECT COUNT(*) FROM refs r CROSS JOIN files f \
+         WHERE r.name = ? AND f.id = r.file_id AND instr(r.context, ?) > 0{scope_clause}"
     );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    all_params.push(Box::new(name.to_string()));
-    for p in &scope_params {
-        all_params.push(Box::new(p.clone()));
-    }
-    all_params.push(Box::new(limit as i64));
-
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
-    let results = stmt
-        .query_map(param_refs.as_slice(), row_to_ref_result)?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(results)
+    let mut values = vec![name.to_string(), mention.to_string()];
+    values.extend(scope_params);
+    let params: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::types::ToSql)
+        .collect();
+    let count: i64 = conn.query_row(&sql, params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
 }
 
 /// A named workspace subtree attached to the current project (#31).
@@ -8332,6 +9682,1517 @@ pub fn mark_modules_indexed(conn: &Connection) -> Result<()> {
     mark_metadata_timestamp(conn, "last_modules_indexed_at")
 }
 
+/// Read an arbitrary `metadata` value, or `None` when the key is absent.
+pub fn get_metadata_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM metadata WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .with_context(|| format!("failed to read metadata key '{key}'"))
+}
+
+/// Write an arbitrary `metadata` value, replacing any previous one.
+pub fn set_metadata_value(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .with_context(|| format!("failed to write metadata key '{key}'"))?;
+    Ok(())
+}
+
+/// Delete a `metadata` key if present.
+pub fn delete_metadata_value(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM metadata WHERE key = ?1", params![key])
+        .with_context(|| format!("failed to delete metadata key '{key}'"))?;
+    Ok(())
+}
+
+/// Accumulated VCS history for one project-relative path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitFileStats {
+    pub path: String,
+    pub commits: i64,
+    pub fix_commits: i64,
+    pub lines_added: i64,
+    pub lines_deleted: i64,
+    pub first_commit_at: Option<i64>,
+    pub last_commit_at: Option<i64>,
+    pub current_lines: Option<i64>,
+    pub authors: Vec<String>,
+}
+
+/// Drop every collected git signal and the per-commit store behind it,
+/// leaving the (empty) tables in place.
+pub fn clear_git_signals(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CREATE_GIT_SIGNALS_SQL)?;
+    for table in GIT_SIGNAL_TABLES {
+        conn.execute(&format!("DELETE FROM {table}"), [])
+            .with_context(|| format!("failed to clear {table}"))?;
+    }
+    Ok(())
+}
+
+/// Prefix of every `metadata` key that belongs to the collected git history.
+pub const GIT_SIGNALS_METADATA_PREFIX: &str = "git_signals_";
+
+/// Schema name the live generation is attached under while a rebuild copies
+/// its git history.
+const CARRIED_HISTORY_SCHEMA: &str = "carried_history";
+
+/// The git history the live generation holds, as a rebuild sees it before
+/// deciding whether to keep it.
+#[derive(Debug)]
+pub struct StoredGitHistory {
+    /// Every `git_signals_*` metadata value.
+    pub metadata: HashMap<String, String>,
+    /// Live commits in the store that changed the project.
+    pub live_commits: usize,
+}
+
+/// What [`carry_git_history`] did with the live generation's git history.
+#[derive(Debug)]
+pub enum GitHistoryCarry {
+    /// There is no previous index, or no history was ever collected into it.
+    Absent,
+    /// The history is now part of the staged generation.
+    Kept(StoredGitHistory),
+    /// The previous index held history that was left behind, and why.
+    Dropped(String),
+}
+
+/// Copy the git history collected into the live generation into `staged`, a
+/// fresh full-rebuild generation, unless `rejection` gives a reason not to.
+///
+/// The history depends on the repository, not on the code index, so a
+/// rebuild keeps it instead of making the next `hotspots --collect` read the
+/// whole log again. The live generation is attached read-only and copied in
+/// one transaction: every table comes from the same snapshot of it, and any
+/// failure leaves the staged tables empty and returns
+/// [`GitHistoryCarry::Dropped`] rather than failing the rebuild. It is
+/// detached and released again before this returns, so the caller can seal
+/// and publish the staged generation exactly as before.
+pub fn carry_git_history<F>(
+    staged: &Connection,
+    project_root: &Path,
+    rejection: F,
+) -> Result<GitHistoryCarry>
+where
+    F: FnOnce(&StoredGitHistory) -> Option<String>,
+{
+    // Held for the whole copy: it keeps the live generation from being
+    // replaced meanwhile and its WAL index present for the read-only attach.
+    let live = match open_existing_db_leased(project_root) {
+        Ok(Some(live)) => live,
+        Ok(None) => return Ok(GitHistoryCarry::Absent),
+        Err(error) => {
+            return Ok(GitHistoryCarry::Dropped(format!(
+                "the previous index cannot be opened: {error:#}"
+            )))
+        }
+    };
+    let Some(uri) = live
+        .path()
+        .filter(|path| !path.is_empty())
+        .map(read_only_sqlite_uri)
+    else {
+        return Ok(GitHistoryCarry::Dropped(
+            "the previous index has no usable file path".to_string(),
+        ));
+    };
+    if let Err(error) = staged.execute(
+        &format!("ATTACH DATABASE ?1 AS {CARRIED_HISTORY_SCHEMA}"),
+        params![uri],
+    ) {
+        return Ok(GitHistoryCarry::Dropped(format!(
+            "the previous index cannot be attached: {error}"
+        )));
+    }
+    let carried = copy_attached_git_history(staged, rejection);
+    staged
+        .execute(&format!("DETACH DATABASE {CARRIED_HISTORY_SCHEMA}"), [])
+        .context("failed to detach the previous index")?;
+    drop(live);
+    Ok(carried.unwrap_or_else(|error| GitHistoryCarry::Dropped(format!("{error:#}"))))
+}
+
+fn copy_attached_git_history<F>(staged: &Connection, rejection: F) -> Result<GitHistoryCarry>
+where
+    F: FnOnce(&StoredGitHistory) -> Option<String>,
+{
+    // Dropping the transaction on any early return rolls the copy back.
+    let tx = staged.unchecked_transaction()?;
+    let mut metadata = HashMap::new();
+    {
+        let mut statement = tx.prepare(&format!(
+            "SELECT key, value FROM {CARRIED_HISTORY_SCHEMA}.metadata"
+        ))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            if key.starts_with(GIT_SIGNALS_METADATA_PREFIX) {
+                metadata.insert(key, row.get(1)?);
+            }
+        }
+    }
+    if metadata.is_empty() {
+        return Ok(GitHistoryCarry::Absent);
+    }
+    let live_commits: i64 = tx
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {CARRIED_HISTORY_SCHEMA}.git_commits
+                 WHERE live = 1 AND author IS NOT NULL"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to read git_commits")?;
+    let history = StoredGitHistory {
+        metadata,
+        live_commits: live_commits as usize,
+    };
+    if let Some(reason) = rejection(&history) {
+        return Ok(GitHistoryCarry::Dropped(reason));
+    }
+
+    for table in GIT_SIGNAL_TABLES {
+        anyhow::ensure!(
+            table_layout(&tx, "main", table)? == table_layout(&tx, CARRIED_HISTORY_SCHEMA, table)?,
+            "{table} in the previous index has an unexpected layout"
+        );
+        tx.execute(&format!("DELETE FROM main.{table}"), [])
+            .with_context(|| format!("failed to clear {table}"))?;
+        // Identical column lists make `SELECT *` exact, and let SQLite copy
+        // the table's pages instead of inserting row by row.
+        tx.execute(
+            &format!("INSERT INTO main.{table} SELECT * FROM {CARRIED_HISTORY_SCHEMA}.{table}"),
+            [],
+        )
+        .with_context(|| format!("failed to copy {table}"))?;
+    }
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO main.metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )?;
+        for (key, value) in &history.metadata {
+            insert.execute(params![key, value])?;
+        }
+    }
+    tx.commit()
+        .context("failed to commit the copied git history")?;
+    Ok(GitHistoryCarry::Kept(history))
+}
+
+/// Column definitions of `schema.table` in declaration order: name, declared
+/// type, `NOT NULL`, default and primary-key position.
+type ColumnLayout = (String, String, bool, Option<String>, i64);
+
+fn table_layout(conn: &Connection, schema: &str, table: &str) -> Result<Vec<ColumnLayout>> {
+    let mut statement = conn.prepare(
+        "SELECT name, type, \"notnull\", dflt_value, pk
+         FROM pragma_table_info(?1, ?2) ORDER BY cid",
+    )?;
+    let layout = statement
+        .query_map(params![table, schema], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read the layout of {schema}.{table}"))?;
+    Ok(layout)
+}
+
+/// A `file:` URI that makes `ATTACH` open `path` read-only.
+fn read_only_sqlite_uri(path: &str) -> String {
+    #[cfg(windows)]
+    let path = path.replace('\\', "/");
+    let mut uri = String::from("file://");
+    if !path.starts_with('/') {
+        uri.push('/');
+    }
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            uri.push(byte as char);
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri.push_str("?mode=ro");
+    uri
+}
+
+/// Load every collected path, authors included. Used by the reporting path.
+pub fn load_all_git_file_stats(conn: &Connection) -> Result<Vec<GitFileStats>> {
+    if !table_exists(conn, "git_file_stats")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn.prepare(
+        "SELECT path, commits, fix_commits, lines_added, lines_deleted,
+                first_commit_at, last_commit_at, current_lines
+         FROM git_file_stats",
+    )?;
+    let mut rows: Vec<GitFileStats> = statement
+        .query_map([], |row| {
+            Ok(GitFileStats {
+                path: row.get(0)?,
+                commits: row.get(1)?,
+                fix_commits: row.get(2)?,
+                lines_added: row.get(3)?,
+                lines_deleted: row.get(4)?,
+                first_commit_at: row.get(5)?,
+                last_commit_at: row.get(6)?,
+                current_lines: row.get(7)?,
+                authors: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read git_file_stats")?;
+
+    let mut index: HashMap<String, usize> = HashMap::with_capacity(rows.len());
+    for (position, row) in rows.iter().enumerate() {
+        index.insert(row.path.clone(), position);
+    }
+    let mut author_statement = conn.prepare("SELECT path, author FROM git_file_authors")?;
+    let mut author_rows = author_statement.query([])?;
+    while let Some(row) = author_rows.next()? {
+        let path: String = row.get(0)?;
+        if let Some(position) = index.get(&path) {
+            rows[*position].authors.push(row.get(1)?);
+        }
+    }
+    Ok(rows)
+}
+
+/// [`GitFileStats`] with the author count instead of the author list: what
+/// percentile ranking needs, without materializing every author string.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitFileSignalRow {
+    pub path: String,
+    pub commits: i64,
+    pub fix_commits: i64,
+    pub lines_added: i64,
+    pub lines_deleted: i64,
+    pub first_commit_at: Option<i64>,
+    pub last_commit_at: Option<i64>,
+    pub current_lines: Option<i64>,
+    pub authors: usize,
+}
+
+impl From<GitFileStats> for GitFileSignalRow {
+    fn from(stats: GitFileStats) -> Self {
+        GitFileSignalRow {
+            authors: stats.authors.len(),
+            path: stats.path,
+            commits: stats.commits,
+            fix_commits: stats.fix_commits,
+            lines_added: stats.lines_added,
+            lines_deleted: stats.lines_deleted,
+            first_commit_at: stats.first_commit_at,
+            last_commit_at: stats.last_commit_at,
+            current_lines: stats.current_lines,
+        }
+    }
+}
+
+/// Signals of every path that still exists in the working tree (the
+/// population `hotspots` ranks against), with author counts.
+pub fn load_live_git_file_signals(conn: &Connection) -> Result<Vec<GitFileSignalRow>> {
+    if !table_exists(conn, "git_file_stats")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn.prepare(
+        "SELECT s.path, s.commits, s.fix_commits, s.lines_added, s.lines_deleted,
+                s.first_commit_at, s.last_commit_at, s.current_lines,
+                (SELECT COUNT(*) FROM git_file_authors a WHERE a.path = s.path)
+         FROM git_file_stats s
+         WHERE s.current_lines IS NOT NULL",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(GitFileSignalRow {
+                path: row.get(0)?,
+                commits: row.get(1)?,
+                fix_commits: row.get(2)?,
+                lines_added: row.get(3)?,
+                lines_deleted: row.get(4)?,
+                first_commit_at: row.get(5)?,
+                last_commit_at: row.get(6)?,
+                current_lines: row.get(7)?,
+                authors: row.get::<_, i64>(8)? as usize,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read git_file_stats")?;
+    Ok(rows)
+}
+
+/// Upsert the signals of the supplied paths, authors included, inside the
+/// caller's transaction. Paths absent from `stats` are left untouched.
+pub fn write_git_file_stats(conn: &Connection, stats: &[GitFileStats]) -> Result<()> {
+    let mut delete_authors = conn.prepare_cached("DELETE FROM git_file_authors WHERE path = ?1")?;
+    let mut insert_author = conn
+        .prepare_cached("INSERT OR IGNORE INTO git_file_authors (path, author) VALUES (?1, ?2)")?;
+    let mut upsert = conn.prepare_cached(
+        "INSERT INTO git_file_stats
+             (path, commits, fix_commits, lines_added, lines_deleted,
+              first_commit_at, last_commit_at, current_lines)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(path) DO UPDATE SET
+             commits = excluded.commits,
+             fix_commits = excluded.fix_commits,
+             lines_added = excluded.lines_added,
+             lines_deleted = excluded.lines_deleted,
+             first_commit_at = excluded.first_commit_at,
+             last_commit_at = excluded.last_commit_at,
+             current_lines = excluded.current_lines",
+    )?;
+    for entry in stats {
+        upsert.execute(params![
+            entry.path,
+            entry.commits,
+            entry.fix_commits,
+            entry.lines_added,
+            entry.lines_deleted,
+            entry.first_commit_at,
+            entry.last_commit_at,
+            entry.current_lines,
+        ])?;
+        delete_authors.execute(params![entry.path])?;
+        for author in &entry.authors {
+            insert_author.execute(params![entry.path, author])?;
+        }
+    }
+    Ok(())
+}
+
+/// Forget the derived signals of `paths`.
+pub fn delete_git_file_stats(conn: &Connection, paths: &[&str]) -> Result<()> {
+    for chunk in paths.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        for table in ["git_file_stats", "git_file_authors"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE path IN ({placeholders})"),
+                rusqlite::params_from_iter(chunk.iter()),
+            )
+            .with_context(|| format!("failed to delete from {table}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// `git_commit_changes.kind`: a plain change of `path_id`.
+pub const GIT_CHANGE_TOUCH: i64 = 0;
+/// `git_commit_changes.kind`: `path_id` renamed from `from_path_id`.
+pub const GIT_CHANGE_RENAME: i64 = 1;
+// `load_live_git_renames` and `idx_git_commit_changes_renames` spell the rename kind
+// out as a literal so the planner can match the partial index.
+const _: () = assert!(GIT_CHANGE_RENAME == 1);
+/// `git_commit_changes.kind`: `path_id` moved out of the project.
+pub const GIT_CHANGE_MOVED_OUT: i64 = 2;
+
+/// A commit of the per-commit store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredGitCommit {
+    pub id: i64,
+    pub order_key: i64,
+    pub live: bool,
+    /// Non-merge commit that changed the project (it has an author row).
+    pub changed_project: bool,
+}
+
+/// Look a commit up by its full hash.
+pub fn find_git_commit(conn: &Connection, sha: &str) -> Result<Option<StoredGitCommit>> {
+    conn.prepare_cached(
+        "SELECT id, order_key, live, author IS NOT NULL FROM git_commits WHERE sha = ?1",
+    )?
+    .query_row(params![sha], |row| {
+        Ok(StoredGitCommit {
+            id: row.get(0)?,
+            order_key: row.get(1)?,
+            live: row.get::<_, i64>(2)? != 0,
+            changed_project: row.get::<_, i64>(3)? != 0,
+        })
+    })
+    .optional()
+    .context("failed to read git_commits")
+}
+
+/// Author and intent of a commit that changed the project.
+#[derive(Clone, Copy, Debug)]
+pub struct GitCommitMeta<'a> {
+    pub authored_at: i64,
+    pub author: &'a str,
+    pub is_fix: bool,
+}
+
+/// Insert a live commit. `meta` is `None` for merges and for commits that
+/// did not change the project: the store keeps them for their place in the
+/// graph only.
+pub fn insert_git_commit(
+    conn: &Connection,
+    sha: &str,
+    order_key: i64,
+    meta: Option<GitCommitMeta<'_>>,
+) -> Result<i64> {
+    conn.prepare_cached(
+        "INSERT INTO git_commits (sha, order_key, live, authored_at, author, is_fix)
+         VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+    )?
+    .execute(params![
+        sha,
+        order_key,
+        meta.map(|meta| meta.authored_at),
+        meta.map(|meta| meta.author),
+        meta.map(|meta| i64::from(meta.is_fix)),
+    ])
+    .context("failed to insert git_commits row")?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 64-bit FNV-1a of a path: `git_paths` is looked up through an index on
+/// this instead of on the text, which would store every path a second time.
+fn git_path_hash(path: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash as i64
+}
+
+/// Id of a project path in the per-commit store, `None` when it is not there.
+pub fn find_git_path_id(conn: &Connection, path: &str) -> Result<Option<i64>> {
+    let hash = git_path_hash(path);
+    conn.prepare_cached("SELECT id FROM git_paths WHERE hash = ?1 AND path = ?2")?
+        .query_row(params![hash, path], |row| row.get::<_, i64>(0))
+        .optional()
+        .context("failed to read git_paths")
+}
+
+/// Id of a project path in the per-commit store, inserted when new.
+pub fn git_path_id(conn: &Connection, path: &str) -> Result<i64> {
+    if let Some(id) = find_git_path_id(conn, path)? {
+        return Ok(id);
+    }
+    conn.prepare_cached("INSERT INTO git_paths (hash, path) VALUES (?1, ?2)")?
+        .execute(params![git_path_hash(path), path])
+        .context("failed to insert git_paths row")?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Record what one commit did to one path.
+///
+/// A second record for the same pair can only come from two raw Git paths
+/// that decode to the same text; their line counts are summed.
+pub fn insert_git_change(
+    conn: &Connection,
+    commit_id: i64,
+    path_id: i64,
+    kind: i64,
+    from_path_id: Option<i64>,
+    added: i64,
+    deleted: i64,
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO git_commit_changes (commit_id, path_id, kind, from_path_id, added, deleted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(commit_id, path_id) DO UPDATE SET
+             added = added + excluded.added,
+             deleted = deleted + excluded.deleted",
+    )?
+    .execute(params![
+        commit_id,
+        path_id,
+        kind,
+        from_path_id,
+        added,
+        deleted
+    ])
+    .context("failed to insert git_commit_changes row")?;
+    Ok(())
+}
+
+/// Mark a stored commit as reachable (or no longer reachable) from HEAD.
+pub fn set_git_commit_live(conn: &Connection, id: i64, live: bool) -> Result<()> {
+    conn.prepare_cached("UPDATE git_commits SET live = ?2 WHERE id = ?1")?
+        .execute(params![id, i64::from(live)])
+        .context("failed to update git_commits.live")?;
+    Ok(())
+}
+
+/// Every path a stored commit changed, renamed from, or moved out.
+pub fn git_commit_touched_paths(conn: &Connection, commit_id: i64) -> Result<Vec<i64>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT path_id, from_path_id FROM git_commit_changes WHERE commit_id = ?1",
+    )?;
+    let mut rows = statement.query(params![commit_id])?;
+    let mut paths = Vec::new();
+    while let Some(row) = rows.next()? {
+        paths.push(row.get::<_, i64>(0)?);
+        if let Some(from) = row.get::<_, Option<i64>>(1)? {
+            paths.push(from);
+        }
+    }
+    Ok(paths)
+}
+
+/// `(from, to)` path ids of every rename made by a live commit.
+pub fn load_live_git_renames(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut statement = conn.prepare(
+        "SELECT c.from_path_id, c.path_id
+         FROM git_commit_changes c JOIN git_commits k ON k.id = c.commit_id
+         WHERE c.kind = 1 AND k.live = 1",
+    )?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read git renames")?;
+    Ok(rows)
+}
+
+/// One row of `git_commit_changes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredGitChange {
+    pub commit_id: i64,
+    pub path_id: i64,
+    pub kind: i64,
+    pub from_path_id: Option<i64>,
+    pub added: i64,
+    pub deleted: i64,
+}
+
+fn read_git_change(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredGitChange> {
+    Ok(StoredGitChange {
+        commit_id: row.get(0)?,
+        path_id: row.get(1)?,
+        kind: row.get(2)?,
+        from_path_id: row.get(3)?,
+        added: row.get(4)?,
+        deleted: row.get(5)?,
+    })
+}
+
+/// Changes whose `path_id` is one of `paths` (every change for `None`),
+/// live or not.
+pub fn load_git_changes(conn: &Connection, paths: Option<&[i64]>) -> Result<Vec<StoredGitChange>> {
+    const COLUMNS: &str = "commit_id, path_id, kind, from_path_id, added, deleted";
+    let Some(paths) = paths else {
+        let mut statement = conn.prepare(&format!("SELECT {COLUMNS} FROM git_commit_changes"))?;
+        return statement
+            .query_map([], read_git_change)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read git_commit_changes");
+    };
+    let mut changes = Vec::new();
+    for chunk in paths.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut statement = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM git_commit_changes WHERE path_id IN ({placeholders})"
+        ))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(chunk.iter()), read_git_change)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read git_commit_changes")?;
+        changes.extend(rows);
+    }
+    Ok(changes)
+}
+
+/// Everything the history fold needs to know about a stored commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredGitCommitDetail {
+    pub order_key: i64,
+    pub sha: String,
+    pub live: bool,
+    pub authored_at: i64,
+    pub author: String,
+    pub is_fix: bool,
+}
+
+fn read_git_commit_detail(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(i64, StoredGitCommitDetail)> {
+    Ok((
+        row.get(0)?,
+        StoredGitCommitDetail {
+            order_key: row.get(1)?,
+            sha: row.get(2)?,
+            live: row.get::<_, i64>(3)? != 0,
+            authored_at: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            author: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            is_fix: row.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+        },
+    ))
+}
+
+/// Details of the commits in `ids` (of every commit that changed the
+/// project for `None`).
+pub fn load_git_commit_details(
+    conn: &Connection,
+    ids: Option<&[i64]>,
+) -> Result<HashMap<i64, StoredGitCommitDetail>> {
+    const COLUMNS: &str = "id, order_key, sha, live, authored_at, author, is_fix";
+    let mut details = HashMap::new();
+    let Some(ids) = ids else {
+        let mut statement = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM git_commits WHERE author IS NOT NULL"
+        ))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let (id, detail) = read_git_commit_detail(row)?;
+            details.insert(id, detail);
+        }
+        return Ok(details);
+    };
+    for chunk in ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut statement = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM git_commits WHERE id IN ({placeholders})"
+        ))?;
+        let mut rows = statement.query(rusqlite::params_from_iter(chunk.iter()))?;
+        while let Some(row) = rows.next()? {
+            let (id, detail) = read_git_commit_detail(row)?;
+            details.insert(id, detail);
+        }
+    }
+    Ok(details)
+}
+
+/// Text of the path ids in `ids` (of every stored path for `None`).
+pub fn load_git_paths(conn: &Connection, ids: Option<&[i64]>) -> Result<HashMap<i64, String>> {
+    let mut paths = HashMap::new();
+    let Some(ids) = ids else {
+        let mut statement = conn.prepare("SELECT id, path FROM git_paths")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            paths.insert(row.get::<_, i64>(0)?, row.get::<_, String>(1)?);
+        }
+        return Ok(paths);
+    };
+    for chunk in ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut statement = conn.prepare(&format!(
+            "SELECT id, path FROM git_paths WHERE id IN ({placeholders})"
+        ))?;
+        let mut rows = statement.query(rusqlite::params_from_iter(chunk.iter()))?;
+        while let Some(row) = rows.next()? {
+            paths.insert(row.get::<_, i64>(0)?, row.get::<_, String>(1)?);
+        }
+    }
+    Ok(paths)
+}
+
+/// Live commits that changed the project: the history the tables describe.
+pub fn count_live_git_commits(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM git_commits WHERE live = 1 AND author IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// `(live, not live)` counts of every stored commit, merges included.
+pub fn count_git_commits(conn: &Connection) -> Result<(usize, usize)> {
+    let (live, dead): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(live = 1), 0), COALESCE(SUM(live = 0), 0) FROM git_commits",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((live as usize, dead as usize))
+}
+
+/// Drop every commit that is no longer reachable from HEAD, with its changes
+/// and the paths nothing else refers to. Returns how many commits went.
+///
+/// It is all or nothing on purpose: the stored commits stay closed under
+/// "parent of", which is what lets a later run find the commits it has not
+/// read yet with a plain `HEAD --not <stored boundary>` range.
+pub fn prune_dead_git_commits(conn: &Connection) -> Result<usize> {
+    let dead: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM git_commits WHERE live = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "DELETE FROM git_commit_changes
+         WHERE commit_id IN (SELECT id FROM git_commits WHERE live = 0)",
+        [],
+    )?;
+    conn.execute("DELETE FROM git_commits WHERE live = 0", [])?;
+    conn.execute(
+        "DELETE FROM git_paths
+         WHERE id NOT IN (SELECT path_id FROM git_commit_changes)
+           AND id NOT IN (SELECT from_path_id FROM git_commit_changes
+                          WHERE from_path_id IS NOT NULL)",
+        [],
+    )?;
+    Ok(dead as usize)
+}
+
+// ---------------------------------------------------------------------------
+// Symbol graph
+// ---------------------------------------------------------------------------
+
+const SYMBOL_GRAPH_FINGERPRINT_KEY: &str = "symbol_graph_fingerprint";
+/// Writes of the indexed content so far; see [`bump_index_generation`].
+const INDEX_GENERATION_KEY: &str = "index_generation";
+const SYMBOL_GRAPH_BUILT_AT_KEY: &str = "symbol_graph_built_at";
+const SYMBOL_GRAPH_SUMMARY_KEY: &str = "symbol_graph_summary";
+/// SQLite's default host-parameter ceiling is 32766 on current builds but 999
+/// on old ones; staying well under the old limit keeps chunked `IN` lists safe.
+const GRAPH_ID_CHUNK: usize = 500;
+
+/// One indexed file as the graph builder sees it.
+#[derive(Clone, Debug)]
+pub struct GraphFileRow {
+    pub id: i64,
+    pub path: String,
+    pub root_path: String,
+}
+
+/// One indexed symbol as the graph builder sees it.
+#[derive(Clone, Debug)]
+pub struct GraphSymbolRow {
+    pub id: i64,
+    pub file_id: i64,
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+    pub end_line: Option<i64>,
+}
+
+/// A stored `symbol_edges` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SymbolEdgeRow {
+    pub source_id: i64,
+    pub target_id: i64,
+    pub confidence: u8,
+    pub candidates: u32,
+    pub ref_count: u32,
+    pub line: i64,
+}
+
+/// Per-symbol graph metrics, one `symbol_metrics` row.
+///
+/// `fan_in` / `fan_out` / `fan_in_files` / `dependents` / `pagerank` count
+/// resolved edges only; ambiguous edges are reported separately in the
+/// `*_ambiguous` counters and never mixed into the other numbers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct SymbolGraphMetrics {
+    pub symbol_id: i64,
+    pub fan_in: u32,
+    pub fan_in_files: u32,
+    pub fan_in_ambiguous: u32,
+    pub fan_out: u32,
+    pub fan_out_ambiguous: u32,
+    pub dependents: u32,
+    pub pagerank: f64,
+    pub pagerank_pct: f64,
+}
+
+/// Symbol identity joined with its file, for graph output.
+#[derive(Clone, Debug, Serialize)]
+pub struct GraphSymbolInfo {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+    pub end_line: Option<i64>,
+    pub path: String,
+    #[serde(skip_serializing)]
+    pub root_path: Option<String>,
+}
+
+/// Whether a graph was built, and whether the index moved on since.
+#[derive(Clone, Debug)]
+pub struct SymbolGraphState {
+    pub built: bool,
+    pub stale: bool,
+    pub built_at: Option<i64>,
+    pub summary: Option<String>,
+}
+
+pub fn load_graph_files(conn: &Connection) -> Result<Vec<GraphFileRow>> {
+    let mut stmt = conn.prepare("SELECT id, path, root_path FROM files ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(GraphFileRow {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                root_path: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every symbol, grouped by file and ordered by start line.
+pub fn load_graph_symbols(conn: &Connection) -> Result<Vec<GraphSymbolRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_id, name, kind, line, end_line FROM symbols ORDER BY file_id, line, id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(GraphSymbolRow {
+                id: row.get(0)?,
+                file_id: row.get(1)?,
+                name: row.get(2)?,
+                kind: row.get(3)?,
+                line: row.get(4)?,
+                end_line: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Stream every reference grouped by file, without materializing the table.
+pub fn for_each_graph_ref<F>(conn: &Connection, mut visit: F) -> Result<()>
+where
+    F: FnMut(i64, &str, i64, Option<&str>) -> Result<()>,
+{
+    let mut stmt =
+        conn.prepare("SELECT file_id, name, line, context FROM refs ORDER BY file_id")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let file_id: i64 = row.get(0)?;
+        let name = row.get_ref(1)?.as_str()?;
+        let line: i64 = row.get(2)?;
+        let context = row.get_ref(3)?.as_str_or_null()?;
+        visit(file_id, name, line, context)?;
+    }
+    Ok(())
+}
+
+/// `(child symbol id, parent name as written)` for every inheritance row.
+pub fn load_inheritance_rows(conn: &Connection) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT child_id, parent_name FROM inheritance")?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Count one more write of the indexed content the symbol graph is derived
+/// from — `files`, `symbols`, `refs` or `inheritance` rows — in the metadata
+/// row [`INDEX_GENERATION_KEY`]. Every writer calls it in the transaction of
+/// its write, and only when it writes something: an update that finds
+/// nothing to do has to leave the graph fresh.
+pub fn bump_index_generation(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        params![INDEX_GENERATION_KEY],
+    )?;
+    Ok(())
+}
+
+/// What the symbol graph records about the index it was built from, and a
+/// query compares with the live index: the write generation
+/// ([`bump_index_generation`]) and the highest row ids of `files`, `symbols`
+/// and `refs`. A metadata read and three seeks to the end of a rowid tree,
+/// where counting and summing the tables cost every graph query tens of
+/// milliseconds on a large index. The ids catch what a version without the
+/// counter writes into the same index: re-indexing a file inserts its rows
+/// anew. An index no version with the counter has written reads as
+/// generation 0.
+pub fn index_fingerprint(conn: &Connection) -> Result<String> {
+    let generation = get_metadata_value(conn, INDEX_GENERATION_KEY)?;
+    let max_id = |table: &str| -> Result<i64> {
+        Ok(conn.query_row(
+            &format!("SELECT COALESCE(MAX(id), 0) FROM {table}"),
+            [],
+            |row| row.get(0),
+        )?)
+    };
+    Ok(format!(
+        "generation:{}/ids:{}:{}:{}",
+        generation.as_deref().unwrap_or("0"),
+        max_id("files")?,
+        max_id("symbols")?,
+        max_id("refs")?
+    ))
+}
+
+/// Replace the whole stored graph in one transaction.
+pub fn store_symbol_graph(
+    conn: &mut Connection,
+    edges: &[SymbolEdgeRow],
+    metrics: &[SymbolGraphMetrics],
+    fingerprint: &str,
+    summary_json: &str,
+) -> Result<()> {
+    let built_at = current_unix_millis()?;
+    let tx = conn
+        .transaction()
+        .context("failed to start symbol graph write")?;
+    tx.execute_batch(CREATE_SYMBOL_GRAPH_SQL)?;
+    tx.execute("DELETE FROM symbol_edges", [])?;
+    tx.execute("DELETE FROM symbol_metrics", [])?;
+    // Bulk-loading into the primary key order and indexing afterwards is
+    // several times faster than maintaining the target index row by row.
+    tx.execute("DROP INDEX IF EXISTS idx_symbol_edges_target", [])?;
+    {
+        let mut insert_edge = tx.prepare(
+            "INSERT INTO symbol_edges
+                 (source_id, target_id, confidence, candidates, ref_count, line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for edge in edges {
+            insert_edge.execute(params![
+                edge.source_id,
+                edge.target_id,
+                edge.confidence,
+                edge.candidates,
+                edge.ref_count,
+                edge.line,
+            ])?;
+        }
+        let mut insert_metrics = tx.prepare(
+            "INSERT INTO symbol_metrics
+                 (symbol_id, fan_in, fan_in_files, fan_in_ambiguous, fan_out,
+                  fan_out_ambiguous, dependents, pagerank, pagerank_pct)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for row in metrics {
+            insert_metrics.execute(params![
+                row.symbol_id,
+                row.fan_in,
+                row.fan_in_files,
+                row.fan_in_ambiguous,
+                row.fan_out,
+                row.fan_out_ambiguous,
+                row.dependents,
+                row.pagerank,
+                row.pagerank_pct,
+            ])?;
+        }
+    }
+    tx.execute_batch(CREATE_SYMBOL_GRAPH_SQL)?;
+    for (key, value) in [
+        (SYMBOL_GRAPH_FINGERPRINT_KEY, fingerprint.to_string()),
+        (SYMBOL_GRAPH_BUILT_AT_KEY, built_at.to_string()),
+        (SYMBOL_GRAPH_SUMMARY_KEY, summary_json.to_string()),
+    ] {
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+    }
+    tx.commit().context("failed to commit symbol graph write")?;
+    Ok(())
+}
+
+/// Report whether a graph exists and whether it still matches the index.
+///
+/// An unresolved incremental-update dirty marker counts as stale even when
+/// the fingerprint happens to match: the index may be half-applied.
+pub fn symbol_graph_state(conn: &Connection) -> Result<SymbolGraphState> {
+    let fingerprint = get_metadata_value(conn, SYMBOL_GRAPH_FINGERPRINT_KEY)?;
+    let built_at = get_metadata_value(conn, SYMBOL_GRAPH_BUILT_AT_KEY)?
+        .and_then(|value| value.parse::<i64>().ok());
+    let summary = get_metadata_value(conn, SYMBOL_GRAPH_SUMMARY_KEY)?;
+    let Some(fingerprint) = fingerprint else {
+        return Ok(SymbolGraphState {
+            built: false,
+            stale: false,
+            built_at,
+            summary,
+        });
+    };
+    let stale = has_index_update_dirty(conn)? || index_fingerprint(conn)? != fingerprint;
+    Ok(SymbolGraphState {
+        built: true,
+        stale,
+        built_at,
+        summary,
+    })
+}
+
+fn row_to_symbol_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolEdgeRow> {
+    Ok(SymbolEdgeRow {
+        source_id: row.get(0)?,
+        target_id: row.get(1)?,
+        confidence: row.get(2)?,
+        candidates: row.get(3)?,
+        ref_count: row.get(4)?,
+        line: row.get(5)?,
+    })
+}
+
+fn load_symbol_edges_by(
+    conn: &Connection,
+    column: &str,
+    ids: &[i64],
+    max_confidence: u8,
+) -> Result<Vec<SymbolEdgeRow>> {
+    let mut edges = Vec::new();
+    for chunk in ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT source_id, target_id, confidence, candidates, ref_count, line
+             FROM symbol_edges WHERE {column} IN ({placeholders}) AND confidence <= ?"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        values.push(&max_confidence);
+        let rows = stmt.query_map(values.as_slice(), row_to_symbol_edge)?;
+        for row in rows {
+            edges.push(row?);
+        }
+    }
+    Ok(edges)
+}
+
+/// Edges pointing at any of `target_ids` (who depends on them), with
+/// confidence up to and including `max_confidence`.
+pub fn load_symbol_edges_to(
+    conn: &Connection,
+    target_ids: &[i64],
+    max_confidence: u8,
+) -> Result<Vec<SymbolEdgeRow>> {
+    load_symbol_edges_by(conn, "target_id", target_ids, max_confidence)
+}
+
+/// Edges leaving any of `source_ids` (what they depend on).
+pub fn load_symbol_edges_from(
+    conn: &Connection,
+    source_ids: &[i64],
+    max_confidence: u8,
+) -> Result<Vec<SymbolEdgeRow>> {
+    load_symbol_edges_by(conn, "source_id", source_ids, max_confidence)
+}
+
+/// Every stored edge up to `max_confidence`, in primary-key order.
+pub fn load_all_symbol_edges(conn: &Connection, max_confidence: u8) -> Result<Vec<SymbolEdgeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT source_id, target_id, confidence, candidates, ref_count, line
+         FROM symbol_edges WHERE confidence <= ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![max_confidence], row_to_symbol_edge)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Stored edge counts per confidence level.
+pub fn count_symbol_edges_by_confidence(conn: &Connection) -> Result<Vec<(u8, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT confidence, COUNT(*) FROM symbol_edges GROUP BY confidence ORDER BY confidence",
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn row_to_symbol_metrics(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolGraphMetrics> {
+    Ok(SymbolGraphMetrics {
+        symbol_id: row.get(0)?,
+        fan_in: row.get(1)?,
+        fan_in_files: row.get(2)?,
+        fan_in_ambiguous: row.get(3)?,
+        fan_out: row.get(4)?,
+        fan_out_ambiguous: row.get(5)?,
+        dependents: row.get(6)?,
+        pagerank: row.get(7)?,
+        pagerank_pct: row.get(8)?,
+    })
+}
+
+/// Graph metrics for a batch of symbols in one round trip per 500 ids.
+///
+/// This is the entry point for rankers that need structural signals for a
+/// whole result list. Ids absent from the map touch no edge at all (or the
+/// graph was never built — check [`symbol_graph_state`]); callers should treat
+/// them as zero rather than unknown when the graph is built.
+pub fn load_symbol_graph_metrics(
+    conn: &Connection,
+    symbol_ids: &[i64],
+) -> Result<HashMap<i64, SymbolGraphMetrics>> {
+    let mut metrics = HashMap::with_capacity(symbol_ids.len());
+    if !table_exists(conn, "symbol_metrics")? {
+        return Ok(metrics);
+    }
+    for chunk in symbol_ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT symbol_id, fan_in, fan_in_files, fan_in_ambiguous, fan_out,
+                    fan_out_ambiguous, dependents, pagerank, pagerank_pct
+             FROM symbol_metrics WHERE symbol_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(values.as_slice(), row_to_symbol_metrics)?;
+        for row in rows {
+            let row = row?;
+            metrics.insert(row.symbol_id, row);
+        }
+    }
+    Ok(metrics)
+}
+
+/// A symbol that has a `symbol_metrics` row, with the file it lives in.
+#[derive(Clone, Debug)]
+pub struct FileSymbolMetrics {
+    pub path: String,
+    pub root_path: Option<String>,
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+    pub metrics: SymbolGraphMetrics,
+}
+
+/// Graph metrics of every symbol defined in any of `paths` (all roots), for
+/// rankers that score whole files by the symbols inside them.
+pub fn load_file_symbol_metrics(
+    conn: &Connection,
+    paths: &[&str],
+) -> Result<Vec<FileSymbolMetrics>> {
+    let mut rows = Vec::new();
+    if !table_exists(conn, "symbol_metrics")? {
+        return Ok(rows);
+    }
+    for chunk in paths.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT f.path, f.root_path, s.name, s.kind, s.line,
+                    m.symbol_id, m.fan_in, m.fan_in_files, m.fan_in_ambiguous, m.fan_out,
+                    m.fan_out_ambiguous, m.dependents, m.pagerank, m.pagerank_pct
+             FROM files f
+             JOIN symbols s ON s.file_id = f.id
+             JOIN symbol_metrics m ON m.symbol_id = s.id
+             WHERE f.path IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|path| path as &dyn rusqlite::types::ToSql)
+            .collect();
+        let found = stmt.query_map(values.as_slice(), |row| {
+            Ok(FileSymbolMetrics {
+                path: row.get(0)?,
+                root_path: row.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty()),
+                name: row.get(2)?,
+                kind: row.get(3)?,
+                line: row.get(4)?,
+                metrics: SymbolGraphMetrics {
+                    symbol_id: row.get(5)?,
+                    fan_in: row.get(6)?,
+                    fan_in_files: row.get(7)?,
+                    fan_in_ambiguous: row.get(8)?,
+                    fan_out: row.get(9)?,
+                    fan_out_ambiguous: row.get(10)?,
+                    dependents: row.get(11)?,
+                    pagerank: row.get(12)?,
+                    pagerank_pct: row.get(13)?,
+                },
+            })
+        })?;
+        for row in found {
+            rows.push(row?);
+        }
+    }
+    Ok(rows)
+}
+
+/// The last name segment of an inheritance parent as the source wrote it:
+/// `BaseImporter` for `Billing::BaseImporter`, `Contract` for a parametrised
+/// `Component::Contract[Query]`.
+fn inheritance_parent_segment(parent_name: &str) -> &str {
+    let name = parent_name.trim_start_matches(':');
+    let end = name
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':' || c == '.'))
+        .unwrap_or(name.len());
+    last_name_segment(&name[..end])
+}
+
+/// Superclasses of a class as the symbol graph resolved them: targets of the
+/// class's edges on its declaration line (`class A < B`) that are class-like
+/// and whose last name segment is one of the class's inheritance parents.
+/// Ambiguous edges are left out. Empty when the graph was never built.
+pub fn load_superclasses(conn: &Connection, class_id: i64) -> Result<Vec<(i64, String)>> {
+    if !table_exists(conn, "symbol_edges")? {
+        return Ok(Vec::new());
+    }
+    let parents: Vec<String> = conn
+        .prepare_cached("SELECT parent_name FROM inheritance WHERE child_id = ?1")?
+        .query_map(params![class_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if parents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let segments: Vec<&str> = parents
+        .iter()
+        .map(|parent| inheritance_parent_segment(parent))
+        .collect();
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.id, t.name FROM symbols c
+         JOIN symbol_edges e ON e.source_id = c.id AND e.line = c.line
+         JOIN symbols t ON t.id = e.target_id
+         WHERE c.id = ?1 AND e.confidence < 4
+           AND t.kind IN ('class', 'interface', 'object', 'enum', 'protocol', 'struct', 'actor', 'package')",
+    )?;
+    let targets = stmt
+        .query_map(params![class_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(targets
+        .into_iter()
+        .filter(|(_, name)| segments.contains(&last_name_segment(name)))
+        .collect())
+}
+
+/// `(root_path, path)` of the file of every class whose superclass resolves
+/// to `class_id` ([`load_superclasses`]), one entry per class.
+pub fn load_subclass_files(
+    conn: &Connection,
+    class_id: i64,
+    class_name: &str,
+) -> Result<Vec<(Option<String>, String)>> {
+    if !table_exists(conn, "symbol_edges")? {
+        return Ok(Vec::new());
+    }
+    let segment = last_name_segment(class_name);
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id, f.root_path, f.path, i.parent_name FROM symbol_edges e
+         JOIN symbols c ON c.id = e.source_id AND e.line = c.line
+         JOIN inheritance i ON i.child_id = c.id
+         JOIN files f ON f.id = c.file_id
+         WHERE e.target_id = ?1 AND e.confidence < 4",
+    )?;
+    let rows = stmt
+        .query_map(params![class_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty()),
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|(_, _, _, parent)| inheritance_parent_segment(parent) == segment)
+        .filter(|(id, _, _, _)| seen.insert(*id))
+        .map(|(_, root, path, _)| (root, path))
+        .collect())
+}
+
+/// `(kind, line, end_line)` of each of `symbol_ids`; `end_line` is `None`
+/// for parsers that record no ranges.
+pub fn load_symbol_extents(
+    conn: &Connection,
+    symbol_ids: &[i64],
+) -> Result<HashMap<i64, (String, i64, Option<i64>)>> {
+    let mut extents = HashMap::with_capacity(symbol_ids.len());
+    for chunk in symbol_ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql =
+            format!("SELECT id, kind, line, end_line FROM symbols WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(values.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                (row.get(1)?, row.get(2)?, row.get::<_, Option<i64>>(3)?),
+            ))
+        })?;
+        for row in rows {
+            let (id, extent) = row?;
+            extents.insert(id, extent);
+        }
+    }
+    Ok(extents)
+}
+
+/// Every stored metrics row (symbols touching at least one edge).
+pub fn load_all_symbol_graph_metrics(conn: &Connection) -> Result<Vec<SymbolGraphMetrics>> {
+    let mut stmt = conn.prepare(
+        "SELECT symbol_id, fan_in, fan_in_files, fan_in_ambiguous, fan_out,
+                fan_out_ambiguous, dependents, pagerank, pagerank_pct
+         FROM symbol_metrics",
+    )?;
+    let rows = stmt
+        .query_map([], row_to_symbol_metrics)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn row_to_graph_symbol_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphSymbolInfo> {
+    Ok(GraphSymbolInfo {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        line: row.get(3)?,
+        end_line: row.get(4)?,
+        path: row.get(5)?,
+        root_path: row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
+    })
+}
+
+/// Symbol and file details for a batch of symbol ids.
+pub fn load_graph_symbol_infos(
+    conn: &Connection,
+    symbol_ids: &[i64],
+) -> Result<HashMap<i64, GraphSymbolInfo>> {
+    let mut infos = HashMap::with_capacity(symbol_ids.len());
+    for chunk in symbol_ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT s.id, s.name, s.kind, s.line, s.end_line, f.path, f.root_path
+             FROM symbols s JOIN files f ON f.id = s.file_id
+             WHERE s.id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(values.as_slice(), row_to_graph_symbol_info)?;
+        for row in rows {
+            let row = row?;
+            infos.insert(row.id, row);
+        }
+    }
+    Ok(infos)
+}
+
+/// Symbols a user-supplied name may denote: an exact `name` match plus the
+/// qualified spellings the parsers produce for the same short name
+/// (`Outer::Name`, `self.name`, `:name`).
+pub fn find_graph_symbols_by_name(conn: &Connection, name: &str) -> Result<Vec<GraphSymbolInfo>> {
+    let escaped = name
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.id, s.name, s.kind, s.line, s.end_line, f.path, f.root_path
+        FROM symbols s JOIN files f ON f.id = s.file_id
+        WHERE s.name = ?1
+           OR s.name = 'self.' || ?1
+           OR s.name = ':' || ?1
+           OR s.name LIKE ?2 ESCAPE '\'
+           OR s.name LIKE ?3 ESCAPE '\'
+           OR s.name IN ('let(:' || ?1 || ')', 'let!(:' || ?1 || ')', 'subject(:' || ?1 || ')')
+        ORDER BY f.path, s.line
+        "#,
+    )?;
+    let rows = stmt
+        .query_map(
+            params![name, format!("%::{escaped}"), format!("%.{escaped}")],
+            row_to_graph_symbol_info,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Definitions nested inside a class-like symbol's range in its own file.
+pub fn find_member_symbols(conn: &Connection, container_id: i64) -> Result<Vec<GraphSymbolInfo>> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT m.id, m.name, m.kind, m.line, m.end_line, f.path, f.root_path
+        FROM symbols c
+        JOIN symbols m ON m.file_id = c.file_id
+        JOIN files f ON f.id = m.file_id
+        WHERE c.id = ?1
+          AND m.id <> c.id
+          AND c.end_line IS NOT NULL
+          AND c.kind IN ('class', 'interface', 'object', 'enum', 'package', 'table')
+          AND m.kind NOT IN ('import', 'annotation')
+          AND m.line >= c.line
+          AND COALESCE(m.end_line, m.line) <= c.end_line
+        ORDER BY m.line
+        "#,
+    )?;
+    let rows = stmt
+        .query_map(params![container_id], row_to_graph_symbol_info)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// `(container id, member id)` for every definition nested inside any of the
+/// class-like symbols in `container_ids`; other ids contribute nothing.
+pub fn load_member_links(conn: &Connection, container_ids: &[i64]) -> Result<Vec<(i64, i64)>> {
+    let mut links = Vec::new();
+    for chunk in container_ids.chunks(GRAPH_ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT c.id, m.id
+             FROM symbols c
+             JOIN symbols m ON m.file_id = c.file_id
+             WHERE c.id IN ({placeholders})
+               AND c.kind IN ('class', 'interface', 'object', 'enum', 'package')
+               AND c.end_line IS NOT NULL
+               AND m.id <> c.id
+               AND m.kind NOT IN ('import', 'annotation')
+               AND m.line >= c.line
+               AND COALESCE(m.end_line, m.line) <= c.end_line"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let values: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(values.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))?;
+        for row in rows {
+            links.push(row?);
+        }
+    }
+    Ok(links)
+}
+
+/// Narrowest class-like symbol whose range encloses `line` in the file that
+/// holds `symbol_id`, excluding the symbol itself.
+pub fn find_enclosing_container(
+    conn: &Connection,
+    symbol_id: i64,
+) -> Result<Option<GraphSymbolInfo>> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT c.id, c.name, c.kind, c.line, c.end_line, f.path, f.root_path
+        FROM symbols s
+        JOIN symbols c ON c.file_id = s.file_id
+        JOIN files f ON f.id = c.file_id
+        WHERE s.id = ?1
+          AND c.id <> s.id
+          AND c.kind IN ('class', 'interface', 'object', 'enum', 'package', 'table')
+          AND c.end_line IS NOT NULL
+          AND c.line <= s.line
+          AND c.end_line >= COALESCE(s.end_line, s.line)
+        ORDER BY c.end_line - c.line ASC, c.line DESC
+        LIMIT 1
+        "#,
+    )?;
+    Ok(stmt
+        .query_row(params![symbol_id], row_to_graph_symbol_info)
+        .optional()?)
+}
+
 /// Returns module indexing time and the effective file-update time.
 ///
 /// An unresolved `index_update_dirty_at` forces the effective update to
@@ -8408,6 +11269,243 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         conn
+    }
+
+    fn fts_count_plan(conn: &Connection, kind_filter: &str) -> String {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM symbols_fts fts \
+             JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id \
+             WHERE symbols_fts MATCH ?1{kind_filter}"
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let values = ["\"Job\"*", "class"];
+        let bound = &values[..stmt.parameter_count()];
+        let details = stmt
+            .query_map(rusqlite::params_from_iter(bound), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        details.join("\n")
+    }
+
+    #[test]
+    fn table_layout_tells_reordered_columns_apart() {
+        let conn = create_test_db();
+        conn.execute("ATTACH DATABASE ':memory:' AS other", [])
+            .unwrap();
+        conn.execute_batch(
+            &CREATE_GIT_SIGNALS_SQL.replace(" TABLE IF NOT EXISTS ", " TABLE other."),
+        )
+        .unwrap();
+        for table in GIT_SIGNAL_TABLES {
+            let layout = table_layout(&conn, "main", table).unwrap();
+            assert!(!layout.is_empty(), "{table}");
+            assert_eq!(
+                layout,
+                table_layout(&conn, "other", table).unwrap(),
+                "{table}"
+            );
+        }
+
+        conn.execute_batch(
+            "DROP TABLE other.git_file_authors;
+             CREATE TABLE other.git_file_authors (
+                 author TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (path, author)
+             );",
+        )
+        .unwrap();
+        assert_ne!(
+            table_layout(&conn, "main", "git_file_authors").unwrap(),
+            table_layout(&conn, "other", "git_file_authors").unwrap()
+        );
+    }
+
+    #[test]
+    fn read_only_uri_attaches_awkward_paths_without_write_access() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let directory = temp.path().join("a b?c#d%e");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("index.db");
+        let source = Connection::open(&path).unwrap();
+        source
+            .execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('kept');")
+            .unwrap();
+        drop(source);
+
+        let uri = read_only_sqlite_uri(path.to_str().unwrap());
+        assert!(
+            uri.ends_with("/a%20b%3Fc%23d%25e/index.db?mode=ro"),
+            "{uri}"
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("ATTACH DATABASE ?1 AS other", [&uri]).unwrap();
+        let value: String = conn
+            .query_row("SELECT v FROM other.t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "kept");
+        assert!(conn.execute("DELETE FROM other.t", []).is_err());
+    }
+
+    #[test]
+    fn kind_filtered_full_text_search_is_driven_by_the_full_text_index() {
+        let conn = create_test_db();
+        let plan = fts_count_plan(&conn, FTS_KIND_FILTER);
+        assert!(!plan.contains("idx_symbols_kind"), "{plan}");
+        assert!(plan.starts_with("SCAN fts VIRTUAL TABLE"), "{plan}");
+
+        let class_only = fts_count_plan(&conn, FTS_CLASS_ONLY_FILTER);
+        assert!(!class_only.contains("idx_symbols_kind"), "{class_only}");
+    }
+
+    #[test]
+    fn vendor_path_covers_packages_and_declarations_only() {
+        assert!(is_vendor_path("node_modules/@types/react/index.d.ts"));
+        assert!(is_vendor_path("frontend/node_modules/lodash/debounce.js"));
+        assert!(is_vendor_path("frontend/types/global.d.ts"));
+        assert!(!is_vendor_path("app/services/applicant/merge_service.rb"));
+        assert!(!is_vendor_path("vendor/lib.rs"));
+        assert!(is_third_party_path("app/node_modules/lodash/fp.js"));
+        assert!(!is_third_party_path("frontend/types/global.d.ts"));
+        assert!(!is_third_party_path("vendor/lib.rs"));
+        assert!(!is_third_party_path("src/node_modules_helper.ts"));
+    }
+
+    #[test]
+    fn vendor_path_sql_agrees_with_rust() {
+        let conn = Connection::open_in_memory().unwrap();
+        let paths = [
+            "node_modules/@types/react/index.d.ts",
+            "frontend/node_modules/lodash/debounce.js",
+            "frontend/types/global.d.ts",
+            "app/services/applicant/merge_service.rb",
+            "vendor/lib.rs",
+            "app/node-modules/x.rb",
+            "app/nodeXmodules/x.rb",
+            "src/node_modules_helper.ts",
+            "node_modules",
+            "tools/node_modules/pkg/index.js",
+            "Types/Global.D.TS",
+            "d.ts",
+        ];
+        for path in paths {
+            let in_sql: bool = conn
+                .query_row(
+                    &format!("SELECT {VENDOR_PATH_SQL} FROM (SELECT ?1 AS path) f"),
+                    params![path],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(in_sql, is_vendor_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn last_name_segment_sql_agrees_with_rust() {
+        let conn = Connection::open_in_memory().unwrap();
+        let cases = [
+            ("Billing::Importers::LedgerImporter", "LedgerImporter"),
+            ("::LedgerImporter", "LedgerImporter"),
+            ("LedgerImporter", "LedgerImporter"),
+            ("Billing::Importers::LedgerImporter", "Importer"),
+            ("Billing::Importers::ledgerimporter", "LedgerImporter"),
+            (
+                "describe \"Billing::Importers::LedgerImporter\"",
+                "LedgerImporter",
+            ),
+            (
+                "include Billing::Importers::LedgerImporter",
+                "LedgerImporter",
+            ),
+            ("Billing::Importers::\n  LedgerImporter", "LedgerImporter"),
+            ("Scopes::pg_search_scope", "pg_search_scope"),
+            ("Scopes::pgXsearchXscope", "pg_search_scope"),
+            ("Scopes::Größe", "Größe"),
+            ("A::B", "A::B"),
+            ("X::A::B", "A::B"),
+            ("users.email", "email"),
+            ("events.email_communicator_email_id", "email"),
+            ("users.email", "Email"),
+            ("self.build", "build"),
+            ("Outer.Inner", "Inner"),
+            ("MyApp.Services", "Services"),
+            ("describe \".call\"", "call"),
+            ("users_email", "email"),
+            ("email", "email"),
+            ("Größe.Maß", "Maß"),
+        ];
+        for (name, term) in cases {
+            let in_sql: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM (SELECT ?1 AS name) s",
+                        last_name_segment_sql(&["?2"])
+                    ),
+                    params![name, term],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                in_sql,
+                is_last_name_segment(name, term),
+                "{name:?} / {term:?}"
+            );
+        }
+        assert!(is_last_name_segment("A::B::Merge", "Merge"));
+        assert!(!is_last_name_segment("A::B::AutoMerge", "Merge"));
+        assert!(!is_last_name_segment("include A::Merge", "Merge"));
+        assert!(is_last_name_segment("users.email", "email"));
+        assert!(is_last_name_segment("self.build", "build"));
+        assert!(!is_last_name_segment("users.primary_email", "email"));
+        assert!(!is_last_name_segment("describe \".call\"", "call"));
+    }
+
+    #[test]
+    fn last_name_segment_is_what_references_are_recorded_under() {
+        assert_eq!(last_name_segment("Billing::Importers::Ledger"), "Ledger");
+        assert_eq!(last_name_segment("::Ledger"), "Ledger");
+        assert_eq!(last_name_segment("self.build"), "build");
+        assert_eq!(last_name_segment("users.email"), "email");
+        assert_eq!(last_name_segment("Outer.Inner::Deep"), "Deep");
+        assert_eq!(last_name_segment("Ledger"), "Ledger");
+        assert_eq!(last_name_segment("Billing::"), "Billing::");
+        assert_eq!(last_name_segment("include A::B"), "include A::B");
+    }
+
+    #[test]
+    fn last_segment_match_leaves_imports_out() {
+        let conn = Connection::open_in_memory().unwrap();
+        let cases = [
+            ("anyhow::Result", "import", "Result"),
+            ("anyhow::Result", "typealias", "Result"),
+            ("Billing::LedgerImporter", "class", "LedgerImporter"),
+            ("Billing::LedgerImporter", "import", "LedgerImporter"),
+            ("Result", "import", "Result"),
+        ];
+        for (name, kind, term) in cases {
+            let in_sql: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM (SELECT ?1 AS name, ?2 AS kind) s",
+                        last_segment_match_sql(&["?3"])
+                    ),
+                    params![name, kind, term],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                in_sql,
+                is_last_segment_match(name, kind, term),
+                "{name:?} [{kind}] / {term:?}"
+            );
+        }
+        assert!(!is_last_segment_match("anyhow::Result", "import", "Result"));
+        assert!(is_last_segment_match(
+            "anyhow::Result",
+            "typealias",
+            "Result"
+        ));
     }
 
     #[test]
@@ -9393,6 +12491,302 @@ mod tests {
         assert!(!recreated.overlaps(&requested_after_remount));
     }
 
+    fn owner_lookup_outcome(result: Result<Option<CacheOwnerManifest>>) -> String {
+        match result {
+            Ok(owner) => format!("{owner:?}"),
+            Err(error) => format!("error: {error:#}"),
+        }
+    }
+
+    /// Walk the base the way the auto-migration scan does and check that one
+    /// shared listing answers every owner lookup exactly like a per-cache one.
+    fn assert_shared_listing_matches_per_cache_reads(cache_base: &Path) -> HashMap<String, String> {
+        let mut listing = CacheOwnerIntentListing::new(cache_base);
+        let mut outcomes = HashMap::new();
+        for entry in std::fs::read_dir(cache_base).unwrap() {
+            let entry = entry.unwrap();
+            let key = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type().unwrap().is_dir() || !is_cache_key(&key) {
+                continue;
+            }
+            let cache_dir = entry.path();
+            let shared = owner_lookup_outcome(listing.effective_owner(&cache_dir, &key));
+            let per_cache =
+                owner_lookup_outcome(effective_cache_owner(cache_base, &cache_dir, &key));
+            assert_eq!(shared, per_cache, "owner lookup diverged for cache {key}");
+            outcomes.insert(key, shared);
+        }
+        outcomes
+    }
+
+    fn create_owned_cache(cache_base: &Path, root: &str) -> (String, PathBuf) {
+        let key = simple_hash(root);
+        let cache_dir = cache_base.join(&key);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("index.db"), b"").unwrap();
+        persist_cache_owner_manifest(&cache_dir, &key, &CacheOwnerManifest::new(root, root))
+            .unwrap();
+        for suffix in ["lock", "publish.lock"] {
+            open_lock_file(&leases_dir(cache_base).join(format!("{key}.{suffix}"))).unwrap();
+        }
+        (key, cache_dir)
+    }
+
+    fn raw_owner_intent(key: &str, generation: &str, owner: &CacheOwnerManifest) -> Vec<u8> {
+        serde_json::to_vec(&CacheOwnerIntent {
+            version: CACHE_OWNER_INTENT_VERSION,
+            cache_key: key.to_owned(),
+            generation: generation.to_owned(),
+            owner: owner.clone(),
+        })
+        .unwrap()
+    }
+
+    fn write_raw_owner_intent(cache_base: &Path, key: &str, nonce: u32, contents: &[u8]) {
+        let name = cache_owner_intent_name(key, 4242, u128::from(nonce));
+        std::fs::write(leases_dir(cache_base).join(name), contents).unwrap();
+    }
+
+    #[test]
+    fn shared_intent_listing_matches_per_cache_owner_reads() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_base = temp.path().join("cache");
+        std::fs::create_dir_all(leases_dir(&cache_base)).unwrap();
+        let retired_alias = "/retired/alias";
+
+        // Plain caches, some with an intent left by a retired generation.
+        let mut plain = Vec::new();
+        for index in 0..24_u32 {
+            let root = format!("/layout/plain/{index}");
+            let (key, _) = create_owned_cache(&cache_base, &root);
+            if index % 5 == 0 {
+                let retired = CacheOwnerManifest::new(&root, retired_alias);
+                write_raw_owner_intent(
+                    &cache_base,
+                    &key,
+                    index,
+                    &raw_owner_intent(&key, "1-1-1", &retired),
+                );
+            }
+            plain.push(key);
+        }
+        let live_lease =
+            open_lock_file(&leases_dir(&cache_base).join(format!("{}.lock", plain[1]))).unwrap();
+        fs2::FileExt::lock_shared(&live_lease).unwrap();
+
+        // Several current-generation intents extend one installed owner.
+        let alias_root = "/layout/aliases";
+        let (alias_key, alias_dir) = create_owned_cache(&cache_base, alias_root);
+        let aliases = ["/alias/one", "/alias/two", "/alias/three"];
+        for alias in aliases {
+            let intent = CacheOwnerManifest::new(alias_root, alias);
+            write_cache_owner_intent(&cache_base, &alias_dir, &alias_key, &intent).unwrap();
+        }
+
+        // A directory moved to a new key whose manifest still names the old
+        // key: only the current-generation intent bridges the two.
+        let first_root = "/layout/rekey/first";
+        let second_root = "/layout/rekey/second";
+        let rekey_alias = "/layout/rekey/alias";
+        let first_key = simple_hash(first_root);
+        let second_key = simple_hash(second_root);
+        let first_dir = cache_base.join(&first_key);
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::write(first_dir.join("index.db"), b"").unwrap();
+        let first_owner = CacheOwnerManifest::new(first_root, rekey_alias);
+        persist_cache_owner_manifest(&first_dir, &first_key, &first_owner).unwrap();
+        let second_desired = first_owner
+            .merged_for_target(&CacheOwnerManifest::new(second_root, rekey_alias))
+            .unwrap();
+        rename_cache_directory(
+            &first_dir,
+            &cache_base.join(&second_key),
+            &second_key,
+            &second_desired,
+        )
+        .unwrap();
+
+        // The owner exists only as an intent; no manifest was installed.
+        let intent_only_root = "/layout/intent-only";
+        let intent_only_key = simple_hash(intent_only_root);
+        let intent_only_dir = cache_base.join(&intent_only_key);
+        std::fs::create_dir_all(&intent_only_dir).unwrap();
+        write_cache_owner_intent(
+            &cache_base,
+            &intent_only_dir,
+            &intent_only_key,
+            &CacheOwnerManifest::new(intent_only_root, intent_only_root),
+        )
+        .unwrap();
+
+        // A manifest for another key with no intent to bridge it.
+        let mismatched_key = simple_hash("/layout/mismatched");
+        let mismatched_dir = cache_base.join(&mismatched_key);
+        std::fs::create_dir_all(&mismatched_dir).unwrap();
+        ensure_cache_generation(&mismatched_dir).unwrap();
+        std::fs::write(
+            cache_owner_manifest_path(&mismatched_dir),
+            serde_json::to_vec(&CacheOwnerManifest::new("/layout/other", "/layout/other")).unwrap(),
+        )
+        .unwrap();
+
+        // Unreadable and inconsistent intents fail only their own cache.
+        let (malformed_key, _) = create_owned_cache(&cache_base, "/layout/malformed-intent");
+        write_raw_owner_intent(&cache_base, &malformed_key, 1, b"{not-json");
+        let (wrong_key, wrong_dir) = create_owned_cache(&cache_base, "/layout/wrong-key");
+        let wrong_generation = read_cache_generation(&wrong_dir).unwrap().unwrap();
+        write_raw_owner_intent(
+            &cache_base,
+            &wrong_key,
+            1,
+            &raw_owner_intent(
+                &plain[0],
+                &wrong_generation,
+                &CacheOwnerManifest::new("/layout/plain/0", "/layout/plain/0"),
+            ),
+        );
+
+        // Without a generation marker no intent applies, not even a broken one.
+        let unmarked_root = "/layout/unmarked";
+        let unmarked_key = simple_hash(unmarked_root);
+        let unmarked_dir = cache_base.join(&unmarked_key);
+        std::fs::create_dir_all(&unmarked_dir).unwrap();
+        std::fs::write(
+            cache_owner_manifest_path(&unmarked_dir),
+            serde_json::to_vec(&CacheOwnerManifest::new(unmarked_root, unmarked_root)).unwrap(),
+        )
+        .unwrap();
+        write_raw_owner_intent(&cache_base, &unmarked_key, 1, b"{not-json");
+
+        let (bad_marker_key, bad_marker_dir) =
+            create_owned_cache(&cache_base, "/layout/bad-marker");
+        std::fs::write(cache_generation_marker_path(&bad_marker_dir), b"{bad").unwrap();
+
+        let legacy_key = simple_hash("/layout/legacy");
+        std::fs::create_dir_all(cache_base.join(&legacy_key)).unwrap();
+
+        let (publishing_key, publishing_dir) =
+            create_owned_cache(&cache_base, "/layout/publishing");
+        std::fs::write(publishing_dir.join("index.db.publish-state-v1"), b"{}").unwrap();
+        std::fs::write(publishing_dir.join("index.db.swap"), b"").unwrap();
+
+        // Lease files and intents whose caches are gone, plus crash leftovers.
+        for index in 0..8_u32 {
+            let gone_root = format!("/layout/gone/{index}");
+            let gone_key = simple_hash(&gone_root);
+            for suffix in ["lock", "publish.lock"] {
+                open_lock_file(&leases_dir(&cache_base).join(format!("{gone_key}.{suffix}")))
+                    .unwrap();
+            }
+            write_raw_owner_intent(
+                &cache_base,
+                &gone_key,
+                index,
+                &raw_owner_intent(
+                    &gone_key,
+                    "2-2-2",
+                    &CacheOwnerManifest::new(&gone_root, &gone_root),
+                ),
+            );
+        }
+        std::fs::write(
+            leases_dir(&cache_base).join(".owner-manifest.4242.1.tmp"),
+            b"",
+        )
+        .unwrap();
+        std::fs::create_dir_all(cache_base.join(".gc-trash")).unwrap();
+
+        let outcomes = assert_shared_listing_matches_per_cache_reads(&cache_base);
+        drop(live_lease);
+
+        let outcome = |key: &str| {
+            outcomes
+                .get(key)
+                .unwrap_or_else(|| panic!("cache {key} was not inspected"))
+                .clone()
+        };
+        for (index, key) in plain.iter().enumerate() {
+            let owner = outcome(key);
+            assert!(
+                owner.contains(&format!("\"/layout/plain/{index}\"")),
+                "{owner}"
+            );
+            assert!(
+                !owner.contains(retired_alias),
+                "retired intent applied: {owner}"
+            );
+        }
+        for alias in aliases {
+            assert!(outcome(&alias_key).contains(alias));
+        }
+        let rekeyed = outcome(&second_key);
+        for identity in [first_root, second_root, rekey_alias] {
+            assert!(rekeyed.contains(identity), "{rekeyed}");
+        }
+        assert!(outcome(&intent_only_key).contains(intent_only_root));
+        assert!(outcome(&mismatched_key).contains("does not match directory key"));
+        assert!(outcome(&malformed_key).contains("invalid cache owner manifest"));
+        assert!(outcome(&wrong_key).contains("does not match filename key"));
+        assert!(outcome(&unmarked_key).starts_with("Some("));
+        assert!(outcome(&bad_marker_key).starts_with("error: "));
+        assert_eq!(outcome(&legacy_key), "None");
+        assert!(outcome(&publishing_key).contains("/layout/publishing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_intent_listing_retries_a_failed_listing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_base = temp.path().join("cache");
+        let (first_key, first_dir) = create_owned_cache(&cache_base, "/retry/first");
+        let (second_key, second_dir) = create_owned_cache(&cache_base, "/retry/second");
+        let leases = leases_dir(&cache_base);
+        let real_leases = temp.path().join("real-leases");
+        std::fs::rename(&leases, &real_leases).unwrap();
+        std::os::unix::fs::symlink(&real_leases, &leases).unwrap();
+
+        let mut listing = CacheOwnerIntentListing::new(&cache_base);
+        let unusable = owner_lookup_outcome(listing.effective_owner(&first_dir, &first_key));
+        assert_eq!(
+            unusable,
+            owner_lookup_outcome(effective_cache_owner(&cache_base, &first_dir, &first_key))
+        );
+        assert!(unusable.contains("not a real directory"), "{unusable}");
+
+        std::fs::remove_file(&leases).unwrap();
+        std::fs::rename(&real_leases, &leases).unwrap();
+        let recovered = owner_lookup_outcome(listing.effective_owner(&second_dir, &second_key));
+        assert_eq!(
+            recovered,
+            owner_lookup_outcome(effective_cache_owner(&cache_base, &second_dir, &second_key))
+        );
+        assert!(recovered.contains("/retry/second"), "{recovered}");
+    }
+
+    #[test]
+    fn intent_removed_behind_a_shared_listing_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_base = temp.path().join("cache");
+        let (first_key, first_dir) = create_owned_cache(&cache_base, "/removed/first");
+        let second_root = "/removed/second";
+        let (second_key, second_dir) = create_owned_cache(&cache_base, second_root);
+        let alias = CacheOwnerManifest::new(second_root, "/removed/alias");
+        let intent =
+            write_cache_owner_intent(&cache_base, &second_dir, &second_key, &alias).unwrap();
+
+        let mut listing = CacheOwnerIntentListing::new(&cache_base);
+        listing.effective_owner(&first_dir, &first_key).unwrap();
+        std::fs::remove_file(&intent).unwrap();
+
+        let error = listing
+            .effective_owner(&second_dir, &second_key)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("disappeared"), "{error:#}");
+        assert!(effective_cache_owner(&cache_base, &second_dir, &second_key)
+            .unwrap()
+            .is_some());
+    }
+
     #[test]
     fn relative_cache_owner_identities_are_scoped_to_their_working_directory() {
         let relative = Path::new(".");
@@ -9767,6 +13161,40 @@ mod tests {
 
         let results = search_symbols(&conn, "Test", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn index_writes_move_the_generation_the_graph_is_checked_against() {
+        let mut conn = create_test_db();
+        assert_eq!(index_fingerprint(&conn).unwrap(), "generation:0/ids:0:0:0");
+        let file_id = upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
+        insert_symbol(&conn, file_id, "Main", SymbolKind::Class, 1, None).unwrap();
+        let built = index_fingerprint(&conn).unwrap();
+        assert_eq!(built, "generation:2/ids:1:1:0");
+        store_symbol_graph(&mut conn, &[], &[], &built, "{}").unwrap();
+        assert!(!symbol_graph_state(&conn).unwrap().stale);
+
+        insert_inheritance(&conn, 1, "Base", "extends").unwrap();
+        assert!(symbol_graph_state(&conn).unwrap().stale);
+        let rebuilt = index_fingerprint(&conn).unwrap();
+        store_symbol_graph(&mut conn, &[], &[], &rebuilt, "{}").unwrap();
+        assert!(!symbol_graph_state(&conn).unwrap().stale);
+        clear_db(&conn).unwrap();
+        assert!(symbol_graph_state(&conn).unwrap().stale);
+
+        // A writer without the counter still moves the row ids.
+        let unchanged = index_fingerprint(&conn).unwrap();
+        store_symbol_graph(&mut conn, &[], &[], &unchanged, "{}").unwrap();
+        conn.execute(
+            "INSERT INTO files (path, root_path, mtime, size) VALUES ('b.kt', '', 1, 1)",
+            [],
+        )
+        .unwrap();
+        assert!(symbol_graph_state(&conn).unwrap().stale);
+
+        // A graph an older version built recorded a row-count digest.
+        store_symbol_graph(&mut conn, &[], &[], "f1:1:1000:100/s1:1/r0:0/i0", "{}").unwrap();
+        assert!(symbol_graph_state(&conn).unwrap().stale);
     }
 
     #[test]

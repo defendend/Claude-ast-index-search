@@ -5,12 +5,19 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ast_index::db;
 use tempfile::TempDir;
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+const CHILD_LOCK_PATH: &str = "AST_INDEX_GC_TEST_CHILD_LOCK_PATH";
+const CHILD_PROJECT: &str = "AST_INDEX_GC_TEST_CHILD_PROJECT";
+const CHILD_READY: &str = "AST_INDEX_GC_TEST_CHILD_READY";
+const CHILD_RELEASE: &str = "AST_INDEX_GC_TEST_CHILD_RELEASE";
 
 fn test_now() -> SystemTime {
     // Whole seconds make exact-boundary assertions independent of how a
@@ -49,6 +56,96 @@ fn assert_empty_dir(path: &Path) {
         "{} should be empty",
         path.display()
     );
+}
+
+fn leases(base: &Path) -> PathBuf {
+    base.join(".leases")
+}
+
+/// Create empty `.leases` files the way ast-index leaves them behind.
+fn touch_leases(base: &Path, names: &[&str]) {
+    fs::create_dir_all(leases(base)).unwrap();
+    for name in names {
+        File::create(leases(base).join(name)).unwrap();
+    }
+}
+
+fn lock_pair(key: &str) -> [String; 2] {
+    [format!("{key}.lock"), format!("{key}.publish.lock")]
+}
+
+fn touch_lock_pair(base: &Path, key: &str) {
+    let [lock, publish] = lock_pair(key);
+    touch_leases(base, &[&lock, &publish]);
+}
+
+fn lease_exists(base: &Path, name: &str) -> bool {
+    fs::symlink_metadata(leases(base).join(name)).is_ok()
+}
+
+fn open_lease(base: &Path, name: &str) -> File {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(leases(base).join(name))
+        .unwrap()
+}
+
+fn wait_for_path(path: &Path, timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    panic!("test child process did not exit");
+}
+
+fn child_env(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key).map(PathBuf::from)
+}
+
+/// Re-run one test of this binary as a child process with extra variables.
+fn spawn_test_child(test_name: &str, env: &[(&str, &Path)]) -> Child {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", test_name, "--nocapture"]);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.spawn().unwrap()
+}
+
+/// Hold a shared flock on `path` from another thread until the returned
+/// sender is dropped or signalled.
+fn hold_shared_lock_in_thread(path: PathBuf) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        fs2::FileExt::lock_shared(&file).unwrap();
+        ready_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+        drop(file);
+    });
+    ready_rx.recv().unwrap();
+    (release_tx, holder)
 }
 
 #[test]
@@ -355,6 +452,7 @@ fn held_shared_project_lease_defers_collection_until_released() {
         db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
     assert_eq!(while_held, 0);
     assert!(stale.is_dir());
+    assert!(leases.join(format!("{key}.lock")).is_file());
 
     fs2::FileExt::unlock(&lease).unwrap();
     drop(lease);
@@ -363,6 +461,7 @@ fn held_shared_project_lease_defers_collection_until_released() {
         db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
     assert_eq!(after_release, 1);
     assert!(!stale.exists());
+    assert!(!leases.join(format!("{key}.lock")).exists());
 }
 
 #[test]
@@ -404,4 +503,337 @@ fn missing_base_directory_is_a_noop() {
 
     assert_eq!(removed, 0);
     assert!(!missing.exists());
+}
+
+#[test]
+fn collected_cache_loses_its_lease_locks() {
+    let base = TempDir::new().unwrap();
+    let now = test_now();
+    let stale_mtime = at_age(now, db::STALE_CACHE_MAX_AGE + DAY);
+    let fresh = make_cache(
+        base.path(),
+        "a1",
+        "index.db",
+        at_age(now, Duration::from_secs(60)),
+    );
+    let stale = make_cache(base.path(), "0123456789abcdef", "index.db", stale_mtime);
+    let never_leased = make_cache(base.path(), "fed", "index.db", stale_mtime);
+    touch_lock_pair(base.path(), "a1");
+    touch_lock_pair(base.path(), "0123456789abcdef");
+
+    let removed = db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, now).unwrap();
+
+    assert_eq!(removed, 2);
+    assert!(fresh.is_dir());
+    assert!(!stale.exists() && !never_leased.exists());
+    for key in ["0123456789abcdef", "fed"] {
+        for name in lock_pair(key) {
+            assert!(
+                !lease_exists(base.path(), &name),
+                "{name} outlived its cache"
+            );
+        }
+    }
+    for name in lock_pair("a1") {
+        assert!(
+            lease_exists(base.path(), &name),
+            "{name} of a live cache was removed"
+        );
+    }
+    assert!(lease_exists(base.path(), "layout.lock"));
+}
+
+#[test]
+fn orphaned_lease_locks_are_removed_regardless_of_age() {
+    let base = TempDir::new().unwrap();
+    let now = test_now();
+    let fresh = make_cache(
+        base.path(),
+        "a1",
+        "index.db",
+        at_age(now, Duration::from_secs(60)),
+    );
+    touch_lock_pair(base.path(), "a1");
+    let orphans = ["0a", "0b", "0123456789abcdef", "0c", "0d"];
+    for key in &orphans[..3] {
+        touch_lock_pair(base.path(), key);
+    }
+    touch_leases(base.path(), &["0c.lock", "0d.publish.lock"]);
+    // The kept key keeps its locks, and so does a key whose name a plain file
+    // still occupies in the base.
+    touch_lock_pair(base.path(), "cafe");
+    fs::write(base.path().join("bead"), b"not a cache directory").unwrap();
+    touch_lock_pair(base.path(), "bead");
+    let unrelated = [
+        "layout.lock",
+        "0a.owner.4242.1.json",
+        ".owner-manifest.4242.1.tmp",
+        "notes.lock",
+        "ABC.lock",
+        "0123456789abcdef0.lock",
+        "0e.lock.tmp",
+    ];
+    touch_leases(base.path(), &unrelated);
+
+    let removed =
+        db::gc_stale_caches_in(base.path(), Some("cafe"), db::STALE_CACHE_MAX_AGE, now).unwrap();
+
+    assert_eq!(removed, 0);
+    assert!(fresh.is_dir());
+    for key in orphans {
+        for name in lock_pair(key) {
+            assert!(
+                !lease_exists(base.path(), &name),
+                "orphaned {name} survived"
+            );
+        }
+    }
+    for key in ["a1", "cafe", "bead"] {
+        for name in lock_pair(key) {
+            assert!(lease_exists(base.path(), &name), "{name} was removed");
+        }
+    }
+    for name in unrelated {
+        assert!(lease_exists(base.path(), name), "{name} was removed");
+    }
+}
+
+#[test]
+fn orphaned_locks_held_by_another_process_or_thread_survive_until_released() {
+    if let Some(lock_path) = child_env(CHILD_LOCK_PATH) {
+        let ready = child_env(CHILD_READY).unwrap();
+        let release = child_env(CHILD_RELEASE).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fs2::FileExt::lock_shared(&file).unwrap();
+        fs::write(&ready, b"ready").unwrap();
+        assert!(wait_for_path(&release, Duration::from_secs(30)));
+        drop(file);
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let base = temp.path().join("cache");
+    let (process_key, thread_key, publication_key) = ("0e", "0f", "10");
+    for key in [process_key, thread_key, publication_key] {
+        touch_lock_pair(&base, key);
+    }
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let mut child = spawn_test_child(
+        "orphaned_locks_held_by_another_process_or_thread_survive_until_released",
+        &[
+            (
+                CHILD_LOCK_PATH,
+                &leases(&base).join(format!("{process_key}.lock")),
+            ),
+            (CHILD_READY, &ready),
+            (CHILD_RELEASE, &release),
+        ],
+    );
+    assert!(
+        wait_for_path(&ready, Duration::from_secs(30)),
+        "lock-holding child did not start"
+    );
+    let (release_thread, thread) =
+        hold_shared_lock_in_thread(leases(&base).join(format!("{thread_key}.lock")));
+    let (release_publication, publication) =
+        hold_shared_lock_in_thread(leases(&base).join(format!("{publication_key}.publish.lock")));
+
+    let removed = db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+
+    assert_eq!(removed, 0);
+    for key in [process_key, thread_key, publication_key] {
+        for name in lock_pair(key) {
+            assert!(lease_exists(&base, &name), "held {name} was removed");
+        }
+    }
+
+    fs::write(&release, b"release").unwrap();
+    let status = wait_for_exit(&mut child, Duration::from_secs(30));
+    assert!(status.success(), "lock-holding child failed: {status}");
+    release_thread.send(()).unwrap();
+    thread.join().unwrap();
+    release_publication.send(()).unwrap();
+    publication.join().unwrap();
+
+    db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    for key in [process_key, thread_key, publication_key] {
+        for name in lock_pair(key) {
+            assert!(!lease_exists(&base, &name), "released {name} survived");
+        }
+    }
+}
+
+#[test]
+fn lease_sweep_waits_for_the_cache_layout_lock() {
+    let base = TempDir::new().unwrap();
+    touch_lock_pair(base.path(), "0a");
+    touch_leases(base.path(), &["layout.lock"]);
+    let layout = open_lease(base.path(), "layout.lock");
+    fs2::FileExt::lock_exclusive(&layout).unwrap();
+
+    db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    for name in lock_pair("0a") {
+        assert!(
+            lease_exists(base.path(), &name),
+            "{name} removed without the layout lock"
+        );
+    }
+
+    drop(layout);
+    db::gc_stale_caches_in(base.path(), None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+    for name in lock_pair("0a") {
+        assert!(
+            !lease_exists(base.path(), &name),
+            "orphaned {name} survived"
+        );
+    }
+    assert!(lease_exists(base.path(), "layout.lock"));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_leases_directory_is_not_swept() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let base = temp.path().join("base");
+    let outside = temp.path().join("outside-leases");
+    fs::create_dir_all(&base).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    for name in lock_pair("0a") {
+        File::create(outside.join(name)).unwrap();
+    }
+    symlink(&outside, leases(&base)).unwrap();
+
+    db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+
+    for name in lock_pair("0a") {
+        assert!(
+            outside.join(&name).is_file(),
+            "{name} removed through a symlink"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_lease_locks_and_cache_entries_are_left_alone() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let base = temp.path().join("base");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let outside_lock = outside.join("target.lock");
+    let outside_publication = outside.join("target.publish.lock");
+    File::create(&outside_lock).unwrap();
+    File::create(&outside_publication).unwrap();
+
+    touch_leases(&base, &["0a.publish.lock", "0b.lock"]);
+    symlink(&outside_lock, leases(&base).join("0a.lock")).unwrap();
+    symlink(&outside_publication, leases(&base).join("0b.publish.lock")).unwrap();
+    symlink(&outside, base.join("feed")).unwrap();
+    touch_lock_pair(&base, "feed");
+
+    db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, test_now()).unwrap();
+
+    for key in ["0a", "0b", "feed"] {
+        for name in lock_pair(key) {
+            assert!(lease_exists(&base, &name), "{name} was removed");
+        }
+    }
+    assert!(outside_lock.is_file() && outside_publication.is_file());
+}
+
+// Removing a directory that holds an open SQLite database is Unix-only.
+#[cfg(unix)]
+#[test]
+fn concurrent_leased_opens_never_split_a_key_lock_across_inodes() {
+    const ITERATIONS: usize = 100;
+
+    if let Some(project) = child_env(CHILD_PROJECT) {
+        let base = child_env("AST_INDEX_CACHE_DIR").unwrap();
+        let db_path = db::get_db_path(&project).unwrap();
+        let cache_dir = db_path.parent().unwrap().to_path_buf();
+        let key = cache_dir.file_name().unwrap().to_str().unwrap().to_owned();
+        for iteration in 0..ITERATIONS {
+            let connection = db::open_db_leased(&project)
+                .unwrap_or_else(|error| panic!("open {iteration} failed: {error:#}"));
+            // Every other cache vanishes while its lease is still held, and
+            // the sweeping parent gets time to see the key as orphaned.
+            let removed_while_leased = iteration % 2 == 1;
+            if removed_while_leased {
+                fs::remove_dir_all(&cache_dir).unwrap();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // A path that no longer names the inode this lease locks would
+            // let the next opener lock a different file for the same key.
+            for name in lock_pair(&key) {
+                let probe = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(leases(&base).join(&name))
+                    .unwrap_or_else(|error| {
+                        panic!("open {iteration}: held {name} disappeared: {error}")
+                    });
+                assert!(
+                    fs2::FileExt::try_lock_exclusive(&probe).is_err(),
+                    "open {iteration}: {name} no longer names the held lock"
+                );
+            }
+            drop(connection);
+            if !removed_while_leased {
+                fs::remove_dir_all(&cache_dir).unwrap();
+            }
+        }
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let base = temp.path().join("cache");
+    let project = temp.path().join("project");
+    fs::create_dir_all(&base).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "concurrent_leased_opens_never_split_a_key_lock_across_inodes",
+            "--nocapture",
+        ])
+        .env(CHILD_PROJECT, &project)
+        .env("AST_INDEX_CACHE_DIR", &base)
+        .env_remove("AST_INDEX_DB_PATH")
+        .env_remove("KOTLIN_INDEX_DB_PATH")
+        .spawn()
+        .unwrap();
+
+    let started = Instant::now();
+    let mut sweeps = 0_u64;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            child.kill().unwrap();
+            panic!("leased-open child did not finish");
+        }
+        db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, SystemTime::now()).unwrap();
+        sweeps += 1;
+        std::thread::sleep(Duration::from_micros(200));
+    };
+    assert!(status.success(), "leased-open child failed: {status}");
+    assert!(sweeps > 0);
+
+    db::gc_stale_caches_in(&base, None, db::STALE_CACHE_MAX_AGE, SystemTime::now()).unwrap();
+    let leftover: Vec<String> = fs::read_dir(leases(&base))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".lock") && name != "layout.lock")
+        .collect();
+    assert!(leftover.is_empty(), "orphaned locks survived: {leftover:?}");
 }

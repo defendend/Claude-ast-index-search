@@ -14,11 +14,52 @@ use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 
+use super::is_test_path;
+use super::rank::{self, PoolSummary, Preset, RankContext, RankSummary, RankedFile, RankedSymbol};
 use super::{
     print_truncation_notice, relative_path, search_files_page, Page, Pagination, PathResolver,
     PAGINATED_JSON_SCHEMA_VERSION,
 };
 use crate::db::{self, SearchScope};
+
+/// Matches read per section when `search --rank --exclude-tests` filters
+/// test files out: the path test runs in Rust, so the section is read whole
+/// (up to this many rows) to keep its pool and total exact.
+const EXCLUDE_TESTS_SCAN: usize = 50_000;
+
+/// One ranked section with test files left out: the project candidates to
+/// re-rank, the third-party ones to append when the page is not full, and
+/// how many matches remain.
+struct TestlessSection<T> {
+    project: Vec<T>,
+    vendor: Vec<T>,
+    total: usize,
+}
+
+fn without_tests<T>(
+    scanned: Vec<T>,
+    path: impl Fn(&T) -> &str,
+    sql_total: usize,
+    pool: usize,
+    probe: usize,
+) -> TestlessSection<T> {
+    let read = scanned.len();
+    let kept: Vec<T> = scanned
+        .into_iter()
+        .filter(|item| !is_test_path(path(item)))
+        .collect();
+    // Matches past the scan cap were never looked at; counting them as they
+    // are keeps the total an upper bound instead of an undercount.
+    let total = kept.len() + sql_total.saturating_sub(read);
+    let (vendor, project): (Vec<T>, Vec<T>) = kept
+        .into_iter()
+        .partition(|item| db::is_vendor_path(path(item)));
+    TestlessSection {
+        project: project.into_iter().take(pool).collect(),
+        vendor: vendor.into_iter().take(probe).collect(),
+        total,
+    }
+}
 
 fn symbol_display_name(symbol: &db::SearchResult) -> &str {
     symbol.display_name()
@@ -38,7 +79,11 @@ fn auto_pattern_from_name<'a>(
     }
 }
 
-/// Full-text search across files, symbols, and file contents
+/// Full-text search across files, symbols, and file contents.
+///
+/// With `rank`, the files and symbols sections are re-ranked by a preset (see
+/// [`super::rank`]); without it the output is the plain relevance order.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_search(
     root: &Path,
     query: &str,
@@ -47,7 +92,11 @@ pub fn cmd_search(
     format: &str,
     scope: &SearchScope,
     fuzzy: bool,
+    rank: Option<&str>,
+    exclude_tests: bool,
 ) -> Result<()> {
+    let preset = rank.map(Preset::parse).transpose()?;
+    let exclude_tests = exclude_tests && preset.is_some();
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -68,17 +117,89 @@ pub fn cmd_search(
     let mut content_matches: Vec<(String, usize, String)> = vec![];
 
     let mut seen_content = std::collections::HashSet::new();
-    let files_total = db::count_files_with_roots_terms_scoped(&conn, &terms, scope)?;
-    let symbols_total =
+    let mut files_total = db::count_files_with_roots_terms_scoped(&conn, &terms, scope)?;
+    let mut symbols_total =
         db::count_search_symbol_terms_scoped(&conn, &terms, kind_filter, scope, fuzzy)?;
     let refs_total = db::count_search_ref_terms_scoped(&conn, &terms, scope)?;
 
     let probe_limit = limit.saturating_add(1);
+    let ranking = preset
+        .map(|preset| RankContext::load(&conn, preset))
+        .transpose()?;
     // One OR query per indexed category fills the page with unique rows while
-    // keeping memory bounded to the requested page plus one probe row.
-    let files = db::find_files_with_roots_terms_scoped(&conn, &terms, probe_limit, scope)?;
-    let mut symbols =
-        db::search_symbol_terms_scoped(&conn, &terms, kind_filter, probe_limit, scope, fuzzy)?;
+    // keeping memory bounded to the requested page plus one probe row. A
+    // preset instead needs a pool of project candidates to re-rank: it lists
+    // third-party candidates after every project one, so they must not use
+    // up the pool and are only fetched when the page is not full without them.
+    let mut vendor_files: Option<Vec<db::FileResult>> = None;
+    let mut vendor_symbols: Option<Vec<(i64, db::SearchResult)>> = None;
+    let (files, mut symbols) = if exclude_tests {
+        let files = without_tests(
+            db::find_files_with_roots_terms_filtered(
+                &conn,
+                &terms,
+                EXCLUDE_TESTS_SCAN,
+                scope,
+                None,
+            )?,
+            |file| file.path.as_str(),
+            files_total,
+            Preset::file_pool(limit),
+            probe_limit,
+        );
+        let symbols = without_tests(
+            db::search_symbol_terms_scoped_with_ids(
+                &conn,
+                &terms,
+                kind_filter,
+                EXCLUDE_TESTS_SCAN,
+                scope,
+                fuzzy,
+                None,
+            )?,
+            |(_, symbol)| symbol.path.as_str(),
+            symbols_total,
+            Preset::symbol_pool(limit),
+            probe_limit,
+        );
+        files_total = files.total;
+        symbols_total = symbols.total;
+        vendor_files = Some(files.vendor);
+        vendor_symbols = Some(symbols.vendor);
+        (files.project, symbols.project)
+    } else if ranking.is_some() {
+        (
+            db::find_files_with_roots_terms_filtered(
+                &conn,
+                &terms,
+                Preset::file_pool(limit),
+                scope,
+                Some(false),
+            )?,
+            db::search_symbol_terms_scoped_with_ids(
+                &conn,
+                &terms,
+                kind_filter,
+                Preset::symbol_pool(limit),
+                scope,
+                fuzzy,
+                Some(false),
+            )?,
+        )
+    } else {
+        (
+            db::find_files_with_roots_terms_scoped(&conn, &terms, probe_limit, scope)?,
+            db::search_symbol_terms_scoped_with_ids(
+                &conn,
+                &terms,
+                kind_filter,
+                probe_limit,
+                scope,
+                fuzzy,
+                None,
+            )?,
+        )
+    };
     let ref_matches = db::search_ref_terms_scoped(&conn, &terms, probe_limit, scope)?;
 
     // 4. Search in file contents (grep)
@@ -92,11 +213,22 @@ pub fn cmd_search(
         regex::escape(query)
     };
 
-    let content_page = search_files_page(
+    // The pattern is the query, or each comma-separated term, as a literal.
+    let literals: Vec<&str> = if terms.len() > 1 {
+        terms.clone()
+    } else {
+        vec![query]
+    };
+    let word_index = super::WordIndex::load(root, &conn)?;
+    let prefilter = word_index
+        .as_ref()
+        .and_then(|words| words.prefilter(&literals));
+    let content_page = super::search_files_page_prefiltered(
         root,
         &pattern,
         &super::grep::ALL_SOURCE_EXTENSIONS,
         limit,
+        prefilter.as_ref(),
         |path, line_num, line| {
             let rel_path = super::relative_path(root, path);
             // Apply scope filter for grep results
@@ -129,17 +261,99 @@ pub fn cmd_search(
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     // Apply --subtree / --local filters before resolving paths so we don't
     // do extra work on rows the user will throw away.
-    let files: Vec<String> = files
+    let files: Vec<db::FileResult> = files
         .into_iter()
         .filter(|f| resolver.matches_filter(f.root_path.as_deref()))
-        .map(|file| resolver.resolve_with_root(&file.path, file.root_path.as_deref()))
         .collect();
-    symbols.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
-    for s in &mut symbols {
-        s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
-    }
+    symbols.retain(|(_, s)| resolver.matches_filter(s.root_path.as_deref()));
     for m in &mut content_matches {
         m.0 = resolver.resolve(&m.0);
+    }
+
+    if let Some(ranking) = ranking {
+        let pool = PoolSummary {
+            symbols: symbols.len(),
+            files: files.len(),
+            tests_excluded: exclude_tests,
+        };
+        let mut files = files;
+        if files.len() < limit {
+            let vendor = match vendor_files {
+                Some(vendor) => vendor,
+                None => db::find_files_with_roots_terms_filtered(
+                    &conn,
+                    &terms,
+                    probe_limit,
+                    scope,
+                    Some(true),
+                )?,
+            };
+            files.extend(
+                vendor
+                    .into_iter()
+                    .filter(|f| resolver.matches_filter(f.root_path.as_deref())),
+            );
+        }
+        if symbols.len() < limit {
+            let vendor = match vendor_symbols {
+                Some(vendor) => vendor,
+                None => db::search_symbol_terms_scoped_with_ids(
+                    &conn,
+                    &terms,
+                    kind_filter,
+                    probe_limit,
+                    scope,
+                    fuzzy,
+                    Some(true),
+                )?,
+            };
+            symbols.extend(
+                vendor
+                    .into_iter()
+                    .filter(|(_, s)| resolver.matches_filter(s.root_path.as_deref())),
+            );
+        }
+        // Ranking reads history by the stored, root-relative path, so paths
+        // are resolved for display only afterwards.
+        let mut ranked_files = rank::rank_files(&conn, &ranking, &resolver, files, &terms, limit)?;
+        let mut ranked_symbols =
+            rank::rank_symbols(&conn, &ranking, &resolver, symbols, &terms, fuzzy, limit)?;
+        for file in &mut ranked_files {
+            file.path = resolver.resolve_with_root(&file.path, file.root_path.as_deref());
+        }
+        for symbol in &mut ranked_symbols {
+            symbol.result.path =
+                resolver.resolve_with_root(&symbol.result.path, symbol.result.root_path.as_deref());
+        }
+        let nothing_found = ranked_files.is_empty()
+            && ranked_symbols.is_empty()
+            && ref_matches.is_empty()
+            && content_matches.is_empty();
+        if nothing_found && is_multi_term_query(query) {
+            return super::explore::cmd_search_fallback(root, query, format, scope);
+        }
+        let content_pagination =
+            Pagination::new(content_page.pagination.total, content_matches.len(), limit);
+        return render_ranked_search(RankedSearch {
+            query,
+            summary: ranking.summary(pool),
+            preset: ranking.preset(),
+            files: Page::new(ranked_files, files_total, limit),
+            symbols: Page::new(ranked_symbols, symbols_total, limit),
+            refs: Page::new(ref_matches, refs_total, limit),
+            content_matches,
+            content_pagination,
+            format,
+        });
+    }
+
+    let files: Vec<String> = files
+        .into_iter()
+        .map(|file| resolver.resolve_with_root(&file.path, file.root_path.as_deref()))
+        .collect();
+    let mut symbols: Vec<db::SearchResult> = symbols.into_iter().map(|(_, s)| s).collect();
+    for s in &mut symbols {
+        s.path = resolver.resolve_with_root(&s.path, s.root_path.as_deref());
     }
 
     let files_page = Page::new(files, files_total, limit);
@@ -257,6 +471,146 @@ pub fn cmd_search(
         println!("  No results found.");
     }
 
+    Ok(())
+}
+
+struct RankedSearch<'a> {
+    query: &'a str,
+    summary: RankSummary,
+    preset: Preset,
+    files: Page<RankedFile>,
+    symbols: Page<RankedSymbol>,
+    refs: Page<(String, i64)>,
+    content_matches: Vec<(String, usize, String)>,
+    content_pagination: Pagination,
+    format: &'a str,
+}
+
+/// Output of `search --rank`: the plain search report plus a `rank` summary
+/// and, next to every file and symbol, the dossier it was ranked by.
+fn render_ranked_search(report: RankedSearch<'_>) -> Result<()> {
+    let content_pagination = report.content_pagination;
+    if report.format == "json" {
+        let result = serde_json::json!({
+            "schema_version": PAGINATED_JSON_SCHEMA_VERSION,
+            "rank": report.summary,
+            "files": report.files.items,
+            "symbols": report.symbols.items,
+            "references": report.refs.items.iter().map(|(name, count)| {
+                serde_json::json!({"name": name, "usage_count": count})
+            }).collect::<Vec<_>>(),
+            "content_matches": report.content_matches.iter().map(|(p, l, c)| {
+                serde_json::json!({"path": p, "line": l, "content": c})
+            }).collect::<Vec<_>>(),
+            "pagination": {
+                "files": report.files.pagination,
+                "symbols": report.symbols.pagination,
+                "references": report.refs.pagination,
+                "content_matches": content_pagination,
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        format!(
+            "Search results for '{}' (ranked: {}):",
+            report.query,
+            report.preset.as_str()
+        )
+        .bold()
+    );
+    for line in rank::render_header(&report.summary) {
+        println!("  {line}");
+    }
+
+    if !report.files.items.is_empty() {
+        println!(
+            "\n{}",
+            format!(
+                "Files by path (showing {} of {}):",
+                report.files.pagination.returned, report.files.pagination.total
+            )
+            .cyan()
+        );
+        for file in &report.files.items {
+            println!("  {}", file.path);
+            if let Some(dossier) = &file.rank {
+                for line in rank::render_dossier(dossier, report.preset) {
+                    println!("    {}", line.dimmed());
+                }
+            }
+        }
+        print_truncation_notice(report.files.pagination);
+    }
+
+    if !report.symbols.items.is_empty() {
+        println!(
+            "\n{}",
+            format!(
+                "Symbols (showing {} of {}):",
+                report.symbols.pagination.returned, report.symbols.pagination.total
+            )
+            .cyan()
+        );
+        for symbol in &report.symbols.items {
+            let s = &symbol.result;
+            println!(
+                "  {} [{}]: {}:{}",
+                symbol_display_name(s).cyan(),
+                s.kind,
+                s.path,
+                s.line
+            );
+            if let Some(dossier) = &symbol.rank {
+                for line in rank::render_dossier(dossier, report.preset) {
+                    println!("    {}", line.dimmed());
+                }
+            }
+        }
+        print_truncation_notice(report.symbols.pagination);
+    }
+
+    if !report.refs.items.is_empty() {
+        println!(
+            "\n{}",
+            format!(
+                "References (showing {} of {}, not ranked):",
+                report.refs.pagination.returned, report.refs.pagination.total
+            )
+            .cyan()
+        );
+        for (name, count) in &report.refs.items {
+            println!("  {} — used in {} places", name.cyan(), count);
+        }
+        print_truncation_notice(report.refs.pagination);
+    }
+
+    if !report.content_matches.is_empty() {
+        println!(
+            "\n{}",
+            format!(
+                "Content matches (showing {} of {}, not ranked):",
+                content_pagination.returned, content_pagination.total
+            )
+            .cyan()
+        );
+        for (path, line_num, content) in &report.content_matches {
+            println!("  {}:{}", path.cyan(), line_num);
+            println!("    {}", content.dimmed());
+        }
+        print_truncation_notice(content_pagination);
+    }
+
+    if report.files.items.is_empty()
+        && report.symbols.items.is_empty()
+        && report.refs.items.is_empty()
+        && report.content_matches.is_empty()
+    {
+        println!("  No results found.");
+    }
     Ok(())
 }
 
@@ -549,7 +903,13 @@ pub fn cmd_implementations(
 }
 
 /// Show cross-references: definitions, imports, usages
-pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result<()> {
+pub fn cmd_refs(
+    root: &Path,
+    symbol: &str,
+    limit: usize,
+    format: &str,
+    scope: &SearchScope,
+) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -559,13 +919,12 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
     }
 
     let conn = db::open_db_leased(root)?;
-    let no_scope = SearchScope::none();
-    let definitions_total = db::count_symbols_by_name_scoped(&conn, symbol, None, &no_scope, true)?;
-    let imports_total = db::count_imports_scoped(&conn, symbol, &no_scope)?;
-    let usages_total = db::count_references_scoped(&conn, symbol, &no_scope)?;
-    let mut definitions = db::find_definitions_scoped(&conn, symbol, limit, &no_scope)?;
-    let mut imports = db::find_imports_scoped(&conn, symbol, limit, &no_scope)?;
-    let mut usages = db::find_references_scoped(&conn, symbol, limit, &no_scope)?;
+    let definitions_total = db::count_symbols_by_name_scoped(&conn, symbol, None, scope, true)?;
+    let imports_total = db::count_imports_scoped(&conn, symbol, scope)?;
+    let (usage_source, usages_total) = ReferenceSource::resolve(&conn, symbol, scope)?;
+    let mut definitions = db::find_definitions_scoped(&conn, symbol, limit, scope)?;
+    let mut imports = db::find_imports_scoped(&conn, symbol, limit, scope)?;
+    let mut usages = usage_source.find(&conn, symbol, limit, scope)?;
 
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     definitions.retain(|s| resolver.matches_filter(s.root_path.as_deref()));
@@ -651,6 +1010,9 @@ pub fn cmd_refs(root: &Path, symbol: &str, limit: usize, format: &str) -> Result
             )
             .cyan()
         );
+        if let Some(note) = usage_source.note(symbol) {
+            println!("    {}", note.dimmed());
+        }
         for r in &usages_page.items {
             println!("    {}:{}", r.path.cyan(), r.line);
             if let Some(ctx) = &r.context {
@@ -683,11 +1045,12 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
 
     let conn = db::open_db_leased(root)?;
 
-    // Find the class/interface/package
-    let classes = db::find_symbols_by_name(&conn, name, Some("class"), 1)?;
-    let interfaces = db::find_symbols_by_name(&conn, name, Some("interface"), 1)?;
-    let packages = db::find_symbols_by_name(&conn, name, Some("package"), 1)?;
-    let protocols = db::find_symbols_by_name(&conn, name, Some("protocol"), 1)?;
+    // Find the class/interface/package, respecting scope so --in-file picks the right definition
+    // when multiple classes share the same name.
+    let classes = db::find_symbols_by_name_scoped(&conn, name, Some("class"), 1, scope)?;
+    let interfaces = db::find_symbols_by_name_scoped(&conn, name, Some("interface"), 1, scope)?;
+    let packages = db::find_symbols_by_name_scoped(&conn, name, Some("package"), 1, scope)?;
+    let protocols = db::find_symbols_by_name_scoped(&conn, name, Some("protocol"), 1, scope)?;
 
     let target = classes
         .first()
@@ -695,22 +1058,21 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
         .or(packages.first())
         .or(protocols.first());
 
-    if target.is_none() {
+    let Some(target) = target else {
         println!("{}", format!("Class '{}' not found.", name).red());
         return Ok(());
-    }
+    };
 
-    println!("{}", format!("Hierarchy for '{}':", name).bold());
+    // `LedgerImporter` finds `class Billing::LedgerImporter`, whose index
+    // name is the full one: name what was found, and read its parents by it.
+    let heading = if target.name == name {
+        name
+    } else {
+        target.display_name()
+    };
+    println!("{}", format!("Hierarchy for '{}':", heading).bold());
 
-    // Find parents
-    let mut stmt = conn.prepare(
-        "SELECT i.parent_name, i.kind FROM inheritance i JOIN symbols s ON i.child_id = s.id WHERE s.name = ?1 OR s.qualified_name = ?2",
-    )?;
-    let parents: Vec<(String, String)> = stmt
-        .query_map([target.unwrap().name.as_str(), name], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?
-        .collect::<Result<_, _>>()?;
+    let parents: Vec<(String, String)> = db::find_parents_scoped(&conn, &target.name, scope)?;
 
     if !parents.is_empty() {
         println!("\n  {}", "Parents:".cyan());
@@ -781,6 +1143,56 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
     Ok(())
 }
 
+/// Where `usages` and `refs` read the references to a symbol from.
+enum ReferenceSource<'a> {
+    /// References recorded under the name as given.
+    Name,
+    /// A qualified name no reference is recorded under: references are
+    /// recorded under the last segment (`Billing::Invoice.new` records
+    /// `Invoice`), so read those whose line spells the qualified name out.
+    Mention { segment: &'a str },
+}
+
+impl<'a> ReferenceSource<'a> {
+    fn resolve(
+        conn: &rusqlite::Connection,
+        symbol: &'a str,
+        scope: &SearchScope,
+    ) -> Result<(ReferenceSource<'a>, usize)> {
+        let total = db::count_references_scoped(conn, symbol, scope)?;
+        let segment = db::last_name_segment(symbol);
+        if total > 0 || segment == symbol {
+            return Ok((ReferenceSource::Name, total));
+        }
+        let total = db::count_references_mentioning_scoped(conn, segment, symbol, scope)?;
+        Ok((ReferenceSource::Mention { segment }, total))
+    }
+
+    fn find(
+        &self,
+        conn: &rusqlite::Connection,
+        symbol: &str,
+        limit: usize,
+        scope: &SearchScope,
+    ) -> Result<Vec<db::RefResult>> {
+        match self {
+            ReferenceSource::Name => db::find_references_scoped(conn, symbol, limit, scope),
+            ReferenceSource::Mention { segment } => {
+                db::find_references_mentioning_scoped(conn, segment, symbol, limit, scope)
+            }
+        }
+    }
+
+    fn note(&self, symbol: &str) -> Option<String> {
+        match self {
+            ReferenceSource::Name => None,
+            ReferenceSource::Mention { segment } => Some(format!(
+                "(recorded as '{segment}': lines that mention '{symbol}'; `usages {segment}` lists all)"
+            )),
+        }
+    }
+}
+
 /// Find symbol usages (indexed or grep-based)
 pub fn cmd_usages(
     root: &Path,
@@ -795,13 +1207,10 @@ pub fn cmd_usages(
     if db_path.exists() {
         let conn = db::open_db_leased(root)?;
 
-        // Check if refs table has data
-        let refs_count = db::count_references_scoped(&conn, symbol, scope)?;
+        let (source, total) = ReferenceSource::resolve(&conn, symbol, scope)?;
 
-        if refs_count > 0 {
-            // Use indexed references with scope filtering
-            let total = db::count_references_scoped(&conn, symbol, scope)?;
-            let mut refs = db::find_references_scoped(&conn, symbol, limit, scope)?;
+        if total > 0 {
+            let mut refs = source.find(&conn, symbol, limit, scope)?;
             let resolver = PathResolver::try_from_conn(root, &conn)?;
             refs.retain(|r| resolver.matches_filter(r.root_path.as_deref()));
             for r in &mut refs {
@@ -822,6 +1231,9 @@ pub fn cmd_usages(
                 )
                 .bold()
             );
+            if let Some(note) = source.note(symbol) {
+                println!("  {}", note.dimmed());
+            }
 
             for r in &page.items {
                 println!("  {}:{}", r.path.cyan(), r.line);

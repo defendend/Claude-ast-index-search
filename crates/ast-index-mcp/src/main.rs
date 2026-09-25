@@ -18,6 +18,7 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -38,11 +39,10 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("cannot determine default project root"))?;
 
     let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-    let mut line = String::new();
+    let stdout = Arc::new(Mutex::new(io::stdout()));
+    let mut calls = Vec::new();
 
     for raw in stdin.lock().lines() {
-        line.clear();
         let raw = raw.context("stdin read failed")?;
         if raw.trim().is_empty() {
             continue;
@@ -56,16 +56,40 @@ fn main() -> Result<()> {
             }
         };
 
-        let response = handle_request(request, &ast_index_bin, &default_root);
+        // A tool call runs an `ast-index` process, from milliseconds to
+        // seconds. Answering calls one at a time made an agent that sends
+        // several at once wait for their sum; each call now answers on its
+        // own thread as soon as its process is done, matched by `id`.
+        if request.method == "tools/call" {
+            let (bin, root, stdout) = (ast_index_bin.clone(), default_root.clone(), stdout.clone());
+            calls.retain(|call: &std::thread::JoinHandle<()>| !call.is_finished());
+            calls.push(std::thread::spawn(move || {
+                if let Some(response) = handle_request(request, &bin, &root) {
+                    if let Err(e) = write_response(&stdout, &response) {
+                        eprintln!("[ast-index-mcp] failed to write a response: {e}");
+                    }
+                }
+            }));
+            continue;
+        }
 
         // Notifications (no `id`) produce no response. Everything else gets one.
-        if let Some(response) = response {
-            let json = serde_json::to_string(&response)?;
-            writeln!(stdout, "{json}")?;
-            stdout.flush()?;
+        if let Some(response) = handle_request(request, &ast_index_bin, &default_root) {
+            write_response(&stdout, &response)?;
         }
     }
 
+    for call in calls {
+        let _ = call.join();
+    }
+    Ok(())
+}
+
+fn write_response(stdout: &Mutex<io::Stdout>, response: &JsonRpcResponse) -> Result<()> {
+    let json = serde_json::to_string(response)?;
+    let mut stdout = stdout.lock().unwrap_or_else(|e| e.into_inner());
+    writeln!(stdout, "{json}")?;
+    stdout.flush()?;
     Ok(())
 }
 
@@ -142,7 +166,7 @@ fn handle_request(
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION
                 },
-                "instructions": "Prefer these ast-index tools over grep/ripgrep and over reading whole files for any code or symbol search in this project. They query a precomputed index: precise (never match inside comments or strings), language-aware, and far cheaper in tokens and round-trips. Rules of thumb: `explore` FIRST to understand an area or answer 'how does X work' (one call returns ranked source + callers/subclasses + tests); `search` for broad discovery; `usages`/`refs`/`callers` for a named symbol; `outline` before reading a file over ~500 lines. Reach for raw grep/Read only for plain text, regex, or non-code files, or to confirm a detail these tools did not cover."
+                "instructions": "Prefer these ast-index tools over grep/ripgrep and over reading whole files for any code or symbol search in this project. They query a precomputed index of definitions, references and files: structural, language-aware, and far cheaper in tokens and round-trips. Rules of thumb: `explore` FIRST to understand an area or answer 'how does X work' (one call returns ranked symbols with an outline or source + callers/subclasses + tests); `search` for broad discovery; `usages`/`refs`/`callers` for a named symbol; `outline` before reading a file over ~500 lines; `graph_dependents` before changing a symbol; `search` with `rank` to pick which of several matches to copy or to treat with care. Reach for raw grep/Read only for plain text, regex, or non-code files, or to confirm a detail these tools did not cover."
             }),
         ),
         "tools/list" => ok(id, json!({ "tools": tool_descriptors() })),
@@ -174,13 +198,13 @@ fn tool_descriptors() -> Vec<Value> {
     vec![
         json!({
             "name": "explore",
-            "description": "Call this FIRST for almost any 'how does X work', 'where/what is X', architecture, or area-survey question — one call returns the ranked verbatim source of the relevant symbols (read fresh from disk), their graph neighbours (callers/subclasses), and tests located by path convention. It REPLACES a grep + read loop: more precise (no comment/string false positives) and far fewer tool calls and tokens. Reach for raw grep/read only to confirm a detail this didn't cover. Language-agnostic and vendor-aware (node_modules .d.ts and cross-stack matches are down-ranked). Set `rwr` to re-rank by an in-memory call/inheritance graph (personalized PageRank) — surfaces callers/subclasses.",
+            "description": "Call this FIRST for 'how does X work', 'where/what is X' or an area survey: one call returns the relevant symbols ranked, an outline with line ranges of the best types/modules and the source of the best functions (read fresh from disk), their callers/subclasses and tests found by path convention — instead of a grep + read loop. Dependencies' .d.ts and cross-stack matches rank lower.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query":        { "type": "string",  "description": "Natural-language question or a bag of symbol/file names." },
                     "max_files":    { "type": "integer", "description": "Max source files to include (default 6)." },
-                    "rwr":          { "type": "boolean", "description": "Re-rank via in-memory call/inheritance graph (RWR). Surfaces callers/subclasses; slightly slower." },
+                    "rwr":          { "type": "boolean", "description": "Re-rank by an in-memory call/inheritance graph to surface callers/subclasses; slightly slower." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
                     "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient)." }
                 },
@@ -189,18 +213,20 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "search",
-            "description": "Literal code search across file paths, symbol definitions, imports/usages, and file contents. Use it when you already know an identifier or path fragment (`UserService`, `parseConfig`, `auth/`). For a question or a description of what you are looking for, call `explore` instead — it ranks by relevance. If a multi-word query has no literal match, `search` automatically returns `explore` results with a `fallback: \"explore\"` marker in JSON. Prefer this over grep.",
+            "description": "Literal search over paths, definitions, imports/usages and file contents, for a known identifier or path fragment (`UserService`, `auth/`). A question goes to `explore` (a multi-word query without literal hits falls back to it). Choosing among several matches? Add `rank`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query":        { "type": "string", "description": "Search query. Comma-separated for OR: 'email,mail'." },
-                    "limit":        { "type": "integer", "description": "Max results per category (default 50)." },
+                    "limit":        { "type": "integer", "description": "Max results per category (default 20)." },
                     "kind":         { "type": "string",  "description": "Filter symbols by kind: class, interface, function, method, struct, enum, etc." },
                     "in_file":      { "type": "string",  "description": "Restrict to files whose path contains this substring." },
                     "module":       { "type": "string",  "description": "Restrict to files whose path starts with this prefix." },
                     "fuzzy":        { "type": "boolean", "description": "Enable typo-tolerant fuzzy matching." },
+                    "rank":         { "type": "string",  "enum": ["proven", "hotspots", "risky", "central"], "description": "Re-order by Git history and the symbol graph, evidence per result. proven: safest to copy; risky: dangerous to change; hotspots: keeps being changed and fixed; central: what the code leans on. Exact names stay first. Needs `ast-index hotspots --collect` in a shell (not for central) and `graph_build` (not for hotspots); what is missing is reported." },
+                    "exclude_tests": { "type": "boolean", "description": "With `rank`: leave test files out of the ranked results (they crowd `hotspots` and `risky`)." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional if the server was started with --root or AST_INDEX_ROOT." },
-                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
                 "required": ["query"]
             }
@@ -220,7 +246,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "usages",
-            "description": "Find every usage (call site, import, downcast, DI registration) of a symbol anywhere in the indexed codebase. Use this when the question is 'who uses X' / 'where is X called from'. Returns file:line + surrounding context. Prefer this over grepping the symbol name — it resolves real references and won't match inside comments or strings.",
+            "description": "Every indexed reference to a symbol name (call, type use, import, …) as file:line + the line's text — for 'who uses X'. Matched by name, not resolved by type: same-named symbols are mixed, and a mention in a comment or string can slip in. For the dependents of one definition use `graph_dependents`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -229,21 +255,21 @@ fn tool_descriptors() -> Vec<Value> {
                     "in_file":      { "type": "string",  "description": "Restrict to files whose path contains this substring." },
                     "module":       { "type": "string",  "description": "Restrict to files whose path starts with this prefix." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
-                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
                 "required": ["symbol"]
             }
         }),
         json!({
             "name": "callers",
-            "description": "Find every function that calls the given function, one level up. Use for 'who calls processPayment' questions. For the full transitive caller tree, call this repeatedly or use `search` with deeper queries. Prefer this over grep for call sites — it attributes calls to the calling function, not just raw text matches.",
+            "description": "Call sites of a function by name: matching lines (`name(`, `.name`, …) as file:line + text — for 'where is X called'. It does not name the calling function; for that, and for callers of callers, use `call_tree`. A text match at query time: same-named methods, comments and strings can appear.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "function":     { "type": "string",  "description": "Function or method name." },
                     "limit":        { "type": "integer", "description": "Max results (default 50)." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
-                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
                 "required": ["function"]
             }
@@ -259,21 +285,21 @@ fn tool_descriptors() -> Vec<Value> {
                     "in_file":      { "type": "string",  "description": "Restrict to files whose path contains this substring." },
                     "module":       { "type": "string",  "description": "Restrict to files whose path starts with this prefix." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
-                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
                 "required": ["parent"]
             }
         }),
         json!({
             "name": "refs",
-            "description": "Show cross-references for a symbol in one shot: every definition, every import, every usage. Use this when you want the complete picture in a single response, rather than calling `usages` / `callers` separately. Prefer this over grep for a symbol — precise, deduplicated, and grouped by kind.",
+            "description": "Show cross-references for a symbol in one shot: every definition, every import, every usage. Use this when you want the complete picture in a single response, rather than calling `usages` / `callers` separately. Deduplicated and grouped by kind; usages are matched by name, as in `usages`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "symbol":       { "type": "string",  "description": "Symbol name." },
                     "limit":        { "type": "integer", "description": "Max results per category (default 50)." },
                     "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
-                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Output format. Default 'text' (compact, token-efficient). Pass 'json' only if you need structured parsing — costs ~2-3× more tokens." }
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact); 'json' costs ~2-3× the tokens." }
                 },
                 "required": ["symbol"]
             }
@@ -462,6 +488,127 @@ fn tool_descriptors() -> Vec<Value> {
                 "required": ["function"]
             }
         }),
+        json!({
+            "name": "graph_dependents",
+            "description": "Call BEFORE changing a symbol's name, signature or behaviour: who depends on it, from the precomputed symbol graph. `depth` 1 (default): direct dependents with resolution confidence; 2-3: transitive blast radius per hop. Unlike `usages`, edges point at one definition, so same-named symbols stay out. Best resolved for Ruby and JS/TS; elsewhere confirm 'no dependents' with `usages`. Missing or stale graph: add `refresh: true`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "symbol":            { "type": "string",  "description": "Name, `Outer::Name`, or `Class#member` (e.g. `Billing::Invoice#total`)." },
+                    "depth":             { "type": "integer", "description": "1 (default): direct dependents. 2+: transitive impact per hop." },
+                    "members":           { "type": "boolean", "description": "For a class, also cover the definitions inside it (the class alone owns only superclass/mixin references)." },
+                    "include_ambiguous": { "type": "boolean", "description": "Also list/follow references whose name matched several definitions (upper bound)." },
+                    "exclude_tests":     { "type": "boolean", "description": "Leave out dependents defined in test files (spec/, tests/, *_test.*, *.spec.*); with depth 2+ they are not followed either." },
+                    "in_file":           { "type": "string",  "description": "Only definitions whose path contains this substring." },
+                    "kind":              { "type": "string",  "description": "Only definitions of this kind: class, function, property, ..." },
+                    "limit":             { "type": "integer", "description": "Max rows (default 50)." },
+                    "refresh":           { "type": "boolean", "description": "Rebuild the graph first if it is missing or stale; no-op when fresh." },
+                    "project_root":      { "type": "string",  "description": "Absolute path to project root. Optional." },
+                    "format":            { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact). 'json' = raw CLI JSON, ~2-3× the tokens." }
+                },
+                "required": ["symbol"]
+            }
+        }),
+        json!({
+            "name": "graph_dependencies",
+            "description": "What a symbol's definition references (classes, methods, constants), each resolved to one definition with confidence — what it pulls in before you move, extract or stub it. For a class pass `members: true` (calls live in its methods). Same graph, caveats and `refresh` as `graph_dependents`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "symbol":            { "type": "string",  "description": "Name, `Outer::Name`, or `Class#member`." },
+                    "members":           { "type": "boolean", "description": "For a class, also cover every definition inside it." },
+                    "include_ambiguous": { "type": "boolean", "description": "Also list references whose name matched several definitions." },
+                    "in_file":           { "type": "string",  "description": "Only definitions whose path contains this substring." },
+                    "kind":              { "type": "string",  "description": "Only definitions of this kind: class, function, property, ..." },
+                    "limit":             { "type": "integer", "description": "Max rows (default 50)." },
+                    "refresh":           { "type": "boolean", "description": "Rebuild the graph first if it is missing or stale." },
+                    "project_root":      { "type": "string",  "description": "Absolute path to project root. Optional." },
+                    "format":            { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact). 'json' = raw CLI JSON." }
+                },
+                "required": ["symbol"]
+            }
+        }),
+        json!({
+            "name": "graph_path",
+            "description": "How does A reach B? Shortest dependency path(s) from `from` to `to`, hop by hop with edge confidence. A class stands for itself and its methods (`contains` hops); if only `to` reaches `from`, the reverse path is shown. Same graph and `refresh` as `graph_dependents`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from":              { "type": "string",  "description": "Starting symbol (e.g. an entry point)." },
+                    "to":                { "type": "string",  "description": "Destination symbol." },
+                    "from_file":         { "type": "string",  "description": "Only `from` definitions whose path contains this substring." },
+                    "to_file":           { "type": "string",  "description": "Only `to` definitions whose path contains this substring." },
+                    "max_depth":         { "type": "integer", "description": "Give up beyond this many hops (default 8)." },
+                    "max_paths":         { "type": "integer", "description": "Max shortest paths to list (default 3)." },
+                    "include_ambiguous": { "type": "boolean", "description": "Also follow references whose name matched several definitions." },
+                    "refresh":           { "type": "boolean", "description": "Rebuild the graph first if it is missing or stale." },
+                    "project_root":      { "type": "string",  "description": "Absolute path to project root. Optional." },
+                    "format":            { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact). 'json' = raw CLI JSON." }
+                },
+                "required": ["from", "to"]
+            }
+        }),
+        json!({
+            "name": "graph_metrics",
+            "description": "Centrality from the symbol graph. Without `symbols`: the most central symbols, to orient in an unfamiliar repo. With `symbols`: their fan-in, fan-out, dependents and PageRank percentile — how load-bearing before you touch them. Same graph and `refresh` as `graph_dependents`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "symbols":       { "type": "array", "items": { "type": "string" }, "description": "Symbols to measure. Omit to list the most central ones." },
+                    "sort":          { "type": "string",  "enum": ["pagerank", "fan-in", "fan-out", "dependents"], "description": "Top list only: ranking key (default pagerank)." },
+                    "kind":          { "type": "string",  "description": "Only symbols of this kind: class, function, ..." },
+                    "path":          { "type": "string",  "description": "Top list only: symbols under this path prefix." },
+                    "exclude_tests": { "type": "boolean", "description": "Top list only: skip symbols defined in test files." },
+                    "in_file":       { "type": "string",  "description": "With `symbols` only: definitions whose path contains this substring." },
+                    "limit":         { "type": "integer", "description": "Max rows (default 20 for the top list, 50 with `symbols`)." },
+                    "refresh":       { "type": "boolean", "description": "Rebuild the graph first if it is missing or stale." },
+                    "project_root":  { "type": "string",  "description": "Absolute path to project root. Optional." },
+                    "format":        { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact). 'json' = raw CLI JSON." }
+                }
+            }
+        }),
+        json!({
+            "name": "graph_cycles",
+            "description": "Dependency cycles (strongly connected components over resolved edges), largest first, each with one concrete cycle — for untangling architecture. Same graph and `refresh` as `graph_dependents`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path":         { "type": "string",  "description": "Only components with a member under this path prefix." },
+                    "min_size":     { "type": "integer", "description": "Smallest component size to report (default 2)." },
+                    "limit":        { "type": "integer", "description": "Max components (default 20)." },
+                    "refresh":      { "type": "boolean", "description": "Rebuild the graph first if it is missing or stale." },
+                    "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact). 'json' = raw CLI JSON." }
+                }
+            }
+        }),
+        json!({
+            "name": "graph_build",
+            "description": "Build the symbol graph that the `graph_*` tools and `search` `rank` (proven, risky, central) read — only when one of them reports it missing or stale (`graph_*` tools can take `refresh: true` instead). Seconds even on a large monorepo; `rebuild` and `update` never build it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_root": { "type": "string", "description": "Absolute path to project root. Optional." },
+                    "format":       { "type": "string", "enum": ["text", "json"], "description": "Default 'text' (compact). 'json' = raw CLI JSON." }
+                }
+            }
+        }),
+        json!({
+            "name": "hotspots",
+            "description": "Git-history risk per file — commits, churn, bugfix share, authors, age, last change — labelled by percentiles within this repository. Use before editing a file, when scoping a refactor, or with `sort: fixes` to find where bugs keep landing. Reads collected history only: collect with `ast-index hotspots --collect` in a shell (the first run reads the whole history, later ones are incremental).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sort":         { "type": "string",  "enum": ["score", "commits", "churn", "relative-churn", "fixes", "authors", "recent"], "description": "Ranking key. score (default): mean percentile of commits, churn and bugfix ratio; fixes: bugfix share discounted for thin history." },
+                    "path":         { "type": "string",  "description": "Only files whose path starts with this prefix." },
+                    "min_commits":  { "type": "integer", "description": "Skip files with fewer commits (default 1)." },
+                    "exclude_tests": { "type": "boolean", "description": "Leave test files out of the list; percentiles still rank every file." },
+                    "limit":        { "type": "integer", "description": "Max files (default 20)." },
+                    "project_root": { "type": "string",  "description": "Absolute path to project root. Optional." },
+                    "format":       { "type": "string",  "enum": ["text", "json"], "description": "Default 'text' (compact). 'json' = raw CLI JSON." }
+                }
+            }
+        }),
     ]
 }
 
@@ -529,8 +676,17 @@ fn supports_json_format(tool: &str) -> bool {
             | "symbol"
             | "class"
             | "changed"
+            | "hotspots"
+            | "graph_dependents"
+            | "graph_dependencies"
+            | "graph_path"
+            | "graph_metrics"
+            | "graph_cycles"
+            | "graph_build"
     )
 }
+
+const RANK_PRESETS: [&str; 4] = ["proven", "hotspots", "risky", "central"];
 
 /// Translate an MCP `tools/call` invocation into the equivalent
 /// `ast-index <subcommand> <args> [--format json]` argv. Pure function —
@@ -541,8 +697,8 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         "explore" => {
             argv.push("explore".into());
             // query is a single string; the CLI tokenizes it into terms.
-            argv.push(require_string(&arguments, "query")?);
-            push_if_num(&mut argv, &arguments, "max_files", "--max-files");
+            argv.push(require_string(arguments, "query")?);
+            push_if_num(&mut argv, arguments, "max_files", "--max-files");
             if arguments
                 .get("rwr")
                 .and_then(Value::as_bool)
@@ -553,11 +709,11 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         }
         "search" => {
             argv.push("search".into());
-            argv.push(require_string(&arguments, "query")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
-            push_if_str(&mut argv, &arguments, "kind", "--type");
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            argv.push(require_string(arguments, "query")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_str(&mut argv, arguments, "kind", "--type");
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
             if arguments
                 .get("fuzzy")
                 .and_then(Value::as_bool)
@@ -565,41 +721,63 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             {
                 argv.push("--fuzzy".into());
             }
+            if let Some(preset) = arguments.get("rank").and_then(Value::as_str) {
+                if !RANK_PRESETS.contains(&preset) {
+                    return Err(anyhow!(
+                        "'rank' must be one of: {}",
+                        RANK_PRESETS.join(", ")
+                    ));
+                }
+                argv.push("--rank".into());
+                argv.push(preset.into());
+            }
+            if arguments
+                .get("exclude_tests")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                if arguments.get("rank").and_then(Value::as_str).is_none() {
+                    return Err(anyhow!(
+                        "'exclude_tests' applies to ranked search; add 'rank'"
+                    ));
+                }
+                argv.push("--exclude-tests".into());
+            }
         }
         "outline" => {
             argv.push("outline".into());
-            argv.push(require_string(&arguments, "file")?);
+            argv.push(require_string(arguments, "file")?);
         }
         "usages" => {
             argv.push("usages".into());
-            argv.push(require_string(&arguments, "symbol")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            argv.push(require_string(arguments, "symbol")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
         }
         "callers" => {
             argv.push("callers".into());
-            argv.push(require_string(&arguments, "function")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            argv.push(require_string(arguments, "function")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "implementations" => {
             argv.push("implementations".into());
-            argv.push(require_string(&arguments, "parent")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            argv.push(require_string(arguments, "parent")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
         }
         "refs" => {
             argv.push("refs".into());
-            argv.push(require_string(&arguments, "symbol")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            argv.push(require_string(arguments, "symbol")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "rebuild" => {
             argv.push("rebuild".into());
         }
         "find_file" => {
             argv.push("file".into());
-            argv.push(require_string(&arguments, "pattern")?);
+            argv.push(require_string(arguments, "pattern")?);
             if arguments
                 .get("exact")
                 .and_then(Value::as_bool)
@@ -607,7 +785,7 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             {
                 argv.push("--exact".into());
             }
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "stats" => {
             argv.push("stats".into());
@@ -620,11 +798,11 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             if let Some(n) = arguments.get("name").and_then(Value::as_str) {
                 argv.push(n.into());
             }
-            push_if_str(&mut argv, &arguments, "pattern", "--pattern");
-            push_if_str(&mut argv, &arguments, "kind", "--type");
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            push_if_str(&mut argv, arguments, "pattern", "--pattern");
+            push_if_str(&mut argv, arguments, "kind", "--type");
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
             if arguments
                 .get("fuzzy")
                 .and_then(Value::as_bool)
@@ -638,10 +816,10 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
             if let Some(n) = arguments.get("name").and_then(Value::as_str) {
                 argv.push(n.into());
             }
-            push_if_str(&mut argv, &arguments, "pattern", "--pattern");
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            push_if_str(&mut argv, arguments, "pattern", "--pattern");
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
             if arguments
                 .get("fuzzy")
                 .and_then(Value::as_bool)
@@ -652,18 +830,18 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         }
         "hierarchy" => {
             argv.push("hierarchy".into());
-            argv.push(require_string(&arguments, "name")?);
-            push_if_str(&mut argv, &arguments, "in_file", "--in-file");
-            push_if_str(&mut argv, &arguments, "module", "--module");
+            argv.push(require_string(arguments, "name")?);
+            push_if_str(&mut argv, arguments, "in_file", "--in-file");
+            push_if_str(&mut argv, arguments, "module", "--module");
         }
         "imports" => {
             argv.push("imports".into());
-            argv.push(require_string(&arguments, "file")?);
+            argv.push(require_string(arguments, "file")?);
         }
         "api" => {
             argv.push("api".into());
-            argv.push(require_string(&arguments, "module_path")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            argv.push(require_string(arguments, "module_path")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "changed" => {
             argv.push("changed".into());
@@ -672,22 +850,117 @@ pub fn build_argv(name: &str, arguments: &Value) -> Result<Vec<String>> {
         }
         "module" => {
             argv.push("module".into());
-            argv.push(require_string(&arguments, "pattern")?);
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            argv.push(require_string(arguments, "pattern")?);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
         }
         "deps" => {
             argv.push("deps".into());
-            argv.push(require_string(&arguments, "module")?);
+            argv.push(require_string(arguments, "module")?);
         }
         "dependents" => {
             argv.push("dependents".into());
-            argv.push(require_string(&arguments, "module")?);
+            argv.push(require_string(arguments, "module")?);
         }
         "call_tree" => {
             argv.push("call-tree".into());
-            argv.push(require_string(&arguments, "function")?);
-            push_if_num(&mut argv, &arguments, "depth", "--depth");
-            push_if_num(&mut argv, &arguments, "limit", "--limit");
+            argv.push(require_string(arguments, "function")?);
+            push_if_num(&mut argv, arguments, "depth", "--depth");
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+        }
+        "graph_dependents" => {
+            let symbol = require_string(arguments, "symbol")?;
+            let depth = arguments
+                .get("depth")
+                .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+                .unwrap_or(1);
+            argv.push("graph".into());
+            if depth > 1 {
+                argv.extend(["impact".into(), symbol, "--depth".into(), depth.to_string()]);
+            } else {
+                argv.extend(["dependents".into(), symbol]);
+            }
+            push_graph_symbol_filters(&mut argv, arguments);
+            push_if_flag(&mut argv, arguments, "exclude_tests", "--exclude-tests");
+        }
+        "graph_dependencies" => {
+            argv.extend([
+                "graph".into(),
+                "dependencies".into(),
+                require_string(arguments, "symbol")?,
+            ]);
+            push_graph_symbol_filters(&mut argv, arguments);
+        }
+        "graph_path" => {
+            argv.extend([
+                "graph".into(),
+                "path".into(),
+                require_string(arguments, "from")?,
+                require_string(arguments, "to")?,
+            ]);
+            push_if_str(&mut argv, arguments, "from_file", "--from-file");
+            push_if_str(&mut argv, arguments, "to_file", "--to-file");
+            push_if_num(&mut argv, arguments, "max_depth", "--max-depth");
+            push_if_num(&mut argv, arguments, "max_paths", "--max-paths");
+            push_if_flag(
+                &mut argv,
+                arguments,
+                "include_ambiguous",
+                "--include-ambiguous",
+            );
+            push_if_flag(&mut argv, arguments, "refresh", "--refresh");
+        }
+        "graph_metrics" => {
+            let symbols = string_list(arguments, "symbols");
+            argv.push("graph".into());
+            if symbols.is_empty() {
+                if is_set(arguments, "in_file") {
+                    return Err(anyhow!(
+                        "'in_file' applies only with 'symbols'; filter the top list with 'path'"
+                    ));
+                }
+                argv.push("top".into());
+                push_if_str(&mut argv, arguments, "sort", "--sort");
+                push_if_num(&mut argv, arguments, "limit", "--limit");
+                push_if_str(&mut argv, arguments, "kind", "--kind");
+                push_if_str(&mut argv, arguments, "path", "--path");
+                push_if_flag(&mut argv, arguments, "exclude_tests", "--exclude-tests");
+            } else {
+                if let Some(key) = ["sort", "path", "exclude_tests"]
+                    .into_iter()
+                    .find(|key| is_set(arguments, key))
+                {
+                    return Err(anyhow!(
+                        "'{key}' applies only to the top list; omit 'symbols' or drop '{key}'"
+                    ));
+                }
+                argv.push("metrics".into());
+                argv.extend(symbols);
+                push_if_str(&mut argv, arguments, "in_file", "--in-file");
+                push_if_str(&mut argv, arguments, "kind", "--kind");
+                push_if_num(&mut argv, arguments, "limit", "--limit");
+            }
+            push_if_flag(&mut argv, arguments, "refresh", "--refresh");
+        }
+        "graph_cycles" => {
+            argv.extend(["graph".into(), "cycles".into()]);
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_num(&mut argv, arguments, "min_size", "--min-size");
+            push_if_str(&mut argv, arguments, "path", "--path");
+            push_if_flag(&mut argv, arguments, "refresh", "--refresh");
+        }
+        "graph_build" => {
+            argv.extend(["graph".into(), "build".into()]);
+        }
+        "hotspots" => {
+            // Collection is deliberately not reachable from here: a first or
+            // reset run walks the whole history, longer than common MCP client
+            // timeouts, and this server handles one request at a time.
+            argv.push("hotspots".into());
+            push_if_num(&mut argv, arguments, "limit", "--limit");
+            push_if_num(&mut argv, arguments, "min_commits", "--min-commits");
+            push_if_str(&mut argv, arguments, "path", "--path");
+            push_if_str(&mut argv, arguments, "sort", "--sort");
+            push_if_flag(&mut argv, arguments, "exclude_tests", "--exclude-tests");
         }
         other => return Err(anyhow!("unknown tool: {other}")),
     }
@@ -723,6 +996,47 @@ fn push_if_num(argv: &mut Vec<String>, args: &Value, key: &str, flag: &str) {
     }
 }
 
+fn push_if_flag(argv: &mut Vec<String>, args: &Value, key: &str, flag: &str) {
+    if args.get(key).and_then(Value::as_bool).unwrap_or(false) {
+        argv.push(flag.into());
+    }
+}
+
+/// Filters shared by the graph queries that take one symbol spec.
+fn push_graph_symbol_filters(argv: &mut Vec<String>, args: &Value) {
+    push_if_str(argv, args, "in_file", "--in-file");
+    push_if_str(argv, args, "kind", "--kind");
+    push_if_flag(argv, args, "members", "--members");
+    push_if_flag(argv, args, "include_ambiguous", "--include-ambiguous");
+    push_if_num(argv, args, "limit", "--limit");
+    push_if_flag(argv, args, "refresh", "--refresh");
+}
+
+/// Whether an optional argument carries a value that would change the query:
+/// `false`, `null` and `""` are what clients send for "not set".
+fn is_set(args: &Value, key: &str) -> bool {
+    match args.get(key) {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(_) => true,
+    }
+}
+
+/// A string-array argument; a lone string counts as a one-element list.
+fn string_list(args: &Value, key: &str) -> Vec<String> {
+    match args.get(key) {
+        Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,12 +1045,12 @@ mod tests {
     // --- tool_descriptors metadata ---
 
     #[test]
-    fn descriptors_expose_exactly_twentyone_tools() {
+    fn descriptors_expose_exactly_twentyeight_tools() {
         let names: Vec<String> = tool_descriptors()
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
             .collect();
-        assert_eq!(names.len(), 21, "MCP must expose 21 tools, got {names:?}");
+        assert_eq!(names.len(), 28, "MCP must expose 28 tools, got {names:?}");
     }
 
     #[test]
@@ -776,7 +1090,7 @@ mod tests {
         let stub_args = json!({
             "query": "x", "file": "f", "symbol": "s", "function": "f",
             "parent": "p", "name": "n", "module_path": "m",
-            "pattern": "*", "module": "m"
+            "pattern": "*", "module": "m", "from": "a", "to": "b"
         });
         for tool in tool_descriptors() {
             let name = tool["name"].as_str().unwrap();
@@ -824,6 +1138,423 @@ mod tests {
                 "json",
             ]
         );
+    }
+
+    #[test]
+    fn search_forwards_rank_preset_after_existing_flags() {
+        for preset in RANK_PRESETS {
+            let argv = build_argv(
+                "search",
+                &json!({"query": "Service", "fuzzy": true, "rank": preset}),
+            )
+            .unwrap();
+            assert_eq!(
+                argv,
+                vec!["search", "Service", "--fuzzy", "--rank", preset, "--format", "json"]
+            );
+        }
+    }
+
+    #[test]
+    fn search_without_rank_keeps_the_plain_argv() {
+        let argv = build_argv("search", &json!({"query": "Foo", "limit": 5})).unwrap();
+        assert!(!argv.contains(&"--rank".to_string()));
+    }
+
+    #[test]
+    fn search_rejects_unknown_rank_preset() {
+        let err = build_argv("search", &json!({"query": "Foo", "rank": "safest"})).unwrap_err();
+        assert!(
+            err.to_string().contains("proven, hotspots, risky, central"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn search_descriptor_advertises_the_four_presets() {
+        let descriptor = tool_descriptors()
+            .into_iter()
+            .find(|tool| tool["name"] == "search")
+            .unwrap();
+        assert_eq!(
+            descriptor["inputSchema"]["properties"]["rank"]["enum"],
+            json!(RANK_PRESETS)
+        );
+    }
+
+    // --- graph tools ---
+
+    #[test]
+    fn graph_dependents_defaults_to_direct_edges() {
+        let argv = build_argv("graph_dependents", &json!({"symbol": "Invoice"})).unwrap();
+        assert_eq!(
+            argv,
+            vec!["graph", "dependents", "Invoice", "--format", "json"]
+        );
+    }
+
+    #[test]
+    fn graph_dependents_depth_one_stays_on_direct_edges() {
+        let argv = build_argv("graph_dependents", &json!({"symbol": "X", "depth": 1})).unwrap();
+        assert_eq!(argv[1], "dependents");
+        assert!(!argv.contains(&"--depth".to_string()));
+    }
+
+    #[test]
+    fn graph_dependents_deeper_switches_to_impact_with_every_filter() {
+        let argv = build_argv(
+            "graph_dependents",
+            &json!({
+                "symbol": "Billing::Invoice#total", "depth": 3, "members": true,
+                "include_ambiguous": true, "in_file": "app/models", "kind": "class",
+                "limit": 10, "refresh": true, "exclude_tests": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "graph",
+                "impact",
+                "Billing::Invoice#total",
+                "--depth",
+                "3",
+                "--in-file",
+                "app/models",
+                "--kind",
+                "class",
+                "--members",
+                "--include-ambiguous",
+                "--limit",
+                "10",
+                "--refresh",
+                "--exclude-tests",
+                "--format",
+                "json",
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_dependents_forwards_exclude_tests_to_direct_edges() {
+        let argv = build_argv(
+            "graph_dependents",
+            &json!({"symbol": "MergeService", "exclude_tests": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "graph",
+                "dependents",
+                "MergeService",
+                "--exclude-tests",
+                "--format",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_dependents_false_flags_are_not_forwarded() {
+        let argv = build_argv(
+            "graph_dependents",
+            &json!({"symbol": "X", "members": false, "refresh": false, "exclude_tests": false}),
+        )
+        .unwrap();
+        assert_eq!(argv, vec!["graph", "dependents", "X", "--format", "json"]);
+    }
+
+    #[test]
+    fn graph_dependencies_forwards_members_and_filters() {
+        let argv = build_argv(
+            "graph_dependencies",
+            &json!({"symbol": "OrdersController", "members": true, "limit": 5}),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "graph",
+                "dependencies",
+                "OrdersController",
+                "--members",
+                "--limit",
+                "5",
+                "--format",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_symbol_tools_require_symbol() {
+        for tool in ["graph_dependents", "graph_dependencies"] {
+            let err = build_argv(tool, &json!({})).unwrap_err();
+            assert!(err.to_string().contains("'symbol'"), "{tool}: {err}");
+        }
+    }
+
+    #[test]
+    fn graph_path_passes_both_ends_and_options() {
+        let argv = build_argv(
+            "graph_path",
+            &json!({
+                "from": "OrdersController", "to": "Invoice", "from_file": "app/controllers",
+                "to_file": "app/models", "max_depth": 5, "max_paths": 2,
+                "include_ambiguous": true, "refresh": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "graph",
+                "path",
+                "OrdersController",
+                "Invoice",
+                "--from-file",
+                "app/controllers",
+                "--to-file",
+                "app/models",
+                "--max-depth",
+                "5",
+                "--max-paths",
+                "2",
+                "--include-ambiguous",
+                "--refresh",
+                "--format",
+                "json",
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_path_requires_from_and_to() {
+        let err = build_argv("graph_path", &json!({"from": "A"})).unwrap_err();
+        assert!(err.to_string().contains("'to'"), "got: {err}");
+        let err = build_argv("graph_path", &json!({"to": "B"})).unwrap_err();
+        assert!(err.to_string().contains("'from'"), "got: {err}");
+    }
+
+    #[test]
+    fn graph_metrics_without_symbols_lists_the_top() {
+        let argv = build_argv(
+            "graph_metrics",
+            &json!({
+                "sort": "fan-in", "limit": 5, "kind": "class",
+                "path": "app/", "exclude_tests": true, "refresh": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "graph",
+                "top",
+                "--sort",
+                "fan-in",
+                "--limit",
+                "5",
+                "--kind",
+                "class",
+                "--path",
+                "app/",
+                "--exclude-tests",
+                "--refresh",
+                "--format",
+                "json",
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_metrics_with_symbols_measures_them() {
+        let argv = build_argv(
+            "graph_metrics",
+            &json!({"symbols": ["Invoice", "Payment"], "in_file": "app/", "kind": "class"}),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "graph",
+                "metrics",
+                "Invoice",
+                "Payment",
+                "--in-file",
+                "app/",
+                "--kind",
+                "class",
+                "--format",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_metrics_accepts_a_single_symbol_string() {
+        let argv = build_argv("graph_metrics", &json!({"symbols": "Invoice"})).unwrap();
+        assert_eq!(
+            argv,
+            vec!["graph", "metrics", "Invoice", "--format", "json"]
+        );
+    }
+
+    #[test]
+    fn graph_metrics_empty_symbols_means_top() {
+        let argv = build_argv("graph_metrics", &json!({"symbols": []})).unwrap();
+        assert_eq!(argv, vec!["graph", "top", "--format", "json"]);
+    }
+
+    #[test]
+    fn graph_metrics_rejects_top_only_options_with_symbols() {
+        for key in ["sort", "path", "exclude_tests"] {
+            let mut args = json!({"symbols": ["Invoice"]});
+            args[key] = json!("x");
+            let err = build_argv("graph_metrics", &args).unwrap_err();
+            assert!(err.to_string().contains(key), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn graph_metrics_tolerates_unset_top_options_with_symbols() {
+        let argv = build_argv(
+            "graph_metrics",
+            &json!({"symbols": ["X"], "exclude_tests": false, "sort": "", "path": null}),
+        )
+        .unwrap();
+        assert_eq!(argv, vec!["graph", "metrics", "X", "--format", "json"]);
+    }
+
+    #[test]
+    fn graph_metrics_rejects_in_file_without_symbols() {
+        let err = build_argv("graph_metrics", &json!({"in_file": "app/"})).unwrap_err();
+        assert!(err.to_string().contains("'path'"), "got: {err}");
+    }
+
+    #[test]
+    fn graph_cycles_forwards_filters() {
+        let argv = build_argv(
+            "graph_cycles",
+            &json!({"path": "app/models", "min_size": 3, "limit": 4, "refresh": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "graph",
+                "cycles",
+                "--limit",
+                "4",
+                "--min-size",
+                "3",
+                "--path",
+                "app/models",
+                "--refresh",
+                "--format",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_build_takes_no_arguments() {
+        let argv = build_argv("graph_build", &json!({"format": "text"})).unwrap();
+        assert_eq!(argv, vec!["graph", "build", "--format", "json"]);
+    }
+
+    // --- hotspots ---
+
+    #[test]
+    fn hotspots_minimal_is_a_report() {
+        let argv = build_argv("hotspots", &json!({})).unwrap();
+        assert_eq!(argv, vec!["hotspots", "--format", "json"]);
+    }
+
+    #[test]
+    fn hotspots_forwards_report_options() {
+        let argv = build_argv(
+            "hotspots",
+            &json!({"limit": 5, "min_commits": 4, "path": "src/", "sort": "fixes"}),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "hotspots",
+                "--limit",
+                "5",
+                "--min-commits",
+                "4",
+                "--path",
+                "src/",
+                "--sort",
+                "fixes",
+                "--format",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn hotspots_forwards_exclude_tests() {
+        let argv = build_argv("hotspots", &json!({"exclude_tests": true})).unwrap();
+        assert_eq!(
+            argv,
+            vec!["hotspots", "--exclude-tests", "--format", "json"]
+        );
+        let argv = build_argv("hotspots", &json!({"exclude_tests": false})).unwrap();
+        assert!(!argv.contains(&"--exclude-tests".to_string()));
+    }
+
+    #[test]
+    fn search_exclude_tests_needs_a_preset() {
+        let argv = build_argv(
+            "search",
+            &json!({"query": "Merge", "rank": "risky", "exclude_tests": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "search",
+                "Merge",
+                "--rank",
+                "risky",
+                "--exclude-tests",
+                "--format",
+                "json"
+            ]
+        );
+        let err =
+            build_argv("search", &json!({"query": "Merge", "exclude_tests": true})).unwrap_err();
+        assert!(err.to_string().contains("add 'rank'"), "{err}");
+    }
+
+    #[test]
+    fn hotspots_never_collects() {
+        let argv = build_argv(
+            "hotspots",
+            &json!({"collect": true, "full": true, "timeout_ms": 1}),
+        )
+        .unwrap();
+        for flag in ["--collect", "--full", "--timeout-ms"] {
+            assert!(!argv.contains(&flag.to_string()), "{flag} leaked: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn hotspots_descriptor_says_how_to_collect() {
+        let descriptor = tool_descriptors()
+            .into_iter()
+            .find(|tool| tool["name"] == "hotspots")
+            .unwrap();
+        let description = descriptor["description"].as_str().unwrap();
+        assert!(description.contains("ast-index hotspots --collect"));
+        assert!(descriptor["inputSchema"]["properties"]
+            .get("collect")
+            .is_none());
     }
 
     #[test]
@@ -1032,6 +1763,13 @@ mod tests {
             "symbol",
             "class",
             "changed",
+            "hotspots",
+            "graph_dependents",
+            "graph_dependencies",
+            "graph_path",
+            "graph_metrics",
+            "graph_cycles",
+            "graph_build",
         ];
         let no = [
             "outline",

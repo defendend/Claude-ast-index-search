@@ -17,13 +17,51 @@ tools directly — no per-agent plugin required.
 
 | Tool | Purpose |
 |---|---|
-| `search` | Universal search: filenames + symbols + imports/usages + content, one call |
+| `explore` | One-shot answer to "how does X work": the relevant symbols ranked, an outline of the best types/modules and the source of the best functions, their callers/subclasses, and tests |
+| `search` | Literal search: filenames + symbols + imports/usages + content, one call; `rank` re-orders by history and graph (see below) |
 | `outline` | Structural outline of one file (classes, functions, line numbers) — ALWAYS run before reading files > 500 lines |
-| `usages` | Every usage of a symbol |
-| `callers` | Who calls a function (one level up) |
+| `usages` | Every indexed reference to a symbol, matched by name |
+| `callers` | Call-site lines of a function, matched by name at query time |
+| `call_tree` | The function each call sits in, then its callers, up to a depth |
 | `implementations` | Concrete types that implement an interface / protocol / abstract class |
+| `hierarchy` | Superclasses and subclasses of a type |
 | `refs` | Cross-references in one shot: definitions + imports + usages |
-| `rebuild` | Rebuild index from scratch (maintenance) |
+| `symbol` / `class` | Definitions by exact name or glob |
+| `find_file` | Files by name |
+| `imports` / `api` | A file's imports; a module's public API |
+| `module` / `deps` / `dependents` | Modules (Gradle, Cargo, …) and their dependencies in both directions |
+| `changed` | Files changed on the current branch |
+| `graph_dependents` | Who depends on a symbol: direct edges, or the transitive blast radius with `depth` ≥ 2 |
+| `graph_dependencies` | What a symbol depends on |
+| `graph_path` | Shortest dependency path(s) from one symbol to another |
+| `graph_metrics` | Most central symbols, or fan-in / fan-out / dependents / PageRank of given ones |
+| `graph_cycles` | Dependency cycles |
+| `graph_build` | Build or refresh the symbol graph the `graph_*` tools and `search` `rank` read |
+| `hotspots` | Git-history risk per file: churn, bugfix share, authors, age (report only) |
+| `stats` / `update` / `rebuild` | Index statistics and maintenance |
+
+### Graph and history tools need data collected first
+
+The symbol dependency graph and the Git history signals are not part of the
+index `rebuild` / `update` produce; each is collected by an explicit command.
+
+- **Symbol graph** — read by the `graph_*` tools and by `search` with `rank`
+  `proven`, `risky` or `central`. Build it with the `graph_build` tool or
+  `ast-index graph build` (seconds, even on a large monorepo). A `graph_*`
+  call with `refresh: true` builds it first when it is missing or stale. After
+  `update` changes the index the graph reports itself as stale until rebuilt.
+- **Git history** — read by `hotspots` and by `search` with `rank` `proven`,
+  `risky` or `hotspots`. Collect it with `ast-index hotspots --collect` in a
+  shell. It is deliberately **not** exposed through MCP: the first collection
+  reads the whole history (about a minute on a large monorepo), longer than
+  many MCP clients wait for a tool call. Later runs take seconds, including
+  after a branch switch, rebase or `rebuild`: history is stored per commit, so
+  only commits HEAD gained or lost are read. A Git hook or a session-start
+  hook is a good place for it.
+
+When either is missing, the tools say so and name the remedy instead of
+returning empty results; `search` with `rank` falls back to plain relevance
+order.
 
 ## Output format (token-efficient by default)
 
@@ -44,6 +82,19 @@ If an agent explicitly needs structured JSON for programmatic parsing,
 pass `format: "json"` in the tool arguments — at the cost of ~2-3× more
 tokens. In practice this is rarely necessary; modern LLMs parse the
 compact text format reliably.
+
+`search` with `rank` prints each result's evidence once: a file's history is
+shared by every symbol in it, so a symbol whose file was already described
+says `history and graph: as above` instead of repeating the numbers.
+
+`explore` answers with a text report under an `explore: <query>` line: the
+source of the best functions and an outline (`:start-end name [kind]` rows)
+of the best types and modules, the ranked symbols, graph neighbours and tests
+found by path convention.
+
+A multi-word `search` without literal matches answers with `explore` results.
+The text starts with `fallback: explore — <reason>` and carries the same
+report.
 
 ## Install
 
@@ -274,10 +325,37 @@ When you need to find code in this repository:
 1. Use the ast-index MCP tools BEFORE grep or bulk Read.
 2. Before reading any file longer than 500 lines, call `outline` on it
    first, then Read only the line range you actually need.
-3. For "who uses X" questions use `usages`; for "who calls X" use
-   `callers`; for "what implements X" use `implementations`.
-4. If ast-index returns empty, fall back to grep — don't bulk-read files.
+3. For "who uses X" questions use `usages`; for "where is X called" use
+   `callers`, or `call_tree` to get the calling functions; for "what
+   implements X" use `implementations`.
+4. Before changing a class or method, call `graph_dependents` on it; pass
+   `depth: 3` to see how far the change reaches.
+5. Picking an existing file to copy as a pattern, use `search` with
+   `rank: "proven"`; to see which matches are dangerous to touch,
+   `rank: "risky"`.
+6. If ast-index returns empty, fall back to grep — don't bulk-read files.
 ```
+
+## Smoke test
+
+Talk to the server directly over stdio. Each line is one JSON-RPC message;
+the server answers every message that has an `id`:
+
+```bash
+cd /path/to/your/project
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"query":"Service","rank":"proven","limit":3}}}' \
+  '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"graph_dependents","arguments":{"symbol":"ApplicationService","depth":2,"limit":5}}}' \
+  | AST_INDEX_BIN=ast-index ast-index-mcp
+```
+
+Point `AST_INDEX_BIN` at a specific `ast-index` build to test it, e.g.
+`AST_INDEX_BIN=/path/to/checkout/target/release/ast-index`. A tool failure
+comes back as a normal response with `"isError": true` and the CLI's stderr in
+the text.
 
 ## Troubleshooting
 

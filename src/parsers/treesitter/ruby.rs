@@ -5,7 +5,11 @@ use regex::Regex;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{
+    extract_refs_masked, is_constant_path, line_text, mask_non_code, node_end_line, node_line,
+    node_text, parse_tree, signature_line, walk_tree_preorder, LanguageParser, NonCode,
+    WalkControl,
+};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -27,8 +31,28 @@ impl RubyParser {
         defined: &[ParsedSymbol],
         file_type: Option<super::super::FileType>,
     ) -> Result<Vec<super::super::ParsedRef>> {
-        // Start with the language-aware generic references
-        let mut refs = super::super::extract_references_for_lang(content, defined, file_type)?;
+        let tree = parse_tree(content, &RUBY_LANGUAGE)?;
+        self.ruby_extract_refs_in(content, &tree, defined, file_type)
+    }
+
+    fn ruby_extract_refs_in(
+        &self,
+        content: &str,
+        tree: &tree_sitter::Tree,
+        defined: &[ParsedSymbol],
+        file_type: Option<super::super::FileType>,
+    ) -> Result<Vec<super::super::ParsedRef>> {
+        let calls = method_call_refs(content, tree.root_node());
+        let called: std::collections::HashSet<(&str, usize)> = calls.iter().copied().collect();
+        let masked = mask_non_code(content, tree.root_node(), &RUBY_NON_CODE);
+
+        // A lowercase `name(` the tree does not see as a call on that line
+        // names the method on a `def self.name(` line.
+        let mut refs = extract_refs_masked(content, &masked, defined, file_type)?;
+        refs.retain(|r| {
+            r.name.starts_with(|c: char| c.is_ascii_uppercase())
+                || called.contains(&(r.name.as_str(), r.line))
+        });
 
         // Add Ruby-specific: bang methods (method!) and question methods (method?)
         // The generic extractor misses these because ! and ? are outside \w
@@ -37,15 +61,12 @@ impl RubyParser {
 
         let defined_names: std::collections::HashSet<&str> =
             defined.iter().map(|s| s.name.as_str()).collect();
+        let lines: Vec<&str> = content.lines().collect();
 
-        for (line_num, line) in content.lines().enumerate() {
+        for (line_num, line) in masked.lines().enumerate() {
             let line_num = line_num + 1;
             let trimmed = line.trim();
 
-            // Skip comments and definitions
-            if trimmed.starts_with('#') {
-                continue;
-            }
             if trimmed.starts_with("def ") || trimmed.starts_with("def self.") {
                 continue;
             }
@@ -53,17 +74,396 @@ impl RubyParser {
             for caps in RUBY_BANG_RE.captures_iter(line) {
                 let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 if !name.is_empty() && !defined_names.contains(name) && name.len() > 2 {
+                    let text = lines.get(line_num - 1).map_or("", |l| l.trim());
                     refs.push(super::super::ParsedRef {
                         name: name.to_string(),
                         line: line_num,
-                        context: super::super::truncate_context(trimmed),
+                        context: super::super::truncate_context(text),
                     });
                 }
             }
         }
 
+        // Most Ruby calls are written without parentheses: `recv.name`,
+        // `name arg`, a bare `name`. The tree sees them all.
+        // A method named by a symbol is called too: `before_save :normalize`,
+        // `if: :paid?`, `list.map(&:total)`.
+        let mut seen: std::collections::HashSet<(String, usize)> =
+            refs.iter().map(|r| (r.name.clone(), r.line)).collect();
+        let named = symbol_method_refs(content, tree.root_node());
+        for (name, line) in calls.into_iter().chain(named) {
+            if name.len() <= 2 || UNTRACKED_RUBY_CALLS.contains(name) {
+                continue;
+            }
+            if !seen.insert((name.to_string(), line)) {
+                continue;
+            }
+            let text = lines.get(line - 1).map(|l| l.trim()).unwrap_or("");
+            refs.push(super::super::ParsedRef {
+                name: name.to_string(),
+                line,
+                context: super::super::truncate_context(text),
+            });
+        }
+
+        let schema = schema_definition_lines(content, tree.root_node());
+        if !schema.is_empty() {
+            refs.retain(|r| !schema.iter().any(|lines| lines.contains(&r.line)));
+        }
+
         Ok(refs)
     }
+}
+
+/// Comments, heredocs, regexes, word arrays and string literals; only the
+/// `#{...}` inside them is code.
+static RUBY_NON_CODE: NonCode = NonCode {
+    language: &RUBY_LANGUAGE,
+    prose: &["comment", "heredoc_beginning", "character"],
+    strings: &[
+        "string",
+        "bare_string",
+        "heredoc_body",
+        "regex",
+        "subshell",
+        "delimited_symbol",
+    ],
+    code: &["interpolation"],
+    keep: constant_names_in,
+    declared: super::declares_nothing,
+};
+
+/// The parts of a string that name a class, kept when the string is blanked:
+/// the whole string when it is exactly a constant path (`'Invoice'`,
+/// `"Billing::Plan"`, a `%w[Event::Stage]` word) — how Rails names a class in
+/// `class_name:`, a polymorphic type or a `constantize` call — or else each
+/// quoted constant path inside it, such as an STI type in SQL
+/// (`WHERE type = 'Event::Stage'`).
+fn constant_names_in(content: &str, node: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    static QUOTED_CONSTANT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*'|"(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*""#).unwrap()
+    });
+    if names_constant(content, node) {
+        return vec![node.byte_range()];
+    }
+    if !matches!(node.kind(), "string" | "heredoc_body") {
+        return Vec::new();
+    }
+    let mut kept = Vec::new();
+    let mut cursor = node.walk();
+    for part in node.named_children(&mut cursor) {
+        if !matches!(part.kind(), "string_content" | "heredoc_content") {
+            continue;
+        }
+        let start = part.start_byte();
+        kept.extend(
+            QUOTED_CONSTANT
+                .find_iter(node_text(content, &part))
+                .map(|found| start + found.start()..start + found.end()),
+        );
+    }
+    kept
+}
+
+/// A string or `%w[]` word that is exactly a constant path.
+fn names_constant(content: &str, node: tree_sitter::Node) -> bool {
+    if !matches!(node.kind(), "string" | "bare_string") || node.named_child_count() != 1 {
+        return false;
+    }
+    node.named_child(0).is_some_and(|only| {
+        only.kind() == "string_content" && is_constant_path(node_text(content, &only))
+    })
+}
+
+/// Lines of every `ActiveRecord::Schema.define` block. A schema dump's
+/// `t.string` / `t.integer` / `create_table` calls are column types, not uses
+/// of the project's own `string` or `integer` methods; the tables and columns
+/// are symbols of their own.
+fn schema_definition_lines(
+    content: &str,
+    root: tree_sitter::Node,
+) -> Vec<std::ops::RangeInclusive<usize>> {
+    let mut lines = Vec::new();
+    if !content.contains("ActiveRecord::Schema") {
+        return lines;
+    }
+    walk_tree_preorder(&root, |node| {
+        if node.kind() != "call" {
+            return WalkControl::Continue;
+        }
+        let defines_schema = node
+            .child_by_field_name("method")
+            .is_some_and(|method| node_text(content, &method) == "define")
+            && node
+                .child_by_field_name("receiver")
+                .is_some_and(|receiver| {
+                    node_text(content, &receiver).starts_with("ActiveRecord::Schema")
+                });
+        if defines_schema {
+            lines.push(node_line(&node)..=node_end_line(&node));
+            return WalkControl::SkipChildren;
+        }
+        WalkControl::Continue
+    });
+    lines
+}
+
+/// Calls not recorded as references: keywords in method form, and core Ruby
+/// and Active Support methods of strings, numbers and collections. `x.to_h`
+/// or `list.count` on a value of unknown type would otherwise be offered as a
+/// use of every project method that happens to share the name.
+static UNTRACKED_RUBY_CALLS: LazyLock<std::collections::HashSet<&str>> = LazyLock::new(|| {
+    "require require_relative include extend prepend private protected public
+     module_function attr_reader attr_writer attr_accessor raise puts print warn lambda
+     proc loop catch throw sleep format sprintf rand block_given?
+     class send public_send respond_to? is_a? kind_of? instance_of? tap then yield_self
+     itself dup clone freeze frozen? inspect hash object_id instance_variable_get
+     instance_variable_set define_method method methods nil? eql? equal? presence present?
+     blank? try try! as_json to_json to_param to_query
+     to_s to_i to_f to_a to_h to_sym to_proc to_str to_ary to_hash to_date to_time
+     to_datetime to_set to_sentence
+     each each_with_index each_with_object each_slice each_pair each_key each_value
+     each_cons map flat_map collect select filter filter_map reject find detect find_index
+     index count size length first last take drop take_while drop_while min max min_by
+     max_by minmax sort sort_by group_by partition chunk_while slice_when tally sum reduce
+     inject zip uniq compact flatten reverse include? member? any? all? none? one? empty?
+     keys values values_at key? has_key? value? fetch dig merge merge! delete slice except
+     transform_values transform_keys symbolize_keys stringify_keys deep_symbolize_keys
+     deep_stringify_keys deep_merge with_indifferent_access push pop shift unshift concat
+     join sample shuffle cycle lazy entries invert compact_blank index_by in_groups_of
+     each_char
+     split strip lstrip rstrip chomp chop gsub gsub! sub sub! match match? scan start_with?
+     end_with? downcase upcase capitalize titleize humanize underscore camelize squish
+     chars bytes lines center ljust rjust encode force_encoding parameterize pluralize
+     singularize constantize safe_constantize demodulize truncate strftime iso8601
+     times upto downto step round floor ceil abs zero? positive? negative? between? clamp
+     even? odd? cover? ago from_now since beginning_of_day end_of_day in_time_zone"
+        .split_whitespace()
+        .collect()
+});
+
+/// Method names called in `root`: every `recv.name`, `name(...)` and
+/// `name arg` call, and every lone `name` that is not a local variable (Ruby
+/// reads `name` as a call on `self` unless a parameter or an assignment in
+/// the same method made it a local).
+fn method_call_refs<'a>(content: &'a str, root: tree_sitter::Node) -> Vec<(&'a str, usize)> {
+    let mut out = Vec::new();
+    let mut locals_stack: Vec<(usize, std::collections::HashSet<&'a str>)> = Vec::new();
+    walk_tree_preorder(&root, |node| {
+        while locals_stack
+            .last()
+            .is_some_and(|(end, _)| node.start_byte() >= *end)
+        {
+            locals_stack.pop();
+        }
+        match node.kind() {
+            "method" | "singleton_method" | "class" | "module" | "program" => {
+                locals_stack.push((node.end_byte(), collect_locals(content, node)));
+            }
+            "call" => {
+                if let Some(method) = node.child_by_field_name("method") {
+                    if method.kind() == "identifier" {
+                        out.push((node_text(content, &method), node_line(&method)));
+                    }
+                }
+            }
+            "identifier" if is_bare_call(node) => {
+                let name = node_text(content, &node);
+                let local = locals_stack
+                    .last()
+                    .is_some_and(|(_, locals)| locals.contains(name));
+                if !local {
+                    out.push((name, node_line(&node)));
+                }
+            }
+            _ => {}
+        }
+        WalkControl::Continue
+    });
+    out
+}
+
+/// Class-body calls whose symbol arguments name methods of the class: Active
+/// Record, Action Controller and Active Job callbacks, custom validators, view
+/// helpers and `alias_method` (its second argument only).
+static METHOD_NAMING_CALLS: LazyLock<std::collections::HashSet<&str>> = LazyLock::new(|| {
+    "before_validation after_validation before_save around_save after_save before_create
+     around_create after_create before_update around_update after_update before_destroy
+     around_destroy after_destroy after_commit after_rollback after_create_commit
+     after_update_commit after_destroy_commit after_save_commit after_initialize after_find
+     after_touch before_action after_action around_action skip_before_action
+     skip_after_action skip_around_action prepend_before_action prepend_after_action
+     prepend_around_action append_before_action append_after_action append_around_action
+     before_filter after_filter around_filter skip_before_filter before_perform
+     after_perform around_perform before_enqueue after_enqueue around_enqueue validate
+     helper_method"
+        .split_whitespace()
+        .collect()
+});
+
+/// Methods a symbol names, with their lines: a callback or custom validator
+/// (`before_save :normalize`, `validate :check_total`), an attribute a
+/// validation reads (`validates :email`), a condition (`if: :paid?`,
+/// `unless: [:draft?, :locked?]`), a `rescue_from ... with: :handler`, the
+/// original of `alias_method`, what `delegate` forwards and where
+/// (`delegate :name, to: :owner`), and a block argument (`map(&:total)`).
+/// Other symbols are data (`on: :create`, `status: :active`).
+fn symbol_method_refs<'a>(content: &'a str, root: tree_sitter::Node) -> Vec<(&'a str, usize)> {
+    let mut out = Vec::new();
+    let mut push = |node: tree_sitter::Node| {
+        if node.kind() != "simple_symbol" {
+            return;
+        }
+        let name = &node_text(content, &node)[1..];
+        let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name
+                .trim_end_matches(['?', '!'])
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if valid {
+            out.push((name, node_line(&node)));
+        }
+    };
+    walk_tree_preorder(&root, |node| {
+        match node.kind() {
+            "block_argument" => {
+                if let Some(symbol) = node.named_child(0) {
+                    push(symbol);
+                }
+            }
+            "call" => {
+                let Some(args) = node.child_by_field_name("arguments") else {
+                    return WalkControl::Continue;
+                };
+                let method = node
+                    .child_by_field_name("method")
+                    .map_or("", |method| node_text(content, &method));
+                let on_self = node
+                    .child_by_field_name("receiver")
+                    .is_none_or(|receiver| receiver.kind() == "self");
+                let positional = on_self
+                    && (METHOD_NAMING_CALLS.contains(method)
+                        || method == "delegate"
+                        || method == "validates"
+                        || (method.starts_with("validates_") && method.ends_with("_of")));
+                let mut cursor = args.walk();
+                for (index, arg) in args.named_children(&mut cursor).enumerate() {
+                    match arg.kind() {
+                        "simple_symbol"
+                            if positional || (method == "alias_method" && index == 1) =>
+                        {
+                            push(arg)
+                        }
+                        "pair" => {
+                            let key = arg
+                                .child_by_field_name("key")
+                                .map_or("", |key| node_text(content, &key));
+                            let key = key.trim_start_matches(':');
+                            let names_method = matches!(key, "if" | "unless")
+                                || (key == "to" && method == "delegate")
+                                || (key == "with" && method == "rescue_from");
+                            let Some(value) = arg.child_by_field_name("value") else {
+                                continue;
+                            };
+                            if !names_method {
+                                continue;
+                            }
+                            if value.kind() == "array" {
+                                let mut items = value.walk();
+                                for item in value.named_children(&mut items) {
+                                    push(item);
+                                }
+                            } else {
+                                push(value);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        WalkControl::Continue
+    });
+    out
+}
+
+/// An `identifier` standing alone as an expression or as a receiver, where
+/// Ruby reads it as a local variable or a call on `self`.
+fn is_bare_call(node: tree_sitter::Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let field_of = |field: &str| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|child| child.id() == node.id())
+    };
+    match parent.kind() {
+        "call" => field_of("receiver"),
+        "method" | "singleton_method" | "alias" | "undef" => false,
+        "assignment" | "operator_assignment" => field_of("right"),
+        "keyword_parameter" | "optional_parameter" => field_of("value"),
+        kind if kind.ends_with("parameters")
+            || kind.ends_with("_parameter")
+            || kind == "left_assignment_list"
+            || kind == "destructured_parameter"
+            || kind == "destructured_left_assignment"
+            || kind == "exception_variable"
+            || kind == "rest_assignment"
+            || kind == "for" =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Every name a scope (a method body, or a class / module / file body)
+/// binds as a local: parameters, assignment targets, block parameters,
+/// `rescue => e`. Nested `def`s are separate scopes and are skipped.
+fn collect_locals<'a>(
+    content: &'a str,
+    scope: tree_sitter::Node,
+) -> std::collections::HashSet<&'a str> {
+    let mut locals = std::collections::HashSet::new();
+    walk_tree_preorder(&scope, |node| {
+        if node.id() != scope.id()
+            && matches!(
+                node.kind(),
+                "method" | "singleton_method" | "class" | "module"
+            )
+        {
+            return WalkControl::SkipChildren;
+        }
+        if node.kind() == "identifier" {
+            if let Some(parent) = node.parent() {
+                let is_target = match parent.kind() {
+                    "assignment" | "operator_assignment" => parent
+                        .child_by_field_name("left")
+                        .is_some_and(|left| left.id() == node.id()),
+                    "keyword_parameter" | "optional_parameter" => parent
+                        .child_by_field_name("name")
+                        .is_some_and(|name| name.id() == node.id()),
+                    kind => {
+                        kind.ends_with("parameters")
+                            || kind.ends_with("_parameter")
+                            || kind == "left_assignment_list"
+                            || kind == "destructured_parameter"
+                            || kind == "destructured_left_assignment"
+                            || kind == "exception_variable"
+                            || kind == "rest_assignment"
+                            || kind == "for"
+                    }
+                };
+                if is_target {
+                    locals.insert(node_text(content, &node));
+                }
+            }
+        }
+        WalkControl::Continue
+    });
+    locals
 }
 
 impl LanguageParser for RubyParser {
@@ -86,6 +486,23 @@ impl LanguageParser for RubyParser {
 
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &RUBY_LANGUAGE)?;
+        self.symbols_in(content, &tree)
+    }
+
+    fn parse_symbols_and_refs(
+        &self,
+        content: &str,
+        file_type: super::super::FileType,
+    ) -> Result<(Vec<ParsedSymbol>, Vec<super::super::ParsedRef>)> {
+        let tree = parse_tree(content, &RUBY_LANGUAGE)?;
+        let symbols = self.symbols_in(content, &tree)?;
+        let refs = self.ruby_extract_refs_in(content, &tree, &symbols, Some(file_type))?;
+        Ok((symbols, refs))
+    }
+}
+
+impl RubyParser {
+    fn symbols_in(&self, content: &str, tree: &tree_sitter::Tree) -> Result<Vec<ParsedSymbol>> {
         let mut symbols = Vec::new();
         let query = &*RUBY_QUERY;
         let mut cursor = QueryCursor::new();
@@ -100,13 +517,24 @@ impl LanguageParser for RubyParser {
 
         let idx_class_name = idx("class_name");
         let idx_class_parent = idx("class_parent");
+        let idx_class_node = idx("class_node");
         let idx_module_name = idx("module_name");
+        let idx_module_node = idx("module_node");
         let idx_method_name = idx("method_name");
+        let idx_method_node = idx("method_node");
         let idx_singleton_object = idx("singleton_object");
         let idx_singleton_method_name = idx("singleton_method_name");
+        let idx_singleton_method_node = idx("singleton_method_node");
         let idx_assign_const_name = idx("assign_const_name");
+        let idx_assign_const_node = idx("assign_const_node");
+        let idx_self_setting_name = idx("self_setting_name");
+        let idx_self_setting_value = idx("self_setting_value");
         let idx_call_method = idx("call_method");
         let idx_call_first_arg = idx("call_first_arg");
+
+        let end_line_of = |m: &tree_sitter::QueryMatch, capture: Option<u32>| {
+            find_capture(m, capture).map(|c| node_end_line(&c.node))
+        };
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
@@ -128,7 +556,8 @@ impl LanguageParser for RubyParser {
                     name,
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    end_line: end_line_of(m, idx_class_node),
+                    signature: signature_line(content, line),
                     parents,
                 });
                 continue;
@@ -143,7 +572,8 @@ impl LanguageParser for RubyParser {
                     name,
                     kind: SymbolKind::Package,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    end_line: end_line_of(m, idx_module_node),
+                    signature: signature_line(content, line),
                     parents: vec![],
                 });
                 continue;
@@ -159,9 +589,26 @@ impl LanguageParser for RubyParser {
                         name: format!("{}.{}", obj, method_name),
                         kind: SymbolKind::Function,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        end_line: end_line_of(m, idx_singleton_method_node),
+                        signature: signature_line(content, line),
                         parents: vec![],
                     });
+                    // `def self.table_name_prefix; "billing_"; end` on a namespace
+                    // module prefixes the tables of the models inside it.
+                    let prefix = (obj == "self" && method_name == "table_name_prefix")
+                        .then(|| find_capture(m, idx_singleton_method_node))
+                        .flatten()
+                        .and_then(|def| returned_literal(content, def.node));
+                    if let Some(prefix) = prefix {
+                        symbols.push(ParsedSymbol {
+                            name: format!("table_name_prefix \"{prefix}\""),
+                            kind: SymbolKind::Annotation,
+                            line,
+                            end_line: Some(line),
+                            signature: signature_line(content, line),
+                            parents: vec![],
+                        });
+                    }
                 }
                 continue;
             }
@@ -174,22 +621,57 @@ impl LanguageParser for RubyParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    end_line: end_line_of(m, idx_method_node),
+                    signature: signature_line(content, line),
                     parents: vec![],
                 });
                 continue;
             }
 
-            // Constant assignment: CONST_NAME = value
+            // Constant assignment: `LIMIT = 10`, `Types = Dry.Types()`,
+            // `Billing::Import = Container.injector`
             if let Some(cap) = find_capture(m, idx_assign_const_name) {
-                let name = node_text(content, &cap.node);
+                let text = node_text(content, &cap.node);
                 let line = node_line(&cap.node);
-                if is_constant_name(name) {
+                if is_constant_path(text) {
+                    let name = if cap.node.kind() == "scope_resolution" {
+                        qualify_scoped_constant(content, &cap.node, text)
+                    } else {
+                        text.to_string()
+                    };
                     symbols.push(ParsedSymbol {
-                        name: name.to_string(),
+                        name,
                         kind: SymbolKind::Constant,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        end_line: end_line_of(m, idx_assign_const_node),
+                        signature: signature_line(content, line),
+                        parents: vec![],
+                    });
+                }
+                continue;
+            }
+
+            // `self.table_name = "legacy_users"` binds a model to its table;
+            // `self.abstract_class = true` says it has none.
+            if let Some(cap) = find_capture(m, idx_self_setting_name) {
+                let value = find_capture(m, idx_self_setting_value)
+                    .map(|value| node_text(content, &value.node))
+                    .unwrap_or("");
+                let name = match node_text(content, &cap.node) {
+                    "table_name" => {
+                        literal_name(value).map(|table| format!("table_name \"{table}\""))
+                    }
+                    "abstract_class" if value == "true" => Some("abstract_class".to_string()),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    let line = node_line(&cap.node);
+                    symbols.push(ParsedSymbol {
+                        name,
+                        kind: SymbolKind::Annotation,
+                        line,
+                        end_line: Some(line),
+                        signature: signature_line(content, line),
                         parents: vec![],
                     });
                 }
@@ -206,6 +688,7 @@ impl LanguageParser for RubyParser {
                 // Skip calls with a receiver (e.g., Foo.bar, obj.method)
                 // We only want bare calls like `require 'json'`, `include Mod`, etc.
                 let call_node = method_cap.node.parent();
+                let call_end_line = call_node.as_ref().map(node_end_line);
                 let has_receiver = call_node
                     .map(|n| n.child_by_field_name("receiver").is_some())
                     .unwrap_or(false);
@@ -219,21 +702,24 @@ impl LanguageParser for RubyParser {
                                 name: path.to_string(),
                                 kind: SymbolKind::Import,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
 
                     // include / extend / prepend — Annotation (not Import) so outline shows them
-                    "include" | "extend" | "prepend" if !has_receiver => {
+                    // Rails engines: `isolate_namespace Billing` prefixes its tables
+                    "include" | "extend" | "prepend" | "isolate_namespace" if !has_receiver => {
                         if let Some(arg) = first_arg {
                             symbols.push(ParsedSymbol {
                                 name: format!("{} {}", method, arg),
                                 kind: SymbolKind::Annotation,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -253,6 +739,7 @@ impl LanguageParser for RubyParser {
                                             line,
                                             signature: sig.clone(),
                                             parents: vec![],
+                                            end_line: call_end_line,
                                         });
                                     }
                                 }
@@ -270,8 +757,9 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} :{}", method, sym_name),
                                 kind: SymbolKind::Property,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -285,8 +773,9 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} :{}", method, sym_name),
                                 kind: SymbolKind::Property,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -306,6 +795,7 @@ impl LanguageParser for RubyParser {
                                             line,
                                             signature: sig.clone(),
                                             parents: vec![],
+                                            end_line: call_end_line,
                                         });
                                     }
                                 }
@@ -324,8 +814,9 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} :{}", method, sym_name),
                                 kind: SymbolKind::Property,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -338,8 +829,9 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} :{}", method, sym_name),
                                 kind: SymbolKind::Annotation,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -376,8 +868,9 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} :{}", method, sym_name),
                                 kind: SymbolKind::Annotation,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -390,8 +883,9 @@ impl LanguageParser for RubyParser {
                                 name: format!("scope :{}", sym_name),
                                 kind: SymbolKind::Function,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -417,8 +911,9 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} \"{}\"", method, desc),
                                 kind: SymbolKind::Class,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -431,8 +926,9 @@ impl LanguageParser for RubyParser {
                                 name: format!("{} \"{}\"", method, desc),
                                 kind: SymbolKind::Function,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
                         }
                     }
@@ -445,9 +941,19 @@ impl LanguageParser for RubyParser {
                                 name: format!("{}(:{})", method, sym_name),
                                 kind: SymbolKind::Property,
                                 line,
-                                signature: line_text(content, line).trim().to_string(),
+                                signature: signature_line(content, line),
                                 parents: vec![],
+                                end_line: call_end_line,
                             });
+                        }
+                    }
+
+                    // Rails schema dump: `create_table "users" do |t| t.string "email" end`
+                    "create_table" if !has_receiver => {
+                        if let (Some(call), Some(arg)) = (call_node, first_arg) {
+                            if is_schema_definition(content, call) {
+                                push_schema_table(content, call, arg, &mut symbols);
+                            }
                         }
                     }
 
@@ -473,8 +979,6 @@ impl LanguageParser for RubyParser {
 /// Already-qualified names (e.g., `Admin::Dashboard` from `class Admin::Dashboard`) are preserved as-is
 /// and get parent scopes prepended if nested further.
 fn build_qualified_name(content: &str, name_node: &tree_sitter::Node, base_name: &str) -> String {
-    let mut scope_parts: Vec<String> = Vec::new();
-
     // The name_node is the captured name (constant or scope_resolution).
     // Its parent should be the class/module AST node.
     let container = match name_node.parent() {
@@ -482,8 +986,13 @@ fn build_qualified_name(content: &str, name_node: &tree_sitter::Node, base_name:
         _ => return base_name.to_string(),
     };
 
-    // Walk up from the container's parent, looking for enclosing class/module nodes
-    let mut current = container.parent();
+    prefix_enclosing_scopes(content, container, base_name)
+}
+
+/// Prepend the names of every class/module enclosing `node` (outermost first).
+fn prefix_enclosing_scopes(content: &str, node: tree_sitter::Node, base_name: &str) -> String {
+    let mut scope_parts: Vec<String> = Vec::new();
+    let mut current = node.parent();
     while let Some(node) = current {
         if node.kind() == "class" || node.kind() == "module" {
             if let Some(name_child) = node.child_by_field_name("name") {
@@ -502,13 +1011,140 @@ fn build_qualified_name(content: &str, name_node: &tree_sitter::Node, base_name:
     }
 }
 
-/// Check if a name is an ALL_CAPS constant
-fn is_constant_name(name: &str) -> bool {
-    !name.is_empty()
+/// Full name of a `Scope::Name = value` assignment, qualified like a class
+/// written `class Scope::Name` at the same place; `::Name = value` is top-level.
+fn qualify_scoped_constant(content: &str, name_node: &tree_sitter::Node, text: &str) -> String {
+    if let Some(absolute) = text.strip_prefix("::") {
+        return absolute.to_string();
+    }
+    match name_node.parent() {
+        Some(assignment) => prefix_enclosing_scopes(content, assignment, text),
+        None => text.to_string(),
+    }
+}
+
+/// Table-block methods of a schema dump that declare no column of their own.
+const NON_COLUMN_TABLE_METHODS: &[&str] = &[
+    "index",
+    "check_constraint",
+    "exclusion_constraint",
+    "unique_constraint",
+    "foreign_key",
+    "timestamps",
+    "references",
+    "belongs_to",
+];
+
+/// `"users"`, `'users'` or `:users` without interpolation.
+fn literal_name(text: &str) -> Option<&str> {
+    let name = text
+        .strip_prefix(':')
+        .or_else(|| {
+            text.strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+        })
+        .or_else(|| {
+            text.strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })?;
+    (!name.is_empty()
         && name
             .chars()
-            .all(|c| c.is_uppercase() || c.is_ascii_digit() || c == '_')
-        && name.chars().any(|c| c.is_uppercase())
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.'))
+    .then_some(name)
+}
+
+/// The string a method body consists of (`def self.x; "value"; end`).
+fn returned_literal<'a>(content: &'a str, method: tree_sitter::Node) -> Option<&'a str> {
+    let body = method.child_by_field_name("body")?;
+    let only = (body.named_child_count() == 1)
+        .then(|| body.named_child(0))
+        .flatten()?;
+    (only.kind() == "string")
+        .then(|| literal_name(node_text(content, &only)))
+        .flatten()
+}
+
+/// Whether `call` sits inside `ActiveRecord::Schema.define` (or the versioned
+/// `ActiveRecord::Schema[7.1].define`): the schema dump, not a migration.
+fn is_schema_definition(content: &str, call: tree_sitter::Node) -> bool {
+    let mut current = call.parent();
+    while let Some(node) = current {
+        if node.kind() == "call" {
+            if let Some(receiver) = node.child_by_field_name("receiver") {
+                if node_text(content, &receiver).starts_with("ActiveRecord::Schema") {
+                    return true;
+                }
+            }
+        }
+        current = node.parent();
+    }
+    false
+}
+
+/// A `create_table` block: the table and one `table.column` symbol per
+/// `t.<type> "column"` line.
+fn push_schema_table(
+    content: &str,
+    call: tree_sitter::Node,
+    first_arg: &str,
+    symbols: &mut Vec<ParsedSymbol>,
+) {
+    let Some(table) = literal_name(first_arg) else {
+        return;
+    };
+    let line = node_line(&call);
+    symbols.push(ParsedSymbol {
+        name: table.to_string(),
+        kind: SymbolKind::Table,
+        line,
+        end_line: Some(node_end_line(&call)),
+        signature: signature_line(content, line),
+        parents: vec![],
+    });
+    let Some(block) = call.child_by_field_name("block") else {
+        return;
+    };
+    let mut block_cursor = block.walk();
+    let variable = block
+        .named_children(&mut block_cursor)
+        .find(|child| child.kind() == "block_parameters")
+        .and_then(|params| params.named_child(0))
+        .map(|param| node_text(content, &param));
+    let Some(variable) = variable else {
+        return;
+    };
+    walk_tree_preorder(&block, |node| {
+        if node.kind() != "call" {
+            return WalkControl::Continue;
+        }
+        let on_table = node
+            .child_by_field_name("receiver")
+            .is_some_and(|receiver| node_text(content, &receiver) == variable);
+        if !on_table {
+            return WalkControl::Continue;
+        }
+        let method = node
+            .child_by_field_name("method")
+            .map(|method| node_text(content, &method))
+            .unwrap_or("");
+        let column = node
+            .child_by_field_name("arguments")
+            .and_then(|args| args.named_child(0))
+            .and_then(|arg| literal_name(node_text(content, &arg)));
+        if let (Some(column), false) = (column, NON_COLUMN_TABLE_METHODS.contains(&method)) {
+            let line = node_line(&node);
+            symbols.push(ParsedSymbol {
+                name: format!("{table}.{column}"),
+                kind: SymbolKind::Column,
+                line,
+                end_line: Some(node_end_line(&node)),
+                signature: signature_line(content, line),
+                parents: vec![],
+            });
+        }
+        WalkControl::SkipChildren
+    });
 }
 
 /// Normalize a Ruby symbol argument: strip leading `:` from `:name`
@@ -1083,6 +1719,170 @@ end
     }
 
     #[test]
+    fn test_scoped_constant_assignment_is_qualified() {
+        let content = "Billing::Import = Billing::Container.injector\n\
+                       module Api\n  V2::Client = Struct.new(:token) do\n    def ping; end\n  end\nend\n\
+                       ::Root::Setting = 1\n\
+                       Config::timeout = 5\n";
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        let constant = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name && s.kind == SymbolKind::Constant)
+                .unwrap_or_else(|| panic!("no constant {name}: {symbols:?}"))
+        };
+        assert_eq!(constant("Billing::Import").line, 1);
+        assert_eq!(constant("Billing::Import").end_line, Some(1));
+        assert_eq!(constant("Api::V2::Client").line, 3);
+        assert_eq!(constant("Api::V2::Client").end_line, Some(5));
+        assert_eq!(constant("Root::Setting").line, 7);
+        assert!(
+            !symbols.iter().any(|s| s.name.contains("timeout")),
+            "a setter call is not a constant: {symbols:?}"
+        );
+    }
+
+    #[test]
+    fn test_schema_dump_tables_and_columns() {
+        let content = r#"ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do
+  enable_extension "plpgsql"
+
+  create_table "invoices", force: :cascade do |t|
+    t.bigint "customer_id", null: false
+    t.string "number"
+    t.decimal "total", precision: 10, scale: 2
+    t.datetime "created_at", null: false
+    t.index ["customer_id"], name: "index_invoices_on_customer_id"
+  end
+
+  create_table :people do |table|
+    table.column "full_name", :string
+  end
+
+  add_foreign_key "invoices", "people", column: "customer_id"
+end
+"#;
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        let of_kind = |kind: SymbolKind| -> Vec<(&str, usize, Option<usize>)> {
+            symbols
+                .iter()
+                .filter(|s| s.kind == kind)
+                .map(|s| (s.name.as_str(), s.line, s.end_line))
+                .collect()
+        };
+        assert_eq!(
+            of_kind(SymbolKind::Table),
+            vec![("invoices", 4, Some(10)), ("people", 12, Some(14))]
+        );
+        assert_eq!(
+            of_kind(SymbolKind::Column),
+            vec![
+                ("invoices.customer_id", 5, Some(5)),
+                ("invoices.number", 6, Some(6)),
+                ("invoices.total", 7, Some(7)),
+                ("invoices.created_at", 8, Some(8)),
+                ("people.full_name", 13, Some(13)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_schema_dump_has_symbols_but_no_refs() {
+        let content = r#"# Generated from the current state of the Database.
+ActiveRecord::Schema[7.1].define(version: 2024_01_01_000000) do
+  create_table "invoices", force: :cascade do |t|
+    t.integer "number"
+    t.string "state"
+    t.boolean "paid?"
+  end
+  add_foreign_key "invoices", "people"
+end
+"#;
+        let (symbols, refs) = RUBY_PARSER
+            .parse_symbols_and_refs(content, crate::parsers::FileType::Ruby)
+            .unwrap();
+        assert!(symbols.iter().any(|s| s.name == "invoices.number"));
+        assert!(
+            refs.iter().all(|r| r.line == 1),
+            "refs inside the schema block: {refs:?}"
+        );
+        assert!(!refs
+            .iter()
+            .any(|r| r.name == "integer" || r.name == "string"));
+    }
+
+    #[test]
+    fn test_schema_block_in_a_helper_keeps_the_code_around_it() {
+        let content = r#"module TestDatabase
+  def self.setup
+    ActiveRecord::Schema.define do
+      create_table :widgets do |t|
+        t.string :name
+      end
+    end
+    seed_widgets(Widget)
+  end
+end
+"#;
+        let refs = RUBY_PARSER
+            .extract_refs_for_lang(content, &[], crate::parsers::FileType::Ruby)
+            .unwrap();
+        assert!(!refs
+            .iter()
+            .any(|r| r.name == "string" || r.name == "create_table"));
+        assert!(refs.iter().any(|r| r.name == "seed_widgets" && r.line == 8));
+        assert!(refs.iter().any(|r| r.name == "Widget" && r.line == 8));
+    }
+
+    #[test]
+    fn test_create_table_in_a_migration_is_not_a_schema() {
+        let content = r#"class CreateInvoices < ActiveRecord::Migration[7.1]
+  def change
+    create_table :invoices do |t|
+      t.string :number
+    end
+  end
+end
+"#;
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        assert!(!symbols
+            .iter()
+            .any(|s| matches!(s.kind, SymbolKind::Table | SymbolKind::Column)));
+    }
+
+    #[test]
+    fn test_explicit_table_name() {
+        let content = "class Customer < ApplicationRecord\n  self.table_name = \"people\"\n  self.primary_key = :uuid\nend\n\
+                       class BaseRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n\
+                       module Billing\n  def self.table_name_prefix\n    'billing_'\n  end\nend\n\
+                       module Shop\n  class Engine < Rails::Engine\n    isolate_namespace Shop\n  end\nend\n";
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        let settings: Vec<(&str, usize)> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Annotation)
+            .map(|s| (s.name.as_str(), s.line))
+            .collect();
+        assert_eq!(
+            settings,
+            vec![
+                ("table_name \"people\"", 2),
+                ("abstract_class", 6),
+                ("table_name_prefix \"billing_\"", 9),
+                ("isolate_namespace Shop", 15),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_camel_case_constant_assignment() {
+        let content = "module Types\n  Email = String.constrained(format: /@/)\nend\n";
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Email" && s.kind == SymbolKind::Constant && s.line == 2));
+    }
+
+    #[test]
     fn test_constant_not_class() {
         // Constants should not be confused with class names
         let content = "VERSION = \"1.0\"\nMAX_RETRIES = 3\n";
@@ -1096,6 +1896,46 @@ end
         assert!(!symbols
             .iter()
             .any(|s| s.kind == SymbolKind::Class && s.name == "VERSION"));
+    }
+
+    #[test]
+    fn test_extract_refs_calls_without_parentheses() {
+        let content = r##"class Importer
+  def run(source, limit: 10)
+    batch, rest = split_rows(source.rows)
+    user.update_profile(batch)
+    notify_admins rest
+    log "#{source_name}: #{limit}"
+    [1, 2].each { |item| handle_item item }
+    list.to_h.count
+  rescue StandardError => failure
+    report_failure failure
+  end
+end
+"##;
+        let symbols = RUBY_PARSER.parse_symbols(content).unwrap();
+        let refs = RUBY_PARSER.extract_refs(content, &symbols).unwrap();
+        let at = |name: &str| -> Vec<usize> {
+            refs.iter()
+                .filter(|r| r.name == name)
+                .map(|r| r.line)
+                .collect()
+        };
+        assert_eq!(at("split_rows"), vec![3]);
+        assert_eq!(at("rows"), vec![3]);
+        assert_eq!(at("user"), vec![4]);
+        assert_eq!(at("update_profile"), vec![4]);
+        assert_eq!(at("notify_admins"), vec![5]);
+        assert_eq!(at("source_name"), vec![6]);
+        assert_eq!(at("handle_item"), vec![7]);
+        assert_eq!(at("list"), vec![8]);
+        assert_eq!(at("report_failure"), vec![10]);
+        for local in ["source", "limit", "batch", "rest", "item", "failure"] {
+            assert!(at(local).is_empty(), "{local} is a local variable");
+        }
+        for core in ["each", "to_h", "count"] {
+            assert!(at(core).is_empty(), "{core} is a core method");
+        }
     }
 
     #[test]
@@ -1145,6 +1985,51 @@ end
             refs.iter().any(|r| r.name == "success?"),
             "should find 'success?' reference"
         );
+    }
+
+    #[test]
+    fn test_extract_refs_symbols_naming_methods() {
+        let content = r#"class Invoice < ApplicationRecord
+  before_save :normalize_number, if: :draft?
+  after_commit :notify, unless: [:silent?, :imported?]
+  validate :check_total
+  validates :customer_email, presence: true, on: :create
+  delegate :full_name, to: :customer
+  alias_method :amount, :total_amount
+  rescue_from Timeout, with: :handle_timeout
+  enum status: { open: 0 }
+
+  def lines_total
+    lines.map(&:subtotal).sum
+  end
+end
+"#;
+        let refs = RUBY_PARSER.extract_refs(content, &[]).unwrap();
+        let at = |name: &str| -> Vec<usize> {
+            refs.iter()
+                .filter(|r| r.name == name)
+                .map(|r| r.line)
+                .collect()
+        };
+        for (name, line) in [
+            ("normalize_number", 2),
+            ("draft?", 2),
+            ("notify", 3),
+            ("silent?", 3),
+            ("imported?", 3),
+            ("check_total", 4),
+            ("customer_email", 5),
+            ("full_name", 6),
+            ("customer", 6),
+            ("total_amount", 7),
+            ("handle_timeout", 8),
+            ("subtotal", 12),
+        ] {
+            assert_eq!(at(name), vec![line], "{name}: {refs:?}");
+        }
+        for data in ["create", "amount", "status", "open"] {
+            assert!(at(data).is_empty(), "{data} is data: {refs:?}");
+        }
     }
 
     #[test]

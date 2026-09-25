@@ -1,0 +1,490 @@
+{
+  "content_matches": [
+    {
+      "content": "RSpec.describe Billing::ChargeService do",
+      "line": 1,
+      "path": "spec/services/charge_service_spec.rb"
+    },
+    {
+      "content": "Billing::ChargeService.call",
+      "line": 3,
+      "path": "spec/services/charge_service_spec.rb"
+    },
+    {
+      "content": "class DraftService < ApplicationService",
+      "line": 2,
+      "path": "app/services/billing/draft_service.rb"
+    }
+  ],
+  "files": [
+    {
+      "path": "app/services/application_service.rb",
+      "rank": {
+        "blended": 0.815,
+        "components": [
+          {
+            "name": "calm",
+            "value": 0.64
+          },
+          {
+            "name": "age",
+            "value": 0.88
+          },
+          {
+            "name": "idle",
+            "value": 0.88
+          },
+          {
+            "name": "used",
+            "value": 1.0
+          }
+        ],
+        "graph": {
+          "dependents": 8,
+          "dependents_depth": 3,
+          "dependents_pct": 91.7,
+          "fan_in": 3,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 3,
+          "fan_in_files_pct": 75.0,
+          "fan_out": 0,
+          "fan_out_ambiguous": 0,
+          "granularity": "file",
+          "in_graph": true,
+          "labels": [
+            "fan-in:elevated",
+            "dependents:high",
+            "pagerank:high"
+          ],
+          "pagerank": 2.97696,
+          "pagerank_pct": 91.7,
+          "strongest_symbol": {
+            "kind": "class",
+            "line": 1,
+            "name": "ApplicationService"
+          }
+        },
+        "history": {
+          "age_days": 1352.5,
+          "age_pct": 88,
+          "authors": 1,
+          "authors_pct": 35,
+          "churn": 5,
+          "churn_pct": 35,
+          "commits": 1,
+          "commits_pct": 35,
+          "days_since_change": 1352.5,
+          "fix_commits": 0,
+          "fix_ratio": 0.0,
+          "fix_ratio_pct": 38,
+          "granularity": "file",
+          "hotspot_score": 36,
+          "idle_pct": 88,
+          "labels": []
+        },
+        "score": 0.85,
+        "tier": "file_name"
+      }
+    },
+    {
+      "path": "app/services/billing/refund_service.rb",
+      "rank": {
+        "blended": 0.669,
+        "components": [
+          {
+            "name": "calm",
+            "value": 0.56
+          },
+          {
+            "name": "age",
+            "value": 0.46
+          },
+          {
+            "name": "idle",
+            "value": 0.73
+          },
+          {
+            "name": "used",
+            "value": 1.0
+          }
+        ],
+        "graph": {
+          "dependents": 1,
+          "dependents_depth": 3,
+          "dependents_pct": 8.3,
+          "fan_in": 1,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 1,
+          "fan_in_files_pct": 16.7,
+          "fan_out": 1,
+          "fan_out_ambiguous": 0,
+          "granularity": "file",
+          "in_graph": true,
+          "labels": [],
+          "pagerank": 0.768918,
+          "pagerank_pct": 8.3,
+          "strongest_symbol": {
+            "kind": "class",
+            "line": 2,
+            "name": "Billing::RefundService"
+          }
+        },
+        "history": {
+          "age_days": 1271.5,
+          "age_pct": 46,
+          "authors": 1,
+          "authors_pct": 35,
+          "churn": 7,
+          "churn_pct": 58,
+          "commits": 1,
+          "commits_pct": 35,
+          "days_since_change": 1271.5,
+          "fix_commits": 0,
+          "fix_ratio": 0.0,
+          "fix_ratio_pct": 38,
+          "granularity": "file",
+          "hotspot_score": 44,
+          "idle_pct": 73,
+          "labels": []
+        },
+        "score": 0.688,
+        "tier": "file_name"
+      }
+    },
+    {
+      "path": "app/services/billing/charge_service.rb",
+      "rank": {
+        "blended": 0.494,
+        "components": [
+          {
+            "name": "calm",
+            "value": 0.04
+          },
+          {
+            "name": "age",
+            "value": 0.58
+          },
+          {
+            "name": "idle",
+            "value": 0.35
+          },
+          {
+            "name": "used",
+            "value": 1.0
+          }
+        ],
+        "graph": {
+          "dependents": 4,
+          "dependents_depth": 3,
+          "dependents_pct": 25.0,
+          "fan_in": 4,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 3,
+          "fan_in_files_pct": 75.0,
+          "fan_out": 1,
+          "fan_out_ambiguous": 0,
+          "granularity": "file",
+          "in_graph": true,
+          "labels": [
+            "fan-in:elevated"
+          ],
+          "pagerank": 1.828778,
+          "pagerank_pct": 25.0,
+          "strongest_symbol": {
+            "kind": "class",
+            "line": 2,
+            "name": "Billing::ChargeService"
+          }
+        },
+        "history": {
+          "age_days": 1298.5,
+          "age_pct": 58,
+          "authors": 5,
+          "authors_pct": 96,
+          "churn": 15,
+          "churn_pct": 96,
+          "commits": 5,
+          "commits_pct": 96,
+          "days_since_change": 449.5,
+          "fix_commits": 3,
+          "fix_ratio": 0.6,
+          "fix_ratio_pct": 96,
+          "granularity": "file",
+          "hotspot_score": 96,
+          "idle_pct": 35,
+          "labels": [
+            "churn:high",
+            "fixes:high",
+            "authors:many"
+          ]
+        },
+        "score": 0.493,
+        "tier": "file_name"
+      }
+    }
+  ],
+  "pagination": {
+    "content_matches": {
+      "limit": 3,
+      "returned": 3,
+      "total": 9,
+      "truncated": true
+    },
+    "files": {
+      "limit": 3,
+      "returned": 3,
+      "total": 9,
+      "truncated": true
+    },
+    "references": {
+      "limit": 3,
+      "returned": 0,
+      "total": 0,
+      "truncated": false
+    },
+    "symbols": {
+      "limit": 3,
+      "returned": 3,
+      "total": 5,
+      "truncated": true
+    }
+  },
+  "rank": {
+    "applied": true,
+    "formula": "mean of calm (1 - file hotspot score), file age percentile, idle percentile (days since the file last changed) and used (1 when at least one caller resolves to the symbol, else 0)",
+    "graph": {
+      "built": true,
+      "built_at": 1790180724015,
+      "granularity": "symbol",
+      "stale": false
+    },
+    "history": {
+      "collected_at": 1790180696113,
+      "commits_analyzed": 11,
+      "files_with_history": 13,
+      "granularity": "file",
+      "head": "bcc236d01a46d048d162f5e9b0306cd44436e5ae"
+    },
+    "missing": [],
+    "pool": {
+      "files": 9,
+      "symbols": 5
+    },
+    "preset": "proven",
+    "preset_weight": 0.9,
+    "ranked_sections": [
+      "files",
+      "symbols"
+    ],
+    "warnings": []
+  },
+  "references": [],
+  "schema_version": 2,
+  "symbols": [
+    {
+      "kind": "class",
+      "line": 1,
+      "name": "ApplicationService",
+      "path": "app/services/application_service.rb",
+      "rank": {
+        "blended": 0.865,
+        "components": [
+          {
+            "name": "calm",
+            "value": 0.64
+          },
+          {
+            "name": "age",
+            "value": 0.88
+          },
+          {
+            "name": "idle",
+            "value": 0.88
+          },
+          {
+            "name": "used",
+            "value": 1.0
+          }
+        ],
+        "graph": {
+          "dependents": 8,
+          "dependents_depth": 3,
+          "dependents_pct": 91.7,
+          "fan_in": 3,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 3,
+          "fan_in_files_pct": 75.0,
+          "fan_out": 0,
+          "fan_out_ambiguous": 0,
+          "granularity": "symbol",
+          "in_graph": true,
+          "labels": [
+            "fan-in:elevated",
+            "dependents:high",
+            "pagerank:high"
+          ],
+          "pagerank": 2.97696,
+          "pagerank_pct": 91.7
+        },
+        "history": {
+          "age_days": 1352.5,
+          "age_pct": 88,
+          "authors": 1,
+          "authors_pct": 35,
+          "churn": 5,
+          "churn_pct": 35,
+          "commits": 1,
+          "commits_pct": 35,
+          "days_since_change": 1352.5,
+          "fix_commits": 0,
+          "fix_ratio": 0.0,
+          "fix_ratio_pct": 38,
+          "granularity": "file",
+          "hotspot_score": 36,
+          "idle_pct": 88,
+          "labels": []
+        },
+        "relevance_rank": 1,
+        "score": 0.85,
+        "tier": "name"
+      },
+      "signature": "class ApplicationService"
+    },
+    {
+      "kind": "class",
+      "line": 2,
+      "name": "Billing::RefundService",
+      "path": "app/services/billing/refund_service.rb",
+      "rank": {
+        "blended": 0.706,
+        "components": [
+          {
+            "name": "calm",
+            "value": 0.56
+          },
+          {
+            "name": "age",
+            "value": 0.46
+          },
+          {
+            "name": "idle",
+            "value": 0.73
+          },
+          {
+            "name": "used",
+            "value": 1.0
+          }
+        ],
+        "graph": {
+          "dependents": 1,
+          "dependents_depth": 3,
+          "dependents_pct": 8.3,
+          "fan_in": 1,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 1,
+          "fan_in_files_pct": 16.7,
+          "fan_out": 1,
+          "fan_out_ambiguous": 0,
+          "granularity": "symbol",
+          "in_graph": true,
+          "labels": [],
+          "pagerank": 0.768918,
+          "pagerank_pct": 8.3
+        },
+        "history": {
+          "age_days": 1271.5,
+          "age_pct": 46,
+          "authors": 1,
+          "authors_pct": 35,
+          "churn": 7,
+          "churn_pct": 58,
+          "commits": 1,
+          "commits_pct": 35,
+          "days_since_change": 1271.5,
+          "fix_commits": 0,
+          "fix_ratio": 0.0,
+          "fix_ratio_pct": 38,
+          "granularity": "file",
+          "hotspot_score": 44,
+          "idle_pct": 73,
+          "labels": []
+        },
+        "relevance_rank": 4,
+        "score": 0.688,
+        "tier": "name"
+      },
+      "signature": "class RefundService < ApplicationService"
+    },
+    {
+      "kind": "class",
+      "line": 2,
+      "name": "Billing::ChargeService",
+      "path": "app/services/billing/charge_service.rb",
+      "rank": {
+        "blended": 0.535,
+        "components": [
+          {
+            "name": "calm",
+            "value": 0.04
+          },
+          {
+            "name": "age",
+            "value": 0.58
+          },
+          {
+            "name": "idle",
+            "value": 0.35
+          },
+          {
+            "name": "used",
+            "value": 1.0
+          }
+        ],
+        "graph": {
+          "dependents": 4,
+          "dependents_depth": 3,
+          "dependents_pct": 25.0,
+          "fan_in": 4,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 3,
+          "fan_in_files_pct": 75.0,
+          "fan_out": 1,
+          "fan_out_ambiguous": 0,
+          "granularity": "symbol",
+          "in_graph": true,
+          "labels": [
+            "fan-in:elevated"
+          ],
+          "pagerank": 1.828778,
+          "pagerank_pct": 25.0
+        },
+        "history": {
+          "age_days": 1298.5,
+          "age_pct": 58,
+          "authors": 5,
+          "authors_pct": 96,
+          "churn": 15,
+          "churn_pct": 96,
+          "commits": 5,
+          "commits_pct": 96,
+          "days_since_change": 449.5,
+          "fix_commits": 3,
+          "fix_ratio": 0.6,
+          "fix_ratio_pct": 96,
+          "granularity": "file",
+          "hotspot_score": 96,
+          "idle_pct": 35,
+          "labels": [
+            "churn:high",
+            "fixes:high",
+            "authors:many"
+          ]
+        },
+        "relevance_rank": 3,
+        "score": 0.493,
+        "tier": "name"
+      },
+      "signature": "class ChargeService < ApplicationService"
+    }
+  ]
+}

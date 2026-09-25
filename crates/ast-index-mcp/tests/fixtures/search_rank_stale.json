@@ -1,0 +1,222 @@
+{
+  "content_matches": [
+    {
+      "content": "RSpec.describe Billing::ChargeService do",
+      "line": 1,
+      "path": "spec/services/charge_service_spec.rb"
+    },
+    {
+      "content": "Billing::ChargeService.call",
+      "line": 3,
+      "path": "spec/services/charge_service_spec.rb"
+    }
+  ],
+  "files": [
+    {
+      "path": "app/services/application_service.rb",
+      "rank": {
+        "blended": 0.875,
+        "components": [
+          {
+            "name": "pagerank",
+            "value": 0.917
+          }
+        ],
+        "graph": {
+          "dependents": 8,
+          "dependents_depth": 3,
+          "dependents_pct": 91.7,
+          "fan_in": 3,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 3,
+          "fan_in_files_pct": 75.0,
+          "fan_out": 0,
+          "fan_out_ambiguous": 0,
+          "granularity": "file",
+          "in_graph": true,
+          "labels": [
+            "fan-in:elevated",
+            "dependents:high",
+            "pagerank:high"
+          ],
+          "pagerank": 2.97696,
+          "pagerank_pct": 91.7,
+          "strongest_symbol": {
+            "kind": "class",
+            "line": 1,
+            "name": "ApplicationService"
+          }
+        },
+        "score": 0.917,
+        "tier": "file_name"
+      }
+    },
+    {
+      "path": "app/services/billing/charge_service.rb",
+      "rank": {
+        "blended": 0.275,
+        "components": [
+          {
+            "name": "pagerank",
+            "value": 0.25
+          }
+        ],
+        "graph": {
+          "dependents": 4,
+          "dependents_depth": 3,
+          "dependents_pct": 25.0,
+          "fan_in": 4,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 3,
+          "fan_in_files_pct": 75.0,
+          "fan_out": 1,
+          "fan_out_ambiguous": 0,
+          "granularity": "file",
+          "in_graph": true,
+          "labels": [
+            "fan-in:elevated"
+          ],
+          "pagerank": 1.828778,
+          "pagerank_pct": 25.0,
+          "strongest_symbol": {
+            "kind": "class",
+            "line": 2,
+            "name": "Billing::ChargeService"
+          }
+        },
+        "score": 0.25,
+        "tier": "file_name"
+      }
+    }
+  ],
+  "pagination": {
+    "content_matches": {
+      "limit": 2,
+      "returned": 2,
+      "total": 9,
+      "truncated": true
+    },
+    "files": {
+      "limit": 2,
+      "returned": 2,
+      "total": 10,
+      "truncated": true
+    },
+    "references": {
+      "limit": 2,
+      "returned": 0,
+      "total": 0,
+      "truncated": false
+    },
+    "symbols": {
+      "limit": 2,
+      "returned": 2,
+      "total": 5,
+      "truncated": true
+    }
+  },
+  "rank": {
+    "applied": true,
+    "formula": "PageRank percentile among referenced symbols (0 when nothing resolves to it)",
+    "graph": {
+      "built": true,
+      "built_at": 1790180724015,
+      "granularity": "symbol",
+      "stale": true
+    },
+    "missing": [],
+    "pool": {
+      "files": 10,
+      "symbols": 5
+    },
+    "preset": "central",
+    "preset_weight": 0.9,
+    "ranked_sections": [
+      "files",
+      "symbols"
+    ],
+    "warnings": [
+      "symbol graph is stale: the index changed since 'graph build'; rerun 'ast-index graph build'"
+    ]
+  },
+  "references": [],
+  "schema_version": 2,
+  "symbols": [
+    {
+      "kind": "class",
+      "line": 1,
+      "name": "ApplicationService",
+      "path": "app/services/application_service.rb",
+      "rank": {
+        "blended": 0.925,
+        "components": [
+          {
+            "name": "pagerank",
+            "value": 0.917
+          }
+        ],
+        "graph": {
+          "dependents": 8,
+          "dependents_depth": 3,
+          "dependents_pct": 91.7,
+          "fan_in": 3,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 3,
+          "fan_in_files_pct": 75.0,
+          "fan_out": 0,
+          "fan_out_ambiguous": 0,
+          "granularity": "symbol",
+          "in_graph": true,
+          "labels": [
+            "fan-in:elevated",
+            "dependents:high",
+            "pagerank:high"
+          ],
+          "pagerank": 2.97696,
+          "pagerank_pct": 91.7
+        },
+        "relevance_rank": 1,
+        "score": 0.917,
+        "tier": "name"
+      },
+      "signature": "class ApplicationService"
+    },
+    {
+      "kind": "class",
+      "line": 2,
+      "name": "Billing::ChargeService",
+      "path": "app/services/billing/charge_service.rb",
+      "rank": {
+        "blended": 0.316,
+        "components": [
+          {
+            "name": "pagerank",
+            "value": 0.25
+          }
+        ],
+        "graph": {
+          "dependents": 4,
+          "dependents_depth": 3,
+          "dependents_pct": 25.0,
+          "fan_in": 4,
+          "fan_in_ambiguous": 0,
+          "fan_in_files": 3,
+          "fan_in_files_pct": 75.0,
+          "fan_out": 1,
+          "fan_out_ambiguous": 0,
+          "granularity": "symbol",
+          "in_graph": true,
+          "labels": [
+            "fan-in:elevated"
+          ],
+          "pagerank": 1.828778,
+          "pagerank_pct": 25.0
+        },
+        "relevance_rank": 3,
+        "score": 0.25,
+        "tier": "name"
+      },
+      "signature": "class ChargeService < ApplicationService"
+    }
+  ]
+}

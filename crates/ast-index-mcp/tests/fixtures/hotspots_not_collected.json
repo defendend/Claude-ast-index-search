@@ -1,0 +1,14 @@
+{
+  "commits_analyzed": 0,
+  "files_with_history": 0,
+  "paths_in_history": 0,
+  "sort": "score",
+  "schema_version": 2,
+  "items": [],
+  "pagination": {
+    "total": 0,
+    "returned": 0,
+    "truncated": false,
+    "limit": 20
+  }
+}

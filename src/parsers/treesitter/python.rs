@@ -4,7 +4,10 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{
+    line_text, node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser,
+    NonCode,
+};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -19,7 +22,48 @@ pub static PYTHON_PARSER: PythonParser = PythonParser;
 
 pub struct PythonParser;
 
+/// Comments and string literals, docstrings included; only the `{...}` of
+/// an f-string is code.
+static PY_NON_CODE: NonCode = NonCode {
+    language: &PY_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string"],
+    code: &["interpolation"],
+    keep: names_class,
+    declared: super::declares_nothing,
+};
+
+/// A string that is exactly a dotted name ending in a class-like name
+/// (`"Config"`, `"pkg.models.User"`), kept whole: a forward-referenced
+/// annotation, an `__all__` entry, a `mock.patch` target. Upper-case
+/// strings (`"GET"`, `"M"`) are data.
+fn names_class(content: &str, string: tree_sitter::Node) -> Vec<std::ops::Range<usize>> {
+    let mut cursor = string.walk();
+    let mut parts = string
+        .named_children(&mut cursor)
+        .filter(|part| !matches!(part.kind(), "string_start" | "string_end"));
+    let (Some(only), None) = (parts.next(), parts.next()) else {
+        return Vec::new();
+    };
+    let text = node_text(content, &only);
+    let dotted = text.split('.').all(|segment| {
+        segment.starts_with(|c: char| c.is_alphabetic() || c == '_')
+            && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
+    });
+    let last = text.rsplit('.').next().unwrap_or(text);
+    let class_like = last.starts_with(char::is_uppercase) && last.chars().any(char::is_lowercase);
+    if only.kind() == "string_content" && dotted && class_like {
+        vec![string.byte_range()]
+    } else {
+        Vec::new()
+    }
+}
+
 impl LanguageParser for PythonParser {
+    fn non_code(&self) -> Option<&'static NonCode> {
+        Some(&PY_NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &PY_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -51,6 +95,7 @@ impl LanguageParser for PythonParser {
         let idx_decorated_method_name = idx("decorated_method_name");
         let idx_assignment_name = idx("assignment_name");
         let idx_assignment_value = idx("assignment_value");
+        let idx_definition = idx("definition");
 
         let mut emitted_classes = std::collections::HashSet::new();
         let mut emitted_funcs = std::collections::HashSet::new();
@@ -58,6 +103,8 @@ impl LanguageParser for PythonParser {
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Import: import X
             if let Some(cap) = find_capture(m, idx_import_name) {
                 let name = node_text(content, &cap.node);
@@ -66,8 +113,9 @@ impl LanguageParser for PythonParser {
                     name: name.to_string(),
                     kind: SymbolKind::Import,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -84,6 +132,7 @@ impl LanguageParser for PythonParser {
                     line,
                     signature: sig.clone(),
                     parents: vec![],
+                    end_line,
                 });
 
                 if let Some(alias_cap) = find_capture(m, idx_import_alias_name) {
@@ -94,6 +143,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: sig,
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -111,6 +161,7 @@ impl LanguageParser for PythonParser {
                     line,
                     signature: sig.clone(),
                     parents: vec![],
+                    end_line,
                 });
 
                 for cap in m
@@ -126,6 +177,7 @@ impl LanguageParser for PythonParser {
                             line,
                             signature: sig.clone(),
                             parents: vec![],
+                            end_line,
                         });
                     }
                 }
@@ -144,6 +196,7 @@ impl LanguageParser for PythonParser {
                     line,
                     signature: sig.clone(),
                     parents: vec![],
+                    end_line,
                 });
 
                 if let Some(name_cap) = find_capture(m, idx_import_from_aliased_name) {
@@ -154,6 +207,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: sig,
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -171,8 +225,9 @@ impl LanguageParser for PythonParser {
                         name: name.to_string(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents,
+                        end_line,
                     });
                 }
                 continue;
@@ -188,8 +243,9 @@ impl LanguageParser for PythonParser {
                         name: format!("@{}", name),
                         kind: SymbolKind::Annotation,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -206,8 +262,9 @@ impl LanguageParser for PythonParser {
                         name: format!("@{}", name),
                         kind: SymbolKind::Annotation,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -222,8 +279,9 @@ impl LanguageParser for PythonParser {
                         name: name.to_string(),
                         kind: SymbolKind::Function,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -238,8 +296,9 @@ impl LanguageParser for PythonParser {
                         name: name.to_string(),
                         kind: SymbolKind::Function,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -253,8 +312,9 @@ impl LanguageParser for PythonParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -267,8 +327,9 @@ impl LanguageParser for PythonParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -294,6 +355,7 @@ impl LanguageParser for PythonParser {
                             line,
                             signature: sig,
                             parents: vec![],
+                            end_line,
                         });
                         continue;
                     }
@@ -306,6 +368,7 @@ impl LanguageParser for PythonParser {
                         line,
                         signature: sig,
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;

@@ -15,6 +15,8 @@ pub mod android;
 pub mod changed;
 pub mod explore;
 pub mod files;
+pub mod git_signals;
+pub mod graph;
 pub mod grep;
 pub mod index;
 pub mod ios;
@@ -22,9 +24,13 @@ pub mod management;
 pub mod modules;
 pub mod perl;
 pub mod project_info;
+pub mod rank;
+pub mod test_paths;
 pub mod watch;
 
-use std::collections::HashSet;
+pub use test_paths::{is_test_path, is_test_symbol};
+
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -32,9 +38,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use crossbeam_channel as channel;
+use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_searcher::MmapChoice;
-use grep_searcher::{sinks::UTF8, SearcherBuilder};
+use grep_searcher::{
+    sinks::{Bytes, UTF8},
+    Searcher, SearcherBuilder, Sink,
+};
 use ignore::WalkBuilder;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
@@ -200,6 +210,12 @@ impl PathResolver {
             }
         }
         roots
+    }
+
+    /// Whether a stored `root_path` belongs to the primary project root
+    /// rather than to an attached subtree.
+    pub fn is_primary_root(&self, root_path: Option<&str>) -> bool {
+        root_path.map_or(true, |root| root == self.primary_key)
     }
 
     pub fn subtree_name(&self, root_path: Option<&str>) -> Option<&str> {
@@ -390,7 +406,8 @@ pub fn relative_path(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
-/// Fast parallel file search using grep-searcher and ignore crates
+/// Fast parallel file search using grep-searcher and ignore crates. Like
+/// every grep-based walk here, it never reads minified files.
 pub fn search_files<F>(root: &Path, pattern: &str, extensions: &[&str], handler: F) -> Result<()>
 where
     F: FnMut(&Path, usize, &str),
@@ -413,6 +430,142 @@ pub fn search_files_in<F>(
     roots: &[PathBuf],
     pattern: &str,
     extensions: &[&str],
+    handler: F,
+) -> Result<()>
+where
+    F: FnMut(&Path, usize, &str),
+{
+    search_files_in_kept(
+        root,
+        roots,
+        pattern,
+        extensions,
+        None,
+        &|_, _| true,
+        handler,
+    )
+}
+
+/// The words of every indexed file of the primary root, for telling files
+/// that cannot contain a literal apart without opening them: see
+/// [`crate::indexer::content_words`].
+pub struct WordIndex {
+    root: PathBuf,
+    /// Primary-root relative path -> (mtime, size, words) as indexed.
+    files: HashMap<String, (i64, i64, String)>,
+}
+
+impl WordIndex {
+    /// `None` when the index keeps no words.
+    pub fn load(root: &Path, conn: &Connection) -> Result<Option<Self>> {
+        let root_key = db::normalize_root_for_storage(root);
+        let Some(rows) = db::load_file_words(conn, &root_key)? else {
+            return Ok(None);
+        };
+        let files = rows
+            .into_iter()
+            .map(|(path, mtime, size, words)| (path, (mtime, size, words)))
+            .collect();
+        Ok(Some(Self {
+            root: root.to_path_buf(),
+            files,
+        }))
+    }
+
+    /// A filter for files that may contain one of `literals`. `None` when a
+    /// literal has no word runs (`->`), since nothing can be skipped then.
+    pub fn prefilter(&self, literals: &[&str]) -> Option<WordPrefilter<'_>> {
+        let mut runs: Vec<String> = Vec::new();
+        let mut literal_runs = Vec::new();
+        for literal in literals {
+            let own = crate::indexer::literal_word_runs(literal);
+            if own.is_empty() {
+                return None;
+            }
+            literal_runs.push(
+                own.into_iter()
+                    .map(|run| match runs.iter().position(|known| *known == run) {
+                        Some(at) => at,
+                        None => {
+                            runs.push(run);
+                            runs.len() - 1
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if literal_runs.is_empty() {
+            return None;
+        }
+        let runs = regex::RegexSet::new(runs.iter().map(|run| regex::escape(run))).ok()?;
+        Some(WordPrefilter {
+            index: self,
+            runs,
+            literal_runs,
+        })
+    }
+}
+
+/// Files of a [`WordIndex`] that cannot contain any of some literals.
+///
+/// A file is skipped only while it is exactly the version the index read
+/// (same mtime and size) and, for every literal, one of the literal's word
+/// runs occurs in none of its words. Files the index does not hold, changed
+/// files and files under attached subtrees are searched as before, so a
+/// search over the tree finds what it found without the filter.
+pub struct WordPrefilter<'a> {
+    index: &'a WordIndex,
+    runs: regex::RegexSet,
+    /// For each literal, the indices of its runs in `runs`.
+    literal_runs: Vec<Vec<usize>>,
+}
+
+impl WordPrefilter<'_> {
+    /// Whether `path` has to be searched.
+    pub fn may_contain(&self, path: &Path) -> bool {
+        let Some(rel) = path
+            .strip_prefix(&self.index.root)
+            .ok()
+            .and_then(Path::to_str)
+        else {
+            return true;
+        };
+        let Some((mtime, size, words)) = self.index.files.get(rel) else {
+            return true;
+        };
+        let found = self.runs.matches(words);
+        if self
+            .literal_runs
+            .iter()
+            .any(|runs| runs.iter().all(|&run| found.matched(run)))
+        {
+            return true;
+        }
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return true;
+        };
+        let current_mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        current_mtime != Some(*mtime) || metadata.len() as i64 != *size
+    }
+}
+
+/// [`search_files_in`] with a line filter that runs on the search threads.
+///
+/// `keep` sees the same trimmed line `handler` would, and a line it rejects
+/// never reaches `handler`. Filtering there instead of in `handler` spreads a
+/// costly per-line check (a capturing regex) over every search thread rather
+/// than serialising it on the one thread that drains the results.
+pub fn search_files_in_kept<F>(
+    root: &Path,
+    roots: &[PathBuf],
+    pattern: &str,
+    extensions: &[&str],
+    prefilter: Option<&WordPrefilter<'_>>,
+    keep: &(dyn Fn(&Path, &str) -> bool + Sync),
     mut handler: F,
 ) -> Result<()>
 where
@@ -473,18 +626,25 @@ where
                         let path = entry.path();
                         if let Some(ext) = path.extension() {
                             // Fast O(1) HashSet lookup
-                            if extensions.contains(ext.to_str().unwrap_or("")) {
+                            if extensions.contains(ext.to_str().unwrap_or(""))
+                                && prefilter.map_or(true, |filter| filter.may_contain(path))
+                            {
                                 let path_arc: Arc<Path> = Arc::from(path);
 
-                                let _ = searcher.search_path(
+                                search_source_file(
+                                    &mut searcher,
                                     &matcher,
                                     path,
                                     UTF8(|line_num, line| {
+                                        let line = line.trim_end();
+                                        if !keep(path, line) {
+                                            return Ok(true);
+                                        }
                                         if tx
                                             .send((
                                                 Arc::clone(&path_arc),
                                                 line_num as usize,
-                                                line.trim_end().to_string(),
+                                                line.to_string(),
                                             ))
                                             .is_err()
                                         {
@@ -537,6 +697,30 @@ where
     )
 }
 
+/// [`search_files_page`] skipping files `prefilter` rules out.
+pub fn search_files_page_prefiltered<T, F>(
+    root: &Path,
+    pattern: &str,
+    extensions: &[&str],
+    limit: usize,
+    prefilter: Option<&WordPrefilter<'_>>,
+    filter_map: F,
+) -> Result<Page<T>>
+where
+    F: FnMut(&Path, usize, &str) -> Option<T>,
+{
+    search_files_page_in_kept(
+        root,
+        std::slice::from_ref(&root.to_path_buf()),
+        pattern,
+        extensions,
+        limit,
+        prefilter,
+        &|_, _| true,
+        filter_map,
+    )
+}
+
 /// `search_files_page` over several roots; see [`search_files_in`].
 pub fn search_files_page_in<T, F>(
     root: &Path,
@@ -544,6 +728,34 @@ pub fn search_files_page_in<T, F>(
     pattern: &str,
     extensions: &[&str],
     limit: usize,
+    filter_map: F,
+) -> Result<Page<T>>
+where
+    F: FnMut(&Path, usize, &str) -> Option<T>,
+{
+    search_files_page_in_kept(
+        root,
+        roots,
+        pattern,
+        extensions,
+        limit,
+        None,
+        &|_, _| true,
+        filter_map,
+    )
+}
+
+/// [`search_files_page_in`] with a `keep` filter run on the search threads;
+/// see [`search_files_in_kept`].
+#[allow(clippy::too_many_arguments)]
+pub fn search_files_page_in_kept<T, F>(
+    root: &Path,
+    roots: &[PathBuf],
+    pattern: &str,
+    extensions: &[&str],
+    limit: usize,
+    prefilter: Option<&WordPrefilter<'_>>,
+    keep: &(dyn Fn(&Path, &str) -> bool + Sync),
     mut filter_map: F,
 ) -> Result<Page<T>>
 where
@@ -551,15 +763,43 @@ where
 {
     let mut items = Vec::with_capacity(limit.min(1024));
     let mut total = 0usize;
-    search_files_in(root, roots, pattern, extensions, |path, line_num, line| {
-        if let Some(item) = filter_map(path, line_num, line) {
-            total = total.saturating_add(1);
-            if items.len() < limit {
-                items.push(item);
+    search_files_in_kept(
+        root,
+        roots,
+        pattern,
+        extensions,
+        prefilter,
+        keep,
+        |path, line_num, line| {
+            if let Some(item) = filter_map(path, line_num, line) {
+                total = total.saturating_add(1);
+                if items.len() < limit {
+                    items.push(item);
+                }
             }
-        }
-    })?;
+        },
+    )?;
     Ok(Page::new(items, total, limit))
+}
+
+/// Runs `searcher` over `path` unless it is minified. A file type minifiers
+/// emit is read once, and the same bytes are both judged and searched.
+fn search_source_file<S: Sink>(
+    searcher: &mut Searcher,
+    matcher: &RegexMatcher,
+    path: &Path,
+    sink: S,
+) {
+    if crate::minified::judged_by_content(path) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        if !crate::minified::skip(path, Some(&bytes)) {
+            let _ = searcher.search_slice(matcher, &bytes, sink);
+        }
+    } else if !crate::minified::skip_by_name(path) {
+        let _ = searcher.search_path(matcher, path, sink);
+    }
 }
 
 /// Fast parallel file search with early termination support
@@ -574,29 +814,7 @@ where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
-    let no_ignore = try_is_no_ignore_enabled(root)?;
-    let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
-    let arc_root = if no_ignore {
-        None
-    } else {
-        crate::indexer::find_arc_root(root)
-    };
-
-    let mut wb = WalkBuilder::new(root);
-    wb.hidden(true)
-        .git_ignore(use_git)
-        .git_exclude(use_git)
-        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
-        .threads(num_cpus());
-    if let Some(ref arc) = arc_root {
-        wb.add_custom_ignore_filename(".gitignore");
-        wb.add_custom_ignore_filename(".arcignore");
-        let root_gitignore = arc.join(".gitignore");
-        if root_gitignore.exists() {
-            wb.add_ignore(root_gitignore);
-        }
-    }
-    let walker = wb.build_parallel();
+    let walker = project_walker(root)?;
 
     let (tx, rx) = channel::bounded::<(Arc<Path>, usize, String)>(limit.max(1000));
 
@@ -634,7 +852,8 @@ where
                         let found_count = Arc::clone(&found_count);
                         let should_stop = Arc::clone(&should_stop);
 
-                        let _ = searcher.search_path(
+                        search_source_file(
+                            &mut searcher,
                             &matcher,
                             path,
                             UTF8(|line_num, line| {
@@ -676,4 +895,254 @@ where
     }
 
     Ok(())
+}
+
+/// Every file under `root` with one of `extensions`, in path order, under the
+/// ignore rules the indexer applies.
+///
+/// The tree is walked in parallel and sorted afterwards, so the order does not
+/// depend on which thread reached a file first.
+pub fn project_source_files(root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
+    let walker = project_walker(root)?;
+    let extensions: HashSet<&str> = extensions.iter().copied().collect();
+    let (tx, rx) = channel::unbounded::<PathBuf>();
+    walker.run(|| {
+        let tx = tx.clone();
+        let extensions = &extensions;
+        Box::new(move |entry| {
+            if let Ok(entry) = entry {
+                let wanted = entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| extensions.contains(ext.to_str().unwrap_or("")));
+                if wanted {
+                    let _ = tx.send(entry.into_path());
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    drop(tx);
+    let mut files: Vec<PathBuf> = rx.into_iter().collect();
+    files.sort_unstable();
+    Ok(files)
+}
+
+/// A line one of the [`search_files_limited_each`] patterns matched.
+struct PatternHit {
+    pattern: usize,
+    line_num: usize,
+    text: String,
+}
+
+/// Several searches over `files` answered by one pass, with a fixed outcome.
+///
+/// Each of `patterns` gets the first `limit` lines that it matches and `keep`
+/// accepts, taking `files` in the given order and lines in file order, and
+/// `handler` receives them in that order with the pattern's index. Filtering
+/// through `keep` rather than in `handler` makes `limit` count only the lines
+/// the caller wants.
+///
+/// Files are searched in parallel, but a file's lines are handed over only
+/// once every file before it has been searched, so the outcome does not depend
+/// on which thread finished first. Files stop being searched once every
+/// pattern has its lines.
+///
+/// The search is for `candidates`, which must match every line any of the
+/// patterns matches; each candidate line is then tested against the patterns
+/// one by one. A pattern comes with a literal that all of its matches contain,
+/// checked first because a substring test is far cheaper than the pattern.
+///
+/// Minified files among `files` are passed over without a hit.
+pub fn search_files_limited_each<K, F>(
+    files: &[PathBuf],
+    candidates: &str,
+    patterns: &[(String, String)],
+    limit: usize,
+    keep: K,
+    handler: F,
+) -> Result<()>
+where
+    K: Fn(usize, &Path, &str) -> bool + Sync,
+    F: FnMut(usize, &Path, usize, &str),
+{
+    search_files_limited_each_prefiltered(files, candidates, patterns, limit, None, keep, handler)
+}
+
+/// [`search_files_limited_each`] skipping, without opening them, the files
+/// `prefilter` rules out. A skipped file counts as searched with no lines,
+/// so the order in which lines are taken stays the same.
+pub fn search_files_limited_each_prefiltered<K, F>(
+    files: &[PathBuf],
+    candidates: &str,
+    patterns: &[(String, String)],
+    limit: usize,
+    prefilter: Option<&WordPrefilter<'_>>,
+    keep: K,
+    mut handler: F,
+) -> Result<()>
+where
+    K: Fn(usize, &Path, &str) -> bool + Sync,
+    F: FnMut(usize, &Path, usize, &str),
+{
+    let matcher = RegexMatcher::new(candidates).context("Invalid regex pattern")?;
+    let exact = patterns
+        .iter()
+        .map(|(pattern, _)| RegexMatcher::new(pattern).context("Invalid regex pattern"))
+        .collect::<Result<Vec<_>>>()?;
+    let required = patterns
+        .iter()
+        .map(|(_, literal)| regex::bytes::Regex::new(&regex::escape(literal)))
+        .collect::<Result<Vec<_>, _>>()?;
+    if patterns.is_empty() || limit == 0 || files.is_empty() {
+        return Ok(());
+    }
+
+    let satisfied: Vec<AtomicBool> = patterns.iter().map(|_| AtomicBool::new(false)).collect();
+    let stop = AtomicBool::new(false);
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = channel::bounded::<(usize, Vec<PatternHit>)>(1024);
+
+    std::thread::scope(|scope| -> Result<()> {
+        let mut workers = Vec::new();
+        for _ in 0..num_cpus().min(files.len()) {
+            let tx = tx.clone();
+            let (matcher, exact, required) = (&matcher, &exact, &required);
+            let (satisfied, stop, next, keep) = (&satisfied, &stop, &next, &keep);
+            workers.push(scope.spawn(move || {
+                // SAFETY: memory-mapped files are safe when files aren't modified during search
+                let mut searcher = SearcherBuilder::new()
+                    .memory_map(unsafe { MmapChoice::auto() })
+                    .line_number(true)
+                    .build();
+                while !stop.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = files.get(index) else {
+                        break;
+                    };
+                    let mut hits = Vec::new();
+                    if prefilter.is_some_and(|filter| !filter.may_contain(path)) {
+                        if tx.send((index, hits)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    // Lines past a pattern's `limit` in one file can never be
+                    // taken. A pattern already satisfied by earlier files is
+                    // skipped too: every file before this one had been
+                    // searched when that was decided.
+                    let mut taken = vec![0usize; exact.len()];
+                    // A separate search would abort the whole file at the
+                    // first non-UTF-8 line it matched; this marks the patterns
+                    // that did.
+                    let mut abandoned = vec![false; exact.len()];
+                    search_source_file(
+                        &mut searcher,
+                        matcher,
+                        path,
+                        Bytes(|line_num, bytes| {
+                            let line = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+                            let text = std::str::from_utf8(bytes).ok();
+                            let mut open = false;
+                            for index in 0..exact.len() {
+                                if abandoned[index]
+                                    || taken[index] >= limit
+                                    || satisfied[index].load(Ordering::Relaxed)
+                                {
+                                    continue;
+                                }
+                                open = true;
+                                if !required[index].is_match(line)
+                                    || !exact[index].is_match(line).unwrap_or(false)
+                                {
+                                    continue;
+                                }
+                                let Some(text) = text else {
+                                    abandoned[index] = true;
+                                    continue;
+                                };
+                                let text = text.trim_end();
+                                if !keep(index, path, text) {
+                                    continue;
+                                }
+                                taken[index] += 1;
+                                hits.push(PatternHit {
+                                    pattern: index,
+                                    line_num: line_num as usize,
+                                    text: text.to_string(),
+                                });
+                            }
+                            Ok(open && !stop.load(Ordering::Relaxed))
+                        }),
+                    );
+                    if tx.send((index, hits)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(tx);
+
+        let mut taken = vec![0usize; patterns.len()];
+        let mut open = patterns.len();
+        let mut pending = HashMap::new();
+        let mut frontier = 0usize;
+        'files: for (index, hits) in &rx {
+            pending.insert(index, hits);
+            while let Some(hits) = pending.remove(&frontier) {
+                let path = &files[frontier];
+                frontier += 1;
+                for hit in hits {
+                    if taken[hit.pattern] == limit {
+                        continue;
+                    }
+                    handler(hit.pattern, path, hit.line_num, &hit.text);
+                    taken[hit.pattern] += 1;
+                    if taken[hit.pattern] == limit {
+                        satisfied[hit.pattern].store(true, Ordering::Relaxed);
+                        open -= 1;
+                    }
+                }
+                if open == 0 {
+                    stop.store(true, Ordering::Relaxed);
+                    break 'files;
+                }
+            }
+        }
+        drop(rx);
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("parallel file search worker panicked"))?;
+        }
+        Ok(())
+    })
+}
+
+/// Parallel walker over the primary root with the ignore rules the indexer
+/// applies, or none when the index was built with `--no-ignore`.
+fn project_walker(root: &Path) -> Result<ignore::WalkParallel> {
+    let no_ignore = try_is_no_ignore_enabled(root)?;
+    let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
+    let arc_root = if no_ignore {
+        None
+    } else {
+        crate::indexer::find_arc_root(root)
+    };
+
+    let mut wb = WalkBuilder::new(root);
+    wb.hidden(true)
+        .git_ignore(use_git)
+        .git_exclude(use_git)
+        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
+        .threads(num_cpus());
+    if let Some(ref arc) = arc_root {
+        wb.add_custom_ignore_filename(".gitignore");
+        wb.add_custom_ignore_filename(".arcignore");
+        let root_gitignore = arc.join(".gitignore");
+        if root_gitignore.exists() {
+            wb.add_ignore(root_gitignore);
+        }
+    }
+    Ok(wb.build_parallel())
 }

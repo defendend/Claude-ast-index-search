@@ -97,7 +97,7 @@ class LaterImpl : LaterFeature
         );
     }
 
-    let file_symbols = db::get_file_symbols(&conn, "src/T3.kt").unwrap();
+    let file_symbols = db::get_file_symbols(&conn, None, "src/T3.kt").unwrap();
     assert_eq!(
         file_symbols
             .iter()

@@ -4,7 +4,9 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{
+    line_text, node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser,
+};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -45,6 +47,7 @@ impl LanguageParser for GdscriptParser {
         let idx_var_name = idx("var_name");
         let idx_export_var_name = idx("export_var_name");
         let idx_onready_var_name = idx("onready_var_name");
+        let idx_definition = idx("definition");
 
         // Track extends for class parents
         let mut extends_parent: Option<String> = None;
@@ -58,19 +61,21 @@ impl LanguageParser for GdscriptParser {
         }
 
         // Find constructor_definition nodes (they have no name field, always _init)
-        let mut constructor_lines = std::collections::HashSet::new();
+        let mut constructor_lines = std::collections::BTreeMap::new();
         {
             let mut walk = tree.root_node().walk();
             fn find_constructors(
+                content: &str,
                 cursor: &mut tree_sitter::TreeCursor,
-                lines: &mut std::collections::HashSet<usize>,
+                lines: &mut std::collections::BTreeMap<usize, usize>,
             ) {
                 if cursor.node().kind() == "constructor_definition" {
-                    lines.insert(cursor.node().start_position().row + 1);
+                    let node = cursor.node();
+                    lines.insert(node.start_position().row + 1, text_end_line(content, &node));
                 }
                 if cursor.goto_first_child() {
                     loop {
-                        find_constructors(cursor, lines);
+                        find_constructors(content, cursor, lines);
                         if !cursor.goto_next_sibling() {
                             break;
                         }
@@ -78,15 +83,16 @@ impl LanguageParser for GdscriptParser {
                     cursor.goto_parent();
                 }
             }
-            find_constructors(&mut walk, &mut constructor_lines);
+            find_constructors(content, &mut walk, &mut constructor_lines);
         }
-        for line in &constructor_lines {
+        for (line, end_line) in &constructor_lines {
             symbols.push(ParsedSymbol {
                 name: "_init".to_string(),
                 kind: SymbolKind::Function,
                 line: *line,
                 signature: line_text(content, *line).trim().to_string(),
                 parents: vec![],
+                end_line: Some(*end_line),
             });
         }
 
@@ -95,6 +101,8 @@ impl LanguageParser for GdscriptParser {
         let mut matches = cursor2.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // class_name MyClass
             if let Some(cap) = find_capture(m, idx_class_name_decl) {
                 let name = node_text(content, &cap.node);
@@ -103,12 +111,15 @@ impl LanguageParser for GdscriptParser {
                     .as_ref()
                     .map(|p| vec![(p.clone(), "extends".to_string())])
                     .unwrap_or_default();
+                // `class_name` names the whole script: every function of the
+                // file is a method of that class.
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents,
+                    end_line: Some(text_end_line(content, &tree.root_node())),
                 });
                 continue;
             }
@@ -121,8 +132,9 @@ impl LanguageParser for GdscriptParser {
                     name: name.to_string(),
                     kind: SymbolKind::Class,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -135,8 +147,9 @@ impl LanguageParser for GdscriptParser {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -149,8 +162,9 @@ impl LanguageParser for GdscriptParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -163,8 +177,9 @@ impl LanguageParser for GdscriptParser {
                     name: name.to_string(),
                     kind: SymbolKind::Enum,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -177,8 +192,9 @@ impl LanguageParser for GdscriptParser {
                     name: name.to_string(),
                     kind: SymbolKind::Constant,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -194,8 +210,9 @@ impl LanguageParser for GdscriptParser {
                     name: name.to_string(),
                     kind: SymbolKind::Property,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }

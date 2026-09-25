@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
-use super::{line_text, node_line, node_text, parse_tree, LanguageParser};
+use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
 use crate::parsers::ParsedSymbol;
 
@@ -19,7 +19,21 @@ pub static ELIXIR_PARSER: ElixirParser = ElixirParser;
 
 pub struct ElixirParser;
 
+/// Comments, strings, charlists and sigils, `@doc` heredocs included; the interpolations are code.
+static NON_CODE: super::NonCode = super::NonCode {
+    language: &ELIXIR_LANGUAGE,
+    prose: &["comment"],
+    strings: &["string", "charlist", "sigil"],
+    code: &["interpolation"],
+    keep: super::keep_no_string,
+    declared: super::declares_nothing,
+};
+
 impl LanguageParser for ElixirParser {
+    fn non_code(&self) -> Option<&'static super::NonCode> {
+        Some(&NON_CODE)
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &ELIXIR_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -48,10 +62,13 @@ impl LanguageParser for ElixirParser {
         let idx_attr_name_simple = idx("attr_name_simple");
         let idx_impl_call = idx("impl_call");
         let idx_impl_protocol = idx("impl_protocol");
+        let idx_definition = idx("definition");
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
         while let Some(m) = matches.next() {
+            let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
             // Module / Protocol definition: defmodule MyModule / defprotocol MyProtocol
             if let Some(type_cap) = find_capture(m, idx_call_type) {
                 let call_type = node_text(content, &type_cap.node);
@@ -67,8 +84,9 @@ impl LanguageParser for ElixirParser {
                         name: name.to_string(),
                         kind,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -85,8 +103,9 @@ impl LanguageParser for ElixirParser {
                             name: format!("{}(impl)", name),
                             kind: SymbolKind::Class,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![(name.to_string(), "implements".to_string())],
+                            end_line,
                         });
                     }
                 }
@@ -104,8 +123,9 @@ impl LanguageParser for ElixirParser {
                             name: name.to_string(),
                             kind: SymbolKind::Function,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
+                            end_line,
                         });
                     }
                 }
@@ -123,8 +143,9 @@ impl LanguageParser for ElixirParser {
                             name: name.to_string(),
                             kind: SymbolKind::Function,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
+                            end_line,
                         });
                     }
                 }
@@ -142,8 +163,9 @@ impl LanguageParser for ElixirParser {
                             name: name.to_string(),
                             kind: SymbolKind::Function,
                             line,
-                            signature: line_text(content, line).trim().to_string(),
+                            signature: signature_line(content, line),
                             parents: vec![],
+                            end_line,
                         });
                     }
                 }
@@ -159,8 +181,9 @@ impl LanguageParser for ElixirParser {
                         name: "defstruct".to_string(),
                         kind: SymbolKind::Class,
                         line,
-                        signature: line_text(content, line).trim().to_string(),
+                        signature: signature_line(content, line),
                         parents: vec![],
+                        end_line,
                     });
                 }
                 continue;
@@ -181,8 +204,9 @@ impl LanguageParser for ElixirParser {
                     name: format!("@{}", attr),
                     kind,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
@@ -202,8 +226,9 @@ impl LanguageParser for ElixirParser {
                     name: format!("@{}", attr),
                     kind,
                     line,
-                    signature: line_text(content, line).trim().to_string(),
+                    signature: signature_line(content, line),
                     parents: vec![],
+                    end_line,
                 });
                 continue;
             }
