@@ -934,6 +934,13 @@ pub fn detect_stacks(root: &Path) -> StackDetection {
 /// `stats`.
 pub const PROJECT_LABEL_KEY: &str = "project_label";
 
+/// Record [`project_label`] of the primary `root` for `stats` and `map`.
+/// Called by `rebuild` for the primary root only, never for an extra root
+/// or subtree indexed into the same database.
+pub fn record_project_label(conn: &Connection, root: &Path) -> Result<()> {
+    db::set_metadata_value(conn, PROJECT_LABEL_KEY, &project_label(root))
+}
+
 /// What `stats` and `map` call the project: the stacks [`detect_stacks`]
 /// finds, joined (`Ruby + Web (TypeScript/JavaScript)`), or the
 /// [`detect_project_type`] label when no stack marker is present.
@@ -2168,9 +2175,6 @@ fn index_directory_scoped_with_max_depth(
         );
     }
     record_minified_filter(conn)?;
-    if walk_dir == root {
-        db::set_metadata_value(conn, PROJECT_LABEL_KEY, &project_label(root))?;
-    }
 
     Ok(WalkResult {
         file_count: total_count,

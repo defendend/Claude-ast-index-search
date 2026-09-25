@@ -251,3 +251,23 @@ fn qualified_names_of_both_kinds_resolve_and_an_exact_name_still_wins() {
         ["Billing::Invoice"]
     );
 }
+
+#[test]
+fn a_parent_named_like_the_declared_segment_stays_a_reference() {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    for (path, content) in [
+        ("app/models/user.rb", "class User\nend\n"),
+        (
+            "app/models/admin/user.rb",
+            "class Admin::User < User\nend\n",
+        ),
+    ] {
+        let path = project.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    run(project.path(), cache.path(), &["rebuild"]);
+    let usages = run(project.path(), cache.path(), &["usages", "User"]);
+    assert!(usages.contains("app/models/admin/user.rb:1"), "{usages}");
+}

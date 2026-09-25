@@ -558,22 +558,28 @@ const TEST_CANDIDATES_PER_PATTERN: usize = 50;
 /// Directory names that hold tests rather than mirror the source tree.
 const TEST_ROOT_DIRS: &[&str] = &["spec", "specs", "test", "tests", "__tests__", "src"];
 
-/// The candidates whose directory ends like the source's: the most trailing
-/// directory names in common, test roots (`spec/`, `tests/`, `__tests__/`)
-/// left out. `app/services/billing/charge.rb` keeps
+/// The candidates whose directory ends like the source's. A test in the
+/// source's own directory (`config_test.go`) ranks first; then the most
+/// trailing directory names in common, test roots (`spec/`, `tests/`,
+/// `__tests__/`, `src/`) left out: `app/services/billing/charge.rb` keeps
 /// `spec/services/billing/charge_spec.rb` over `engines/x/spec/charge_spec.rb`,
 /// and `src/main/java/a/b/X.java` keeps `src/test/java/a/b/XTest.java`. When
-/// no candidate shares a directory — a flat `tests/` — a single candidate is
-/// still the test; several are a guess and none is returned.
+/// no candidate shares a directory — a flat `tests/`, separate `*.Tests`
+/// projects — every candidate is kept.
 fn closest_tests(source: &str, candidates: Vec<String>) -> Vec<String> {
+    let parent = |path: &str| path.rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
     let dirs = |path: &str| -> Vec<String> {
         let mut dirs: Vec<String> = path.split('/').map(str::to_string).collect();
         dirs.pop();
         dirs.retain(|dir| !TEST_ROOT_DIRS.contains(&dir.as_str()));
         dirs
     };
+    let source_parent = parent(source);
     let source_dirs = dirs(source);
     let shared = |candidate: &str| {
+        if parent(candidate) == source_parent {
+            return usize::MAX;
+        }
         dirs(candidate)
             .iter()
             .rev()
@@ -583,11 +589,7 @@ fn closest_tests(source: &str, candidates: Vec<String>) -> Vec<String> {
     };
     let best = candidates.iter().map(|c| shared(c)).max().unwrap_or(0);
     if best == 0 {
-        return if candidates.len() == 1 {
-            candidates
-        } else {
-            Vec::new()
-        };
+        return candidates;
     }
     candidates
         .into_iter()
@@ -1091,8 +1093,14 @@ fn apply_rwr(
     let graph_dependents = super::graph::resolved_dependents_of(conn, &seeds, REF_LIMIT)?;
     for (i, sym) in seeds.iter().enumerate() {
         let sid = g.intern(sym);
-        let callers: Vec<SearchResult> = match &graph_dependents {
-            Some(dependents) => dependents[i].clone(),
+        // A seed the graph resolves no edge to — calls through a receiver of
+        // unknown type in Java, Swift, Go — keeps the name-matched callers.
+        let resolved = graph_dependents
+            .as_ref()
+            .map(|dependents| dependents[i].clone())
+            .filter(|dependents| !dependents.is_empty());
+        let callers: Vec<SearchResult> = match resolved {
+            Some(dependents) => dependents,
             None => {
                 let mut owners = Vec::new();
                 for r in db::find_references(conn, &sym.name, REF_LIMIT)? {
@@ -1489,14 +1497,32 @@ mod tests {
             pick("pkg/core/parser.py", &["tests/test_parser.py"]),
             vec!["tests/test_parser.py"]
         );
-        assert!(pick(
-            "app/adapters/integrations/application/find_adapter.rb",
-            &[
-                "engines/integrations/spec/lib/integrations/adapters/applicants/applicant/find_adapter_spec.rb",
-                "engines/structs/spec/structs/adapters/applicants/applicant/find_adapter_spec.rb",
-            ]
-        )
-        .is_empty());
+        assert_eq!(
+            pick("config.go", &["cmd/tool/config_test.go", "config_test.go"]),
+            vec!["config_test.go"]
+        );
+        assert_eq!(
+            pick(
+                "pkg/lexer.py",
+                &[
+                    "tests/unit/test_lexer.py",
+                    "tests/integration/test_lexer.py"
+                ]
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            pick(
+                "src/App/InvoiceCalculator.cs",
+                &[
+                    "tests/App.UnitTests/InvoiceCalculatorTests.cs",
+                    "tests/App.IntegrationTests/InvoiceCalculatorTests.cs",
+                ]
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]

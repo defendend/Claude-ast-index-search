@@ -654,25 +654,29 @@ const ARCH_PATTERNS: &[(&[&str], &str)] = &[
     (&["/hooks/"], "Hooks pattern"),
 ];
 
-/// Whether the lowercased import name `import` belongs to a [`FRAMEWORK_RULES`]
-/// prefix: the prefix starts the name or follows a `.` `/` `:` `@` separator,
-/// and is not continued by a letter. `androidx.hilt.navigation`, `retrofit2`,
-/// `@jest/globals` and `react-dom` match; `sequel-combine` is no Swift
-/// Combine and `preact` no React.
+/// Whether the import name `import` belongs to a [`FRAMEWORK_RULES`] prefix,
+/// compared case-insensitively: the prefix starts the name or follows a `.`
+/// `/` `:` `@` separator, and is not continued by a letter — unless both
+/// sides are CamelCase words of one module name (`CombineExt`).
+/// `androidx.hilt.navigation`, `retrofit2`, `@jest/globals`, `react-dom` and
+/// `CombineExt` match; `sequel-combine` is no Swift Combine, `preact` and
+/// `ReactiveSwift` no React.
 fn import_matches_rule(import: &str, prefix: &str) -> bool {
+    let lower = import.to_ascii_lowercase();
     if let Some(whole) = prefix.strip_prefix('=') {
-        return import == whole;
+        return lower == whole;
     }
-    import.match_indices(prefix).any(|(at, _)| {
-        let starts_segment = import[..at]
+    lower.match_indices(prefix).any(|(at, _)| {
+        let starts_segment = lower[..at]
             .chars()
             .next_back()
             .is_none_or(|c| matches!(c, '.' | '/' | ':' | '@'));
+        let camel_case = import[at..].starts_with(|c: char| c.is_ascii_uppercase());
         let ends_word = prefix.ends_with('.')
             || import[at + prefix.len()..]
                 .chars()
                 .next()
-                .is_none_or(|c| !c.is_alphabetic());
+                .is_none_or(|c| !c.is_alphabetic() || (camel_case && c.is_uppercase()));
         starts_segment && ends_word
     })
 }
@@ -731,9 +735,8 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
 
         for row in rows.flatten() {
             let (import_name, cnt) = row;
-            let lower = import_name.to_lowercase();
             for &(prefix, category, display) in FRAMEWORK_RULES {
-                if import_matches_rule(&lower, prefix) {
+                if import_matches_rule(&import_name, prefix) {
                     let cat_map = fw_map.entry(category.to_string()).or_default();
                     *cat_map.entry(display.to_string()).or_insert(0) += cnt;
                     break;
@@ -833,17 +836,19 @@ mod tests {
     use super::*;
 
     fn framework(import: &str) -> Option<&'static str> {
-        let lower = import.to_lowercase();
         FRAMEWORK_RULES
             .iter()
-            .find(|(prefix, _, _)| import_matches_rule(&lower, prefix))
+            .find(|(prefix, _, _)| import_matches_rule(import, prefix))
             .map(|&(_, _, display)| display)
     }
 
     #[test]
     fn framework_rules_match_whole_segments_across_ecosystems() {
         assert_eq!(framework("androidx.hilt.navigation.compose"), Some("Hilt"));
-        assert_eq!(framework("kotlinx.coroutines.flow.Flow"), Some("Coroutines"));
+        assert_eq!(
+            framework("kotlinx.coroutines.flow.Flow"),
+            Some("Coroutines")
+        );
         assert_eq!(framework("retrofit2.Retrofit"), Some("Retrofit"));
         assert_eq!(framework("okhttp3.OkHttpClient"), Some("OkHttp"));
         assert_eq!(framework("rx.Observable"), Some("Rx"));
@@ -857,12 +862,15 @@ mod tests {
         assert_eq!(framework("sidekiq/testing"), Some("Sidekiq"));
         assert_eq!(framework("rspec/rails"), Some("RSpec"));
         assert_eq!(framework("django.db.models"), Some("Django"));
+        assert_eq!(framework("CombineExt"), Some("Combine"));
+        assert_eq!(framework("XCTestDynamicOverlay"), Some("XCTest"));
     }
 
     #[test]
     fn framework_rules_skip_names_that_only_contain_the_prefix() {
         assert_eq!(framework("sequel-combine"), Some("Sequel"));
         assert_eq!(framework("preact"), None);
+        assert_eq!(framework("ReactiveSwift"), None);
         assert_eq!(framework("../testing/setup"), None);
         assert_eq!(framework("./combineUtils"), None);
         assert_eq!(framework("shared-testing/spec_helper"), None);

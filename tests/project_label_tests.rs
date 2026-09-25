@@ -50,3 +50,34 @@ fn stats_and_map_name_the_stacks_found_at_rebuild() {
     let map = run(root, cache.path(), &["map"]);
     assert!(map.starts_with(&format!("Project: {label} | ")), "{map}");
 }
+
+#[test]
+fn an_extra_root_does_not_replace_the_primary_project_label() {
+    let project = TempDir::new().unwrap();
+    let extra = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    fs::write(project.path().join("package.json"), "{}\n").unwrap();
+    fs::write(project.path().join("index.ts"), "export const a = 1;\n").unwrap();
+    fs::write(
+        extra.path().join("Gemfile"),
+        "source 'https://rubygems.org'\n",
+    )
+    .unwrap();
+    fs::write(extra.path().join("lib.rb"), "class Lib\nend\n").unwrap();
+    run(project.path(), cache.path(), &["rebuild"]);
+    run(
+        project.path(),
+        cache.path(),
+        &["add-root", extra.path().to_str().unwrap()],
+    );
+    run(project.path(), cache.path(), &["rebuild"]);
+
+    let stats: serde_json::Value = serde_json::from_str(&run(
+        project.path(),
+        cache.path(),
+        &["--format", "json", "stats"],
+    ))
+    .unwrap();
+    let label = stats["project"].as_str().unwrap();
+    assert!(label.contains("Web") && !label.contains("Ruby"), "{label}");
+}

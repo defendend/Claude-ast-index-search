@@ -403,3 +403,44 @@ fn graph_dependents_leave_out_references_to_a_namesake_in_another_namespace() {
     let paths: Vec<&str> = dependents[0].iter().map(|d| d.path.as_str()).collect();
     assert_eq!(paths, vec!["app/services/charge.rb"], "{paths:?}");
 }
+
+#[test]
+fn rwr_keeps_name_matched_callers_where_the_graph_resolves_none() {
+    let project = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let root = project.path();
+    write(root, "pom.xml", "<project/>\n");
+    write(
+        root,
+        "src/main/java/b/Invoice.java",
+        "package b;\n\npublic class Invoice {\n    public void settle() {}\n}\n",
+    );
+    write(
+        root,
+        "src/main/java/b/Payment.java",
+        "package b;\n\npublic class Payment {\n    public void settle() {}\n}\n",
+    );
+    write(
+        root,
+        "src/main/java/b/Billing.java",
+        "package b;\n\npublic class Billing {\n    public void close(Invoice invoice) {\n        invoice.settle();\n    }\n}\n",
+    );
+    assert!(run(root, cache.path(), &["rebuild"]).status.success());
+    assert!(run(root, cache.path(), &["graph", "build"])
+        .status
+        .success());
+    let out = run(
+        root,
+        cache.path(),
+        &["--format", "json", "explore", "settle", "--rwr"],
+    );
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let names = neighbours(&doc);
+    assert!(
+        names.contains(&(
+            "caller".to_string(),
+            "src/main/java/b/Billing.java:close".to_string()
+        )),
+        "{names:?}"
+    );
+}

@@ -738,8 +738,8 @@ exclude:
   `: public acme::Base`, a namespace the index does not define) still match.
 - **A qualified declaration is no usage of itself** — `class
   Billing::Invoice` no longer records a reference to `Invoice` on its own line
-  (a C# `namespace A.B` or protobuf `Outer.Inner` likewise); `Billing` stays a
-  reference. Takes effect on the next `rebuild`.
+  (a C# `namespace A.B` likewise); `Billing` stays a reference, and so does the
+  parent of `class Admin::User < User`. Takes effect on the next `rebuild`.
 - **`stats` and `map` name the project** — `rebuild` records the stacks it
   finds (`Web (TypeScript/JavaScript) + Ruby`), `stats` prints them as
   `Project:` (JSON `project`, which the MCP `stats` tool already expected)
@@ -749,19 +749,21 @@ exclude:
 - **`conventions` matches frameworks on whole name segments** — a rule no
   longer fires on any import that merely contains it: the Ruby gem
   `sequel-combine` is not Swift Combine, `preact` not React, and
-  `../testing/setup` not Go's `testing`. Rails, Django, Flask, FastAPI,
+  `../testing/setup` not Go's `testing`, while `CombineExt` is still Combine. Rails, Django, Flask, FastAPI,
   Express, Sidekiq, Celery, ActiveRecord and Sequel are recognised.
 - **`explore` picks tests from the mirrored directory** — among test files
-  named after the source the ones whose directories end like the source's
-  are kept (`spec/services/billing/charge_spec.rb` for
-  `app/services/billing/charge.rb`, `src/test/java/a/b/XTest.java` for
-  `src/main/java/a/b/X.java`); a flat `tests/` still yields its single match,
-  several unrelated namesakes yield none instead of a guess. Up to 50
-  candidates per name are considered instead of 5.
+  named after the source, one in the source's own directory comes first, then
+  the ones whose directories end like the source's
+  (`spec/services/billing/charge_spec.rb` for `app/services/billing/charge.rb`,
+  `src/test/java/a/b/XTest.java` for `src/main/java/a/b/X.java`); when none
+  shares a directory (a flat `tests/`, separate `*.Tests` projects) all are
+  listed as before. Up to 50 candidates per name are considered instead of 5.
 - **`explore --rwr` takes callers from the symbol graph** — when `graph build`
   ran and the index has not changed since, neighbours are the definitions
   with a resolved edge to each seed instead of every reference sharing its
-  name, which for a namespaced class found none.
+  name, which for a namespaced class found none. A seed the graph resolves no
+  edge to (a call through a receiver of unknown type in Java, Swift, Go)
+  keeps the name-matched callers.
 - **Performance table in the skill shows a large repository** — next to a
   small project; `search` on a 40k-file monorepo takes 250–550 ms, not 10.
 
