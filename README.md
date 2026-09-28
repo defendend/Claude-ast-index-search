@@ -573,6 +573,27 @@ ast-index stats                    # Index statistics
 ast-index version                  # Version info
 ```
 
+### Usage log
+
+Every CLI run and MCP tool call is logged locally, so you can check that
+ast-index is actually being used, and used well. Nothing is sent anywhere:
+the log is `usage.db` in the cache directory, and `AST_INDEX_NO_USAGE=1`
+turns it off.
+
+```bash
+ast-index usage                    # This project: calls in 7d / 30d / all time + per-command table for 30d
+ast-index usage --since 7d         # Table window: 7d, 30d, all, or a number of days
+ast-index usage --all-projects     # Every project in the log
+ast-index --format json usage      # Machine-readable report
+```
+
+Per command you get the number of calls, errors, empty results, p50/p95
+duration, stdout bytes, and for MCP calls the bytes the agent actually
+received after compaction. Each call records its source: `mcp`, `claude-code`
+(the agent's shell), `human` (a terminal) or `script`. Wrappers can set their
+own label with `AST_INDEX_CALLER`. Stdout size is measured only when stdout is
+not a terminal, which covers agents, MCP and pipes.
+
 ## Language-Specific Features
 
 ### TypeScript/JavaScript (new in v3.9)

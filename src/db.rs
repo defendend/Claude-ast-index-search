@@ -131,6 +131,16 @@ fn overridden_db_path() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Where the usage log lives: beside an overridden index file, otherwise in
+/// the cache base so it outlives `clear`, `rebuild` and stale-cache GC of any
+/// single project.
+pub fn usage_db_path() -> Option<PathBuf> {
+    if let Some(db_path) = overridden_db_path() {
+        return db_path.parent().map(|dir| dir.join("usage.db"));
+    }
+    cache_base_dir().map(|base| base.join("usage.db"))
+}
+
 fn project_cache_key(project_root: &Path) -> Result<String> {
     resolve_root_identities(project_root).map(|(normalized, _raw)| simple_hash(&normalized))
 }
