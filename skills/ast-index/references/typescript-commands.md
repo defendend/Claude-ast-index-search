@@ -77,6 +77,13 @@ ast-index imports "component.tsx"   # Show all imports
 ast-index exports "index.ts"        # Show all exports
 ```
 
+`imports` reads the file itself and lists every `import` statement —
+relative, alias (`shared/...`, `@/...`) and package (`react`,
+`lodash/debounce`) alike — plus re-exports (`export * from './a'`), one line
+each, a multi-line `import { … }` joined onto one. The index keeps an import
+symbol only for a project-local specifier (`./a`, `@/a`, `~/a`), so `refs`
+lists those imports and `search` is not flooded with a row per `import React`.
+
 ## Framework-Specific Patterns
 
 ### React
@@ -233,6 +240,31 @@ export { default as Button } from './Button';
 ```
 
 Use `ast-index exports "index.ts"` to see all exports with line numbers.
+
+### Default exports
+
+A default export is indexed under the name the module's code goes by:
+
+| Code | Symbol |
+|------|--------|
+| `export default function useMap() {}`, `export default class Widget {}` | `useMap`, `Widget` — the declared name |
+| `export default () => {}`, `function () {}`, `class {}` in `hooks/useMap.js` | `useMap` — the file name; an `index` file takes its directory's (`Button/index.jsx` → `Button`) |
+| `export default forwardRef((props, ref) => {})` | the file name, as above |
+| `export default memo(Button)`, `connect(mapState)(Button)`, `compose(a, b)(Button)` | `default(Button)` [object] — what the call wraps, never the wrapper |
+| `export default Button` | `default(Button)` [object] |
+| `export default { … }` | `default` [object] |
+| `export default createRouter({ … })` | `createRouter` — the call builds a value rather than wraps one |
+
+The symbol spans the whole exported expression, so the wrapper call and the
+calls inside an inline component are attributed to it in `call-tree`.
+
+An `index` file under a build or source directory takes the name of the
+directory above it: `node_modules/pkg/dist/index.d.ts` and
+`packages/pkg/src/index.ts` → `pkg`. Skipped are `dist`, `build`, `out`,
+`lib`, `src`, `esm`, `cjs`, `es`, `umd`, `amd`, `commonjs`, `module`,
+`esnext`, `types`, `typings`, `declarations`, their variants (`dist-types`,
+`lib.esm`, `types-ts3.8`) and versioned directories (`es2015`, `esm5`,
+`ts3.4`); a package root in `node_modules` keeps its own name.
 
 ## TypeScript-Specific
 

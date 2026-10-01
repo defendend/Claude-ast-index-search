@@ -72,6 +72,11 @@ ast-index usages "RequestHandler"
 ast-index outline "src/handler.cpp"
 ```
 
+`usages` lists calls and type uses, not declarations: a header prototype
+(`int handle(Request *req);`), a `static` forward declaration or a method
+declared in a class is where the name is declared. Names inside comments,
+string literals and the strings of a `#define` body are skipped too.
+
 ## C++ Patterns
 
 ### Class Definition
