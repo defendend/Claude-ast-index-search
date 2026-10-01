@@ -15,11 +15,12 @@ Fast native Rust CLI for structural code search in Android/Kotlin/Java, iOS/Swif
 1. **ast-index is the PRIMARY search tool** — use it before grep, ripgrep, or Search tool
 2. **Pick the command by what you know:**
    - You have an intent or a description ("how is auth handled", "processing update admin") → `ast-index explore "<query>"`. It ranks by relevance and prints the source.
-   - You have an exact identifier (`UserService`, `parseConfig`) → `ast-index search` / `symbol` / `class`.
+   - You have an exact identifier (`UserService`, `parseConfig`) → `ast-index search` / `symbol` / `class`. Add `--with-content` to `symbol` when you need its definition body, or to `search` when the exact qualified name or kind is uncertain.
    - `search` itself falls back to `explore` ranking when a multi-word query has no literal match, so a wrong pick is not fatal — but `explore` is the right first call for questions.
 3. **DO NOT duplicate results** — if ast-index found usages/implementations, that IS the complete answer
 4. **DO NOT run grep "for completeness"** after ast-index returns results
-5. **Use grep/Search ONLY when:**
+5. **DO NOT re-read bodies returned by `--with-content`** — a successful result replaces the usual `sed` / `awk` / `grep` / `rg` or file-read step. Use those tools only when the body is truncated or unavailable, or when you need text outside the returned definition.
+6. **Use grep/Search ONLY when:**
    - ast-index returns empty results
    - Searching for regex patterns (ast-index uses literal match)
    - Searching for string literals inside code (`"some text"`) — `usages` and
@@ -109,9 +110,11 @@ ast-index explore Session request --rwr --format json
 
 ```bash
 ast-index search "Payment"           # Finds files, classes, functions matching "Payment"
+ast-index search "Payment" --with-content  # Include matched symbol bodies
 ast-index search "ViewModel"         # Returns files, symbols, modules in ranked order
 ast-index search "Store" --fuzzy     # Fuzzy: exact → prefix → contains matching
 ast-index search "Handler" --module "core/"  # Search within a module
+ast-index search "Handler" --with-content  # Include matched symbol bodies
 ast-index search "UserService"       # Find Java/Spring services
 ast-index search "@RestController"   # Find Spring REST controllers (annotation search)
 ast-index search "@GetMapping"       # Find GET endpoint mappings
@@ -177,9 +180,11 @@ ast-index file "ViewController"      # Find iOS view controllers
 
 ```bash
 ast-index symbol "PaymentInteractor" # Find exact symbol
+ast-index symbol "PaymentInteractor" --with-content  # Include its source body
 ast-index symbol "Presenter"         # Find all presenters
 ast-index symbol "Store" --fuzzy     # Fuzzy: exact → prefix → contains matching
 ast-index symbol "Mapper" --in-file "payments/" --limit 10  # Scoped search
+ast-index symbol "Mapper" --with-content  # Include bounded source bodies
 ast-index symbol "@Service"          # Find all @Service annotations
 ```
 
@@ -235,13 +240,14 @@ ast-index refs "BaseFragment" --limit 10  # Limit results per section
 
 ### Implementation Search
 
-**`implementations`** - Find all classes that extend or implement a given class/interface/protocol. Supports partial name matching with relevance ranking (exact → suffix → contains).
+**`implementations`** - Find all classes that extend or implement a given class/interface/protocol. Its argument is a parent type, not a method or function name. Supports partial name matching with relevance ranking (exact → suffix → contains).
 
 ```bash
 ast-index implementations "BasePresenter"  # Find all presenter implementations
 ast-index implementations "Repository"     # Find repository implementations (exact match)
 ast-index implementations "Service"        # Partial: finds UserService, PaymentService impls too
 ast-index implementations "ViewModel" --module "features/"  # Scoped to module
+ast-index implementations "Repository" --with-content  # Include bounded source bodies
 ```
 
 ### Class Hierarchy
