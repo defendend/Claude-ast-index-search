@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use colored::Colorize;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -849,6 +849,20 @@ enum Commands {
     DbPath,
     /// Show database schema (tables and columns)
     Schema,
+    /// Show how often each command ran in this project (local log only)
+    Usage {
+        /// Window for the per-command table: 7d, 30d, all, or a number of days
+        #[arg(long, default_value = "30d")]
+        since: String,
+        /// Report every project in the log instead of the current one
+        #[arg(long)]
+        all_projects: bool,
+        /// Attach an MCP response size to the call with this usage id
+        #[arg(long, hide = true, requires = "response_bytes")]
+        record_response: Option<String>,
+        #[arg(long, hide = true)]
+        response_bytes: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1045,6 +1059,13 @@ enum GraphAction {
 }
 
 fn main() -> Result<()> {
+    let usage = ast_index::usage::start(Cli::command());
+    let result = run();
+    usage.finish(if result.is_ok() { 0 } else { 1 });
+    result
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     // Export the chosen output format so deeply-nested helpers (PathResolver,
     // formatters in subagents) can branch on text vs JSON without us
@@ -1105,6 +1126,7 @@ fn main() -> Result<()> {
             | Commands::InstallGitHooks { .. }
             | Commands::Agrep { .. }
             | Commands::Changed { .. }
+            | Commands::Usage { .. }
     );
     let changed_command = matches!(&cli.command, Commands::Changed { .. });
     let release_command_publication = matches!(&cli.command, Commands::Watch);
@@ -1129,6 +1151,7 @@ fn main() -> Result<()> {
             }
         }
     };
+    ast_index::usage::set_project_root(&root);
     let format = cli.format.as_str();
 
     // Migrate project DB from old kotlin-index to ast-index
@@ -1163,6 +1186,7 @@ fn main() -> Result<()> {
             | Commands::Agrep { .. }
             | Commands::Changed { .. }
             | Commands::DbPath
+            | Commands::Usage { .. }
     );
     if reads_index && db::db_exists(&root) {
         let timeout = std::time::Duration::from_millis(
@@ -1796,6 +1820,7 @@ fn main() -> Result<()> {
             if commands::watch::cmd_watch_status(&root, quiet, format)? {
                 Ok(())
             } else {
+                ast_index::usage::finish_active(1);
                 std::process::exit(1);
             }
         }
@@ -1819,6 +1844,15 @@ fn main() -> Result<()> {
         Commands::Query { sql, limit } => commands::management::cmd_query(&root, &sql, limit),
         Commands::DbPath => commands::management::cmd_db_path(&root),
         Commands::Schema => commands::management::cmd_schema(&root),
+        Commands::Usage {
+            since,
+            all_projects,
+            record_response,
+            response_bytes,
+        } => match (record_response, response_bytes) {
+            (Some(id), Some(bytes)) => ast_index::usage::record_response(&id, bytes),
+            _ => commands::usage::cmd_usage(&root, &since, all_projects, format),
+        },
     }
 }
 
