@@ -282,27 +282,37 @@ pub fn cmd_search(
     let prefilter = word_index
         .as_ref()
         .and_then(|words| words.prefilter(&literals));
-    let content_page = super::search_files_page_prefiltered(
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
+    let grep_roots = resolver.grep_roots();
+    let content_page = super::search_files_page_in_kept(
         root,
+        &grep_roots,
         &pattern,
         &super::grep::ALL_SOURCE_EXTENSIONS,
         limit,
         prefilter.as_ref(),
+        &|_, _| true,
         |path, line_num, line| {
             let rel_path = super::relative_path(root, path);
-            // Apply scope filter for grep results
+            // Scope prefixes are relative to the root that owns the file, as
+            // they are for indexed rows.
+            let owner_rel = grep_roots
+                .iter()
+                .find_map(|owner| path.strip_prefix(owner).ok())
+                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|| rel_path.clone());
             if let Some(prefix) = scope.dir_prefix {
-                if !rel_path.starts_with(prefix) {
+                if !owner_rel.starts_with(prefix) {
                     return None;
                 }
             }
             if let Some(in_file) = scope.in_file {
-                if !rel_path.contains(in_file) {
+                if !owner_rel.contains(in_file) {
                     return None;
                 }
             }
             if let Some(module) = scope.module {
-                if !rel_path.starts_with(module) {
+                if !owner_rel.starts_with(module) {
                     return None;
                 }
             }
@@ -317,7 +327,6 @@ pub fn cmd_search(
     )?;
     content_matches = content_page.items;
 
-    let resolver = PathResolver::try_from_conn(root, &conn)?;
     // Apply --subtree / --local filters before resolving paths so we don't
     // do extra work on rows the user will throw away.
     let files: Vec<db::FileResult> = files

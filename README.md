@@ -722,6 +722,12 @@ no_ignore: false
 
 All fields are optional. CLI flags override config file values.
 
+`include` and `exclude` from this file also scope the grep-based commands
+(`search` content matches, `todo`, `callers`, `usages` fallback and the rest),
+so a directory the index skips is not read by them either. The
+`rebuild --include` / `--exclude` flags apply to that one rebuild only and do
+not change what those commands scan.
+
 ### Examples
 
 **Monorepo with shared libraries:**
@@ -750,6 +756,15 @@ exclude:
   `docs/requirements.txt` in an Android or web project from turning it into
   a polyglot one, and a lone `.python-version` is not treated as Python.
   Contributed in [#74](https://github.com/defendend/Claude-ast-index-search/pull/74).
+- **`search` content matches now cover what the index covers** — the content
+  scan walks attached subtrees as well as the primary root, and `--local` /
+  `--subtree NAME` narrow it the same way they narrow indexed results.
+  `include` and `exclude` from `.ast-index.yaml` now scope every grep-based
+  command, so an excluded `vendor/` or generated directory is no longer read by
+  `search`, `todo` and the others. Fixes
+  [#67](https://github.com/defendend/Claude-ast-index-search/issues/67) and
+  covers the search-scope part of
+  [#62](https://github.com/defendend/Claude-ast-index-search/pull/62).
 
 ### 3.56.0
 

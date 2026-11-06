@@ -217,19 +217,17 @@ pub struct ProjectConfig {
     pub no_ignore: Option<bool>,
 }
 
+fn config_path(root: &Path) -> Option<PathBuf> {
+    [".ast-index.yaml", ".ast-index.yml"]
+        .iter()
+        .map(|name| root.join(name))
+        .find(|path| path.exists())
+}
+
 /// Load project config from `.ast-index.yaml` or `.ast-index.yml` in the given root.
 /// Returns `None` if no config file found or on parse error (with warning).
 pub fn load_config(root: &Path) -> Option<ProjectConfig> {
-    let yaml_path = root.join(".ast-index.yaml");
-    let yml_path = root.join(".ast-index.yml");
-    let config_path = if yaml_path.exists() {
-        yaml_path
-    } else if yml_path.exists() {
-        yml_path
-    } else {
-        return None;
-    };
-
+    let config_path = config_path(root)?;
     match fs::read_to_string(&config_path) {
         Ok(content) => match serde_yaml::from_str::<ProjectConfig>(&content) {
             Ok(config) => {
@@ -246,6 +244,13 @@ pub fn load_config(root: &Path) -> Option<ProjectConfig> {
             None
         }
     }
+}
+
+/// [`load_config`] without its stderr lines, for the grep-based commands that
+/// read the config on every call. A broken file is reported by `rebuild`.
+pub fn load_config_quiet(root: &Path) -> Option<ProjectConfig> {
+    let content = fs::read_to_string(config_path(root)?).ok()?;
+    serde_yaml::from_str(&content).ok()
 }
 
 /// Check if project has build system markers (Gradle/Maven build files)

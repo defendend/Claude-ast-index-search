@@ -580,15 +580,21 @@ where
         crate::indexer::find_arc_root(root)
     };
 
-    let first = roots.first().map(PathBuf::as_path).unwrap_or(root);
+    let scope = ConfigScope::load(root);
+    let roots = scope.walk_roots(roots);
+    let Some((first, rest)) = roots.split_first() else {
+        return Ok(());
+    };
     let mut wb = WalkBuilder::new(first);
-    for extra in roots.iter().skip(1) {
+    for extra in rest {
         wb.add(extra);
     }
     wb.hidden(true)
         .git_ignore(use_git)
         .git_exclude(use_git)
-        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
+        .filter_entry(move |entry| {
+            !crate::indexer::is_excluded_dir(entry) && !scope.excludes(entry)
+        })
         .threads(num_cpus());
     if let Some(ref arc) = arc_root {
         wb.add_custom_ignore_filename(".gitignore");
@@ -814,7 +820,9 @@ where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
-    let walker = project_walker(root)?;
+    let Some(walker) = project_walker(root)? else {
+        return Ok(());
+    };
 
     let (tx, rx) = channel::bounded::<(Arc<Path>, usize, String)>(limit.max(1000));
 
@@ -903,7 +911,9 @@ where
 /// The tree is walked in parallel and sorted afterwards, so the order does not
 /// depend on which thread reached a file first.
 pub fn project_source_files(root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
-    let walker = project_walker(root)?;
+    let Some(walker) = project_walker(root)? else {
+        return Ok(Vec::new());
+    };
     let extensions: HashSet<&str> = extensions.iter().copied().collect();
     let (tx, rx) = channel::unbounded::<PathBuf>();
     walker.run(|| {
@@ -1119,9 +1129,86 @@ where
     })
 }
 
+/// The part of `.ast-index.yaml` that narrows what the indexer walks in the
+/// primary root: the `include` allow-list and the `exclude` patterns. Grep-based
+/// commands apply it too, so a directory left out of the index is not read by
+/// `search` and friends either.
+struct ConfigScope {
+    root: PathBuf,
+    include: Option<Vec<PathBuf>>,
+    exclude: Option<ignore::gitignore::Gitignore>,
+}
+
+impl ConfigScope {
+    fn load(root: &Path) -> Self {
+        let config = crate::indexer::load_config_quiet(root).unwrap_or_default();
+        // A listed directory that does not exist is skipped, as the indexer does.
+        let include = config
+            .include
+            .filter(|dirs| !dirs.is_empty())
+            .map(|dirs| {
+                dirs.iter()
+                    .map(|dir| root.join(dir))
+                    .filter(|dir| dir.is_dir())
+                    .collect()
+            });
+        let exclude = config
+            .exclude
+            .filter(|patterns| !patterns.is_empty())
+            .and_then(|patterns| {
+                let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+                for pattern in &patterns {
+                    builder.add_line(None, pattern).ok();
+                }
+                builder.build().ok()
+            });
+        Self {
+            root: root.to_path_buf(),
+            include,
+            exclude,
+        }
+    }
+
+    /// `roots` with the primary root replaced by its `include` directories.
+    /// Extra roots are attached explicitly and are walked whole.
+    fn walk_roots(&self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for root in roots {
+            match &self.include {
+                Some(dirs) if *root == self.root => {
+                    for dir in dirs {
+                        if !out.contains(dir) {
+                            out.push(dir.clone());
+                        }
+                    }
+                }
+                _ => {
+                    if !out.contains(root) {
+                        out.push(root.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn excludes(&self, entry: &ignore::DirEntry) -> bool {
+        let Some(matcher) = &self.exclude else {
+            return false;
+        };
+        let path = entry.path();
+        if !path.starts_with(&self.root) {
+            return false;
+        }
+        let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+        matcher.matched(path, is_dir).is_ignore()
+    }
+}
+
 /// Parallel walker over the primary root with the ignore rules the indexer
-/// applies, or none when the index was built with `--no-ignore`.
-fn project_walker(root: &Path) -> Result<ignore::WalkParallel> {
+/// applies, or none when the index was built with `--no-ignore`. `None` when
+/// the config's `include` leaves nothing to walk.
+fn project_walker(root: &Path) -> Result<Option<ignore::WalkParallel>> {
     let no_ignore = try_is_no_ignore_enabled(root)?;
     let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
     let arc_root = if no_ignore {
@@ -1130,11 +1217,21 @@ fn project_walker(root: &Path) -> Result<ignore::WalkParallel> {
         crate::indexer::find_arc_root(root)
     };
 
-    let mut wb = WalkBuilder::new(root);
+    let scope = ConfigScope::load(root);
+    let roots = scope.walk_roots(std::slice::from_ref(&root.to_path_buf()));
+    let Some((first, rest)) = roots.split_first() else {
+        return Ok(None);
+    };
+    let mut wb = WalkBuilder::new(first);
+    for extra in rest {
+        wb.add(extra);
+    }
     wb.hidden(true)
         .git_ignore(use_git)
         .git_exclude(use_git)
-        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
+        .filter_entry(move |entry| {
+            !crate::indexer::is_excluded_dir(entry) && !scope.excludes(entry)
+        })
         .threads(num_cpus());
     if let Some(ref arc) = arc_root {
         wb.add_custom_ignore_filename(".gitignore");
@@ -1144,5 +1241,5 @@ fn project_walker(root: &Path) -> Result<ignore::WalkParallel> {
             wb.add_ignore(root_gitignore);
         }
     }
-    Ok(wb.build_parallel())
+    Ok(Some(wb.build_parallel()))
 }
