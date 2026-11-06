@@ -135,7 +135,7 @@ pub enum ProjectType {
     IOS,      // Swift/ObjC - Package.swift, *.xcodeproj
     Perl,     // Perl - .pm files, Makefile.PL, Build.PL
     Frontend, // JS/TS - package.json
-    Python,   // Python - pyproject.toml, setup.py, setup.cfg
+    Python,   // Python - pyproject.toml, setup.py, setup.cfg, Pipfile, poetry.lock
     Go,       // Go - go.mod
     Rust,     // Rust - Cargo.toml
     Bazel,    // Bazel - BUILD, WORKSPACE
@@ -642,25 +642,25 @@ fn is_under_fixture_dir(relative: &str) -> bool {
         .any(|segment| STACK_FIXTURE_DIR_SEGMENTS.contains(segment))
 }
 
-/// Python project markers beyond the classic `pyproject.toml` / `setup.py` /
-/// `setup.cfg` trio: pip-tools, pipenv and poetry manifests, pyenv version pin
-/// and test tooling configs. Many real-world projects (especially pip-tools /
-/// uv workflows) ship only `requirements*.txt/in` and `pytest.ini`.
-/// Note: `.python-version` is a hidden file — the bounded walk skips hidden
-/// entries, but the root-level marker check below still finds it in the root.
+/// Python manifests that mark a Python project wherever they appear, so they
+/// also make a subdirectory a sub-project in [`detect_project_type`].
 const PYTHON_STACK_MARKER_NAMES: &[&str] = &[
     "pyproject.toml",
     "setup.py",
     "setup.cfg",
-    "requirements.txt",
-    "requirements.in",
     "Pipfile",
     "Pipfile.lock",
     "poetry.lock",
-    "pytest.ini",
-    "tox.ini",
-    ".python-version",
 ];
+
+/// Python markers counted only at the project root. pip-tools / uv projects
+/// often ship nothing else, but nested copies are routinely tooling for a
+/// non-Python project (`docs/requirements.txt` for a docs build, a `tox.ini`
+/// next to helper scripts) and must not turn it into a polyglot one.
+/// `.python-version` is left out: node-gyp and pre-commit setups pin it in
+/// projects that contain no Python code.
+const PYTHON_ROOT_STACK_MARKER_NAMES: &[&str] =
+    &["requirements.txt", "requirements.in", "pytest.ini", "tox.ini"];
 
 const ROOT_STACK_MARKER_NAMES: &[&str] = &[
     "settings.gradle.kts",
@@ -695,7 +695,6 @@ const ROOT_STACK_MARKER_NAMES: &[&str] = &[
     "poetry.lock",
     "pytest.ini",
     "tox.ini",
-    ".python-version",
     "go.mod",
     "pubspec.yaml",
     "composer.json",
@@ -1109,7 +1108,22 @@ fn detect_stacks_with_limits(
         });
     }
 
-    let python_markers = collect_markers(entries, PYTHON_STACK_MARKER_NAMES);
+    let mut python_markers = collect_markers(entries, PYTHON_STACK_MARKER_NAMES);
+    let root_entries: Vec<&StackScanEntry> = entries
+        .iter()
+        .filter(|entry| !entry.relative.contains('/'))
+        .collect();
+    for name in PYTHON_ROOT_STACK_MARKER_NAMES {
+        if python_markers.len() >= STACK_MARKERS_PER_KIND {
+            break;
+        }
+        if root_entries
+            .iter()
+            .any(|entry| !entry.is_dir && entry.relative == *name)
+        {
+            python_markers.push((*name).to_string());
+        }
+    }
     if !python_markers.is_empty() {
         stacks.push(DetectedStack {
             kind: "python".to_string(),

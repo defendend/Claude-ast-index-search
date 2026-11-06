@@ -740,6 +740,17 @@ exclude:
 
 ## Changelog
 
+### 3.57.0
+
+- **Detect Python projects that have no `pyproject.toml`** — `detect-stacks`,
+  `/initialize`, `stats` and `map` now recognise pip-tools / uv / pipenv /
+  poetry projects by `Pipfile`, `Pipfile.lock` and `poetry.lock` anywhere in
+  the tree, and by `requirements.txt`, `requirements.in`, `pytest.ini` and
+  `tox.ini` at the project root. The root-only rule keeps a
+  `docs/requirements.txt` in an Android or web project from turning it into
+  a polyglot one, and a lone `.python-version` is not treated as Python.
+  Contributed in [#74](https://github.com/defendend/Claude-ast-index-search/pull/74).
+
 ### 3.56.0
 
 This release merges the symbol graph, Git hotspots and ranked search work

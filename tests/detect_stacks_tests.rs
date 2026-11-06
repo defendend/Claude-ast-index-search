@@ -235,16 +235,12 @@ fn requirements_based_python_project_is_detected() {
     let result = detect_stacks(root);
 
     assert_eq!(kinds(&result), vec!["python"]);
-    // Markers follow the candidate order of PYTHON_STACK_MARKER_NAMES.
     assert_eq!(
         result.stacks[0].markers,
-        vec![
-            "requirements.txt".to_string(),
-            "pytest.ini".to_string(),
-            ".python-version".to_string(),
-        ]
+        vec!["requirements.txt".to_string(), "pytest.ini".to_string()]
     );
     assert!(!result.is_polyglot);
+    assert_eq!(ast_index::indexer::project_label(root), "Python");
 }
 
 #[test]
@@ -287,5 +283,58 @@ fn pyproject_python_project_keeps_legacy_marker_order() {
     assert_eq!(
         result.stacks[0].markers,
         vec!["pyproject.toml".to_string(), "requirements.txt".to_string()]
+    );
+}
+
+#[test]
+fn nested_requirements_do_not_add_python_to_another_stack() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    fs::write(root.join("settings.gradle.kts"), "rootProject.name = \"app\"\n").unwrap();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs/requirements.txt"), "mkdocs\n").unwrap();
+    fs::write(root.join("docs/tox.ini"), "[tox]\n").unwrap();
+
+    let result = detect_stacks(root);
+
+    assert_eq!(kinds(&result), vec!["android"]);
+    assert!(!result.is_polyglot);
+    assert_eq!(
+        ast_index::indexer::detect_project_type(&root.join("docs")),
+        ast_index::indexer::ProjectType::Unknown,
+        "a docs dir with only requirements.txt must not count as a sub-project"
+    );
+}
+
+#[test]
+fn python_version_pin_alone_is_not_a_python_stack() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    fs::write(root.join("package.json"), "{\"name\": \"web\"}\n").unwrap();
+    fs::write(root.join(".python-version"), "3.11\n").unwrap();
+
+    let result = detect_stacks(root);
+
+    assert!(!kinds(&result).contains(&"python"));
+    assert!(!result.is_polyglot);
+}
+
+#[test]
+fn nested_pyproject_still_marks_a_python_stack() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    fs::create_dir_all(root.join("services/api")).unwrap();
+    fs::write(root.join("services/api/pyproject.toml"), "[project]\nname = \"api\"\n").unwrap();
+    fs::write(root.join("services/api/requirements.txt"), "fastapi\n").unwrap();
+
+    let result = detect_stacks(root);
+
+    assert_eq!(kinds(&result), vec!["python"]);
+    assert_eq!(
+        result.stacks[0].markers,
+        vec!["services/api/pyproject.toml".to_string()]
     );
 }

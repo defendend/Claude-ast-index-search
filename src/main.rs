@@ -1992,7 +1992,7 @@ fn cmd_detect_stacks(root: &Path, format: &str) -> Result<()> {
         );
         println!(
             "Markers checked: settings.gradle*, package.json, Cargo.toml, Package.swift, \
-             go.mod, pyproject.toml, Gemfile, composer.json, *.csproj, build.sbt, build.zig, \
+             go.mod, pyproject.toml, requirements.txt, Gemfile, composer.json, *.csproj, build.sbt, build.zig, \
              CMakeLists.txt, Makefile.PL, pubspec.yaml."
         );
         return Ok(());
