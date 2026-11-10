@@ -1442,19 +1442,23 @@ pub fn cmd_ast_grep(root: &Path, pattern: &str, lang: Option<&str>, json: bool) 
     Ok(())
 }
 
+/// `ast-grep` is tried first: on most Linux distributions `sg` is the shadow-utils
+/// "execute command as different group" tool, which also starts with `--version`.
+/// A candidate is accepted only if `--version` succeeds and reports ast-grep.
 fn find_ast_grep_binary() -> Option<String> {
-    for name in &["sg", "ast-grep"] {
-        if std::process::Command::new(name)
+    ["ast-grep", "sg"].into_iter().find_map(|name| {
+        let output = std::process::Command::new(name)
             .arg("--version")
-            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Some(name.to_string());
-        }
-    }
-    None
+            .output()
+            .ok()?;
+        (output.status.success() && is_ast_grep_version(&output.stdout))
+            .then(|| name.to_string())
+    })
+}
+
+fn is_ast_grep_version(stdout: &[u8]) -> bool {
+    stdout.starts_with(b"ast-grep ")
 }
 
 #[cfg(test)]
@@ -2136,5 +2140,12 @@ mod tests {
 
         let result = find_containing_function(&code, 3, &func_def_re);
         assert_eq!(result, Some(("update!".to_string(), 2)));
+    }
+
+    #[test]
+    fn ast_grep_version_accepts_ast_grep_only() {
+        assert!(super::is_ast_grep_version(b"ast-grep 0.51.1\n"));
+        assert!(!super::is_ast_grep_version(b""));
+        assert!(!super::is_ast_grep_version(b"sg from shadow-utils 4.17.4\n"));
     }
 }

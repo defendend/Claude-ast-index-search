@@ -765,6 +765,11 @@ exclude:
   [#67](https://github.com/defendend/Claude-ast-index-search/issues/67) and
   covers the search-scope part of
   [#62](https://github.com/defendend/Claude-ast-index-search/pull/62).
+- **`agrep` no longer runs the system `sg` instead of ast-grep** — on Linux
+  `sg` is usually the shadow-utils "run as another group" tool, and it was
+  picked first because any binary that could be started counted as ast-grep.
+  `agrep` now tries `ast-grep` before `sg` and accepts a binary only when
+  `--version` succeeds and reports ast-grep.
 
 ### 3.56.0
 
