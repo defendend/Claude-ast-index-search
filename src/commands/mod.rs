@@ -26,6 +26,7 @@ pub mod perl;
 pub mod project_info;
 pub mod rank;
 pub mod test_paths;
+pub mod usage;
 pub mod watch;
 
 pub use test_paths::{is_test_path, is_test_symbol};

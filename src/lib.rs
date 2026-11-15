@@ -3,3 +3,4 @@ pub mod db;
 pub mod indexer;
 pub mod minified;
 pub mod parsers;
+pub mod usage;

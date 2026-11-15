@@ -637,10 +637,14 @@ fn call_tool(params: Value, ast_index_bin: &str, default_root: &PathBuf) -> Resu
         .unwrap_or("text");
 
     let argv = build_argv(name, &arguments)?;
+    let usage_id = next_usage_id();
 
     let output = Command::new(ast_index_bin)
         .args(&argv)
         .current_dir(&resolved_root)
+        .env("AST_INDEX_CALLER", "mcp")
+        .env("AST_INDEX_MCP_TOOL", name)
+        .env("AST_INDEX_USAGE_ID", &usage_id)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -653,7 +657,56 @@ fn call_tool(params: Value, ast_index_bin: &str, default_root: &PathBuf) -> Resu
 
     let stdout = String::from_utf8(output.stdout).context("ast-index produced non-UTF8 output")?;
 
-    Ok(render_tool_output(name, output_format, stdout))
+    let rendered = render_tool_output(name, output_format, stdout);
+    record_response_size(ast_index_bin, &resolved_root, &usage_id, rendered.len());
+    Ok(rendered)
+}
+
+/// Unique per tool call; ties the CLI's usage row to the response size
+/// recorded below.
+fn next_usage_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Only this server knows how many bytes the agent actually received after
+/// compaction, so it hands that number back to the CLI's usage log. Runs
+/// detached: the tool result is not held up by bookkeeping, and an older
+/// `ast-index` without the `usage` command just exits with an error nobody
+/// reads.
+fn record_response_size(ast_index_bin: &str, root: &std::path::Path, usage_id: &str, bytes: usize) {
+    let disabled = env::var("AST_INDEX_NO_USAGE")
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false);
+    if disabled {
+        return;
+    }
+    let child = Command::new(ast_index_bin)
+        .args(["usage", "--record-response", usage_id, "--response-bytes"])
+        .arg(bytes.to_string())
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = child {
+        // Reap in the background so a long-lived server leaves no zombies.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 fn render_tool_output(tool: &str, output_format: &str, stdout: String) -> String {
