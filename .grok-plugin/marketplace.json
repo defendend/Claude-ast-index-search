@@ -1,0 +1,20 @@
+{
+  "name": "ast-index",
+  "description": "ast-index plugin marketplace for Grok Build.",
+  "owner": {
+    "name": "defendend"
+  },
+  "plugins": [
+    {
+      "name": "ast-index",
+      "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, PHP, Python, Go, Perl, C++, Protocol Buffers, and WSDL/XSD projects",
+      "author": {
+        "name": "defendend"
+      },
+      "version": "3.56.0",
+      "category": "development",
+      "homepage": "https://github.com/defendend/Claude-ast-index-search",
+      "source": "./plugin"
+    }
+  ]
+}

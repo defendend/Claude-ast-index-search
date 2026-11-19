@@ -38,6 +38,9 @@ brew tap defendend/ast-index
 brew install ast-index
 ```
 
+If the installed CLI rejects a subcommand or flag as unknown, run
+`ast-index version` and ask the user to upgrade. Do not invent flags.
+
 Initialize index in project root:
 
 ```bash
@@ -631,6 +634,7 @@ ast-index version                    # Show CLI version
 ast-index help                       # Show help message
 ast-index help <command>             # Show help for specific command
 ast-index install-claude-plugin      # Install Claude Code plugin to ~/.claude/plugins/
+ast-index install-grok-build-plugin  # Install the Grok Build plugin
 ```
 
 ## Programmatic Access (SQL & SDK)

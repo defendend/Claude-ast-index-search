@@ -1,0 +1,11 @@
+{
+  "name": "ast-index",
+  "version": "3.56.0",
+  "description": "Fast code search for Android/Kotlin/Java, iOS/Swift/ObjC, Dart/Flutter, TypeScript/JavaScript, Rust, Ruby, C#, PHP, Python, Go, Perl, C++, Protocol Buffers, and WSDL/XSD projects",
+  "author": {
+    "name": "defendend"
+  },
+  "commands": "./commands-grok",
+  "skills": "./skills",
+  "hooks": "./hooks/hooks-grok.json"
+}

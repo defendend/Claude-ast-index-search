@@ -56,6 +56,12 @@ echo "  ✓ .claude-plugin/plugin.json"
 sed -i '' "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" .claude-plugin/marketplace.json
 echo "  ✓ .claude-plugin/marketplace.json"
 
+# 7b. Grok Build plugin manifest and marketplace
+sed -i '' "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" plugin/.grok-plugin/plugin.json
+echo "  ✓ plugin/.grok-plugin/plugin.json"
+sed -i '' "s/\"version\": \"$CURRENT\"/\"version\": \"$VERSION\"/" .grok-plugin/marketplace.json
+echo "  ✓ .grok-plugin/marketplace.json"
+
 # 8. npm/package.json (version + optionalDependencies)
 if [ -f npm/package.json ]; then
     sed -i '' "s/$CURRENT/$VERSION/g" npm/package.json
@@ -92,6 +98,8 @@ git add Cargo.toml Cargo.lock README.md \
     plugin/.cursor-plugin/plugin.json \
     .claude-plugin/plugin.json \
     .claude-plugin/marketplace.json \
+    plugin/.grok-plugin/plugin.json \
+    .grok-plugin/marketplace.json \
     npm/package.json npm/platforms/*/package.json 2>/dev/null || true
 git commit -m "Bump to v$VERSION"
 git tag "v$VERSION"
