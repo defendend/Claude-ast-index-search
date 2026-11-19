@@ -8,6 +8,9 @@ This directory is the shared payload for agent integrations.
 - Codex: `.codex-plugin/plugin.json` and `skills/`.
 - Cursor: `.cursor-plugin/plugin.json`, `skills/`, `rules/`, and
   `commands-cursor/`.
+- Grok Build: `.grok-plugin/plugin.json`, `skills/`, `commands-grok/`, and
+  `hooks/hooks-grok.json`. The repo marketplace is
+  `.grok-plugin/marketplace.json`.
 
 The Claude commands are intentionally separate from the Cursor command because
 they write different project configuration files.
@@ -46,3 +49,12 @@ ln -s /absolute/path/to/Claude-ast-index-search/plugin ~/.cursor/plugins/local/a
 Then reload Cursor and verify the `ast-index` skill, rule, and
 `initialize-ast-index` command appear. For Claude Code plugin testing, verify
 that `/initialize` and the manual override `/initialize-*` commands appear.
+
+Validate the Grok manifest from the repo root:
+
+```bash
+grok plugin validate plugin
+```
+
+The Grok command is `/ast-index-initialize`. It writes `.grok/rules/ast-index.md`
+and does not use the Claude `/initialize` command files.

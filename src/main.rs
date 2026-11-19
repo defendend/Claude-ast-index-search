@@ -94,8 +94,9 @@ Project Configuration:
   add-root               Add additional source root
   remove-root            Remove source root
   list-roots             List configured source roots
-  install-claude-plugin  Install Claude Code plugin
-  install-codex-mcp      Register ast-index MCP server in Codex
+  install-claude-plugin      Install Claude Code plugin
+  install-grok-build-plugin  Install Grok Build plugin
+  install-codex-mcp          Register ast-index MCP server in Codex
 
 Programmatic Access:
   agrep                  Structural code search via ast-grep
@@ -808,6 +809,8 @@ enum Commands {
     Version,
     /// Install Claude Code plugin to ~/.claude/plugins/
     InstallClaudePlugin,
+    /// Install the ast-index plugin for Grok Build
+    InstallGrokBuildPlugin,
     /// Register ast-index MCP server in Codex
     InstallCodexMcp {
         /// Print the Codex command and config fallback without changing Codex config
@@ -1100,6 +1103,7 @@ fn main() -> Result<()> {
         &cli.command,
         Commands::Version
             | Commands::InstallClaudePlugin
+            | Commands::InstallGrokBuildPlugin
             | Commands::InstallCodexMcp { .. }
             | Commands::DetectStacks
             | Commands::InstallGitHooks { .. }
@@ -1157,6 +1161,7 @@ fn main() -> Result<()> {
             }
             | Commands::Version
             | Commands::InstallClaudePlugin
+            | Commands::InstallGrokBuildPlugin
             | Commands::InstallCodexMcp { .. }
             | Commands::DetectStacks
             | Commands::InstallGitHooks { .. }
@@ -1805,6 +1810,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::InstallClaudePlugin => cmd_install_claude_plugin(),
+        Commands::InstallGrokBuildPlugin => cmd_install_grok_build_plugin(),
         Commands::InstallCodexMcp { dry_run } => cmd_install_codex_mcp(&root, dry_run),
         Commands::DetectStacks => cmd_detect_stacks(&root, format),
         Commands::InstallGitHooks { force, dry_run } => {
@@ -1867,6 +1873,54 @@ fn cmd_install_claude_plugin() -> Result<()> {
                 "Failed to run claude plugin install: {}",
                 e
             ));
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_install_grok_build_plugin() -> Result<()> {
+    use std::process::Command;
+
+    println!("Adding ast-index marketplace...");
+    let status = Command::new("grok")
+        .args([
+            "plugin",
+            "marketplace",
+            "add",
+            "defendend/Claude-ast-index-search",
+        ])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("Marketplace added successfully.");
+        }
+        Ok(s) => {
+            eprintln!("Warning: marketplace add exited with {}", s);
+        }
+        Err(e) => {
+            eprintln!("Error: could not run 'grok' CLI: {}", e);
+            eprintln!("Install Grok Build, then rerun `ast-index install-grok-build-plugin`.");
+            return Err(anyhow::anyhow!("grok CLI not found"));
+        }
+    }
+
+    println!("Installing ast-index plugin...");
+    let status = Command::new("grok")
+        .args(["plugin", "install", "ast-index", "--trust"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("Plugin installed successfully.");
+            println!("\nStart a new Grok session, then run /ast-index-initialize in the project.");
+        }
+        Ok(s) => {
+            eprintln!("Plugin install exited with {}", s);
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to run grok plugin install: {}", e));
         }
     }
 

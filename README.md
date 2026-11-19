@@ -267,6 +267,37 @@ Reload Cursor after creating the symlink. The Cursor plugin package exposes the
 shared `ast-index` skill, a project rule in `plugin/rules/`, and a Cursor-specific
 `initialize-ast-index` command that writes `.cursor/rules/ast-index.mdc`.
 
+### Grok Build Plugin
+
+```bash
+# Option 1: via marketplace
+grok plugin marketplace add defendend/Claude-ast-index-search
+grok plugin install ast-index --trust
+
+# Option 2: if ast-index is already installed
+ast-index install-grok-build-plugin
+```
+
+`--trust` is required so the skill and hooks load. Start a new Grok session
+after installing. Uninstall with `grok plugin uninstall ast-index`.
+
+In a project, run `/ast-index-initialize`. It reads
+`ast-index --format json detect-stacks` and writes `.grok/rules/ast-index.md`
+for a single stack, Kotlin Multiplatform, or a polyglot repo, plus a project
+allow rule for `ast-index`. It does not write Claude settings. If the installed
+CLI has no `detect-stacks`, the command writes the common rules only and asks
+you to upgrade the CLI the same way it was installed.
+
+The plugin does not start the MCP server. `ast-index-mcp` is a separate
+binary. To use the structured tools, install that binary and add it to the
+project `.grok/config.toml` the same way other agents register it. See
+[`docs/mcp-setup.md`](docs/mcp-setup.md).
+
+The CLI and the plugin are versioned together, but the binary on `PATH` can
+be older or newer. The plugin still loads. A rejected subcommand means the
+CLI should be upgraded. Homebrew is one install option; Cargo, Winget, npm,
+and a source build are listed under Installation.
+
 ### Gemini CLI
 
 ```bash
@@ -748,6 +779,7 @@ exclude:
 
 ### 3.57.0
 
+- **Grok Build plugin** — install with `grok plugin marketplace add defendend/Claude-ast-index-search` and `grok plugin install ast-index --trust`, or `ast-index install-grok-build-plugin`. The plugin ships the shared `ast-index` skill, index hooks, and `/ast-index-initialize`, which writes `.grok/rules/ast-index.md` from `detect-stacks`. An older CLI that lacks `detect-stacks` still gets the common rules and a prompt to upgrade.
 - **Detect Python projects that have no `pyproject.toml`** — `detect-stacks`,
   `/initialize`, `stats` and `map` now recognise pip-tools / uv / pipenv /
   poetry projects by `Pipfile`, `Pipfile.lock` and `poetry.lock` anywhere in

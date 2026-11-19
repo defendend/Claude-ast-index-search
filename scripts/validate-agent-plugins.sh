@@ -75,6 +75,7 @@ shared_plugin_files = [
     "plugin/.claude-plugin/plugin.json",
     "plugin/.codex-plugin/plugin.json",
     "plugin/.cursor-plugin/plugin.json",
+    "plugin/.grok-plugin/plugin.json",
 ]
 
 for path in shared_plugin_files:
@@ -102,6 +103,29 @@ if "hooks/hooks.json" in normalized_manifest_hooks:
         "manifest.hooks must only reference additional hook files"
     )
 
+grok_manifest = load_json("plugin/.grok-plugin/plugin.json")
+if grok_manifest.get("commands") != "./commands-grok":
+    errors.append("plugin/.grok-plugin/plugin.json: commands must be ./commands-grok")
+if grok_manifest.get("skills") not in ("./skills", "./skills/"):
+    errors.append("plugin/.grok-plugin/plugin.json: skills must be ./skills")
+if grok_manifest.get("hooks") != "./hooks/hooks-grok.json":
+    errors.append("plugin/.grok-plugin/plugin.json: hooks must be ./hooks/hooks-grok.json")
+
+grok_marketplace = load_json(".grok-plugin/marketplace.json")
+grok_plugins = grok_marketplace.get("plugins", [])
+if len(grok_plugins) != 1:
+    errors.append(".grok-plugin/marketplace.json: expected exactly one plugin entry")
+else:
+    entry = grok_plugins[0]
+    if entry.get("name") != "ast-index":
+        errors.append(".grok-plugin/marketplace.json: plugin name must be ast-index")
+    if entry.get("version") != cargo_version:
+        errors.append(
+            f".grok-plugin/marketplace.json: version {entry.get('version')!r} != Cargo.toml {cargo_version!r}"
+        )
+    if entry.get("source") != "./plugin":
+        errors.append(".grok-plugin/marketplace.json: source must be ./plugin")
+
 cursor_manifest = load_json("plugin/.cursor-plugin/plugin.json")
 extra = sorted(set(cursor_manifest) - cursor_allowed)
 if extra:
@@ -118,6 +142,8 @@ for path in [
     "plugin/skills/ast-index/SKILL.md",
     "plugin/rules/ast-index.mdc",
     "plugin/commands-cursor/initialize-ast-index.md",
+    "plugin/commands-grok/ast-index-initialize.md",
+    "plugin/hooks/hooks-grok.json",
 ]:
     require_file(path)
 
@@ -201,6 +227,34 @@ if readme and "/initialize" not in readme:
 plugin_readme = require_text("plugin/README.md")
 if plugin_readme and "/initialize" not in plugin_readme:
     errors.append("plugin/README.md: must mention /initialize for Claude plugin testing")
+
+grok_init = require_text("plugin/commands-grok/ast-index-initialize.md")
+if grok_init:
+    grok_snippets = {
+        "frontmatter name": "name: ast-index-initialize",
+        "rules path": ".grok/rules/ast-index.md",
+        "detect-stacks": "detect-stacks",
+        "rebuild step": "ast-index rebuild",
+        "stats step": "ast-index stats",
+        "kmp branch": "is_kmp",
+        "polyglot branch": "is_polyglot",
+        "empty stacks": "`stacks` empty",
+        "permission allow": 'Bash(ast-index *)',
+    }
+    for label, snippet in grok_snippets.items():
+        if snippet not in grok_init:
+            errors.append(
+                f"plugin/commands-grok/ast-index-initialize.md: missing {label} snippet {snippet!r}"
+            )
+    if "brew tap defendend/ast-index" in grok_init and "Winget" not in grok_init:
+        errors.append(
+            "plugin/commands-grok/ast-index-initialize.md: install instructions must not be Homebrew-only"
+        )
+
+if readme and "install-grok-build-plugin" not in readme:
+    errors.append("README.md: must mention install-grok-build-plugin")
+if readme and "/ast-index-initialize" not in readme:
+    errors.append("README.md: must mention /ast-index-initialize")
 
 if errors:
     for error in errors:
